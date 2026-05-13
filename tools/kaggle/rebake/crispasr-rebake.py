@@ -30,7 +30,43 @@
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+# ── Unbuffered I/O + tiny progress.jsonl checkpointer ────────────────
+# Last rebake run hung 11+h inside cmake build between two consecutive
+# compiler-warning lines — invisible because Python's print buffer
+# fills slowly and Kaggle only flushes at process exit. Forcing
+# line-buffered stdio + writing a JSONL marker at every major bootstrap
+# step means the next hang shows up in /kaggle/working/progress.jsonl
+# (fetchable via `kaggle kernels output --file-pattern 'progress.jsonl'`
+# without waiting for termination).
+os.environ["PYTHONUNBUFFERED"] = "1"
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, ValueError):
+    pass
+
+import json as _json
+_PROGRESS = Path("/kaggle/working/progress.jsonl")
+_T0 = time.time()
+
+
+def _step(name: str, **kw):
+    rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           "elapsed_s": round(time.time() - _T0, 2), "step": name, **kw}
+    try:
+        _PROGRESS.parent.mkdir(parents=True, exist_ok=True)
+        with _PROGRESS.open("a") as f:
+            f.write(_json.dumps(rec) + "\n")
+    except Exception:
+        pass
+    print(f"[boot {rec['elapsed_s']:>6.1f}s] {name}", flush=True)
+
+
+_step("bootstrap.start")
 
 WORK = Path("/kaggle/working")
 REPO = WORK / "CrispASR-bootstrap"
@@ -48,12 +84,17 @@ os.environ.setdefault("CRISPASR_REGRESSION_UPLOAD", "1")
 
 # %% [code]
 if not REPO.exists():
+    _step("git-clone.begin")
     subprocess.check_call([
         "git", "clone", "--recursive", "--depth", "20",
         "https://github.com/CrispStrobe/CrispASR.git", str(REPO),
     ])
+    _step("git-clone.done")
+else:
+    _step("git-clone.skipped", reason="repo-cache-hit")
 
 script = REPO / "tools" / "kaggle" / "crispasr-regression.py"
+_step("exec-canonical.begin", script=str(script))
 sys.argv[0] = str(script)
 exec(compile(script.read_text(), str(script), "exec"))
 
