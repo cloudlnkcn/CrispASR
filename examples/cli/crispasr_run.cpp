@@ -24,6 +24,7 @@
 #include "crispasr_stream_finalize.h"
 #include "whisper_params.h"
 #include "fireredpunc.h"
+#include "truecaser.h"
 #include "titanet.h"
 #include "speaker_db.h"
 
@@ -53,6 +54,19 @@ static void apply_punc_model(fireredpunc_context* punc_ctx, std::vector<crispasr
         return;
     for (auto& seg : segs) {
         char* result = fireredpunc_process(punc_ctx, seg.text.c_str());
+        if (result) {
+            seg.text = result;
+            free(result);
+        }
+    }
+}
+
+// Apply statistical truecaser to all segments.
+static void apply_truecase_model(truecaser_context* tc_ctx, std::vector<crispasr_segment>& segs) {
+    if (!tc_ctx)
+        return;
+    for (auto& seg : segs) {
+        char* result = truecaser_process(tc_ctx, seg.text.c_str());
         if (result) {
             seg.text = result;
             free(result);
@@ -126,7 +140,8 @@ std::mutex g_stdout_mutex;
 // per-thread backend instances. Returns 0 on success, non-zero on
 // failure.
 int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, const std::string& fname_out,
-                      whisper_params params, fireredpunc_context* punc_ctx = nullptr) {
+                      whisper_params params, fireredpunc_context* punc_ctx = nullptr,
+                      truecaser_context* tc_ctx = nullptr) {
     // Resolve the output path base for this input. -of FNAME (passed via
     // `fname_out`) wins; otherwise we strip the audio extension off the
     // input path and append the format extension. Mirrors the whisper
@@ -367,6 +382,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         auto all_segs = merge_segments(std::move(stitched_per_slice), slices);
 
         apply_punc_model(punc_ctx, all_segs);
+        apply_truecase_model(tc_ctx, all_segs);
         if (!params.punctuation) {
             for (auto& seg : all_segs)
                 crispasr_strip_punctuation(seg);
@@ -545,6 +561,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             // Post-process this slice immediately
             auto slice_segs = std::move(per_slice[i]);
             apply_punc_model(punc_ctx, slice_segs);
+            apply_truecase_model(tc_ctx, slice_segs);
             if (!params.punctuation) {
                 for (auto& seg : slice_segs)
                     crispasr_strip_punctuation(seg);
@@ -597,6 +614,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             }
             auto all_segs = merge_segments(std::move(per_slice_redo), slices);
             apply_punc_model(punc_ctx, all_segs);
+            apply_truecase_model(tc_ctx, all_segs);
             if (!params.punctuation)
                 for (auto& seg : all_segs)
                     crispasr_strip_punctuation(seg);
@@ -625,6 +643,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     auto all_segs = merge_segments(std::move(per_slice), slices);
 
     apply_punc_model(punc_ctx, all_segs);
+    apply_truecase_model(tc_ctx, all_segs);
     if (!params.punctuation) {
         for (auto& seg : all_segs) {
             crispasr_strip_punctuation(seg);
@@ -1028,6 +1047,29 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
     }
 
+    // Optional truecaser post-processor.
+    // `--truecase-model auto` → auto-download German truecaser (~11 MB).
+    std::unique_ptr<truecaser_context, decltype(&truecaser_free)> tc_ctx(nullptr, truecaser_free);
+    {
+        std::string tc_path = params.truecase_model;
+        if (tc_path == "none" || tc_path == "off")
+            tc_path.clear();
+        if (tc_path == "auto" || tc_path == "de") {
+            tc_path = crispasr_cache::ensure_cached_file(
+                "truecaser-de.bin", "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-de.bin",
+                params.no_prints, "crispasr[tc]", params.cache_dir);
+        }
+        if (!tc_path.empty()) {
+            tc_ctx.reset(truecaser_init(tc_path.c_str()));
+            if (!tc_ctx) {
+                fprintf(stderr, "crispasr: warning: failed to load truecaser '%s' — continuing without\n",
+                        tc_path.c_str());
+            } else if (!params.no_prints) {
+                fprintf(stderr, "crispasr: loaded truecaser '%s'\n", tc_path.c_str());
+            }
+        }
+    }
+
     // ---- Streaming mode: read raw PCM from stdin, transcribe chunks ----
     if (params.stream) {
         const int SR = 16000;
@@ -1296,6 +1338,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             sl_for_text = slice_segs;
                         }
                         apply_punc_model(punc_ctx.get(), sl_for_text);
+                        apply_truecase_model(tc_ctx.get(), sl_for_text);
                         if (!params.punctuation) {
                             for (auto& seg : sl_for_text)
                                 crispasr_strip_punctuation(seg);
@@ -1313,6 +1356,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
 
             apply_punc_model(punc_ctx.get(), segs);
+            apply_truecase_model(tc_ctx.get(), segs);
             if (!params.punctuation) {
                 for (auto& seg : segs) {
                     crispasr_strip_punctuation(seg);
@@ -1393,6 +1437,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             auto utt_segs =
                                 backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
                             apply_punc_model(punc_ctx.get(), utt_segs);
+                            apply_truecase_model(tc_ctx.get(), utt_segs);
                             if (!params.punctuation) {
                                 for (auto& seg : utt_segs)
                                     crispasr_strip_punctuation(seg);
@@ -1683,6 +1728,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     auto utt_segs =
                         backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
                     apply_punc_model(punc_ctx.get(), utt_segs);
+                    apply_truecase_model(tc_ctx.get(), utt_segs);
                     if (!params.punctuation) {
                         for (auto& seg : utt_segs)
                             crispasr_strip_punctuation(seg);
@@ -1763,7 +1809,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         break;
                     const std::string fout =
                         (idx < (int)params.fname_out.size()) ? params.fname_out[idx] : std::string{};
-                    const int file_rc = process_one_input(be, params.fname_inp[idx], fout, params, punc_ctx.get());
+                    const int file_rc =
+                        process_one_input(be, params.fname_inp[idx], fout, params, punc_ctx.get(), tc_ctx.get());
                     if (file_rc != 0)
                         agg_rc.store(file_rc);
                 }
@@ -1781,7 +1828,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
     for (size_t i = 0; i < params.fname_inp.size(); i++) {
         const std::string& fname_inp = params.fname_inp[i];
         const std::string fout = (i < params.fname_out.size()) ? params.fname_out[i] : std::string{};
-        const int file_rc = process_one_input(*backend, fname_inp, fout, params, punc_ctx.get());
+        const int file_rc = process_one_input(*backend, fname_inp, fout, params, punc_ctx.get(), tc_ctx.get());
         if (file_rc != 0)
             rc = file_rc;
     }
@@ -1963,6 +2010,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         auto all_segs = merge_segments(std::move(per_slice), slices);
 
         apply_punc_model(punc_ctx, all_segs);
+        apply_truecase_model(tc_ctx, all_segs);
 
         // Optional post-processing: strip punctuation when --no-punctuation
         // is set. Cohere and canary pass p.punctuation through to their C

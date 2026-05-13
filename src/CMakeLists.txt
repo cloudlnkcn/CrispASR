@@ -993,6 +993,17 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# truecaser — statistical truecaser from word-frequency data
+# ---------------------------------------------------------------------------
+add_library(truecaser STATIC truecaser.h truecaser.cpp)
+set_target_properties(truecaser PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(truecaser PUBLIC .)
+target_compile_features   (truecaser PUBLIC cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(truecaser PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # ctc-align — CTC forced alignment (Viterbi DP, CPU-only, no ggml dependency)
 # ---------------------------------------------------------------------------
 add_library(ctc-align STATIC align.h align.cpp)
@@ -1148,6 +1159,9 @@ if (TARGET kokoro)
 endif()
 if (TARGET fireredpunc)
     target_link_libraries(crispasr PUBLIC fireredpunc)
+endif()
+if (TARGET truecaser)
+    target_link_libraries(crispasr PUBLIC truecaser)
 endif()
 # Pyannote segmentation is not a backend; it's consumed by
 # crispasr_diarize.cpp for the "pyannote" method. Still needs linking in

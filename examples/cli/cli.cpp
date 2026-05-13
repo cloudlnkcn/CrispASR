@@ -371,6 +371,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.punctuation = false;
     } else if (arg == "--punc-model") {
         params.punc_model = ARGV_NEXT;
+    } else if (arg == "--truecase-model") {
+        params.truecase_model = ARGV_NEXT;
     } else if (arg == "--flush-after") {
         params.flush_after = std::stoi(ARGV_NEXT);
     } else if (arg == "-am" || arg == "--aligner-model") {
@@ -762,6 +764,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr,
             "             --punc-model FNAME     [%-7s] punctuation GGUF: auto|firered|fullstop|punctuate-all\n",
             params.punc_model.c_str());
+    fprintf(stderr, "             --truecase-model FNAME [%-7s] truecaser: auto (de) or path to .bin\n",
+            params.truecase_model.c_str());
     fprintf(stderr, "             --flush-after N        [%-7d] flush SRT to stdout every N segments (0=all at end)\n",
             params.flush_after);
     fprintf(stderr, "  -am FNAME, --aligner-model FNAME  [%-7s] CTC aligner GGUF (LLM backends word timestamps)\n",

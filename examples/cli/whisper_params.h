@@ -107,6 +107,7 @@ struct whisper_params {
     std::string target_lang;
     bool punctuation = true;
     std::string punc_model;
+    std::string truecase_model;
     int flush_after = 0;
     bool show_alternatives = false;
     int32_t n_alternatives = 3;
