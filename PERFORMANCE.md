@@ -1051,3 +1051,55 @@ WAV2VEC2_VERBOSE=1 crispasr --backend wav2vec2 -m auto -f jfk.wav -v
 # See tools/kaggle-benchmark-all-backends.py or gist:
 # https://gist.github.com/CrispStrobe/c15f7a64878d93907a8a4a51b193b806
 ```
+
+
+## issue #81 round 2 — Tiger Lake CPU follow-up (2026-05-13)
+
+Cross-comparison on Tiger Lake i7-1165G7 (AVX-512 + VNNI hardware),
+reported by @Tamnac in the issue thread:
+
+| Engine | RT× |
+|---|---|
+| CrispASR Q8_0, AVX-2 build (v0.6.4 prebuilt) | 4.1× |
+| CrispASR Q8_0, AVX-512 + VNNI source build  | 4.3× |
+| onnx-asr int8, CPU EP                       | 21.2× |
+
+VNNI alone gets ~5%, not the 1.5-2× I optimistically projected in
+the first reply on this issue. The structural diagnosis from the
+reporter's LLM is correct: ggml materialises the full activation
+tensor between every op, and on a memory-bandwidth-bound mobile
+CPU (~50 GB/s LPDDR4X) that intermediate traffic dominates total
+throughput. VNNI accelerates *the inner loop of the int8 dot
+product*, but the matmul is only a fraction of total Conformer
+encoder cost.
+
+ONNX Runtime int8 CPU EP closes most of this with broader kernel
+fusion that ggml doesn't ship:
+
+- conv + BN + activation → one kernel
+- MHA (Q/K/V proj + softmax + attn × V) → one kernel
+- LayerNorm + GEMM → one kernel
+- per-tensor int8 *activations*, not just weights — ~4× less
+  bandwidth moving through the same encoder block
+
+ggml has `flash_attn_ext` for attention and a fused `norm + mul +
+add` for RMSNorm, but doesn't cover the broader conv-norm-act or
+layernorm-gemm fusion. Closing the gap meaningfully needs either:
+
+1. CrispASR-side fusion at the FastConformer graph builder
+   (chain the existing ggml ops into fewer materialisations).
+2. New fused ops landed upstream in ggml-org/llama.cpp.
+3. Per-tensor int8 activations in the GGUF quant pipeline
+   (independent of the above; big lift).
+
+Multi-quarter effort. For the documented record: **on Tiger Lake-
+class mobile CPUs with VNNI hardware, ONNX Runtime int8 will win
+on parakeet not because of VNNI usage but because of kernel-fusion
+architecture.** The AVX-512 release variants (v0.6.5+ Linux tarballs)
+get ~5% over AVX-2; they don't close the structural gap.
+
+The wins we already ship are still real: Apple M1 Metal (parakeet
+TDT q8_0) is 8.24× RT vs ONNX CPU's 6.23× RT — see the earlier
+section. The structural-fusion gap is a CPU x86 specific story;
+GPU paths bypass it because compute throughput, not memory
+bandwidth, is what limits them.
