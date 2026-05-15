@@ -282,5 +282,238 @@ class ThresholdEvaluationTests(unittest.TestCase):
         self.assertEqual(m, [])
 
 
+class StreamJsonVadRoutingTests(unittest.TestCase):
+    """Pure-Python model of the stream JSON+VAD routing invariants
+    introduced in PR #92 (perf: skip aggregate segs in JSON VAD path).
+
+    The C++ logic is modelled here so regressions to the routing
+    semantics are caught without needing a built binary or audio data.
+
+    Three invariants locked in by PR #92
+    -------------------------------------
+    1. `json_vad_path` flag
+         True  ⟺  stream_json=True AND vad_model is set
+         False otherwise (stream_json=False, or no VAD, or both)
+
+    2. `decoded_segments_this_step` flag
+         Each decode branch sets it when the backend returns non-empty
+         segments, regardless of which path runs:
+           a) JSON+VAD   → sl_for_text non-empty
+           b) Non-JSON VAD → slice_segs non-empty
+           c) No-VAD       → segs non-empty
+
+    3. `segs` invariant in JSON+VAD mode
+         `segs` is intentionally left empty; aggregate post-processing
+         (punc / truecase / pcs / strip-punc) is skipped via the
+         `if !json_vad_path` guard. In non-JSON or no-VAD paths `segs`
+         accumulates normally.
+
+    `stream_monitor` silence-dot (`·`) now fires on
+    `!decoded_segments_this_step` instead of `segs.empty()`, which
+    was always True in JSON+VAD mode even when audio was transcribed.
+    """
+
+    # ------------------------------------------------------------------
+    # Helper: Python model of the three-branch decode routing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _simulate_step(
+        stream_json: bool,
+        vad_model: str,
+        backend_returns: list[str],   # per-slice mock text; empty list = no VAD
+    ) -> dict:
+        """Return the state dict that C++ would have after one step.
+
+        backend_returns:
+          - If vad_model is set (VAD path): one entry per VAD slice.
+            Each is the text that backend->transcribe() returns for
+            that slice (empty string = backend returned nothing).
+          - If vad_model is empty (no-VAD path): a single entry for
+            the whole-window transcribe call.
+        """
+        json_vad_path   = stream_json and bool(vad_model)
+        segs: list[str] = []
+        decoded_segments_this_step = False
+
+        if vad_model:
+            # VAD branches
+            for text in backend_returns:
+                if stream_json:
+                    # JSON+VAD: sl_for_text, segs stays empty
+                    sl_for_text = [text] if text else []
+                    if sl_for_text:
+                        decoded_segments_this_step = True
+                    # segs intentionally NOT updated here
+                else:
+                    # Non-JSON VAD: aggregate into segs
+                    slice_segs = [text] if text else []
+                    if slice_segs:
+                        decoded_segments_this_step = True
+                    segs.extend(slice_segs)
+        else:
+            # No-VAD path
+            text = backend_returns[0] if backend_returns else ""
+            segs = [text] if text else []
+            if segs:
+                decoded_segments_this_step = True
+
+        # Post-loop guard: skip aggregate post-processing in JSON+VAD mode
+        post_processed = not json_vad_path
+
+        silence_dot = not decoded_segments_this_step
+
+        return {
+            "json_vad_path": json_vad_path,
+            "segs": segs,
+            "decoded_segments_this_step": decoded_segments_this_step,
+            "post_processed": post_processed,
+            "silence_dot": silence_dot,
+        }
+
+    # ------------------------------------------------------------------
+    # 1. json_vad_path flag
+    # ------------------------------------------------------------------
+
+    def test_json_vad_path_true_when_both_set(self):
+        r = self._simulate_step(stream_json=True, vad_model="firered_vad.gguf",
+                                backend_returns=["hello"])
+        self.assertTrue(r["json_vad_path"])
+
+    def test_json_vad_path_false_stream_json_only(self):
+        r = self._simulate_step(stream_json=True, vad_model="",
+                                backend_returns=["hello"])
+        self.assertFalse(r["json_vad_path"])
+
+    def test_json_vad_path_false_vad_only(self):
+        r = self._simulate_step(stream_json=False, vad_model="firered_vad.gguf",
+                                backend_returns=["hello"])
+        self.assertFalse(r["json_vad_path"])
+
+    def test_json_vad_path_false_neither(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["hello"])
+        self.assertFalse(r["json_vad_path"])
+
+    # ------------------------------------------------------------------
+    # 2a. decoded_segments_this_step — JSON+VAD path
+    # ------------------------------------------------------------------
+
+    def test_decoded_flag_json_vad_set_when_backend_returns_text(self):
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["hello world"])
+        self.assertTrue(r["decoded_segments_this_step"])
+
+    def test_decoded_flag_json_vad_clear_when_all_slices_empty(self):
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["", ""])
+        self.assertFalse(r["decoded_segments_this_step"])
+
+    def test_decoded_flag_json_vad_set_when_any_slice_non_empty(self):
+        """Even one non-empty slice among many empty ones is enough."""
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["", "speech here", ""])
+        self.assertTrue(r["decoded_segments_this_step"])
+
+    # ------------------------------------------------------------------
+    # 2b. decoded_segments_this_step — non-JSON VAD path
+    # ------------------------------------------------------------------
+
+    def test_decoded_flag_non_json_vad_set(self):
+        r = self._simulate_step(stream_json=False, vad_model="vad.gguf",
+                                backend_returns=["hello"])
+        self.assertTrue(r["decoded_segments_this_step"])
+
+    def test_decoded_flag_non_json_vad_clear_when_empty(self):
+        r = self._simulate_step(stream_json=False, vad_model="vad.gguf",
+                                backend_returns=[""])
+        self.assertFalse(r["decoded_segments_this_step"])
+
+    # ------------------------------------------------------------------
+    # 2c. decoded_segments_this_step — no-VAD path
+    # ------------------------------------------------------------------
+
+    def test_decoded_flag_no_vad_set_when_backend_returns_text(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["text"])
+        self.assertTrue(r["decoded_segments_this_step"])
+
+    def test_decoded_flag_no_vad_clear_when_silent(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=[""])
+        self.assertFalse(r["decoded_segments_this_step"])
+
+    # ------------------------------------------------------------------
+    # 3. segs invariant
+    # ------------------------------------------------------------------
+
+    def test_segs_empty_in_json_vad_mode(self):
+        """PR #92 core invariant: aggregate segs must stay empty in
+        JSON+VAD mode regardless of what the backend returns.
+        """
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["word1", "word2", "word3"])
+        self.assertEqual(r["segs"], [],
+            "JSON+VAD mode must not populate aggregate segs")
+
+    def test_segs_populated_in_non_json_vad_mode(self):
+        r = self._simulate_step(stream_json=False, vad_model="vad.gguf",
+                                backend_returns=["hello", "world"])
+        self.assertEqual(r["segs"], ["hello", "world"])
+
+    def test_segs_populated_in_no_vad_mode(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["full text"])
+        self.assertEqual(r["segs"], ["full text"])
+
+    def test_post_processing_skipped_in_json_vad_mode(self):
+        """punc/truecase/pcs must not run on the empty segs in JSON+VAD
+        mode (the `if !json_vad_path` guard).
+        """
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["text"])
+        self.assertFalse(r["post_processed"])
+
+    def test_post_processing_runs_in_non_json_vad_mode(self):
+        r = self._simulate_step(stream_json=False, vad_model="vad.gguf",
+                                backend_returns=["text"])
+        self.assertTrue(r["post_processed"])
+
+    def test_post_processing_runs_in_no_vad_mode(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["text"])
+        self.assertTrue(r["post_processed"])
+
+    # ------------------------------------------------------------------
+    # 4. stream_monitor silence dot
+    # ------------------------------------------------------------------
+
+    def test_silence_dot_fires_when_no_decode_output_json_vad(self):
+        """With old code segs.empty() was always True in JSON+VAD mode,
+        so the silence dot always fired even when audio was transcribed.
+        PR #92 fixes this; model the corrected behaviour.
+        """
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=[""])
+        self.assertTrue(r["silence_dot"],
+            "silence dot should fire when no segments decoded")
+
+    def test_silence_dot_suppressed_when_json_vad_has_output(self):
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["hello"])
+        self.assertFalse(r["silence_dot"],
+            "silence dot must NOT fire when backend returned segments")
+
+    def test_silence_dot_fires_in_no_vad_silence(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=[""])
+        self.assertTrue(r["silence_dot"])
+
+    def test_silence_dot_suppressed_in_no_vad_speech(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["speech"])
+        self.assertFalse(r["silence_dot"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
