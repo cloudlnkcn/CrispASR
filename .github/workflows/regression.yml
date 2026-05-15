@@ -124,7 +124,17 @@ jobs:
       fail-fast: false
       matrix:
         backend:
+          # Full diff entry (GGUF + ref dump + crispasr-diff cosine checks)
           - parakeet-tdt-0.6b-ja
+          # Transcript-only entries (skip_diff=true; ref dumps pending Kaggle rebake)
+          - moonshine-tiny
+          - moonshine-base
+          - moonshine-streaming-tiny
+          - parakeet-tdt-0.6b-en
+          - canary-1b-v2
+          - firered-asr2-aed
+          - glm-asr-nano
+          - cohere-transcribe
     steps:
       - uses: actions/checkout@v4
 
@@ -138,7 +148,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install huggingface_hub
 
-      - name: Configure + build crispasr-cli + crispasr-diff
+      - name: Configure + build crispasr-cli (+ crispasr-diff for full-diff backends)
         run: |
           cmake -S . -B build-regression -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
@@ -149,6 +159,10 @@ jobs:
           # binary (target name vs output name diverge — see
           # examples/cli/CMakeLists.txt). Asking for target `crispasr`
           # would build just the library, leaving bin/crispasr absent.
+          #
+          # Also build crispasr-diff unconditionally — the binary is
+          # tiny and building it costs <10 s, much less than adding
+          # conditional logic per matrix backend.
           cmake --build build-regression --target crispasr-cli crispasr-diff -j$(nproc)
 
       - name: Run regression for ${{ matrix.backend }}

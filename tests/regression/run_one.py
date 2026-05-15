@@ -415,10 +415,15 @@ def main() -> int:
         "CRISPASR_BIN", build_dir / "bin" / "crispasr"))
     diff_bin = Path(os.environ.get(
         "DIFF_BIN", build_dir / "bin" / "crispasr-diff"))
-    for p, label in [(crispasr_bin, "crispasr"), (diff_bin, "crispasr-diff")]:
-        if not p.exists():
-            die(f"{label} binary not found at {p}. "
-                f"Build it first or set CRISPASR_BIN/DIFF_BIN.")
+    if not crispasr_bin.exists():
+        die(f"crispasr binary not found at {crispasr_bin}. "
+            f"Build it first or set CRISPASR_BIN.")
+    # crispasr-diff is only needed for full diff entries (skip_diff=false).
+    entry = next((b for b in manifest["backends"] if b["name"] == backend_name), None)
+    if entry and not entry.get("skip_diff", False) and not diff_bin.exists():
+        die(f"crispasr-diff binary not found at {diff_bin}. "
+            f"Build it first or set DIFF_BIN. "
+            f"(Not needed for skip_diff=true entries.)")
 
     work_root = Path(os.environ.get(
         "WORK_DIR",
