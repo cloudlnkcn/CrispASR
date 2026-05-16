@@ -332,7 +332,13 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         c->backend = c->backend_cpu;
     }
 
-    // Load weights
+    // Load weights — issue #94: print before the load too, since the
+    // 366 MB chatterbox-turbo s3gen-q8_0 file can take 10-30 s on slow
+    // disks and the silent gap reads as a hang.
+    if (verbosity >= 1) {
+        fprintf(stderr, "s3gen: loading from %s\n", path);
+        std::fflush(stderr);
+    }
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, c->backend, "s3gen", wl)) {
         delete c;
@@ -345,6 +351,7 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     if (verbosity >= 1) {
         fprintf(stderr, "s3gen: loaded %zu tensors from %s\n", c->tensors.size(), path);
         fprintf(stderr, "s3gen: diffusion noise seed=%u\n", c->noise_seed);
+        std::fflush(stderr);
     }
 
     // Verify critical tensors exist

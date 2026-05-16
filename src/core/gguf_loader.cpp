@@ -425,9 +425,26 @@ static const ggml_backend_buffer_i mmap_wrap_iface = {
     /* .reset          = */ mmap_wrap_reset,
 };
 
+// Issue #94 (chatterbox-turbo segfault during init on macOS / Apple
+// Silicon): the legacy alloc+copy load path takes 30-60 s for the
+// chatterbox-turbo T3 (658 MB Q8_0) on slow disks and reproducibly
+// fails for some users. The zero-copy mmap path completes the same
+// load in ~5-10 s and uses half the peak RSS. The CPU mmap path has
+// been validated for every backend that goes through this loader
+// (mimo-asr, voxtral, voxtral4b, chatterbox base + turbo, kokoro,
+// qwen3-tts, vibevoice, parakeet, granite, …) since the PLAN #51a
+// rollout in late April; flipping the default after a month of opt-in
+// testing matches llama.cpp's behaviour and resolves the slow-load
+// reports.
+//
+// Opt out with `CRISPASR_GGUF_MMAP=0` for users whose model files live
+// on volumes that may disappear mid-run (network mounts, removable
+// disks); mmap-backed weights SIGBUS if the underlying file vanishes.
 static bool mmap_loader_enabled() {
     const char* v = std::getenv("CRISPASR_GGUF_MMAP");
-    return v && *v && *v != '0';
+    if (!v || !*v)
+        return true;
+    return *v != '0';
 }
 
 // PLAN #60c: opt-in preload — page-walk the entire mmap region so every
@@ -502,8 +519,9 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
     // (which would allocate a fresh backend-side buffer) and instead bind
     // each tensor directly into the mmap'd file. Saves one full copy of
     // the weights — the difference between a 14.9 GB F16 GGUF loading on
-    // a 16 GB Mac and thrashing swap. Gated on CRISPASR_GGUF_MMAP=1 +
-    // CPU backend until we've validated all 24 backends.
+    // a 16 GB Mac and thrashing swap. Default-on as of issue #94 (slow /
+    // failing chatterbox-turbo load on macOS); opt out with
+    // `CRISPASR_GGUF_MMAP=0`.
     if (mmap_loader_enabled() && ggml_backend_is_cpu(backend)) {
         MappedFile mf(path, /*writable=*/true);
         if (mf.ok) {

@@ -644,15 +644,26 @@ the most aggressive memory footprint reduction. `KV_QUANT` is
 cheaper than layer offload; reach for `N_GPU_LAYERS` only when the
 *model* doesn't fit, not the cache.
 
-### `CRISPASR_GGUF_MMAP=1` — zero-copy weight load
+### `CRISPASR_GGUF_MMAP` — zero-copy weight load (default **on**)
 
 Map the GGUF file directly into the model's backend buffer instead
 of read-and-copy. Saves one full copy of the GGUF on load: a 14.9 GB
 F16 model goes from "load + 14.9 GB peak RSS" to "mmap +
 ~working-set RSS." No quality impact; pure load-time + RAM win.
 
+Default-on since 0.6.7 (issue #94 — chatterbox-turbo slow / failing
+init on macOS, where the legacy alloc+copy path took 30-60 s for
+the 658 MB T3 GGUF). Opt out with `CRISPASR_GGUF_MMAP=0` if your
+model files live on volumes that may disappear mid-run — mmap-backed
+weights SIGBUS if the underlying file vanishes (network mounts,
+removable disks).
+
 ```bash
-CRISPASR_GGUF_MMAP=1 ./build/bin/crispasr --backend voxtral4b -m auto -f audio.wav
+# Default — mmap is on, no env var needed
+./build/bin/crispasr --backend voxtral4b -m auto -f audio.wav
+
+# Opt out for removable media
+CRISPASR_GGUF_MMAP=0 ./build/bin/crispasr --backend voxtral4b -m auto -f audio.wav
 ```
 
 Honored by every backend that uses `core_gguf::load_weights()` —
@@ -714,7 +725,7 @@ map:
 | Concern | llama.cpp | CrispASR |
 |---|---|---|
 | KV cache dtype | `--type-k q8_0 --type-v q8_0` (CLI flag, separate K/V) | `CRISPASR_KV_QUANT=q8_0` for symmetric, or `CRISPASR_KV_QUANT_K` / `_V` per half |
-| mmap weights | `--no-mmap` (mmap is default **on**) | `CRISPASR_GGUF_MMAP=1` (mmap is default **off**) |
+| mmap weights | `--no-mmap` (mmap is default **on**) | `CRISPASR_GGUF_MMAP=0` (mmap is default **on** since 0.6.7) |
 | Lock pages in RAM | `--mlock` | (not supported — `mmap+preload` is the closest analogue) |
 | GPU layer count | `--n-gpu-layers N` / `-ngl N` (CLI flag) | not supported yet — see [PLAN #69a](https://github.com/CrispStrobe/CrispASR/blob/main/PLAN.md) |
 | KV-on-CPU-only | `--no-kv-offload` | not supported yet — see [PLAN #69b](https://github.com/CrispStrobe/CrispASR/blob/main/PLAN.md) |
@@ -724,11 +735,12 @@ map:
 
 Differences worth flagging:
 
-1. **mmap default.** llama.cpp defaults mmap **on**, CrispASR defaults
-   it **off** (PLAN #51a flipped this opt-in pending wider RSS
-   measurements). On hosts with plenty of RAM, the default-off
-   behavior pays a copy that mmap would skip — set
-   `CRISPASR_GGUF_MMAP=1` to match llama.cpp's behavior.
+1. **mmap default.** Both projects now default mmap **on**. CrispASR
+   flipped from opt-in to default-on in 0.6.7 after issue #94 (slow /
+   failing chatterbox-turbo init on macOS — the legacy alloc+copy
+   path took 30-60 s for the 658 MB T3 GGUF). Set
+   `CRISPASR_GGUF_MMAP=0` to opt out (matches llama.cpp's
+   `--no-mmap`).
 2. **K/V dtype unified.** llama.cpp lets you set `--type-k` and
    `--type-v` independently (rare scenario: quantize K but keep V
    at f16). CrispASR uses a single `CRISPASR_KV_QUANT` for both.

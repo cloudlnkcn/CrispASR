@@ -161,8 +161,9 @@ void free_weights(WeightLoad& wl);
 // PLAN #60g: hint the kernel that the mmap'd weight region is now being
 // accessed in random order (e.g., the per-layer KV revisit pattern of
 // decode steps), and that readahead is therefore wasted IO. No-op if
-// the buffer wasn't allocated through one of our mmap paths or if
-// CRISPASR_GGUF_MMAP wasn't set. Safe to call multiple times.
+// the buffer wasn't allocated through one of our mmap paths (e.g.,
+// when `CRISPASR_GGUF_MMAP=0` opts out of the default mmap loader).
+// Safe to call multiple times.
 //
 // Recommended use: after prefill completes, before entering the decode
 // loop. See PLAN #60g for the rationale.

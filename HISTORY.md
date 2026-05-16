@@ -6,6 +6,39 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-16 Issue #94 — chatterbox-turbo slow / failing init on macOS
+
+External report from `niksedk` (SubtitleEdit ships `crispasr` for
+Chatterbox TTS): selecting the Turbo model in SubtitleEdit on
+Apple Silicon segfaulted during s3gen init (exit 139); the Base
+model worked. Reproduced as a 60 s+ slow load on the legacy
+alloc+copy path that, depending on memory pressure, can manifest
+either as a perceived hang or a hard crash. mmap path (formerly
+`CRISPASR_GGUF_MMAP=1`) loaded the same model in ~26 s and
+produced valid 24 kHz audio.
+
+Fix:
+
+- `src/core/gguf_loader.cpp` — flip `mmap_loader_enabled()` to
+  default **on** (opt out with `CRISPASR_GGUF_MMAP=0`). The CPU
+  mmap path has been the validated default-eligible loader since
+  PLAN #51a in late April; this matches llama.cpp's default.
+- `src/chatterbox.cpp` + `src/chatterbox_s3gen.cpp` — add explicit
+  "loading T3 weights from …" / "T3 loaded N tensors" / "s3gen:
+  loading from …" progress prints with `fflush(stderr)` so the
+  silent gap between "auto-falling back to CPU" and "precomputed
+  conds loaded" reads as progress instead of a hang.
+- `docs/cli.md` — update the mmap section + the llama.cpp
+  comparison table to reflect the new default.
+
+Verified on M1 / macOS Tahoe 26.2:
+
+- chatterbox-turbo: 29 s init (was 60 s+) + working `/v1/audio/speech`.
+- chatterbox (base): 28 s init + working `/v1/audio/speech`.
+- `CRISPASR_GGUF_MMAP=0` opt-out: 37 s init, still works.
+
+---
+
 ## 2026-05-16 Cross-Stack Audit Hardening
 
 Cross-repo audit work covered `CrispASR`, `CrispLens`, and `cloud-backup`.

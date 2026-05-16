@@ -2155,6 +2155,11 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             s3gen_use_gpu = false;
         }
     }
+    // Issue #94: flush so consumers see progress on slow-disk loads — the
+    // 658 MB chatterbox-turbo T3 file can take 30-60 s on slow/external
+    // disks, and a silent gap between this message and "precomputed conds
+    // loaded" reads as a hang.
+    std::fflush(stderr);
     // c->params.use_gpu controls the s3gen sub-context backend (set later
     // via chatterbox_set_s3gen_path). c->backend is the T3 backend.
     c->params.use_gpu = s3gen_use_gpu;
@@ -2168,6 +2173,10 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     }
 
     // Pass 2: weights
+    if (params.verbosity >= 1) {
+        fprintf(stderr, "chatterbox: loading T3 weights from %s\n", path_model);
+        std::fflush(stderr);
+    }
     {
         core_gguf::WeightLoad wl;
         if (!core_gguf::load_weights(path_model, c->backend, "chatterbox", wl)) {
@@ -2177,6 +2186,10 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
         c->ctx_w = wl.ctx;
         c->buf_w = wl.buf;
         c->tensors = std::move(wl.tensors);
+    }
+    if (params.verbosity >= 1) {
+        fprintf(stderr, "chatterbox: T3 loaded %zu tensors\n", c->tensors.size());
+        std::fflush(stderr);
     }
 
     // Bind tensors
@@ -2198,6 +2211,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     if (params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: precomputed conds %s\n",
                 c->conds.loaded ? "loaded" : "NOT loaded (voice cloning required)");
+        std::fflush(stderr);
     }
 
     // Compute scheduler
