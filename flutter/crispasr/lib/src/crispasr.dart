@@ -527,9 +527,23 @@ class LidResult {
 
 enum LidMethod {
   /// Whisper encoder + language head on a multilingual ggml-*.bin model.
+  /// Reuses any multilingual ggml-tiny / base / small / medium / large
+  /// file already on disk — no separate LID model to download.
   whisper,
-  /// GGUF-packed Silero 95-language classifier.
+  /// GGUF-packed Silero 95-language classifier (~16 MB). Fast, no GPU
+  /// required. Recommended default when the user has the
+  /// `silero-lid-95-f16.gguf` (or legacy `silero-lang95-v1-f16.gguf`)
+  /// on disk.
   silero,
+  /// FireRed-LID 120-language Transformer (~300 MB). Higher coverage
+  /// than Silero, especially on low-resource languages. Routes through
+  /// the same `crispasr_detect_language_pcm` C ABI; needs
+  /// `firered-lid-f16.gguf` on disk.
+  firered,
+  /// ECAPA-TDNN 107-language LID (~42 MB, speechbrain/lang-id-voxlingua107).
+  /// Strong on noisy / accented speech; faster than FireRed.
+  /// Needs `ecapa-lid-107-f16.gguf` on disk.
+  ecapa,
 }
 
 /// Run LID on a 16 kHz mono [pcm] buffer using the method in

@@ -8,6 +8,7 @@
 import 'dart:ffi';
 import 'dart:io';
 
+import 'package:crispasr/crispasr.dart' show LidMethod;
 import 'package:ffi/ffi.dart';
 import 'package:test/test.dart';
 
@@ -123,7 +124,13 @@ void main() {
     }
   });
 
-  test('c_api_version reports 0.4.0 (canonical + alias agree)', () {
+  test('c_api_version: canonical + alias agree on the same string', () {
+    // Don't pin a specific version — the C side bumps independently
+    // of the Dart binding. The test's real intent is to verify that
+    // the deprecated alias `crispasr_dart_helpers_version` keeps
+    // returning the same string as the canonical
+    // `crispasr_c_api_version` until the alias is removed.
+    final versions = <String>[];
     for (final sym in const [
       'crispasr_c_api_version',
       'crispasr_dart_helpers_version', // deprecated alias
@@ -132,8 +139,13 @@ void main() {
           Pointer<Utf8> Function()>(sym);
       final ptr = fn();
       expect(ptr.cast<Uint8>().address, isNot(0), reason: sym);
-      expect(ptr.toDartString(), '0.4.0', reason: sym);
+      final s = ptr.toDartString();
+      expect(s, matches(RegExp(r'^\d+\.\d+\.\d+')),
+          reason: '$sym should return a semver-shaped string');
+      versions.add(s);
     }
+    expect(versions[0], versions[1],
+        reason: 'canonical + alias must report the same version string');
   });
 
   test('0.3.0 streaming helpers resolve', () {
@@ -178,5 +190,23 @@ void main() {
     ]) {
       expect(() => lib.lookup(s), returnsNormally, reason: s);
     }
+  });
+
+  test('LidMethod enum indexes match the C-side CrispasrLidMethod', () {
+    // crispasr_detect_language_pcm dispatches on the int value of
+    // `method.index`; the C side's `enum class CrispasrLidMethod`
+    // hard-codes Whisper=0, Silero=1, Firered=2, Ecapa=3 (see
+    // src/crispasr_lid.h). If somebody reorders the Dart enum or
+    // inserts a new variant in the middle, every Firered/Ecapa
+    // call silently routes to the wrong backend with no compile
+    // error. Pin the indexes here so a reorder shows up as a red
+    // test, not a runtime regression.
+    expect(LidMethod.whisper.index, 0);
+    expect(LidMethod.silero.index, 1);
+    expect(LidMethod.firered.index, 2);
+    expect(LidMethod.ecapa.index, 3);
+    expect(LidMethod.values.length, 4,
+        reason: 'extending LidMethod without bumping the C-side enum '
+            'will silently drop the new variant');
   });
 }
