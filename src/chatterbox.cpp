@@ -2493,12 +2493,21 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
                 ctx->tokenizer.has_bpe ? "BPE" : "char");
     }
 
-    // 2. Add start/stop text tokens
-    text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
-    text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
+    // 2. Add start/stop text tokens. Base chatterbox wraps text with
+    // [SOT, ..., EOT] via _ensure_BOT_EOT in its inference path
+    // (chatterbox/models/t3/t3.py:255). The turbo path (`is_gpt2 == true`
+    // → ChatterboxTurboTTS.inference_turbo, t3.py:415) does NOT call
+    // _ensure_BOT_EOT — it feeds the bare tokenizer output to the
+    // GPT-2 backbone. Adding SOT/EOT for turbo shifts every WPE
+    // position by 2 and was the dominant audio-quality defect in #94.
+    if (!is_gpt2) {
+        text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
+        text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
+    }
 
     if (ctx->params.verbosity >= 2 || std::getenv("CHATTERBOX_DEBUG")) {
-        fprintf(stderr, "chatterbox: text_tokens(%zu) [SOT,...,EOT] = [", text_tokens.size());
+        fprintf(stderr, "chatterbox: text_tokens(%zu) %s = [", text_tokens.size(),
+                is_gpt2 ? "(no SOT/EOT for turbo)" : "[SOT,...,EOT]");
         for (size_t i = 0; i < text_tokens.size(); ++i) {
             fprintf(stderr, "%d%s", (int)text_tokens[i], i + 1 == text_tokens.size() ? "" : ", ");
         }

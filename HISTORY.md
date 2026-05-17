@@ -296,6 +296,68 @@ about the onset artifact: sweep `CRISPASR_CHATTERBOX_T3_SEED` until
 a clean output appears; or fall back to base chatterbox (the
 Llama-style backbone doesn't have L05's amplification).
 
+### 2026-05-17 root cause: SOT/EOT prepended for turbo
+
+The "0.1% per-layer accumulated drift" model from the previous bisect
+turned out to mis-diagnose the issue. The real defect was structural:
+`chatterbox_synthesize_tokens` unconditionally wrapped tokenized text
+with `[start_text_token, …, stop_text_token]` (chatterbox.cpp:2496-
+2498). That matches base chatterbox's path
+(`chatterbox/models/t3/t3.py:255` calls `_ensure_BOT_EOT`), but the
+turbo path (`ChatterboxTurboTTS.inference_turbo`, `t3.py:415`) does
+**not** call `_ensure_BOT_EOT` and feeds the raw tokenizer output to
+the GPT-2 backbone.
+
+For "Hello world test." that means C++'s prefill carried 6 text
+tokens `[SOT=255, 15496, 995, 1332, 13, EOT=0]` while Python's
+carried 4 `[15496, 995, 1332, 13]`, making C++'s `prefill_len=383` vs
+Python's `prefill_len=381`. Every WPE position was shifted by 2 and
+the model attended to two phantom positions (SOT/EOT). The per-layer
+cos numbers from the earlier bisect look much closer to "small drift"
+than "structural offset" only because the diff tool aligned on
+matching `n_past` filenames — at `n_past=383` it was comparing C++'s
+first AR step against Python's *third* AR step (Python at
+prefill_len=381 dumps its first AR step at n_past=381). With the
+mis-alignment, L01–L04 cos accidentally landed in the 0.99-band,
+making it look like CPU numerics drift.
+
+Fix (chatterbox.cpp:2496-2509): gate the SOT/EOT insertion on
+`!is_gpt2`. Base chatterbox keeps the existing behaviour; turbo now
+sends the bare tokenizer output to the GPT-2 backbone, matching
+Python's `inference_turbo` exactly.
+
+User-facing audio quality after the fix (q8_0 weights, seed 0,
+default sampling, 5 iterations each, Whisper-base transcripts):
+
+    Pre-fix:  hello world test  → 1/5 clean (other 4 had onset noise)
+              hello chatterbox  → 1/6 clean (5 had "SO,", "UH,", …)
+    Post-fix: hello world test  → 5/5 clean ("Hello world test.")
+              hello chatterbox  → 5/5 clean ("Hello chatterbox/…box turbo.")
+
+The "84% bad" baseline is gone — clean rate on default seeds is now
+indistinguishable from Python's. No remaining "L05 cumulative
+softmax drift" to chase; the diagnostic infrastructure
+(`CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1` env knob, the
+naive-softmax(QK^T)V path, per-layer dumpers under `tools/`) stays
+in the tree as a stage-gate fixture against future regressions.
+
+### 2026-05-17 follow-up: dumper positional-args fix
+
+`tools/cb_turbo_perlayer_dump_pyref.py`'s `patched_block_forward`
+also had a latent bug: its signature `(self, hidden_states, *_,
+**kwargs)` silently swallowed all positional args. HF
+`GPT2Model.forward` calls each block positionally with at least
+`(hidden_states, past_key_values, cache_position, attention_mask,
+head_mask, encoder_hidden_states, …)`, so the patched block lost
+the KV cache and the causal mask on every AR step; the inner
+`self.attn(h, **kwargs)` ran as if the prefill had never happened.
+That is why L05 cos appeared to crash to 0.944 in the previous
+bisect even after C++ and Python were aligned on prefill content —
+the Python side was computing degenerate single-token attention.
+The dumper now promotes the positional args back to kwargs so
+attention sees the full prefix on every step; this only affects
+diagnostics, not production.
+
 ---
 
 ## 2026-05-16 Cross-Stack Audit Hardening

@@ -100,10 +100,43 @@ def main():
     # We need this to name files as cb_gpt2_step_<n_past>_*.bin where n_past = prefill_len.
     prefill_len = [None]
 
-    def patched_block_forward(self, hidden_states, *_, **kwargs):
+    # HF GPT2Model.forward calls each block positionally with
+    #     block(hidden_states, past_key_values, cache_position,
+    #           attention_mask, head_mask, encoder_hidden_states, …)
+    # The earlier `*_, **kwargs` version silently dropped past_key_values
+    # and yielded AR-step hidden states that diverged from a real forward,
+    # so per-layer cos numbers were meaningless. Promote the positionals
+    # back to kwargs so self.attn receives the KV cache + causal mask
+    # exactly as in production.
+    _block_pos_keys = (
+        "past_key_values",
+        "cache_position",
+        "attention_mask",
+        "head_mask",
+        "encoder_hidden_states",
+    )
+
+    def patched_block_forward(self, hidden_states, *args_, **kwargs):
         residual = hidden_states
         h = self.ln_1(hidden_states)
-        attn_out = self.attn(h, **kwargs)
+        attn_kwargs = {
+            k: kwargs[k]
+            for k in (
+                "past_key_values",
+                "cache_position",
+                "attention_mask",
+                "head_mask",
+                "use_cache",
+                "output_attentions",
+            )
+            if k in kwargs
+        }
+        for i, v in enumerate(args_):
+            if i < len(_block_pos_keys) and _block_pos_keys[i] not in attn_kwargs:
+                attn_kwargs[_block_pos_keys[i]] = v
+        # gpt2 attn doesn't take encoder_hidden_states unless cross-attn is on.
+        attn_kwargs.pop("encoder_hidden_states", None)
+        attn_out = self.attn(h, **attn_kwargs)
         attn_hidden = attn_out[0]
         rest = attn_out[1:]
         post_attn = attn_hidden + residual
