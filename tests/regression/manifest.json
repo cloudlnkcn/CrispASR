@@ -3,7 +3,7 @@
   "version": 1,
   "fixtures": {
     "repo": "cstr/crispasr-regression-fixtures",
-    "revision": "c2c4ca191cb3ca4b1f9b48856c69628018551062",
+    "revision": "99c5a281455f864e026476c27cf93b166d412a6b",
     "_note": "Pinned. To re-bake, run `tools/kaggle-regression.py` with MODE=rebake UPLOAD=1; the new commit SHA gets pasted here as a reviewable diff."
   },
   "backends": [
@@ -26,9 +26,9 @@
       "diff_thresholds": {
         "encoder_output": 0.999,
         "encoder_output_ref_mel": 0.999,
-        "mel_spectrogram": 0.95
+        "mel_spectrogram": 0.999
       },
-      "diff_thresholds_note": "mel_spectrogram is allowed below 0.999 because CrispASR's mel front-end has a known small divergence vs NeMo's preprocessor. encoder_output should always be \u2265 0.999."
+      "diff_thresholds_note": "mel_spectrogram tightened from 0.95 to 0.999 after drop_last_frame fix (commit 07cfcff). NeMo ref needs rebake to clip mel to feat_len; current ref has one extra frame that the comparison truncates."
     },
     {
       "name": "moonshine-tiny",
@@ -104,7 +104,7 @@
       "name": "parakeet-tdt-0.6b-en",
       "backend_id": "parakeet",
       "skip_diff": true,
-      "_skip_diff_note": "Encoder diverges from NeMo v3 reference (cos_min=0.596 even with reference mel). All intermediate layers [FAIL] in per-layer diff. V3 may use a different conformer variant or positional encoding; needs further investigation.",
+      "_skip_diff_note": "Q4K model diverges from F16/F32 NeMo reference (all encoder layers cos_min<0.9). The V3 reference needs an F16 GGUF; q4_k is too coarse for diff.",
       "source_model": "nvidia/parakeet-tdt-0.6b-v3",
       "gguf": {
         "repo": "cstr/parakeet-tdt-0.6b-v3-GGUF",
@@ -119,23 +119,31 @@
     {
       "name": "canary-1b-v2",
       "backend_id": "canary",
-      "skip_diff": true,
-      "_skip_diff_note": "Awaiting Kaggle rebake.",
+      "source_model": "nvidia/canary-1b-v2",
+      "source_model_note": "HF id for tools/reference_backends/canary.py. Only needed for re-bake.",
       "gguf": {
         "repo": "cstr/canary-1b-v2-GGUF",
         "revision": "b3715a517928f8f68833142c90fc5810ad583210",
-        "file": "canary-1b-v2-q4_k.gguf",
-        "approx_size_mb": 672
+        "file": "canary-1b-v2.gguf",
+        "approx_size_mb": 1900,
+        "_file_note": "F16 GGUF used for diff regression (cos_min=0.999280 vs NeMo). The q4_k variant diverges too much for diff."
       },
       "sample": "samples/jfk.wav",
       "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
-      "expected_transcript_source": "captured 2026-05-15 with HF revision b3715a5, CPU-only, samples/jfk.wav"
+      "expected_transcript_source": "captured 2026-05-17 with HF revision b3715a5, CPU-only, samples/jfk.wav",
+      "fixture_ref_path": "canary-1b-v2/jfk_11s/ref.gguf",
+      "diff_thresholds": {
+        "encoder_output": 0.999,
+        "mel_spectrogram": 0.999,
+        "pre_encode_output": 0.999
+      },
+      "diff_thresholds_note": "F16 GGUF vs NeMo reference with dither=0 and drop_last_frame. mel cos=1.0, encoder cos=0.999280. Layers 18-19 are F16 near-misses (0.9977/0.9988)."
     },
     {
       "name": "firered-asr2-aed",
       "backend_id": "firered-asr",
       "skip_diff": true,
-      "_skip_diff_note": "Awaiting Kaggle rebake. Note: FireRedASR outputs all-caps.",
+      "_skip_diff_note": "firered-asr not yet in crispasr-diff backend list. Needs backend integration before diff can run.",
       "gguf": {
         "repo": "cstr/firered-asr2-aed-GGUF",
         "revision": "076633a711b3b0f1a5e04ee43b2a9748cde253bd",
@@ -149,23 +157,30 @@
     {
       "name": "glm-asr-nano",
       "backend_id": "glm-asr",
-      "skip_diff": true,
-      "_skip_diff_note": "Awaiting Kaggle rebake.",
+      "source_model": "THUDM/glm-4-voice-tokenizer",
+      "source_model_note": "HF id for tools/reference_backends/glm_asr.py. Only needed for re-bake.",
       "gguf": {
         "repo": "cstr/glm-asr-nano-GGUF",
         "revision": "0eed3da3582c7cbabd7c7206ca7e7925a3ac49a5",
-        "file": "glm-asr-nano-q4_k.gguf",
-        "approx_size_mb": 1300
+        "file": "glm-asr-nano.gguf",
+        "approx_size_mb": 4300,
+        "_file_note": "F32 GGUF used for diff regression (cos_min=1.000). The q4_k/q8_0 variants diverge."
       },
       "sample": "samples/jfk.wav",
       "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
-      "expected_transcript_source": "captured 2026-05-15 with HF revision 0eed3da, CPU-only, samples/jfk.wav"
+      "expected_transcript_source": "captured 2026-05-15 with HF revision 0eed3da, CPU-only, samples/jfk.wav",
+      "fixture_ref_path": "glm-asr-nano/jfk_11s/ref.gguf",
+      "diff_thresholds": {
+        "encoder_output": 0.999,
+        "mel_spectrogram": 0.999
+      },
+      "diff_thresholds_note": "F32 GGUF vs Python reference gives cos_min=1.000 for both mel and encoder."
     },
     {
       "name": "cohere-transcribe",
       "backend_id": "cohere",
       "skip_diff": true,
-      "_skip_diff_note": "Awaiting Kaggle rebake.",
+      "_skip_diff_note": "Awaiting Kaggle rebake. cohere also affected by drop_last_frame fix.",
       "skip_preflight": true,
       "_skip_preflight_note": "cstr/cohere-transcribe-GGUF is private and HF account has hit private-repo storage limit (403). Remove skip_preflight once repo is made public or space freed.",
       "gguf": {
