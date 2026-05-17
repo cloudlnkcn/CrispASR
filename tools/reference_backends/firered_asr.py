@@ -114,7 +114,8 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     opts.frame_opts.frame_shift_ms = 10.0
     opts.mel_opts.num_bins = 80
     fbank_comp = knf.OnlineFbank(opts)
-    fbank_comp.accept_waveform(16000, audio.tolist())
+    # Scale to int16 range: FireRedASR CMVN was trained on int16-scaled fbank.
+    fbank_comp.accept_waveform(16000, (audio * 32768.0).tolist())
     fbank_comp.input_finished()
     n_frames = fbank_comp.num_frames_ready
     features = np.zeros((n_frames, 80), dtype=np.float32)
