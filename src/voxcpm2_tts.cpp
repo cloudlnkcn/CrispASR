@@ -1156,35 +1156,59 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
         std::memcpy(x.data(), initial_noise, (size_t)state_size * sizeof(float));
     }
 
-    for (int s = 0; s < steps; s++) {
-        // Sway schedule: t from 1.0 to 0.0 linearly
-        float t_cur = 1.0f - (float)s / (float)steps;
-        float t_next = 1.0f - (float)(s + 1) / (float)steps;
-        float dt_val = t_next - t_cur; // negative (Euler step direction)
+    // Sway schedule: t_span = linspace(1, 0, steps+1) + sway*(cos(pi/2*t) - 1 + t)
+    // with sway_sampling_coef = 1.0 (default in VoxCPM2)
+    std::vector<float> t_span(steps + 1);
+    for (int i = 0; i <= steps; i++) {
+        float t = 1.0f - (float)i / (float)steps;
+        float sway = std::cos((float)M_PI / 2.0f * t) - 1.0f + t;
+        t_span[i] = t + sway; // sway_coef=1.0
+    }
 
-        // dt_scalar for dt_mlp — 0.0 for non-mean-mode synthesis
-        float dt_scalar = 0.0f;
+    // CFG zero-star: first N steps skip computation (use zero velocity)
+    int zero_init_steps = std::max(1, (int)(steps * 0.04f)); // = 1 for steps<=25
 
-        std::vector<float> v_cond = locdit_forward(ctx, x.data(), mu, t_cur, cond_raw, dt_scalar, cpu_be);
+    float dt_scalar = 0.0f; // non-mean-mode
 
-        std::vector<float> v;
-        if (cfg > 1.0f) {
-            // CFG-zero-star: unconditioned uses zero mu and zero cond
+    for (int step = 1; step <= steps; step++) {
+        float t_cur = t_span[step - 1];
+        float dt_val = t_cur - t_span[step]; // positive (Python uses x = x - dt * v)
+
+        std::vector<float> dphi_dt(state_size, 0.0f);
+
+        if (step <= zero_init_steps) {
+            // CFG zero-star: first step(s) use zero velocity
+            // dphi_dt stays zero
+        } else if (cfg > 1.0f) {
+            // CFG with zero-star scaling:
+            // Run conditioned (mu, cond) and unconditioned (zeros, cond) forward passes
+            std::vector<float> v_cond = locdit_forward(ctx, x.data(), mu, t_cur, cond_raw, dt_scalar, cpu_be);
+
             std::vector<float> zero_mu(ctx->hp.tslm_d_model, 0.0f);
-            std::vector<float> zero_cond(state_size, 0.0f);
             std::vector<float> v_uncond =
-                locdit_forward(ctx, x.data(), zero_mu.data(), t_cur, zero_cond.data(), dt_scalar, cpu_be);
-            v.resize(state_size);
+                locdit_forward(ctx, x.data(), zero_mu.data(), t_cur, cond_raw, dt_scalar, cpu_be);
+
+            // CFG zero-star: st_star = dot(pos, neg) / (||neg||^2 + 1e-8)
+            // pos = v_cond, neg = v_uncond (cfg branch)
+            double dot = 0.0, norm_sq = 0.0;
             for (int i = 0; i < state_size; i++) {
-                v[i] = v_uncond[i] + cfg * (v_cond[i] - v_uncond[i]);
+                dot += (double)v_cond[i] * (double)v_uncond[i];
+                norm_sq += (double)v_uncond[i] * (double)v_uncond[i];
+            }
+            float st_star = (float)(dot / (norm_sq + 1e-8));
+
+            // dphi_dt = v_uncond * st_star + cfg * (v_cond - v_uncond * st_star)
+            for (int i = 0; i < state_size; i++) {
+                float neg_scaled = v_uncond[i] * st_star;
+                dphi_dt[i] = neg_scaled + cfg * (v_cond[i] - neg_scaled);
             }
         } else {
-            v = v_cond;
+            dphi_dt = locdit_forward(ctx, x.data(), mu, t_cur, cond_raw, dt_scalar, cpu_be);
         }
 
-        // Euler step
+        // Euler step: x = x - dt * dphi_dt
         for (int i = 0; i < state_size; i++)
-            x[i] += dt_val * v[i];
+            x[i] -= dt_val * dphi_dt[i];
     }
 
     return x;
@@ -1537,7 +1561,12 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     }
 
     if (ctx->verbosity >= 2) {
-        float mx = 0; for (auto v : latents) { float a = v < 0 ? -v : v; if (a > mx) mx = a; }
+        float mx = 0;
+        for (auto v : latents) {
+            float a = v < 0 ? -v : v;
+            if (a > mx)
+                mx = a;
+        }
         fprintf(stderr, "voxcpm2 VAE: latent [%d, %d] max=%.4f\n", feat_dim, T_lat, mx);
     }
 
@@ -1565,7 +1594,12 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
         }
     }
     if (ctx->verbosity >= 2) {
-        float mx = 0; for (auto v : h) { float a = v < 0 ? -v : v; if (a > mx) mx = a; }
+        float mx = 0;
+        for (auto v : h) {
+            float a = v < 0 ? -v : v;
+            if (a > mx)
+                mx = a;
+        }
         fprintf(stderr, "voxcpm2 VAE: after layer0 (depthwise k=7): Cc=%d Tc=%d max=%.4f\n", Cc, Tc, mx);
     }
 
@@ -1587,7 +1621,12 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
         }
     }
     if (ctx->verbosity >= 2) {
-        float mx = 0; for (auto v : h) { float a = v < 0 ? -v : v; if (a > mx) mx = a; }
+        float mx = 0;
+        for (auto v : h) {
+            float a = v < 0 ? -v : v;
+            if (a > mx)
+                mx = a;
+        }
         fprintf(stderr, "voxcpm2 VAE: after layer1 (1x1 64->%d): Tc=%d max=%.4f\n", Cc, Tc, mx);
     }
 
@@ -1663,7 +1702,12 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
         h = std::move(h_up);
 
         if (ctx->verbosity >= 2) {
-            float mx = 0; for (size_t i = 0; i < (size_t)Cc*Tc; i++) { float a = h[i]<0?-h[i]:h[i]; if(a>mx)mx=a; }
+            float mx = 0;
+            for (size_t i = 0; i < (size_t)Cc * Tc; i++) {
+                float a = h[i] < 0 ? -h[i] : h[i];
+                if (a > mx)
+                    mx = a;
+            }
             fprintf(stderr, "voxcpm2 VAE: block %d upsample(%d): Cc=%d Tc=%d max=%.4f\n", b, up, Cc, Tc, mx);
         }
 
@@ -1678,7 +1722,12 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     }
 
     if (ctx->verbosity >= 2) {
-        float mx = 0; for (size_t i = 0; i < (size_t)Cc*Tc; i++) { float a = h[i] < 0 ? -h[i] : h[i]; if (a > mx) mx = a; }
+        float mx = 0;
+        for (size_t i = 0; i < (size_t)Cc * Tc; i++) {
+            float a = h[i] < 0 ? -h[i] : h[i];
+            if (a > mx)
+                mx = a;
+        }
         fprintf(stderr, "voxcpm2 VAE: after upsample blocks: Cc=%d Tc=%d max=%.4f\n", Cc, Tc, mx);
     }
 
@@ -2808,29 +2857,29 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
             std::vector<float> tslm_h = tslm_prefill(ctx, token_ids, cpu_be);
             {
                 std::vector<float> normed(d);
-                rms_norm_cpu(tslm_h.data(), tensor_data_f32(ctx->weights.tslm_output_norm),
-                             normed.data(), d, ctx->hp.rms_norm_eps);
+                rms_norm_cpu(tslm_h.data(), tensor_data_f32(ctx->weights.tslm_output_norm), normed.data(), d,
+                             ctx->hp.rms_norm_eps);
                 tslm_h = normed;
             }
             int in_dim = 2 * d;
             std::vector<float> cat_buf(in_dim, 0.0f);
             std::memcpy(cat_buf.data(), tslm_h.data(), (size_t)d * sizeof(float));
             std::vector<float> ralm_input(d);
-            matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b,
-                           cat_buf.data(), in_dim, ralm_input.data(), d);
+            matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, cat_buf.data(), in_dim,
+                           ralm_input.data(), d);
             std::vector<float> ralm_h = ralm_prefill(ctx, ralm_input, cpu_be);
             {
                 std::vector<float> normed(d_ralm);
-                rms_norm_cpu(ralm_h.data(), tensor_data_f32(ctx->weights.ralm_output_norm),
-                             normed.data(), d_ralm, ctx->hp.rms_norm_eps);
+                rms_norm_cpu(ralm_h.data(), tensor_data_f32(ctx->weights.ralm_output_norm), normed.data(), d_ralm,
+                             ctx->hp.rms_norm_eps);
                 ralm_h = normed;
             }
             if (ctx->weights.lm_to_dit_w && ctx->weights.lm_to_dit_b)
-                matmul_mv_bias(cpu_be, ctx->weights.lm_to_dit_w, ctx->weights.lm_to_dit_b,
-                               tslm_h.data(), d, mu.data(), d_dit);
+                matmul_mv_bias(cpu_be, ctx->weights.lm_to_dit_w, ctx->weights.lm_to_dit_b, tslm_h.data(), d, mu.data(),
+                               d_dit);
             if (ctx->weights.res_to_dit_w && ctx->weights.res_to_dit_b)
-                matmul_mv_bias(cpu_be, ctx->weights.res_to_dit_w, ctx->weights.res_to_dit_b,
-                               ralm_h.data(), d_ralm, mu.data() + d_dit, d_dit);
+                matmul_mv_bias(cpu_be, ctx->weights.res_to_dit_w, ctx->weights.res_to_dit_b, ralm_h.data(), d_ralm,
+                               mu.data() + d_dit, d_dit);
 
             // Use ref noise if provided (just noise, no mu)
             if (ref_samples && ref_n_samples >= state_size) {
