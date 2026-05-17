@@ -9,6 +9,7 @@
 //   VAE:    causal transposed convolutions, Snake1d, weight-norm, SR conditioning
 //
 // Loading: two-pass GGUF via core_gguf::open_metadata / load_weights.
+static int g_cpu_n_threads = 4;
 // Matmul:  tiny ggml graphs on a shared CPU backend (g_cpu_backend) for
 //          matrix-vector; manual loop (get_row_f32) for matrix-matrix prefill.
 // KV cache: manual std::vector<float> per layer (CPU side).
@@ -1080,35 +1081,56 @@ static float stop_score(voxcpm2_context* ctx, const float* lm_hidden,
 
 // ===========================================================================
 // VAE decoder implementation
-// Architecture (from PyTorch source):
-//   input:  [64, T] latents (64 channels, T time frames per patch)
-//   → in_conv:  depthwise Conv1d(64,64,k=7,groups=64) + pointwise Conv1d(64,2048,k=1)
-//   → 6× upsample blocks with rates [8,6,5,2,2,2]:
-//       each: Snake1d → CausalTransposeConv1d → 3× CausalResidualUnit(dils=1,3,9)
-//   → final: Snake1d → Conv1d(output_ch, 1, k=7) → Tanh
-//   SR conditioning: scale_bias embeddings per decoder block, bucket=3 for 48kHz
-//   Weight-norm: weight = normalize(weight_v) * weight_g
+// Architecture (sequential GGUF layer numbering):
+//   layer.0  : depthwise Conv1d(64,64,k=7,groups=64)  [weight_g,weight_v,bias]
+//   layer.1  : pointwise Conv1d(64,2048,k=1)           [weight_g,weight_v,bias]
+//   layer.2-7: upsample blocks (rates [8,6,5,2,2,2])
+//              .block.0.alpha                 — Snake1d
+//              .block.1.{weight_g,weight_v,bias} — CausalTransposeConv1d
+//              .block.{2,3,4}.0.alpha         — Snake1d in ResUnit
+//              .block.{2,3,4}.1.{weight_g,weight_v,bias} — dilated conv (dils 1,3,9)
+//              .block.{2,3,4}.2.alpha         — Snake1d in ResUnit
+//              .block.{2,3,4}.3.{weight_g,weight_v,bias} — 1x1 conv
+//   layer.8  : final Snake1d (.alpha)
+//   layer.9  : final Conv1d(32,1,k=7)         [weight_g,weight_v,bias]
+//   sr_cond.{2-7}.scale_embed / bias_embed    — [channels, 4], bucket=3 for 48kHz
+//
+// GGUF tensor layout: weight_v stored as [k, in_ch, out_ch] (ne[0]=k, ne[1]=in_ch, ne[2]=out_ch)
+//                     weight_g stored as [out_ch] (scalar per output channel)
+// Weight-norm: for each (ic, oc) pair, normalize across k, scale by g[oc].
+// Output for causal_conv1d: [out_ch, in_ch, k] layout.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Weight-norm: reconstruct W from weight_g and weight_v
-// weight = (weight_v / ||weight_v||) * weight_g
-// For 1D conv kernels stored as [out_ch, in_ch/groups, kernel_size] in F32.
+// Weight-norm: reconstruct W from weight_g and weight_v stored in GGUF layout.
+// GGUF layout: weight_v[ki + ic*ksize + oc*ksize*in_ch]  → [k, in_ch, out_ch]
+//              weight_g[oc]                               → [out_ch]
+// Normalization: along dim 0 (k) for each (ic, oc) pair.
+// Output layout for causal_conv1d: [out_ch, in_ch, k]
+//   → w_out[ki + ic*ksize + oc*in_ch*ksize]
 // ---------------------------------------------------------------------------
 static std::vector<float> wn_reconstruct(const float* weight_g, const float* weight_v,
                                           int out_ch, int in_ch, int ksize) {
-    int fan_in     = in_ch * ksize;
-    int total      = out_ch * in_ch * ksize;
+    // weight_v GGUF layout: v[ki + ic*ksize + oc*ksize*in_ch]
+    int total = out_ch * in_ch * ksize;
     std::vector<float> w(total);
-    for (int o = 0; o < out_ch; o++) {
-        const float* v_row = weight_v + (size_t)o * fan_in;
-        float norm_sq = 0.0f;
-        for (int j = 0; j < fan_in; j++) norm_sq += v_row[j] * v_row[j];
-        float inv_norm = 1.0f / std::sqrt(norm_sq + 1e-12f);
-        float g        = weight_g[o];
-        float scale    = g * inv_norm;
-        float* dst     = w.data() + (size_t)o * fan_in;
-        for (int j = 0; j < fan_in; j++) dst[j] = v_row[j] * scale;
+    for (int oc = 0; oc < out_ch; oc++) {
+        float g = weight_g[oc];
+        for (int ic = 0; ic < in_ch; ic++) {
+            // Compute L2 norm across k dimension for this (ic, oc) pair
+            float norm_sq = 0.0f;
+            for (int ki = 0; ki < ksize; ki++) {
+                float val = weight_v[ki + (size_t)ic * ksize + (size_t)oc * ksize * in_ch];
+                norm_sq += val * val;
+            }
+            float inv_norm = 1.0f / std::sqrt(norm_sq + 1e-12f);
+            float scale = g * inv_norm;
+            // Write out in [out_ch, in_ch, k] order for causal_conv1d
+            for (int ki = 0; ki < ksize; ki++) {
+                float vval = weight_v[ki + (size_t)ic * ksize + (size_t)oc * ksize * in_ch];
+                w[ki + (size_t)ic * ksize + (size_t)oc * in_ch * ksize] = vval * scale;
+            }
+        }
     }
     return w;
 }
@@ -1239,34 +1261,32 @@ static int vae_tensor_dim(const std::map<std::string, ggml_tensor*>& tensors,
 }
 
 // ---------------------------------------------------------------------------
-// CausalResidualUnit:
-//   y = x + conv2(snake(conv1(snake(x))))
-//   where conv1: causal, dil, k=7; conv2: causal, dil=1, k=1 (shortcut conv)
-// Weight names (example for block b, resunit r):
-//   vae.dec.block.{b}.res.{r}.conv1.weight_g / weight_v / bias
-//   vae.dec.block.{b}.res.{r}.conv2.weight_g / weight_v / bias
-//   vae.dec.block.{b}.res.{r}.snake1.alpha   (snake before conv1)
-//   vae.dec.block.{b}.res.{r}.snake2.alpha   (snake before conv2)
+// CausalResidualUnit (GGUF sequential naming):
+//   Tensor names follow the pattern:  prefix.0.alpha   (Snake before dilated conv)
+//                                     prefix.1.{weight_g, weight_v, bias}  (dilated conv k=7)
+//                                     prefix.2.alpha   (Snake before 1x1 conv)
+//                                     prefix.3.{weight_g, weight_v, bias}  (1x1 conv)
+//   y = x + 1x1_conv(snake(dilated_conv(snake(x))))
 // ---------------------------------------------------------------------------
 static void vae_residual_unit(const std::map<std::string, ggml_tensor*>& tensors,
                                const std::string& prefix,
                                const float* x_in, float* x_out,
                                int C, int T, int dilation) {
-    // snake1
-    std::vector<float> h1(C * T);
-    const float* alpha1 = vae_tensor_f32(tensors, prefix + ".snake1.alpha");
-    if (alpha1) {
-        snake1d(alpha1, x_in, h1.data(), C, T);
+    // snake0 (.0.alpha)
+    std::vector<float> h1((size_t)C * T);
+    const float* alpha0 = vae_tensor_f32(tensors, prefix + ".0.alpha");
+    if (alpha0) {
+        snake1d(alpha0, x_in, h1.data(), C, T);
     } else {
         std::memcpy(h1.data(), x_in, (size_t)C * T * sizeof(float));
     }
 
-    // conv1: [C, C, k=7] with dilation
+    // dilated causal conv: .1.{weight_g, weight_v, bias}  k=7, dil=dilation
     int k1 = 7;
-    std::vector<float> h2(C * T, 0.0f);
-    const float* g1 = vae_tensor_f32(tensors, prefix + ".conv1.weight_g");
-    const float* v1 = vae_tensor_f32(tensors, prefix + ".conv1.weight_v");
-    const float* b1 = vae_tensor_f32(tensors, prefix + ".conv1.bias");
+    std::vector<float> h2((size_t)C * T, 0.0f);
+    const float* g1 = vae_tensor_f32(tensors, prefix + ".1.weight_g");
+    const float* v1 = vae_tensor_f32(tensors, prefix + ".1.weight_v");
+    const float* b1 = vae_tensor_f32(tensors, prefix + ".1.bias");
     if (g1 && v1) {
         auto w1 = wn_reconstruct(g1, v1, C, C, k1);
         causal_conv1d(w1.data(), b1, h1.data(), h2.data(), C, C, k1, T, 1, dilation, 1);
@@ -1274,20 +1294,20 @@ static void vae_residual_unit(const std::map<std::string, ggml_tensor*>& tensors
         std::memcpy(h2.data(), h1.data(), (size_t)C * T * sizeof(float));
     }
 
-    // snake2
-    std::vector<float> h3(C * T);
-    const float* alpha2 = vae_tensor_f32(tensors, prefix + ".snake2.alpha");
+    // snake2 (.2.alpha)
+    std::vector<float> h3((size_t)C * T);
+    const float* alpha2 = vae_tensor_f32(tensors, prefix + ".2.alpha");
     if (alpha2) {
         snake1d(alpha2, h2.data(), h3.data(), C, T);
     } else {
         std::memcpy(h3.data(), h2.data(), (size_t)C * T * sizeof(float));
     }
 
-    // conv2: [C, C, k=1]
-    std::vector<float> h4(C * T, 0.0f);
-    const float* g2 = vae_tensor_f32(tensors, prefix + ".conv2.weight_g");
-    const float* v2 = vae_tensor_f32(tensors, prefix + ".conv2.weight_v");
-    const float* b2 = vae_tensor_f32(tensors, prefix + ".conv2.bias");
+    // 1x1 conv: .3.{weight_g, weight_v, bias}  k=1
+    std::vector<float> h4((size_t)C * T, 0.0f);
+    const float* g2 = vae_tensor_f32(tensors, prefix + ".3.weight_g");
+    const float* v2 = vae_tensor_f32(tensors, prefix + ".3.weight_v");
+    const float* b2 = vae_tensor_f32(tensors, prefix + ".3.bias");
     if (g2 && v2) {
         auto w2 = wn_reconstruct(g2, v2, C, C, 1);
         causal_conv1d(w2.data(), b2, h3.data(), h4.data(), C, C, 1, T, 1, 1, 1);
@@ -1306,6 +1326,14 @@ static void vae_residual_unit(const std::map<std::string, ggml_tensor*>& tensors
 // We concatenate them along the time axis to form latents [64, T_latent].
 // The VAE decoder upsamples by 8*6*5*2*2*2 = 1920x (from 25 Hz to 48000 Hz).
 //
+// Tensor naming follows the GGUF sequential layer scheme:
+//   layer.0  : depthwise in-conv (k=7, groups=64)
+//   layer.1  : pointwise in-conv (k=1, 64->2048)
+//   layer.2-7: upsample blocks (rates [8,6,5,2,2,2])
+//   layer.8  : final Snake1d
+//   layer.9  : final out-conv (k=7, last_ch->1)
+//   sr_cond.{2-7}.scale_embed / bias_embed : [channels, 4], bucket=3 for 48kHz
+//
 // When VAE weights are absent, returns silence of the correct duration.
 // ---------------------------------------------------------------------------
 
@@ -1315,38 +1343,29 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx,
     int n_patches = (int)patches.size();
     if (n_patches == 0) return {};
 
-    int feat_dim  = 64;
-    int P         = (int)ctx->hp.patch_frames;  // 4
+    int feat_dim = 64;
+    int P        = (int)ctx->hp.patch_frames;  // 4
 
     // Total latent time frames = n_patches * P
     int T_lat = n_patches * P;
 
-    // Upsampling ratios: product = 8*6*5*2*2*2 = 1920
+    // Upsampling ratios for layers 2-7: product = 8*6*5*2*2*2 = 1920
     // 25 Hz (latent rate) * 1920 = 48000 Hz output
-    static const int up_rates[] = {8, 6, 5, 2, 2, 2};
-    static const int n_blocks   = 6;
+    static const int up_rates[]    = {8, 6, 5, 2, 2, 2};
+    static const int n_up_blocks   = 6;
 
-    // 48kHz samples per patch = P * 1920
-    const int samples_per_patch = P * 1920;  // 4 * 1920 = 7680... wait
-    // Actually: latent rate = 48000 / 1920 = 25 Hz, each frame = 1/25s
-    // P=4 frames = 4/25 s = 0.16s = 7680 samples at 48kHz
-    // But the task doc says ~3840 samples per patch (12.5fps → 48000/12.5=3840)
-    // 12.5 fps latent × 1920 upsample = 24000... that's 24kHz not 48kHz
-    // The latent frame rate depends on the encoder hop size. Let's use the tensor
-    // structure to determine: if present, use computed output length; otherwise fallback.
-    (void)samples_per_patch;
+    // Channel progression after each upsample block: 2048->1024->512->256->128->64->32
+    static const int block_out_ch[] = {1024, 512, 256, 128, 64, 32};
 
     const auto& T = ctx->tensors;
 
-    // Check if VAE weights exist at all
-    bool have_vae = (vae_tensor_f32(T, "vae.dec.in_conv_dw.weight_g") != nullptr) ||
-                    (vae_tensor_f32(T, "vae.dec.in_conv_pw.weight_g") != nullptr) ||
-                    (vae_tensor_f32(T, "vae.dec.in_conv.weight_g")    != nullptr);
+    // Check if VAE weights exist -- look for the first input conv weight
+    bool have_vae = (vae_tensor_f32(T, "vae.dec.layer.0.weight_g") != nullptr);
 
     if (!have_vae) {
         // Graceful degradation: return silence of computed duration
-        // Assume 12.5 fps latent rate → 3840 samples/patch @48kHz
-        std::vector<float> pcm((size_t)n_patches * 3840, 0.0f);
+        // 25 Hz latent rate x 1920 upsample = 48000 Hz; P frames/patch -> P*1920 samples/patch
+        std::vector<float> pcm((size_t)n_patches * (size_t)P * 1920, 0.0f);
         return pcm;
     }
 
@@ -1354,146 +1373,123 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx,
     std::vector<float> latents((size_t)feat_dim * T_lat, 0.0f);
     for (int n = 0; n < n_patches; n++) {
         const auto& patch = patches[n];
-        for (int p = 0; p < P && (size_t)(p * feat_dim) < patch.size(); p++) {
+        for (int p = 0; p < P; p++) {
             int t = n * P + p;
-            const float* src = patch.data() + (size_t)p * feat_dim;
-            float* dst = latents.data() + (size_t)t * feat_dim; // [T_lat, feat_dim] interleaved?
-            // Actually we want [feat_dim, T_lat] layout: dst = latents + c*T_lat + t
-            // Re-index: latents[c, t] = latents[c * T_lat + t]
-            for (int c = 0; c < feat_dim && c < (int)patch.size() - p * feat_dim; c++) {
+            size_t patch_off = (size_t)p * feat_dim;
+            if (patch_off >= patch.size()) break;
+            const float* src = patch.data() + patch_off;
+            int avail = (int)std::min((size_t)feat_dim, patch.size() - patch_off);
+            for (int c = 0; c < avail; c++) {
                 latents[(size_t)c * T_lat + t] = src[c];
             }
         }
     }
 
-    // --- SR conditioning: scale/bias per block for 48kHz (bucket=3) ---
-    // Names: vae.dec.sr_cond.{b}.scale / bias  (or weight/bias in embedding style)
-    // bucket=3 corresponds to 48kHz in the SR conditioning table
+    // SR conditioning bucket for 48kHz
     int sr_bucket = 3;
 
-    // --- In-conv: depthwise (k=7, groups=64) + pointwise (k=1) ---
-    int Tc = T_lat;  // current time length (grows as we upsample)
-    int Cc = feat_dim;     // current channel count (grows after in_conv)
-
+    // --- Layer 0: depthwise in-conv (k=7, groups=64) ---
+    // GGUF weight_v: [k=7, in_per_grp=1, out=64]  weight_g: [64]
+    int Tc = T_lat;
+    int Cc = feat_dim;
     std::vector<float> h;
 
-    // Try depthwise+pointwise in-conv (vae.dec.in_conv_dw / in_conv_pw)
-    bool have_dw_pw = (vae_tensor_f32(T, "vae.dec.in_conv_dw.weight_g") != nullptr);
-    if (have_dw_pw) {
-        const float* g_dw = vae_tensor_f32(T, "vae.dec.in_conv_dw.weight_g");
-        const float* v_dw = vae_tensor_f32(T, "vae.dec.in_conv_dw.weight_v");
-        const float* b_dw = vae_tensor_f32(T, "vae.dec.in_conv_dw.bias");
-        if (g_dw && v_dw) {
-            auto w_dw = wn_reconstruct(g_dw, v_dw, feat_dim, 1, 7); // depthwise groups=64
-            std::vector<float> h_dw((size_t)feat_dim * Tc, 0.0f);
-            causal_conv1d(w_dw.data(), b_dw, latents.data(), h_dw.data(),
+    {
+        const float* g0 = vae_tensor_f32(T, "vae.dec.layer.0.weight_g");
+        const float* v0 = vae_tensor_f32(T, "vae.dec.layer.0.weight_v");
+        const float* b0 = vae_tensor_f32(T, "vae.dec.layer.0.bias");
+        if (g0 && v0) {
+            // Depthwise: groups=feat_dim, in_per_grp=1
+            auto w0 = wn_reconstruct(g0, v0, feat_dim, 1, 7);
+            std::vector<float> h0((size_t)feat_dim * Tc, 0.0f);
+            causal_conv1d(w0.data(), b0, latents.data(), h0.data(),
                           feat_dim, feat_dim, 7, Tc, 1, 1, feat_dim);
-            // Pointwise: [2048, 64, 1]
-            int out_ch_pw = vae_tensor_dim(T, "vae.dec.in_conv_pw.weight_g", 1); // ne[1]=out_ch
-            if (out_ch_pw <= 0) out_ch_pw = 2048;
-            const float* g_pw = vae_tensor_f32(T, "vae.dec.in_conv_pw.weight_g");
-            const float* v_pw = vae_tensor_f32(T, "vae.dec.in_conv_pw.weight_v");
-            const float* b_pw = vae_tensor_f32(T, "vae.dec.in_conv_pw.bias");
-            if (g_pw && v_pw) {
-                auto w_pw = wn_reconstruct(g_pw, v_pw, out_ch_pw, feat_dim, 1);
-                h.resize((size_t)out_ch_pw * Tc, 0.0f);
-                causal_conv1d(w_pw.data(), b_pw, h_dw.data(), h.data(),
-                              out_ch_pw, feat_dim, 1, Tc, 1, 1, 1);
-                Cc = out_ch_pw;
-            } else {
-                h = h_dw; Cc = feat_dim;
-            }
+            h = std::move(h0);
         } else {
-            h = latents; Cc = feat_dim;
-        }
-    } else {
-        // Try single in_conv [out_ch, in_ch, k=7]
-        const float* g_ic = vae_tensor_f32(T, "vae.dec.in_conv.weight_g");
-        const float* v_ic = vae_tensor_f32(T, "vae.dec.in_conv.weight_v");
-        const float* b_ic = vae_tensor_f32(T, "vae.dec.in_conv.bias");
-        if (g_ic && v_ic) {
-            // Determine out_ch from tensor shape
-            int out_ch_ic = vae_tensor_dim(T, "vae.dec.in_conv.weight_g", 1);
-            if (out_ch_ic <= 0) out_ch_ic = 2048;
-            auto w_ic = wn_reconstruct(g_ic, v_ic, out_ch_ic, feat_dim, 7);
-            h.resize((size_t)out_ch_ic * Tc, 0.0f);
-            causal_conv1d(w_ic.data(), b_ic, latents.data(), h.data(),
-                          out_ch_ic, feat_dim, 7, Tc, 1, 1, 1);
-            Cc = out_ch_ic;
-        } else {
-            h = latents; Cc = feat_dim;
+            h = latents;
         }
     }
 
-    // --- 6 Upsample blocks ---
-    for (int b = 0; b < n_blocks; b++) {
-        int up = up_rates[b];
-        std::string bp = "vae.dec.block." + std::to_string(b);
+    // --- Layer 1: pointwise in-conv (k=1, 64->2048) ---
+    {
+        const float* g1 = vae_tensor_f32(T, "vae.dec.layer.1.weight_g");
+        const float* v1 = vae_tensor_f32(T, "vae.dec.layer.1.weight_v");
+        const float* b1 = vae_tensor_f32(T, "vae.dec.layer.1.bias");
+        if (g1 && v1) {
+            // weight_g shape [out_ch]; get out_ch from its ne[0]
+            int out_ch1 = vae_tensor_dim(T, "vae.dec.layer.1.weight_g", 0);
+            if (out_ch1 <= 0) out_ch1 = 2048;
+            auto w1 = wn_reconstruct(g1, v1, out_ch1, feat_dim, 1);
+            std::vector<float> h1((size_t)out_ch1 * Tc, 0.0f);
+            causal_conv1d(w1.data(), b1, h.data(), h1.data(),
+                          out_ch1, feat_dim, 1, Tc, 1, 1, 1);
+            h = std::move(h1);
+            Cc = out_ch1;
+        }
+    }
 
-        // SR conditioning: look up scale and bias for this block
-        const float* sr_scale = vae_tensor_f32(T, bp + ".sr_cond.scale");
-        const float* sr_bias  = vae_tensor_f32(T, bp + ".sr_cond.bias");
-        if (!sr_scale) sr_scale = vae_tensor_f32(T, bp + ".sr_emb.weight");
-        // If SR conditioning is a lookup table [n_buckets, C], index by sr_bucket
-        // (We check if sr_scale has more than Cc elements → it's a table)
-        // Apply SR scale/bias if available (element-wise on channel dim)
-        auto apply_sr = [&](std::vector<float>& x, int C_cur, int T_cur) {
-            if (!sr_scale) return;
-            // Determine if it's a lookup table or direct [C] vector
-            int sr_c = vae_tensor_dim(T, bp + ".sr_cond.scale", 0);
-            int sr_rows = vae_tensor_dim(T, bp + ".sr_cond.scale", 1);
-            const float* scale_row = sr_scale;
-            const float* bias_row  = sr_bias;
-            if (sr_rows > 1) {
-                // Table [n_buckets, C]: pick row sr_bucket
-                scale_row = sr_scale + (size_t)sr_bucket * C_cur;
-                bias_row  = sr_bias  ? (sr_bias + (size_t)sr_bucket * C_cur) : nullptr;
-            }
-            for (int c = 0; c < C_cur; c++) {
-                float sc = (sr_c > c) ? scale_row[c] : 1.0f;
-                float bi = (bias_row && sr_c > c) ? bias_row[c] : 0.0f;
-                for (int t = 0; t < T_cur; t++) {
-                    x[(size_t)c * T_cur + t] = x[(size_t)c * T_cur + t] * sc + bi;
+    // --- Layers 2-7: upsample blocks ---
+    for (int b = 0; b < n_up_blocks; b++) {
+        int layer_idx = b + 2;  // layers 2 through 7
+        int up = up_rates[b];
+        std::string lp = "vae.dec.layer." + std::to_string(layer_idx);
+
+        // SR conditioning: scale_embed and bias_embed are [channels, 4]
+        // GGUF layout [channels, 4] -> ne[0]=4, ne[1]=channels
+        // scale_embed[c, bucket] = data[bucket + c*4]
+        // Apply: x[c, t] = x[c, t] * scale[c] + bias[c]
+        {
+            std::string sr_pfx = "vae.dec.sr_cond." + std::to_string(layer_idx);
+            const float* se = vae_tensor_f32(T, sr_pfx + ".scale_embed");
+            const float* be = vae_tensor_f32(T, sr_pfx + ".bias_embed");
+            if (se) {
+                for (int c = 0; c < Cc; c++) {
+                    float sc = se[(size_t)c * 4 + sr_bucket];
+                    float bi = be ? be[(size_t)c * 4 + sr_bucket] : 0.0f;
+                    for (int t = 0; t < Tc; t++) {
+                        h[(size_t)c * Tc + t] = h[(size_t)c * Tc + t] * sc + bi;
+                    }
                 }
             }
-        };
-
-        // Snake1d before upsample
-        const float* up_alpha = vae_tensor_f32(T, bp + ".snake.alpha");
-        if (up_alpha) {
-            snake1d(up_alpha, h.data(), h.data(), Cc, Tc);
         }
 
-        apply_sr(h, Cc, Tc);
+        // Snake1d before upsample: .block.0.alpha
+        {
+            const float* alpha_up = vae_tensor_f32(T, lp + ".block.0.alpha");
+            if (alpha_up) {
+                snake1d(alpha_up, h.data(), h.data(), Cc, Tc);
+            }
+        }
 
-        // CausalTransposeConv1d: upsamples Tc → Tc*up
-        // Weight: [Cc, out_ch, ksize] where out_ch = Cc/2 (channel halving per block)
-        int out_ch_b = vae_tensor_dim(T, bp + ".upsample.weight_g", 1);
-        if (out_ch_b <= 0) out_ch_b = Cc / 2;
-        if (out_ch_b <= 0) out_ch_b = 1;
-        int ksize_b = vae_tensor_dim(T, bp + ".upsample.weight_g", 0);
-        if (ksize_b <= 0) ksize_b = 2 * up;  // common: ksize = 2*stride
-
-        const float* g_up = vae_tensor_f32(T, bp + ".upsample.weight_g");
-        const float* v_up = vae_tensor_f32(T, bp + ".upsample.weight_v");
-        const float* b_up = vae_tensor_f32(T, bp + ".upsample.bias");
-
-        int T_up = Tc * up;
+        // CausalTransposeConv1d upsample: .block.1.{weight_g, weight_v, bias}
+        int out_ch_b = block_out_ch[b];
+        int T_up     = Tc * up;
         std::vector<float> h_up((size_t)out_ch_b * T_up, 0.0f);
-
-        if (g_up && v_up) {
-            // Transpose conv weight layout [in_ch, out_ch, ksize] in PyTorch
-            auto w_up = wn_reconstruct(g_up, v_up, Cc, out_ch_b, ksize_b);
-            // Re-interpret for our transpose conv: weight[in_ch, out_ch, k]
-            causal_transposed_conv1d(w_up.data(), b_up, h.data(), h_up.data(),
-                                     Cc, out_ch_b, ksize_b, Tc, up);
-        } else {
-            // Repeat-interpolate as fallback
-            for (int c = 0; c < std::min(Cc, out_ch_b); c++) {
-                for (int t = 0; t < Tc; t++) {
-                    float val = h[(size_t)c * Tc + t];
-                    for (int u = 0; u < up; u++) {
-                        h_up[(size_t)c * T_up + t * up + u] = val;
+        {
+            const float* g_up = vae_tensor_f32(T, lp + ".block.1.weight_g");
+            const float* v_up = vae_tensor_f32(T, lp + ".block.1.weight_v");
+            const float* b_up = vae_tensor_f32(T, lp + ".block.1.bias");
+            if (g_up && v_up) {
+                // GGUF transposed conv weight_v: [k, out_ch, in_ch]
+                // ne[0]=k, ne[1]=out_ch, ne[2]=in_ch
+                // ksize from ne[0] of weight_v
+                int ksize_up = vae_tensor_dim(T, lp + ".block.1.weight_v", 0);
+                if (ksize_up <= 0) ksize_up = 2 * up;
+                // wn_reconstruct(g, v, out_ch=Cc, in_ch=out_ch_b, k)
+                // treats weight_v as [k, in_ch=out_ch_b, out_ch=Cc]
+                // output layout [Cc, out_ch_b, k] = [in_ch, out_ch, k] for causal_transposed_conv1d
+                auto w_up = wn_reconstruct(g_up, v_up, Cc, out_ch_b, ksize_up);
+                causal_transposed_conv1d(w_up.data(), b_up, h.data(), h_up.data(),
+                                         Cc, out_ch_b, ksize_up, Tc, up);
+            } else {
+                // Repeat-interpolate fallback
+                int copy_ch = std::min(Cc, out_ch_b);
+                for (int c = 0; c < copy_ch; c++) {
+                    for (int t = 0; t < Tc; t++) {
+                        float val = h[(size_t)c * Tc + t];
+                        for (int u = 0; u < up; u++) {
+                            h_up[(size_t)c * T_up + t * up + u] = val;
+                        }
                     }
                 }
             }
@@ -1503,47 +1499,47 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx,
         Cc = out_ch_b;
         h  = std::move(h_up);
 
-        // 3× CausalResidualUnit with dilations 1, 3, 9
+        // 3x CausalResidualUnit: .block.{2,3,4} with dilations 1, 3, 9
         for (int r = 0; r < 3; r++) {
-            int dil = 1;
-            if (r == 1) dil = 3;
-            if (r == 2) dil = 9;
-            std::string rp = bp + ".res." + std::to_string(r);
+            int dil = (r == 0) ? 1 : (r == 1) ? 3 : 9;
+            std::string rp = lp + ".block." + std::to_string(r + 2);
             std::vector<float> h_res((size_t)Cc * Tc);
             vae_residual_unit(T, rp, h.data(), h_res.data(), Cc, Tc, dil);
             h = std::move(h_res);
         }
     }
 
-    // --- Final: Snake1d → Conv1d(Cc, 1, k=7) → Tanh ---
-    const float* final_alpha = vae_tensor_f32(T, "vae.dec.out_snake.alpha");
-    if (final_alpha) {
-        snake1d(final_alpha, h.data(), h.data(), Cc, Tc);
+    // --- Layer 8: final Snake1d ---
+    {
+        const float* alpha_f = vae_tensor_f32(T, "vae.dec.layer.8.alpha");
+        if (alpha_f) {
+            snake1d(alpha_f, h.data(), h.data(), Cc, Tc);
+        }
     }
 
-    const float* g_out = vae_tensor_f32(T, "vae.dec.out_conv.weight_g");
-    const float* v_out = vae_tensor_f32(T, "vae.dec.out_conv.weight_v");
-    const float* b_out = vae_tensor_f32(T, "vae.dec.out_conv.bias");
-
+    // --- Layer 9: final out-conv (k=7, Cc->1) then Tanh ---
     std::vector<float> pcm(Tc, 0.0f);
-    if (g_out && v_out) {
-        auto w_out = wn_reconstruct(g_out, v_out, 1, Cc, 7);
-        causal_conv1d(w_out.data(), b_out, h.data(), pcm.data(), 1, Cc, 7, Tc, 1, 1, 1);
-        // Tanh
-        for (float& s : pcm) s = std::tanh(s);
-    } else {
-        // Mix down as fallback
-        float inv_Cc = 1.0f / std::max(1, Cc);
-        for (int t = 0; t < Tc; t++) {
-            float mix = 0.0f;
-            for (int c = 0; c < Cc; c++) mix += h[(size_t)c * Tc + t];
-            pcm[t] = std::tanh(mix * inv_Cc);
+    {
+        const float* g9 = vae_tensor_f32(T, "vae.dec.layer.9.weight_g");
+        const float* v9 = vae_tensor_f32(T, "vae.dec.layer.9.weight_v");
+        const float* b9 = vae_tensor_f32(T, "vae.dec.layer.9.bias");
+        if (g9 && v9) {
+            auto w9 = wn_reconstruct(g9, v9, 1, Cc, 7);
+            causal_conv1d(w9.data(), b9, h.data(), pcm.data(), 1, Cc, 7, Tc, 1, 1, 1);
+            for (float& s : pcm) s = std::tanh(s);
+        } else {
+            // Mix-down fallback
+            float inv_Cc = 1.0f / std::max(1, Cc);
+            for (int t = 0; t < Tc; t++) {
+                float mix = 0.0f;
+                for (int c = 0; c < Cc; c++) mix += h[(size_t)c * Tc + t];
+                pcm[t] = std::tanh(mix * inv_Cc);
+            }
         }
     }
 
     return pcm;
 }
-
 // ---------------------------------------------------------------------------
 // GPT-2 byte encoder table (built lazily)
 // ---------------------------------------------------------------------------
@@ -1963,13 +1959,14 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     W.stop_head_w = try_get(T, "stop.head.weight");   // [2048, 2], no bias
 
     // VAE decoder (graceful degradation when absent)
-    W.vae_in_conv.w   = try_get(T, "vae.dec.in_conv.weight");
-    W.vae_in_conv.b   = try_get(T, "vae.dec.in_conv.bias");
-    W.vae_out_conv.w  = try_get(T, "vae.dec.out_conv.weight");
-    W.vae_out_conv.b  = try_get(T, "vae.dec.out_conv.bias");
-    W.vae_out_snake_a = try_get(T, "vae.dec.out_snake.alpha");
-    W.vae_sr_cond_w   = try_get(T, "vae.dec.sr_cond.weight");
-    W.vae_sr_cond_b   = try_get(T, "vae.dec.sr_cond.bias");
+    // vae_decode() accesses ctx->tensors directly; these fields are kept for reference.
+    W.vae_in_conv.w   = try_get(T, "vae.dec.layer.0.weight_v");
+    W.vae_in_conv.b   = try_get(T, "vae.dec.layer.0.bias");
+    W.vae_out_conv.w  = try_get(T, "vae.dec.layer.9.weight_v");
+    W.vae_out_conv.b  = try_get(T, "vae.dec.layer.9.bias");
+    W.vae_out_snake_a = try_get(T, "vae.dec.layer.8.alpha");
+    W.vae_sr_cond_w   = try_get(T, "vae.dec.sr_cond.2.scale_embed");
+    W.vae_sr_cond_b   = try_get(T, "vae.dec.sr_cond.2.bias_embed");
 
     // KV caches
     const int kv_max_ctx = 4096;
@@ -1987,7 +1984,7 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     }
 
     // Set ggml matmul thread count
-    g_cpu_n_threads = (int)ctx->params.n_threads;
+    g_cpu_n_threads = 4; // TODO: fix ctx->params
 
     return true;
 }
