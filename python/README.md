@@ -57,7 +57,11 @@ for seg in s.transcribe_pcm(pcm_f32, sample_rate=16000):
 - `CrispASR` — Whisper-compatible high-level API
 - `Session` — unified API across all 17 backends
 - `align_words(...)` — word-level CTC alignment
-- `diarize_segments(...)` — speaker diarization (pyannote-compatible)
+- `diarize_segments(...)` — speaker diarization (energy / xcorr / vad-turns / pyannote)
+- `SpeakerEmbedder(spec)` — pluggable embedder ("auto"/"titanet", "indextts"/"ecapa", or a `.gguf` path)
+- `PyannoteCache(pcm, model)` — pre-computed pyannote-seg posteriors for cross-slice consistency
+- `agglomerative_cluster(embeddings, ...)` — single-linkage cosine clustering for globally stable speaker IDs
+- `TitaNet` / `SpeakerDB` — standalone speaker verification + profile matching
 - `detect_language_pcm(...)` — language ID
 - `registry_lookup(...)` — auto-download known models from the model hub
 

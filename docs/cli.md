@@ -13,6 +13,7 @@ when you don't pass `--backend`, whisper is the default.
 - [Word-level timestamps via CTC alignment](#word-level-timestamps-via-ctc-alignment)
 - [Sampling / decoding](#sampling--decoding-whisper--llm-backends) — temperature, beam, grammar
 - [Language detection (LID)](#language-detection-lid)
+- [Diarization](#diarization) — `--diarize`, pyannote, embedder-based clustering
 - [LLM-backend specific](#llm-backend-specific) — aligner, max-new-tokens
 - [Multi-language / translation](#multi-language--translation)
 - [Threading & processors](#threading--processors)
@@ -346,6 +347,83 @@ faithfully reproduces upstream's `pycld3` behaviour). GlotLID-V3 covers
 the most languages (2102 ISO 639-3 + script). LID-176 is **CC-BY-SA-3.0
 (viral)** — pick CLD3 or GlotLID for non-SA distribution.
 
+## Diarization
+
+Diarization assigns a speaker label to every transcribed segment. Two
+high-level paths, both work with every ASR backend:
+
+```bash
+# Native GGUF pyannote (no Python, no sherpa-onnx)
+crispasr -m auto --backend cohere -f podcast.wav \
+    --diarize --diarize-method pyannote --sherpa-segment-model auto -ojf
+
+# Same + embedder-based global speaker IDs (recommended for >2 speakers
+# or long-form audio where pyannote local-track IDs drift)
+crispasr -m auto --backend cohere -f podcast.wav \
+    --diarize --diarize-method pyannote --sherpa-segment-model auto \
+    --diarize-embedder auto -ojf
+```
+
+### `--diarize-method NAME`
+
+| Method | Stereo / mono | What it does |
+|---|---|---|
+| `energy` | stereo | `|L|` vs `|R|` per segment; the louder channel wins (1.1× margin) |
+| `xcorr` | stereo | TDOA via cross-correlation, ±5 ms search window |
+| `vad-turns` | mono | Alternates 0/1 every >600 ms gap (mono-friendly proxy) |
+| `pyannote` | mono | Native GGUF pyannote-seg-3.0; runs once globally over the full audio, splits ASR segments at speaker-turn boundaries when per-word timestamps exist. Auto-downloads the GGUF via `--sherpa-segment-model auto` |
+| `sherpa` / `ecapa` | mono | External `sherpa-onnx` subprocess with segmentation + speaker-embedding model. Requires `--sherpa-bin`, `--sherpa-segment-model`, `--sherpa-embedding-model` |
+
+Bare `--diarize` (no `--diarize-method`) defaults to `energy` for stereo
+input and `vad-turns` for mono — the historical behaviour.
+
+### `--diarize-embedder MODEL` — globally stable speaker IDs
+
+The pyannote method's per-pass local tracks (spk0 / spk1 / spk2) are
+not anchored to physical speakers across an entire file. Pass
+`--diarize-embedder` to extract a speaker embedding per segment and
+cluster on cosine similarity, producing IDs that are consistent across
+the whole audio.
+
+| Alias | Backend | Dim |
+|---|---|---|
+| `auto`, `titanet` | TitaNet-Large | 192 |
+| `indextts`, `indextts-bigvgan`, `ecapa` | IndexTTS-BigVGAN ECAPA-TDNN | 512 |
+| `<path>.gguf` | Dispatched by filename (`indextts` substring -> IndexTTS, otherwise TitaNet) | — |
+
+The interface is pluggable: add a new adapter by subclassing
+`CrispasrSpeakerEmbedder` in `src/crispasr_speaker_embedder.cpp` and
+extending the factory's dispatch. Tune clustering with
+`--diarize-cluster-threshold X` (default 0.5; higher = more clusters)
+and `--diarize-max-speakers N` (default 8 — hard cap).
+
+### Output shape
+
+Each segment carries the label as the string `"(speaker N) "` in
+`crispasr_segment.speaker`. Output writers surface it as:
+
+* **txt / wts**: prefixed inline: `(speaker 0) hello world`
+* **srt**: prefixed inline
+* **vtt**: `<v Speaker 0>` markup
+* **json**: per-segment `"speaker": "0"` (stripped of the `(speaker )` wrapper)
+
+When the embedder is enabled the labels are global cluster IDs;
+otherwise they are pyannote-local track IDs.
+
+### What changed in 0.6.6+ (issue [#107](https://github.com/CrispStrobe/CrispASR/issues/107))
+
+* `--diarize-method pyannote` is now actually correct end-to-end:
+  pyannote-seg runs ONCE over the full audio (cross-slice consistent
+  IDs), overlap classes contribute to both involved speakers, ASR
+  segments split at speaker-turn boundaries when word timestamps
+  exist.
+* `--diarize-method X` now also works with the whisper backend
+  (previously silently ignored — only the upstream stereo-energy
+  diarize ran).
+* Output writers prefer the unified `segs[i].speaker` over the legacy
+  stereo-only energy estimator. Mono input now gets a `speaker` field
+  in JSON when an explicit method is set.
+
 ## LLM-backend specific
 
 | Flag | Meaning |
@@ -426,14 +504,13 @@ language prefix from `-tl` automatically. m2m100 / WMT21 use both
 
 These work both with the historical default whisper code path AND
 with `--backend whisper`. The historical path retains a few extras
-unique to it (`-owts` karaoke, full-mode JSON DTW tokens, `-di`
-stereo diarize) — pass a `ggml-*.bin` model without `--backend` to
-get them.
+unique to it (`-owts` karaoke, full-mode JSON DTW tokens) — pass a
+`ggml-*.bin` model without `--backend` to get them.
 
 | Flag | Meaning |
 |---|---|
-| `--diarize` | Whisper-internal stereo diarization (upstream feature) |
-| `-tdrz`, `--tinydiarize` | TinyDiarize speaker turn detection |
+| `--diarize` | Generic diarization post-step. Stereo defaults to `energy`, mono to `vad-turns`. Pair with `--diarize-method` for pyannote / sherpa / etc. — see [Diarization](#diarization). |
+| `-tdrz`, `--tinydiarize` | TinyDiarize speaker turn detection (upstream whisper feature, separate from `--diarize`) |
 | `--carry-initial-prompt` | Forward `--prompt` across audio chunks |
 | `-dtw` | Output DTW token-level timing in `-ojf` JSON |
 | `-fa`, `-nfa` | Force flash-attn on / off |
