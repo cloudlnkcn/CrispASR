@@ -23,6 +23,7 @@
 #include "crispasr_speaker_embedder.h"
 #include "crispasr_mem.h"
 #include "crispasr_stream_finalize.h"
+#include "crispasr_stream_punc.h"
 #include "whisper_params.h"
 #include "fireredpunc.h"
 #include "truecaser.h"
@@ -77,11 +78,11 @@ static std::string apply_punc_text(fireredpunc_context* punc_ctx, const std::str
 }
 
 static bool stream_punc_partials_enabled(const whisper_params& params) {
-    return params.stream_punc == "partial";
+    return crispasr_stream_punc_partials_enabled(params.stream_punc);
 }
 
 static bool stream_punc_finals_enabled(const whisper_params& params) {
-    return params.stream_punc == "final" || params.stream_punc == "partial";
+    return crispasr_stream_punc_finals_enabled(params.stream_punc);
 }
 
 // Apply PCS (punctuation + capitalization + segmentation) to all segments.

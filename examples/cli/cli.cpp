@@ -8,6 +8,7 @@
 #include "crispasr_diagnostics.h"      // --version / --diagnostics + verbose banner (#31)
 #include "crispasr_diarize_cli.h"      // crispasr_apply_diarize / pyannote cache (#107)
 #include "crispasr_speaker_embedder.h" // pluggable speaker embedder (#107 P3)
+#include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_output.h"   // crispasr_make_disp_segments — split-on-punct (#29)
@@ -538,9 +539,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         }
     } else if (arg == "--stream-punc") {
         std::string mode = ARGV_NEXT;
-        if (mode != "off" && mode != "final" && mode != "partial") {
-            fprintf(stderr, "crispasr: --stream-punc must be 'off', 'final', or 'partial' (got '%s')\n",
-                    mode.c_str());
+        if (!crispasr_stream_punc_mode_valid(mode)) {
+            fprintf(stderr, "crispasr: --stream-punc must be 'off', 'final', or 'partial' (got '%s')\n", mode.c_str());
             exit(2);
         }
         params.stream_punc = mode;
@@ -896,8 +896,7 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr,
             "  --stream-vad-merge-gap-ms N       [%-7d] JSON+VAD close-gap merge in ms; clamped below final silence\n",
             params.stream_vad_merge_gap_ms);
-    fprintf(stderr,
-            "  --stream-punc MODE                [%-7s] JSON+VAD FireRedPunc mode: off, final, or partial\n",
+    fprintf(stderr, "  --stream-punc MODE                [%-7s] JSON+VAD FireRedPunc mode: off, final, or partial\n",
             params.stream_punc.c_str());
     fprintf(stderr,
             "  --stream-final-mode MODE          [%-7s] final.text source: 'redecode' (re-runs on the utterance "

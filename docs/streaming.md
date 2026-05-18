@@ -137,18 +137,45 @@ event change.
 
 ### Streaming punctuation (`--stream-punc`)
 
-When `--stream-json --vad` is used with `--punc-model`, FireRedPunc can be
-placed on different parts of the streaming path:
+When `--stream-json --vad` is combined with `--punc-model`, FireRedPunc
+can sit on either the partial path, the final path, both, or neither.
+PR [#112](https://github.com/CrispStrobe/CrispASR/pull/112) introduced
+the explicit knob; before that, partials and finals both ran through
+FireRedPunc (equivalent to today's `--stream-punc partial`).
 
-| Mode | Effect |
-|---|---|
-| `off` | Do not run FireRedPunc on streaming partials or finals. |
-| `final` | Run FireRedPunc only when emitting `final` text. This is the default and the recommended realtime mode. |
-| `partial` | Run FireRedPunc on partials and finals. This preserves the older behavior but can add substantial latency when partials are frequent. |
+| Mode | Partials | Finals | Notes |
+|---|---|---|---|
+| `off` | ❌ | ❌ | FireRedPunc is bypassed entirely on the streaming path. **Both partials and finals come out unpunctuated** — `off` is the most permissive setting, not just "off for partials". |
+| `final` *(default)* | ❌ | ✅ | Recommended realtime mode. Live partials stay cheap; finals get punctuation once per utterance via either `--stream-final-mode redecode` (segments are punc'd before stitching) or the stitched-fallback path (the final string is punc'd in place). |
+| `partial` | ✅ | ✅ | Pre-#112 behaviour. Keep if every partial event needs punctuation downstream — the cost is one FireRedPunc forward per `--stream-step`. |
 
-`final` keeps live partials cheap while still restoring punctuation on finalized
-utterances. Use `partial` only when punctuation on every partial is worth the
-extra compute.
+**Default change.** Before PR #112 the *de-facto* default was equivalent
+to `partial` (no flag existed; every partial got punctuation). After
+#112 the default is `final`. Wrappers that relied on punctuated
+partials should pass `--stream-punc partial` explicitly to restore
+the old behaviour; everyone else gets the better latency profile for
+free.
+
+Smoke results on 30 s of Cohere JA streaming
+(`--stream-step 500 --stream-final-mode redecode`):
+
+| mode | wall_sec | partials | finals |
+|---:|---:|---:|---:|
+| `off` | 35.5 | 36 | 11 |
+| `final` | 44.3 | 36 | 11 |
+| `partial` | 45.9 | 36 | 11 |
+
+Event counts are identical across the three modes — the policy
+controls *processing*, not emission. The ~10 s gap between `off`
+and `final`/`partial` is FireRedPunc on the finals; the (smaller)
+gap between `final` and `partial` is FireRedPunc on the 36 partials.
+On longer audio or shorter `--stream-step` (more partials per second)
+the `partial`-vs-`final` gap widens proportionally.
+
+`--stream-punc` is a no-op without `--punc-model`. Combine with the
+truecasers (`--truecase-model`, `--truecase-crf-model`,
+`--truecase-lstm-model`) and PCS (`--pcs-model`) post-steps as usual
+— those run on every mode (only the FireRedPunc step is gated).
 
 ## Microphone (`--mic`)
 
