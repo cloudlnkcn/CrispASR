@@ -8,6 +8,10 @@
 
 #include "crispasr_diarize_cli.h"
 #include "crispasr_cache.h"
+#include "crispasr_diarize_internal.h"
+#include "crispasr_speaker_cluster.h"
+#include "crispasr_speaker_embedder.h"
+#include "pyannote_seg.h"
 #include "whisper_params.h"
 
 #include <algorithm>
@@ -284,8 +288,225 @@ std::string resolve_pyannote_model(const whisper_params& params) {
 
 } // namespace
 
+namespace {
+
+// Split each multi-speaker ASR segment into runs of same-speaker words.
+// Requires per-word timestamps (seg.words populated with non-zero t1
+// for at least the boundary words). Segments without words are left
+// untouched and labelled with the segment-level dominant speaker.
+//
+// This is what makes a 27-second cohere segment that actually contains
+// two speakers come out as multiple sub-segments after diarize, instead
+// of inheriting a single dominant label (#107 segment-splitting bit).
+//
+// Algorithm:
+//   1. For each word, look up the dominant pyannote speaker over
+//      [w.t0, w.t1] against the cached posteriors. Words with no
+//      timestamp (t0==t1==0) inherit the previous word's speaker.
+//   2. Walk the words. Whenever the per-word speaker label changes
+//      (ignoring -1 silence runs, which are absorbed by their
+//      neighbours), close the previous run as a sub-segment and start
+//      a new one.
+//   3. Each emitted sub-segment carries the contiguous word run, a
+//      rebuilt `text` (joined on space), and inherits other fields
+//      from the original.
+void split_segments_on_pyannote_turns(std::vector<crispasr_segment>& segs, const CrispasrPyannoteCache& cache) {
+    if (!cache.valid() || segs.empty())
+        return;
+
+    using crispasr_diarize_internal::score_speaker_for_range;
+
+    std::vector<crispasr_segment> out;
+    out.reserve(segs.size());
+
+    for (auto& seg : segs) {
+        if (seg.words.empty()) {
+            // No word timestamps — can't split text. Leave segment-
+            // level labelling (already applied) in place.
+            out.push_back(std::move(seg));
+            continue;
+        }
+
+        // Per-word speaker label. -1 for "no info" (zero-duration
+        // word or silence-dominated frame range).
+        std::vector<int> word_spk(seg.words.size(), -1);
+        int last_known = -1;
+        for (size_t i = 0; i < seg.words.size(); i++) {
+            const auto& w = seg.words[i];
+            int spk = -1;
+            if (w.t1 > w.t0) {
+                spk = score_speaker_for_range(cache.log_probs.data(), cache.T, cache.frame_dur_s, w.t0, w.t1);
+            }
+            // Carry forward the previous known speaker for unaligned
+            // words so they stay attached to their neighbour's run
+            // instead of becoming their own silence stub.
+            if (spk < 0)
+                spk = last_known;
+            word_spk[i] = spk;
+            if (spk >= 0)
+                last_known = spk;
+        }
+        // Back-fill leading -1s with the first known speaker so a
+        // run-start never sits at -1.
+        for (size_t i = 0; i < word_spk.size() && word_spk[i] < 0; i++) {
+            for (size_t j = i + 1; j < word_spk.size(); j++) {
+                if (word_spk[j] >= 0) {
+                    word_spk[i] = word_spk[j];
+                    break;
+                }
+            }
+        }
+
+        // Stability filter: pyannote-seg without speaker embeddings
+        // can flip its local track index mid-phrase, producing one-word
+        // "(speaker 2)" stubs inside a contiguous "(speaker 1)" run.
+        // We collapse any run shorter than MIN_RUN_CS into the longer
+        // adjacent run before emitting sub-segments. Tuned at 50 cs
+        // (0.5 s) — long enough to suppress per-word flips, short enough
+        // to keep genuine turns in fast back-and-forth conversation.
+        constexpr int64_t MIN_RUN_CS = 50;
+        auto word_duration_cs = [&](size_t a, size_t b /*exclusive*/) -> int64_t {
+            if (b <= a || b > word_spk.size())
+                return 0;
+            int64_t t0 = seg.words[a].t0;
+            int64_t t1 = seg.words[b - 1].t1;
+            if (t0 <= 0)
+                t0 = seg.t0;
+            if (t1 <= 0)
+                t1 = seg.t1;
+            return std::max<int64_t>(0, t1 - t0);
+        };
+        // Build initial runs as [start, end_exclusive, speaker] triples.
+        struct Run {
+            size_t s, e;
+            int spk;
+        };
+        std::vector<Run> runs;
+        {
+            size_t rs = 0;
+            while (rs < word_spk.size()) {
+                const int rspk = word_spk[rs];
+                size_t re = rs + 1;
+                while (re < word_spk.size() && word_spk[re] == rspk)
+                    re++;
+                runs.push_back({rs, re, rspk});
+                rs = re;
+            }
+        }
+        // Iterate: fold every run shorter than MIN_RUN_CS into the
+        // longer neighbour. Repeat until stable.
+        bool changed = true;
+        while (changed && runs.size() >= 2) {
+            changed = false;
+            for (size_t i = 0; i < runs.size(); i++) {
+                if (word_duration_cs(runs[i].s, runs[i].e) >= MIN_RUN_CS)
+                    continue;
+                int merge_into = -1;
+                if (i == 0)
+                    merge_into = (int)i + 1;
+                else if (i == runs.size() - 1)
+                    merge_into = (int)i - 1;
+                else {
+                    int64_t prev_dur = word_duration_cs(runs[i - 1].s, runs[i - 1].e);
+                    int64_t next_dur = word_duration_cs(runs[i + 1].s, runs[i + 1].e);
+                    merge_into = (prev_dur >= next_dur) ? (int)i - 1 : (int)i + 1;
+                }
+                if (merge_into == (int)i + 1) {
+                    runs[i + 1].s = runs[i].s;
+                } else if (merge_into == (int)i - 1) {
+                    runs[i - 1].e = runs[i].e;
+                }
+                runs.erase(runs.begin() + i);
+                changed = true;
+                break;
+            }
+        }
+
+        // Collect distinct speakers across the (now-filtered) runs to
+        // decide whether to actually split.
+        int first_spk = -1;
+        bool multi = false;
+        for (const auto& r : runs) {
+            if (r.spk < 0)
+                continue;
+            if (first_spk < 0) {
+                first_spk = r.spk;
+            } else if (r.spk != first_spk) {
+                multi = true;
+                break;
+            }
+        }
+        if (!multi) {
+            // Single speaker (or none) after filtering — keep segment.
+            out.push_back(std::move(seg));
+            continue;
+        }
+
+        // Emit one sub-segment per run.
+        for (size_t ri = 0; ri < runs.size(); ri++) {
+            const size_t run_start = runs[ri].s;
+            const size_t run_end = runs[ri].e;
+            const int run_spk = runs[ri].spk;
+
+            crispasr_segment sub;
+            sub.t0 = seg.words[run_start].t0 > 0 ? seg.words[run_start].t0 : seg.t0;
+            sub.t1 = seg.words[run_end - 1].t1 > 0 ? seg.words[run_end - 1].t1 : seg.t1;
+            sub.speaker_turn_next = (ri + 1 < runs.size()); // turn change at boundary
+            sub.words.assign(seg.words.begin() + run_start, seg.words.begin() + run_end);
+            // Rebuild text from the words in this run. Whitespace
+            // handling matches the canonical CrispASR convention:
+            // each word stands alone and we join on a single space.
+            for (size_t j = run_start; j < run_end; j++) {
+                if (!sub.text.empty() && !sub.words[j - run_start].text.empty())
+                    sub.text += ' ';
+                sub.text += seg.words[j].text;
+            }
+            // Tokens carry no per-word alignment, so we drop them on
+            // a split rather than dividing them ambiguously.
+            sub.tokens.clear();
+            if (run_spk >= 0)
+                sub.speaker = "(speaker " + std::to_string(run_spk) + ") ";
+            out.push_back(std::move(sub));
+        }
+    }
+
+    segs = std::move(out);
+}
+
+} // namespace
+
+bool crispasr_compute_pyannote_cache(const float* full_audio, int n_samples, const whisper_params& params,
+                                     CrispasrPyannoteCache& out) {
+    out = {};
+    if (!full_audio || n_samples <= 0)
+        return false;
+    std::string mp = resolve_pyannote_model(params);
+    if (mp.empty())
+        return false;
+
+    pyannote_seg_context* pctx = pyannote_seg_init(mp.c_str(), params.n_threads);
+    if (!pctx)
+        return false;
+    int T = 0;
+    float* probs = pyannote_seg_run(pctx, full_audio, n_samples, &T);
+    pyannote_seg_free(pctx);
+    if (!probs || T <= 0) {
+        if (probs)
+            std::free(probs);
+        return false;
+    }
+
+    out.log_probs.assign(probs, probs + (size_t)T * 7);
+    out.T = T;
+    // Frame duration: sinc(stride=10) × 3 maxpools(stride=3) = 270 samples = 16.875 ms.
+    out.frame_dur_s = 270.0 / 16000.0;
+    std::free(probs);
+    return true;
+}
+
 bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<float>& right, bool is_stereo,
-                            int64_t slice_t0_cs, std::vector<crispasr_segment>& segs, const whisper_params& params) {
+                            int64_t slice_t0_cs, std::vector<crispasr_segment>& segs, const whisper_params& params,
+                            const CrispasrPyannoteCache* pyannote_cache) {
     if (segs.empty())
         return true;
 
@@ -308,6 +529,34 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
         lib_method = CrispasrDiarizeMethod::Pyannote;
     } else {
         use_lib = false;
+    }
+
+    // Pyannote cache short-circuit: when the runner pre-computed the
+    // segmentation posteriors over the full audio (issue #107 cross-
+    // slice fix), skip the per-slice pyannote_seg_run and score this
+    // slice's segments directly against the cached posteriors.
+    //
+    // The cached posteriors cover absolute time [0, T*frame_dur_s), and
+    // segs[i].t0/.t1 are already absolute, so we pass slice_t0_cs=0
+    // into assign_speakers_from_log_posteriors (the cache buffer's
+    // origin), independent of the per-slice slice_t0_cs.
+    if (use_lib && lib_method == CrispasrDiarizeMethod::Pyannote && pyannote_cache && pyannote_cache->valid()) {
+        // Phase 1 first: assign each ASR segment its dominant speaker
+        // (and crucially DO leave seg.speaker populated for segments
+        // that get further split by the next step, since the splitter
+        // overrides per sub-segment via word-range scoring).
+        {
+            auto lib_segs = lib_view(segs);
+            crispasr_diarize_internal::assign_speakers_from_log_posteriors(
+                pyannote_cache->log_probs.data(), pyannote_cache->T, pyannote_cache->frame_dur_s,
+                /*slice_t0_cs=*/0, lib_segs);
+            apply_int_speakers_to_crispasr_segments(lib_segs, segs);
+        }
+        // Phase 2: split multi-speaker segments at word-aligned turn
+        // boundaries (#107). Segments without word timestamps keep
+        // their Phase 1 single-speaker label.
+        split_segments_on_pyannote_turns(segs, *pyannote_cache);
+        return true;
     }
 
     if (use_lib) {
@@ -356,4 +605,64 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
             "vad-turns, pyannote, sherpa. Defaulting to '%s'.\n",
             method.c_str(), is_stereo ? "energy" : "vad-turns");
     return false;
+}
+
+void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params) {
+    if (!embedder || segs.empty() || !full_audio || n_samples <= 0)
+        return;
+
+    // Skip very short segments — TitaNet (and similar) need ~250 ms+
+    // of speech to produce a reliable embedding. Shorter segments
+    // keep their existing pyannote-local label; clustering then
+    // ignores them.
+    constexpr int64_t MIN_EMBED_CS = 25; // 0.25 s
+
+    const int d = embedder->dim();
+    if (d <= 0)
+        return;
+
+    std::vector<size_t> embed_idx;
+    std::vector<float> embeddings;
+    embed_idx.reserve(segs.size());
+    embeddings.reserve((size_t)segs.size() * (size_t)d);
+
+    std::vector<float> tmp(d);
+    for (size_t i = 0; i < segs.size(); i++) {
+        const auto& seg = segs[i];
+        if ((seg.t1 - seg.t0) < MIN_EMBED_CS)
+            continue;
+        // Convert cs (1/100 s) → 16 kHz samples. full_audio is mono 16k.
+        const int64_t s0 = std::max<int64_t>(0, seg.t0 * 160);
+        const int64_t s1 = std::min<int64_t>(n_samples, seg.t1 * 160);
+        if (s1 - s0 < 4000) // <250 ms after clamping
+            continue;
+        if (!embedder->embed(full_audio + s0, (int)(s1 - s0), tmp.data()))
+            continue;
+        embed_idx.push_back(i);
+        embeddings.insert(embeddings.end(), tmp.begin(), tmp.end());
+    }
+    if (embed_idx.size() < 2) {
+        // Nothing to cluster — either zero or one usable segment.
+        if (embed_idx.size() == 1) {
+            // Force the one embeddable segment to (speaker 0) so the
+            // global label exists even on single-speaker inputs.
+            segs[embed_idx[0]].speaker = "(speaker 0) ";
+        }
+        return;
+    }
+
+    const float thr = params.diarize_cluster_threshold;
+    const int max_spk = params.diarize_max_speakers > 0 ? params.diarize_max_speakers : 8;
+    std::vector<int> labels = crispasr_agglomerative_cluster(embeddings, (int)embed_idx.size(), d, thr, max_spk);
+
+    // Rewrite segment speakers from clustering output. Segments that
+    // couldn't be embedded (too short) keep their existing pyannote-
+    // local label as a best-effort fallback.
+    for (size_t k = 0; k < embed_idx.size(); k++) {
+        const int spk = labels[k];
+        if (spk < 0)
+            continue;
+        segs[embed_idx[k]].speaker = "(speaker " + std::to_string(spk) + ") ";
+    }
 }

@@ -22,6 +22,8 @@ language.
 from crispasr import (
     Session, diarize_segments, detect_language_pcm,
     align_words, cache_ensure_file, registry_lookup,
+    # Diarize pipeline primitives (#107):
+    SpeakerEmbedder, PyannoteCache, agglomerative_cluster,
 )
 
 # Transcribe (any of the 24 ASR backends via one session object)
@@ -36,6 +38,13 @@ words = align_words("canary-ctc-aligner.gguf", "hello world", pcm)
 # Auto-download a canonical model
 entry = registry_lookup("parakeet")
 path  = cache_ensure_file(entry.filename, entry.url)
+
+# Custom diarize pipeline: pluggable embedder + cosine clustering.
+# Same building blocks as `--diarize-embedder` in the CLI.
+emb = SpeakerEmbedder("auto", n_threads=4)             # 'titanet'/'indextts'/.gguf
+embeddings = [emb.embed(pcm[s.t0*16000:s.t1*16000]) for s in segs]
+labels = agglomerative_cluster(embeddings, merge_threshold=0.5, max_speakers=8)
+emb.close()
 ```
 
 Install: `pip install crispasr` (or build locally from `python/`).
@@ -47,6 +56,8 @@ use crispasr::{
     Session, DiarizeMethod, DiarizeOptions, DiarizeSegment,
     LidMethod, detect_language_pcm, align_words,
     cache_ensure_file, registry_lookup,
+    // Diarize pipeline primitives (#107):
+    SpeakerEmbedder, PyannoteCache, agglomerative_cluster,
 };
 
 let sess = Session::open("cohere-transcribe-q4_k.gguf", 4)?;
@@ -54,6 +65,17 @@ let segs = sess.transcribe_vad(&pcm, "silero-v5.1.2.bin", None)?;
 
 let entry = registry_lookup("canary")?.unwrap();
 let path  = cache_ensure_file(&entry.filename, &entry.url, false, None)?;
+
+// Custom diarize pipeline: pluggable embedder + cosine clustering.
+let emb = SpeakerEmbedder::new("auto", 4, None)?;     // "titanet"/"indextts"/.gguf
+let mut flat: Vec<f32> = Vec::new();
+for s in &segs {
+    if let Some(v) = emb.embed(&pcm[(s.t0 * 16000.0) as usize .. (s.t1 * 16000.0) as usize]) {
+        flat.extend(v);
+    }
+}
+let labels = agglomerative_cluster(&flat, (flat.len() / emb.dim() as usize) as i32,
+                                   emb.dim(), 0.5, 8)?;
 ```
 
 Crate: `bindings/rust/`.

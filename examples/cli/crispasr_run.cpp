@@ -20,6 +20,7 @@
 #include "crispasr_lid_cli.h"
 #include "crispasr_lid.h" // crispasr_lid_free_cache()
 #include "crispasr_diarize_cli.h"
+#include "crispasr_speaker_embedder.h"
 #include "crispasr_mem.h"
 #include "crispasr_stream_finalize.h"
 #include "whisper_params.h"
@@ -62,6 +63,25 @@ static void apply_punc_model(fireredpunc_context* punc_ctx, std::vector<crispasr
             free(result);
         }
     }
+}
+
+static std::string apply_punc_text(fireredpunc_context* punc_ctx, const std::string& text) {
+    if (!punc_ctx || text.empty())
+        return text;
+    char* result = fireredpunc_process(punc_ctx, text.c_str());
+    if (!result)
+        return text;
+    std::string out = result;
+    free(result);
+    return out;
+}
+
+static bool stream_punc_partials_enabled(const whisper_params& params) {
+    return params.stream_punc == "partial";
+}
+
+static bool stream_punc_finals_enabled(const whisper_params& params) {
+    return params.stream_punc == "final" || params.stream_punc == "partial";
 }
 
 // Apply PCS (punctuation + capitalization + segmentation) to all segments.
@@ -472,6 +492,38 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // Process VAD slices — parallel when multiple slices AND n_processors > 1
     std::vector<std::vector<crispasr_segment>> per_slice(slices.size());
 
+    // Pyannote cross-slice fix (issue #107): pre-compute the
+    // segmentation posteriors once over the FULL mono audio, then have
+    // each per-slice diarize call score against the cached buffer. Per-
+    // slice pyannote runs would reset local track indices (spk0/1/2
+    // mean different physical speakers in each forward pass), which is
+    // why the bug-report podcast saw speakers swapping across slices.
+    //
+    // Only allocated when the user actually picked --diarize-method
+    // pyannote — otherwise we incur no extra cost. Stereo input is
+    // downmixed to mono for pyannote (matches what apply_pyannote does
+    // when called per-slice today).
+    CrispasrPyannoteCache pyannote_cache;
+    if (params.diarize && params.diarize_method == "pyannote" && !samples.empty()) {
+        const float* full = samples.data();
+        std::vector<float> mono_buf;
+        if (have_stereo && !stereo[0].empty() && !stereo[1].empty()) {
+            const size_t n = std::min(stereo[0].size(), stereo[1].size());
+            mono_buf.resize(n);
+            for (size_t i = 0; i < n; i++)
+                mono_buf[i] = 0.5f * (stereo[0][i] + stereo[1][i]);
+            full = mono_buf.data();
+        }
+        const int n_samples_full = (int)samples.size();
+        if (!crispasr_compute_pyannote_cache(full, n_samples_full, params, pyannote_cache)) {
+            // Cache build failed (model missing, etc.). Fall back to
+            // per-slice apply_pyannote — same code path as before P2a.
+            // crispasr_apply_diarize handles the missing-cache case by
+            // running the model per slice.
+            pyannote_cache = {};
+        }
+    }
+
     // Each slice is transcribed with its own audio only. Boundaries are placed
     // by audio_chunking::split_at_energy_minima at the quietest 100 ms within
     // each chunk window, so chunk seams already fall in pauses; we don't need
@@ -494,14 +546,15 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             be.transcribe(samples.data() + sl.start, sl.end - sl.start, sl.t0_cs, params);
 
         if (params.diarize && !segs.empty()) {
+            const CrispasrPyannoteCache* cache_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
             if (have_stereo) {
                 std::vector<float> sl_l(stereo[0].begin() + sl.start, stereo[0].begin() + sl.end);
                 std::vector<float> sl_r(stereo[1].begin() + sl.start, stereo[1].begin() + sl.end);
-                crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true, sl.t0_cs, segs, params);
+                crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true, sl.t0_cs, segs, params, cache_ptr);
             } else {
                 std::vector<float> mono_slice(samples.begin() + sl.start, samples.begin() + sl.end);
                 crispasr_apply_diarize(mono_slice, mono_slice,
-                                       /*is_stereo=*/false, sl.t0_cs, segs, params);
+                                       /*is_stereo=*/false, sl.t0_cs, segs, params, cache_ptr);
             }
         }
 
@@ -680,6 +733,17 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                 per_slice_redo[i] = std::move(per_slice[i]);
             }
             auto all_segs = merge_segments(std::move(per_slice_redo), slices);
+            // Mirror the embedding-based remap from the sequential
+            // path above so file outputs in the parallel/output-redo
+            // path get globally stable speaker IDs too (#107 P3).
+            if (params.diarize && !params.diarize_embedder.empty() && !all_segs.empty() && !samples.empty()) {
+                auto embedder =
+                    crispasr_make_speaker_embedder(params.diarize_embedder, params.n_threads, params.cache_dir);
+                if (embedder) {
+                    crispasr_remap_speakers_via_embeddings(all_segs, samples.data(), (int)samples.size(),
+                                                           embedder.get(), params);
+                }
+            }
             apply_punc_model(punc_ctx, all_segs);
             apply_truecase_model(tc_ctx, all_segs);
             apply_truecase_crf_model(tc_crf_ctx, all_segs);
@@ -712,6 +776,19 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             process_slice(i, backend);
     }
     auto all_segs = merge_segments(std::move(per_slice), slices);
+
+    // Optional embedding-based clustering (#107 P3). When the user
+    // supplied --diarize-embedder, anchor speaker IDs globally across
+    // all slices by embedding each finalized segment and clustering
+    // on cosine similarity. The pluggable embedder dispatches to
+    // TitaNet today; future adapters drop in via the same factory.
+    if (params.diarize && !params.diarize_embedder.empty() && !all_segs.empty() && !samples.empty()) {
+        auto embedder = crispasr_make_speaker_embedder(params.diarize_embedder, params.n_threads, params.cache_dir);
+        if (embedder) {
+            crispasr_remap_speakers_via_embeddings(all_segs, samples.data(), (int)samples.size(), embedder.get(),
+                                                   params);
+        }
+    }
 
     apply_punc_model(punc_ctx, all_segs);
     apply_truecase_model(tc_ctx, all_segs);
@@ -1519,7 +1596,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         }
                         if (!sl_for_text.empty())
                             decoded_segments_this_step = true;
-                        apply_punc_model(punc_ctx.get(), sl_for_text);
+                        if (stream_punc_partials_enabled(params))
+                            apply_punc_model(punc_ctx.get(), sl_for_text);
                         apply_truecase_model(tc_ctx.get(), sl_for_text);
                         apply_truecase_crf_model(tc_crf_ctx.get(), sl_for_text);
                         apply_truecase_lstm_model(tc_lstm_ctx.get(), sl_for_text);
@@ -1625,6 +1703,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     // replaced by an empty final. (Round 4 of #84: CKwasd
                     // report 2026-05-11 "empty finals on sub-2-s utterances".)
                     std::string final_text;
+                    bool final_text_from_redecode = false;
                     if (params.stream_final_mode == "redecode") {
                         if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples) {
                             // Disable nested VAD: utterance_pcm is already
@@ -1636,7 +1715,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             decode_params.vad_model.clear();
                             auto utt_segs =
                                 backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
-                            apply_punc_model(punc_ctx.get(), utt_segs);
+                            if (stream_punc_finals_enabled(params))
+                                apply_punc_model(punc_ctx.get(), utt_segs);
                             apply_truecase_model(tc_ctx.get(), utt_segs);
                             apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
                             apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
@@ -1647,6 +1727,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             }
                             for (const auto& s : utt_segs)
                                 final_text += s.text;
+                            final_text_from_redecode = !final_text.empty();
                         }
                         if (final_text.empty())
                             final_text = crispasr::stitch_partial_accumulator(prefix_committed, last_partial_text);
@@ -1654,6 +1735,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         // prefix mode: stitch committed prefix + last partial tail
                         final_text = crispasr::stitch_partial_accumulator(prefix_committed, last_partial_text);
                     }
+                    if (stream_punc_finals_enabled(params) && !final_text_from_redecode)
+                        final_text = apply_punc_text(punc_ctx.get(), final_text);
                     const double t0 = (double)utterance_start_sample / (double)SR;
                     const double t1 = (double)last_speech_end_sample / (double)SR;
                     fprintf(stdout,
@@ -1923,6 +2006,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
             // EOF path: identical redecode→stitch-fallback contract to the
             // in-loop finalize_utterance. See crispasr_stream_finalize.h.
             std::string final_text;
+            bool final_text_from_redecode = false;
             if (params.stream_final_mode == "redecode") {
                 if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples) {
                     whisper_params decode_params = params;
@@ -1930,7 +2014,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     decode_params.vad_model.clear();
                     auto utt_segs =
                         backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
-                    apply_punc_model(punc_ctx.get(), utt_segs);
+                    if (stream_punc_finals_enabled(params))
+                        apply_punc_model(punc_ctx.get(), utt_segs);
                     apply_truecase_model(tc_ctx.get(), utt_segs);
                     apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
                     apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
@@ -1941,12 +2026,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     }
                     for (const auto& s : utt_segs)
                         final_text += s.text;
+                    final_text_from_redecode = !final_text.empty();
                 }
                 if (final_text.empty())
                     final_text = crispasr::stitch_partial_accumulator(prefix_committed, last_partial_text);
             } else {
                 final_text = crispasr::stitch_partial_accumulator(prefix_committed, last_partial_text);
             }
+            if (stream_punc_finals_enabled(params) && !final_text_from_redecode)
+                final_text = apply_punc_text(punc_ctx.get(), final_text);
             const double t0 = (double)utterance_start_sample / (double)SR;
             const double t1 = last_speech_end_sample > 0 ? (double)last_speech_end_sample / (double)SR
                                                          : (double)cumulative_samples / (double)SR;

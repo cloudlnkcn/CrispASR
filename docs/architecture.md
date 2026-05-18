@@ -25,6 +25,13 @@ symbols. The CLI keeps only presentation + UX policy.
 │                                  stitching, timestamp remap       │
 │   crispasr_diarize.{h,cpp}       energy / xcorr / vad-turns /     │
 │                                  native pyannote diarization      │
+│   crispasr_speaker_embedder.{h,cpp}                                │
+│                                  pluggable speaker-embedding      │
+│                                  interface; TitaNet + IndexTTS    │
+│                                  adapters                          │
+│   crispasr_speaker_cluster.{h,cpp}                                 │
+│                                  agglomerative cosine clustering  │
+│                                  for globally stable speaker IDs  │
 │   crispasr_lid.{h,cpp}           whisper-tiny + silero-native LID │
 │   crispasr_aligner.{h,cpp}       canary-CTC + qwen3-forced-aligner│
 │   crispasr_cache.{h,cpp}         HF download + ~/.cache/crispasr  │
@@ -55,7 +62,9 @@ all consume the same symbols.
 |---|---|
 | `crispasr_c_api.cpp` | The C-ABI. Exports session open/close/transcribe, VAD, diarize, LID, alignment, cache, registry — everything a wrapper needs. |
 | `crispasr_vad.{h,cpp}` | Silero VAD slicing + whisper-style stitching with timestamp remapping. Used by `crispasr_session_transcribe_vad`. |
-| `crispasr_diarize.{h,cpp}` | Four diarizers: energy (stereo), xcorr (stereo, TDOA), vad-turns (mono, timing), pyannote (mono, GGUF). |
+| `crispasr_diarize.{h,cpp}` | Four diarizers: energy (stereo), xcorr (stereo, TDOA), vad-turns (mono, timing), pyannote (mono, GGUF; #107 added cross-slice cache + segment splitting + overlap-aware scoring). |
+| `crispasr_speaker_embedder.{h,cpp}` | Pluggable speaker-embedding interface (`CrispasrSpeakerEmbedder` base class + factory). Concrete adapters: TitaNet-Large (192-d, 16 kHz) and IndexTTS-BigVGAN ECAPA-TDNN (512-d, internally resamples 16→24 kHz). Add a third by subclassing and extending the factory dispatch. |
+| `crispasr_speaker_cluster.{h,cpp}` | Agglomerative single-linkage cosine clustering on speaker embeddings, with both a similarity-threshold stop and a hard `max_speakers` cap. Drives `--diarize-embedder`'s remap of pyannote-local track IDs into globally stable speaker IDs. |
 | `crispasr_lid.{h,cpp}` | whisper-tiny + silero-native **audio**-LID with process-wide whisper-context cache. |
 | `lid_fasttext.{h,cpp}` | Text-LID runtime for fastText supervised models — GlotLID-V3 (flat softmax, 2102 ISO 639-3 + script labels) and Facebook LID-176 (hierarchical softmax, 176 ISO 639-1 codes). Pure manual F32/F16 + on-the-fly dequant; no ggml graph. |
 | `lid_cld3.{h,cpp}` | Text-LID runtime for Google CLD3 — six feature extractors (4× cbog, RelevantScript, ScriptFeature) → 80-d concat → FC + ReLU → 208-d hidden → FC → softmax over 109 ISO 639-1 labels. Pure manual F32 forward. |
