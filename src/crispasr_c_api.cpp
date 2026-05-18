@@ -396,8 +396,8 @@ CA_EXPORT float crispasr_detect_language(whisper_context* ctx, const float* pcm,
 //   -3  VAD inference failed
 
 CA_EXPORT int crispasr_vad_segments(const char* vad_model_path, const float* pcm, int n_samples, int sample_rate,
-                                     float threshold, int min_speech_ms, int min_silence_ms, int n_threads, bool use_gpu,
-                                     float** out_spans) {
+                                    float threshold, int min_speech_ms, int min_silence_ms, int n_threads, bool use_gpu,
+                                    float** out_spans) {
     if (!vad_model_path || !pcm || n_samples <= 0 || !out_spans)
         return -1;
     *out_spans = nullptr;
@@ -486,7 +486,8 @@ CA_EXPORT int crispasr_vad_slices(const char* vad_model_path, const float* pcm, 
     if (n_threads > 0)
         opts.n_threads = n_threads;
 
-    std::vector<crispasr_audio_slice> slices = crispasr_compute_vad_slices(pcm, n_samples, sample_rate, vad_model_path, opts);
+    std::vector<crispasr_audio_slice> slices =
+        crispasr_compute_vad_slices(pcm, n_samples, sample_rate, vad_model_path, opts);
     const int n = (int)slices.size();
     if (n == 0)
         return 0;
