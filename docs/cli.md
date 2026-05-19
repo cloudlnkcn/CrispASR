@@ -181,9 +181,11 @@ crispasr --backend parakeet -m parakeet.gguf -f long_audio.wav \
   `--vad`. Without VAD, leading silence can throw off sentence
   starts, especially for the qwen3 forced aligner.
 - **If parakeet OOMs on very long audio:** cap memory with explicit
-  chunking (`--chunk-seconds 180`). When chunking is active, each
-  chunk is extended by `--chunk-overlap` seconds on each side for
-  encoder context. The overlap is trimmed back before output.
+  chunking (`--chunk-seconds 60` or `120` recommended). When chunking
+  is active, each chunk is extended by `--chunk-overlap` seconds
+  (default 3.0) on each side for encoder context. Avoid
+  `--chunk-seconds 30` — benchmarks show it is an anomalous worst
+  case (93% of full quality) while 60/120/180 stay within ±1%.
 - **Hybrid TDT+CTC models** (e.g. `parakeet-tdt_ctc-0.6b-ja`): pass
   `--parakeet-decoder ctc` to use the CTC head. CTC decode is
   frame-synchronous and avoids TDT emission-frame-shift artifacts

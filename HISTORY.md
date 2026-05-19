@@ -39,6 +39,32 @@ boundaries. The default `--chunk-seconds 30` was a whisper-era default.
    tensor support. CLI: `--parakeet-decoder ctc`. CTC is frame-
    synchronous and avoids TDT boundary artifacts entirely.
 
+5. **`a069018` — split encode/decode API.** Added `parakeet_encode()` +
+   `parakeet_decode_frames()` public API for future full-encode +
+   chunked-decode path.
+
+6. **`adaedb3` — honor `--chunk-seconds` for OOM.** Explicit
+   `--chunk-seconds` is respected with overlap-save + quality warning.
+   Default remains full-audio encoding.
+
+**Chunk-size quality sweep** (parakeet-tdt_ctc-0.6b-ja, 300 s JA audio,
+`--chunk-overlap 3`, reference = full-audio = 3663 chars):
+
+| `--chunk-seconds` | chars | vs full |
+|---|---|---|
+| 10 | 3707 | 101.2% (minor boundary dupes) |
+| 15 | 3649 | 99.6% |
+| 20 | 3636 | 99.3% |
+| **30** | **3413** | **93.2% (worst — the old default)** |
+| 60 | 3705 | 101.1% |
+| 120 | 3690 | 100.7% |
+| 180 | 3670 | 100.2% |
+| full | 3663 | 100.0% |
+
+30 s is an anomalous outlier; every other size is within ±1.2%.
+Default (no `--chunk-seconds`) = full-audio = 100%. If OOM forces
+chunking, `--chunk-seconds 60` or `120` are safe.
+
 ---
 
 ## 2026-05-17 Graduate canary-1b-v2 mel + encoder to full diff
