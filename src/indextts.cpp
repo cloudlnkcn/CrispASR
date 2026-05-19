@@ -2174,7 +2174,17 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
     const int mel_vocab = (int)ctx->hp.mel_vocab_size;
     const int stop_token = (int)ctx->hp.stop_mel_token;
     const float rep_penalty = ctx->params.repetition_penalty;
-    const int B = 3; // beam size matching Python
+    // Beam size. Python uses 3 by default. Each step requires snapshotting and
+    // restoring the full KV cache (≈ 158 MiB) per beam — that round-trips through
+    // host memory and dominates wall time, especially on GPU backends. Greedy
+    // (B=1) skips the snapshot entirely. INDEXTTS_BEAM_SIZE overrides at runtime.
+    int B = 3;
+    if (const char* bs = getenv("INDEXTTS_BEAM_SIZE")) {
+        int v = atoi(bs);
+        if (v >= 1 && v <= 16) {
+            B = v;
+        }
+    }
 
     struct Beam {
         std::vector<int32_t> tokens;
@@ -2447,17 +2457,24 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     if (ref_pcm && ref_n_samples > 0 && ctx->voc) {
         spk_emb = indextts_voc_speaker_embed(ctx->voc, ref_pcm, ref_n_samples);
         if (spk_emb) {
-            // L2-normalize the speaker embedding to match Python's output magnitude (~0.9).
-            // Our ECAPA BN produces 3x-4x the norm of Python's, likely due to
-            // subtle BatchNorm differences. Normalizing prevents the vocoder from
-            // being overwhelmed by the speaker conditioning signal.
-            float norm = 0.0f;
+            float raw_norm = 0.0f;
             for (int i = 0; i < 512; i++)
-                norm += spk_emb[i] * spk_emb[i];
-            norm = sqrtf(norm);
-            if (norm > 1e-6f) {
-                float target_norm = 0.9f; // Python's typical speaker embedding norm
-                float scale = target_norm / norm;
+                raw_norm += spk_emb[i] * spk_emb[i];
+            raw_norm = sqrtf(raw_norm);
+
+            // Upstream BigVGAN feeds the raw ECAPA output (no L2 norm) into
+            // cond_layer/conds. The previous "clamp to 0.9" workaround masked a
+            // suspected ECAPA BN magnitude bug at the cost of fixing the speaker
+            // conditioning energy. INDEXTTS_SPK_NORM controls the behaviour:
+            //   unset / "raw"   → pass through unchanged (matches upstream)
+            //   "0.9" / "1.0" …→ rescale to that L2 norm (old behaviour)
+            const char* spk_norm_env = getenv("INDEXTTS_SPK_NORM");
+            float target_norm = 0.0f;
+            if (spk_norm_env && spk_norm_env[0] && strcmp(spk_norm_env, "raw") != 0) {
+                target_norm = (float)atof(spk_norm_env);
+            }
+            if (target_norm > 0.0f && raw_norm > 1e-6f) {
+                float scale = target_norm / raw_norm;
                 for (int i = 0; i < 512; i++)
                     spk_emb[i] *= scale;
             }
@@ -2465,7 +2482,8 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
                 float n2 = 0;
                 for (int i = 0; i < 512; i++)
                     n2 += spk_emb[i] * spk_emb[i];
-                fprintf(stderr, "indextts: speaker embedding norm = %.4f (normalized)\n", sqrtf(n2));
+                fprintf(stderr, "indextts: speaker embedding norm = %.4f (raw=%.4f, target=%s)\n", sqrtf(n2), raw_norm,
+                        target_norm > 0.0f ? "clamped" : "raw");
             }
         }
     }
