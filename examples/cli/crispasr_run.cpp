@@ -1190,11 +1190,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 15;
         }
 
+        // Sample rate of the synthesized PCM — backend-declared. Most TTS
+        // backends emit 24 kHz; voxcpm2-tts emits 48 kHz. Hard-coding 24 kHz
+        // here is why voxcpm2 output played at half-speed before this fix.
+        const int sr_in = backend->tts_sample_rate();
+
         // Optional leading-silence trim. RMS gate over a 20 ms window;
         // drop frames below -50 dBFS (≈ 0.0032 RMS) until the gate
         // opens, then back off 50 ms so we don't clip the consonant onset.
         if (params.tts_trim_silence) {
-            const int sr_in = 24000;
             const int win = sr_in / 50;       // 20 ms
             const int headroom = sr_in / 20;  // 50 ms
             const float rms_thresh = 0.0032f; // ≈ -50 dBFS
@@ -1216,15 +1220,14 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
         }
 
-        // Write output WAV (24 kHz mono)
+        // Write output WAV (backend-native sample rate, mono)
         std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
         FILE* fout = fopen(out_path.c_str(), "wb");
         if (!fout) {
             fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
             return 16;
         }
-        // WAV header: 24 kHz, mono, 16-bit PCM
-        int32_t sr = 24000;
+        int32_t sr = sr_in;
         int16_t channels = 1;
         int16_t bits = 16;
         int32_t data_size = (int32_t)audio.size() * 2;
@@ -1258,8 +1261,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
         fclose(fout);
 
         if (!params.no_prints)
-            fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples, %.2f sec)\n", out_path.c_str(),
-                    audio.size(), audio.size() / 24000.0);
+            fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
+                    audio.size(), sr_in, (double)audio.size() / (double)sr_in);
         return 0;
     }
 
