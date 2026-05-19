@@ -131,6 +131,167 @@ struct indextts_tokenizer {
     bool loaded = false;
 };
 
+// UTF-8 helpers + upstream IndexTTS text preprocessing
+// (indextts/utils/front.py: TextNormalizer.char_rep_map → common.py:
+// tokenize_by_CJK_char). Without this, CJK characters run together and the
+// SentencePiece Viterbi produces a 29-token stream where upstream produces 53
+// (▁ separator between every CJK char), garbling Chinese output (issue #75
+// follow-up). English (ASCII-only) text is unaffected: no codepoint hits the
+// CJK ranges, so the pipeline collapses to "uppercase ASCII" — same as before.
+
+static int utf8_decode(const char* s, uint32_t& cp) {
+    unsigned char c = (unsigned char)s[0];
+    if (c < 0x80) {
+        cp = c;
+        return 1;
+    }
+    if ((c & 0xE0) == 0xC0) {
+        cp = ((uint32_t)(c & 0x1F) << 6) | (uint32_t)((unsigned char)s[1] & 0x3F);
+        return 2;
+    }
+    if ((c & 0xF0) == 0xE0) {
+        cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)((unsigned char)s[1] & 0x3F) << 6) |
+             (uint32_t)((unsigned char)s[2] & 0x3F);
+        return 3;
+    }
+    if ((c & 0xF8) == 0xF0) {
+        cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)((unsigned char)s[1] & 0x3F) << 12) |
+             ((uint32_t)((unsigned char)s[2] & 0x3F) << 6) | (uint32_t)((unsigned char)s[3] & 0x3F);
+        return 4;
+    }
+    cp = '?';
+    return 1;
+}
+
+static void utf8_encode(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out += (char)cp;
+    } else if (cp < 0x800) {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else {
+        out += (char)(0xF0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+// CJK_RANGE_PATTERN from upstream indextts/utils/common.py — Hangul Jamo,
+// CJK Unified + radicals + Bopomofo + kana + hangul syllables, CJK
+// compatibility, halfwidth katakana, CJK Extensions B–F.
+static bool is_cjk_codepoint(uint32_t cp) {
+    return (cp >= 0x1100 && cp <= 0x11FF) || (cp >= 0x2E80 && cp <= 0xA4CF) || (cp >= 0xA840 && cp <= 0xD7AF) ||
+           (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF65 && cp <= 0xFFDC) ||
+           (cp >= 0x20000 && cp <= 0x2FFFF);
+}
+
+// Subset of TextNormalizer.char_rep_map (front.py) covering CJK punctuation
+// that has an obvious ASCII counterpart. We skip the full wetext normalizer
+// (numbers→hanzi, English contractions, pinyin tones) — those need a real
+// rule engine and are not blocking the basic Chinese roundtrip.
+static uint32_t normalize_cjk_punct(uint32_t cp) {
+    switch (cp) {
+    case 0xFF1A:
+        return ','; // ：
+    case 0xFF1B:
+        return ','; // ；
+    case 0xFF0C:
+        return ','; // ，
+    case 0xFF01:
+        return '!'; // ！
+    case 0xFF1F:
+        return '?'; // ？
+    case 0x3001:
+        return ','; // 、
+    case 0x00B7:
+        return '-'; // ·
+    case 0x201C:
+        return '\''; // “
+    case 0x201D:
+        return '\''; // ”
+    case 0x2018:
+        return '\''; // ‘
+    case 0x2019:
+        return '\''; // ’
+    case 0x300C:
+        return '\''; // 「
+    case 0x300D:
+        return '\''; // 」
+    case 0xFF08:
+        return '\''; // （
+    case 0xFF09:
+        return '\''; // ）
+    case 0x300A:
+        return '\''; // 《
+    case 0x300B:
+        return '\''; // 》
+    case 0x3010:
+        return '\''; // 【
+    case 0x3011:
+        return '\''; // 】
+    case 0x2014:
+        return '-'; // —
+    case 0xFF5E:
+        return '-'; // ～
+    default:
+        return 0;
+    }
+}
+
+// Match Python upstream order: punct map → tokenize_by_CJK_char → upper().
+// Note: full-width period U+3002 (。) is inside the CJK range so it gets
+// split as a CJK char (not punct-mapped) — same as upstream.
+static std::string preprocess_indextts_text(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() * 2);
+    bool last_was_sep = true; // suppress a leading separator
+
+    for (size_t i = 0; i < text.size();) {
+        uint32_t cp = 0;
+        int n = utf8_decode(text.c_str() + i, cp);
+        if (n <= 0) {
+            break;
+        }
+        i += (size_t)n;
+
+        if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r') {
+            if (!last_was_sep) {
+                out += ' ';
+                last_was_sep = true;
+            }
+            continue;
+        }
+
+        if (uint32_t r = normalize_cjk_punct(cp)) {
+            cp = r;
+        }
+
+        if (is_cjk_codepoint(cp)) {
+            if (!last_was_sep) {
+                out += ' ';
+            }
+            utf8_encode(out, cp);
+            out += ' ';
+            last_was_sep = true;
+        } else {
+            if (cp >= 'a' && cp <= 'z') {
+                cp -= 32;
+            }
+            utf8_encode(out, cp);
+            last_was_sep = false;
+        }
+    }
+    while (!out.empty() && out.back() == ' ') {
+        out.pop_back();
+    }
+    return out;
+}
+
 // Simple character-level fallback tokenizer when BPE vocab is not available.
 // Each UTF-8 byte becomes its own token ID (clamped to vocab size).
 static std::vector<int32_t> tokenize_fallback(const indextts_tokenizer& /*tok*/, const std::string& text,
@@ -2091,25 +2252,19 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
         }
     }
 
-    // 1. Uppercase text then tokenize (IndexTTS normalizer uppercases before BPE)
-    std::string text_upper;
-    for (const char* p = text; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c >= 'a' && c <= 'z')
-            text_upper += (char)(c - 32);
-        else
-            text_upper += (char)c;
-    }
+    // 1. Run upstream-equivalent text preprocessing (CJK punct map + CJK
+    //    char split + ASCII upper), then SentencePiece-encode.
+    std::string text_prepped = preprocess_indextts_text(text ? text : "");
 
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.loaded) {
-        text_tokens = tokenize_bpe(ctx->tokenizer, text_upper);
+        text_tokens = tokenize_bpe(ctx->tokenizer, text_prepped);
     } else {
-        text_tokens = tokenize_fallback(ctx->tokenizer, text_upper, ctx->hp.text_vocab_size);
+        text_tokens = tokenize_fallback(ctx->tokenizer, text_prepped, ctx->hp.text_vocab_size);
     }
 
     if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "indextts: text \"%s\" -> %zu tokens\n", text_upper.c_str(), text_tokens.size());
+        fprintf(stderr, "indextts: text \"%s\" -> %zu tokens\n", text_prepped.c_str(), text_tokens.size());
     }
 
     // 2. Allocate KV cache
@@ -2425,17 +2580,15 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
         return nullptr;
     }
 
-    // Step 2: Re-tokenize text (uppercased) for latent pass
-    std::string text_upper2;
-    for (const char* p = text; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        text_upper2 += (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
-    }
+    // Step 2: Re-tokenize text for latent pass — must match the prefill
+    // tokenization, otherwise the latent positions don't align with the
+    // hidden states the GPT actually saw during generate().
+    std::string text_prepped2 = preprocess_indextts_text(text ? text : "");
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.loaded) {
-        text_tokens = tokenize_bpe(ctx->tokenizer, text_upper2);
+        text_tokens = tokenize_bpe(ctx->tokenizer, text_prepped2);
     } else {
-        text_tokens = tokenize_fallback(ctx->tokenizer, text_upper2, ctx->hp.text_vocab_size);
+        text_tokens = tokenize_fallback(ctx->tokenizer, text_prepped2, ctx->hp.text_vocab_size);
     }
 
     std::vector<int32_t> mel_codes_vec(codes, codes + n_codes);
