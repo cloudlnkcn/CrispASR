@@ -15,6 +15,8 @@ static int g_cpu_n_threads = 4;
 // KV cache: manual std::vector<float> per layer (CPU side).
 
 #include "voxcpm2_tts.h"
+#include "core/attention.h"
+#include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/torch_rng.h"
 #include "ggml.h"
@@ -315,6 +317,29 @@ struct voxcpm2_context {
 
     // RNG for CFM noise generation (seeded per synthesis call)
     mt19937_state rng;
+
+    // VOXCPM2_USE_GRAPH backend pool. Init unconditionally so the gate
+    // can be flipped per-call without re-loading the model. Weights still
+    // live on backend_cpu (legacy CPU paths read them directly via
+    // tensor->data); the graph paths run on this same CPU backend, gaining
+    // amortised graph build/alloc and ggml's planner.
+    ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
+    std::vector<uint8_t> compute_meta;
+    ggml_gallocr_t galloc = nullptr;
+
+    // Persistent KV cache as a backend tensor for VOXCPM2_USE_GRAPH=1 TSLM
+    // step. Sized to match the legacy tslm_kv (max_ctx × n_kv × head_dim ×
+    // n_layers). Populated lazily from tslm_kv before the AR loop's first
+    // graph step, then read/written directly by the step graph.
+    ggml_context* tslm_kv_ctx = nullptr;
+    ggml_backend_buffer_t tslm_kv_buf = nullptr;
+    ggml_tensor* tslm_kv_k = nullptr;
+    ggml_tensor* tslm_kv_v = nullptr;
+    int tslm_kv_max_ctx = 0;
+    bool tslm_kv_synced = false; // true once tslm_kv (CPU vector) has been
+                                 // copied into the backend tensor for this
+                                 // synthesis call.
 };
 
 // Stream struct
@@ -1199,6 +1224,260 @@ static std::vector<float> locdit_forward(voxcpm2_context* ctx, const float* x_ra
 }
 
 // ---------------------------------------------------------------------------
+// LocDiT — per-call ggml_cgraph variant.
+//
+// Replaces the ~30 per-matmul tiny graphs (`matmul_mv_ggml`) per
+// `locdit_forward` invocation with one cgraph for the full 12-layer
+// bidirectional DiT. Same algebra as `locdit_forward`, gated on
+// `VOXCPM2_USE_GRAPH=1`.
+//
+// Inputs (all set per call via ggml_backend_tensor_set):
+//   x_in     [feat_dim=64, P=4]  F32  noisy latent
+//   cond_in  [feat_dim=64, P=4]  F32  previous patch (zeros at step 0)
+//   mu_in    [d=1024, mu_toks=2] F32  TSLM/RALM-projected mu
+//   t_sin    [d]                 F32  bf16-rounded sinusoidal time emb
+//   dt_sin   [d]                 F32  bf16-rounded sinusoidal dt emb
+//
+// `t_sin` / `dt_sin` are precomputed in C++ via the existing
+// `sinusoidal_time_emb` so the bf16-round bug-#24 fix from commit 52622dc2
+// is preserved.
+//
+// Output (named "vel"):
+//   vel      [feat_dim=64, P=4]  F32  predicted velocity
+// ---------------------------------------------------------------------------
+
+static ggml_cgraph* build_locdit_graph(voxcpm2_context* ctx) {
+    const vox_hparams& hp = ctx->hp;
+    const vox_weights& W = ctx->weights;
+    const int d = (int)hp.locdit_d_model;
+    const int n_q = (int)hp.locdit_n_heads;
+    const int n_kv = (int)hp.locdit_n_kv;
+    const int hd = (int)hp.locdit_head_dim;
+    const int n_kv_grp = n_q / n_kv;
+    const float eps = hp.rms_norm_eps;
+    const float ascale = 1.0f / std::sqrt((float)hd);
+    const int feat_dim = 64;
+    const int P = (int)hp.patch_frames; // 4
+    const int mu_toks = 2;
+    const int T = mu_toks + 1 + P + P; // 11
+    const int x_offset = mu_toks + 1 + P;
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), /*no_alloc=*/true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    // ── Inputs ───────────────────────────────────────────────────
+    ggml_tensor* x_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
+    ggml_set_name(x_in, "x_in");
+    ggml_set_input(x_in);
+    ggml_tensor* cond_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
+    ggml_set_name(cond_in, "cond_in");
+    ggml_set_input(cond_in);
+    ggml_tensor* mu_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, mu_toks);
+    ggml_set_name(mu_in, "mu_in");
+    ggml_set_input(mu_in);
+    ggml_tensor* t_sin = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d);
+    ggml_set_name(t_sin, "t_sin");
+    ggml_set_input(t_sin);
+    ggml_tensor* dt_sin = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d);
+    ggml_set_name(dt_sin, "dt_sin");
+    ggml_set_input(dt_sin);
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    // ── time_mlp + delta_time_mlp ────────────────────────────────
+    // Each MLP: Linear → SiLU → Linear, both with bias. Sum the two MLPs.
+    auto two_layer_mlp = [&](ggml_tensor* sin_in, ggml_tensor* w0, ggml_tensor* b0, ggml_tensor* w1,
+                             ggml_tensor* b1) -> ggml_tensor* {
+        // sin_in is 1-D [d]; ggml_mul_mat needs a [d, T=1] 2-D view.
+        ggml_tensor* in_2d = ggml_reshape_2d(ctx0, sin_in, d, 1);
+        ggml_tensor* h = ggml_mul_mat(ctx0, w0, in_2d);
+        h = ggml_add(ctx0, h, b0);
+        h = ggml_silu(ctx0, h);
+        h = ggml_mul_mat(ctx0, w1, h);
+        h = ggml_add(ctx0, h, b1);
+        return h; // [d, 1]
+    };
+    ggml_tensor* t_emb_2d = two_layer_mlp(t_sin, W.locdit_time_mlp_0_w, W.locdit_time_mlp_0_b, W.locdit_time_mlp_1_w,
+                                          W.locdit_time_mlp_1_b);
+    ggml_tensor* dt_emb_2d =
+        two_layer_mlp(dt_sin, W.locdit_dt_mlp_0_w, W.locdit_dt_mlp_0_b, W.locdit_dt_mlp_1_w, W.locdit_dt_mlp_1_b);
+    ggml_tensor* time_token = ggml_add(ctx0, t_emb_2d, dt_emb_2d); // [d, 1]
+
+    // ── in_proj / cond_proj on x / cond ──────────────────────────
+    ggml_tensor* x_proj = ggml_mul_mat(ctx0, W.locdit_in_proj_w, x_in);         // [d, P]
+    x_proj = ggml_add(ctx0, x_proj, W.locdit_in_proj_b);                        // bias broadcast
+    ggml_tensor* cond_proj = ggml_mul_mat(ctx0, W.locdit_cond_proj_w, cond_in); // [d, P]
+    cond_proj = ggml_add(ctx0, cond_proj, W.locdit_cond_proj_b);
+
+    // ── Concat to [d, T=11] in order [mu_toks(2) | time(1) | cond(P) | x(P)] ──
+    ggml_tensor* mu_time = ggml_concat(ctx0, mu_in, time_token, /*dim=*/1); // [d, 3]
+    ggml_tensor* mu_time_cond = ggml_concat(ctx0, mu_time, cond_proj, 1);   // [d, 3+P=7]
+    ggml_tensor* cur = ggml_concat(ctx0, mu_time_cond, x_proj, 1);          // [d, T=11]
+
+    // LongRoPE freq factors as a graph input (zero-copy view into the F32
+    // weight tensor). NEOX RoPE expects [n_rot/2] factors; tslm_rope_short
+    // matches that shape.
+    ggml_tensor* rope_factors = W.tslm_rope_short; // F32 weight tensor; nullptr → no factors
+
+    const core_attn::KvSelfAttnParams kvp = {
+        /*n_heads*/ n_q,
+        /*n_kv_heads*/ n_kv,
+        /*head_dim*/ hd,
+        /*n_kv_grp*/ n_kv_grp,
+        /*n_ctx_orig*/ (int)hp.tslm_max_pos,
+        /*rope_theta*/ hp.tslm_rope_theta,
+        /*rope_beta_fast*/ 0.0f,
+        /*rope_beta_slow*/ 0.0f,
+        /*attn_scale*/ ascale,
+        /*qk_norm_eps*/ 0.0f,
+        /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
+        /*rope_type*/ GGML_ROPE_TYPE_NEOX,
+        /*n_rot*/ 0,
+        /*v_rms_norm*/ false,
+        /*rope_freq_factors*/ rope_factors,
+    };
+
+    // ── 12 bidirectional transformer layers ──────────────────────
+    // Bidirectional == no causal mask. No KV cache (full T each call).
+    // We can't reuse core_attn::kv_self_attn (it requires a KV cache);
+    // inline the smaller bidir-attn path here.
+    for (uint32_t il = 0; il < hp.locdit_n_layers; il++) {
+        const vox_enc_layer& L = W.locdit_layers[il];
+        ggml_tensor* residual = cur;
+
+        // RMSNorm + scale (norm1)
+        ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, L.norm1_w);
+
+        // Q/K/V projections (no biases on LocDiT/LocEnc attn)
+        ggml_tensor* Q = ggml_mul_mat(ctx0, L.attn_q_w, x);
+        ggml_tensor* K = ggml_mul_mat(ctx0, L.attn_k_w, x);
+        ggml_tensor* V = ggml_mul_mat(ctx0, L.attn_v_w, x);
+
+        Q = ggml_reshape_3d(ctx0, Q, hd, n_q, T);
+        K = ggml_reshape_3d(ctx0, K, hd, n_kv, T);
+        V = ggml_reshape_3d(ctx0, V, hd, n_kv, T);
+
+        // LongRoPE (NEOX) with tslm_rope_short factors. Same theta /
+        // n_ctx_orig as TSLM (LocDiT inherits MiniCPM RoPE config via
+        // model_copy(deep=True)).
+        Q = ggml_rope_ext(ctx0, Q, positions, kvp.rope_freq_factors, hd, GGML_ROPE_TYPE_NEOX, kvp.n_ctx_orig,
+                          kvp.rope_theta, /*freq_scale*/ 1.0f, /*ext_factor*/ 0.0f, /*attn_factor*/ 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_ext(ctx0, K, positions, kvp.rope_freq_factors, hd, GGML_ROPE_TYPE_NEOX, kvp.n_ctx_orig,
+                          kvp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        // GQA: LocDiT has n_q == n_kv (16/16), so n_kv_grp == 1 — the
+        // expansion is a no-op for this architecture. Keep the branch
+        // out for clarity and future-proofing if hp ever changes.
+        if (n_kv_grp > 1) {
+            ggml_tensor* K4 = ggml_reshape_4d(ctx0, K, hd, 1, n_kv, T);
+            ggml_tensor* V4 = ggml_reshape_4d(ctx0, V, hd, 1, n_kv, T);
+            K4 = ggml_repeat_4d(ctx0, K4, hd, n_kv_grp, n_kv, T);
+            V4 = ggml_repeat_4d(ctx0, V4, hd, n_kv_grp, n_kv, T);
+            K = ggml_cont(ctx0, ggml_reshape_3d(ctx0, K4, hd, n_q, T));
+            V = ggml_cont(ctx0, ggml_reshape_3d(ctx0, V4, hd, n_q, T));
+        }
+
+        // Permute to flash-attention layout: (head_dim, T, n_heads)
+        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+        K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+        V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+
+        // Bidirectional flash-attn (no mask).
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, /*mask=*/nullptr, ascale, /*max_bias*/ 0.0f,
+                                                /*logit_softcap*/ 0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        attn = ggml_reshape_2d(ctx0, attn, hd * n_q, T);
+
+        // Output projection (no bias on attn)
+        attn = ggml_mul_mat(ctx0, L.attn_o_w, attn);
+        cur = ggml_add(ctx0, residual, attn);
+
+        // Pre-FFN norm + scale, SwiGLU, residual
+        residual = cur;
+        x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, L.norm2_w);
+        ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, L.ffn_gate_w, L.ffn_up_w, L.ffn_down_w);
+        cur = ggml_add(ctx0, residual, mlp);
+    }
+
+    // ── Final norm + out_proj on last P positions ────────────────
+    // Slice positions [x_offset, x_offset+P) out of [d, T=11]. View is
+    // contiguous along d, strided along T (which is already contiguous
+    // for cur), so ggml_view_2d works directly without ggml_cont.
+    ggml_tensor* x_tail = ggml_view_2d(ctx0, cur, d, P, cur->nb[1], (size_t)x_offset * cur->nb[1]);
+    ggml_tensor* normed = ggml_rms_norm(ctx0, x_tail, eps);
+    if (W.locdit_norm_w) {
+        normed = ggml_mul(ctx0, normed, W.locdit_norm_w);
+    }
+    ggml_tensor* vel = ggml_mul_mat(ctx0, W.locdit_out_proj_w, normed); // [feat_dim, P]
+    vel = ggml_add(ctx0, vel, W.locdit_out_proj_b);
+    ggml_set_name(vel, "vel");
+    ggml_set_output(vel);
+    ggml_build_forward_expand(gf, vel);
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Run the LocDiT graph for one denoising step. Same signature as
+// `locdit_forward` so the CFM solver can swap between paths via a single
+// env check. Returns [feat_dim * P] in [T, C] row-major (same as legacy).
+static std::vector<float> locdit_forward_graph(voxcpm2_context* ctx, const float* x_raw, const float* mu,
+                                               float t_scalar, const float* cond_raw, float dt_scalar) {
+    const vox_hparams& hp = ctx->hp;
+    const int d = (int)hp.locdit_d_model;
+    const int feat_dim = 64;
+    const int P = (int)hp.patch_frames;
+    const int mu_toks = 2;
+    const int T = mu_toks + 1 + P + P;
+
+    // ── Inputs ───────────────────────────────────────────────────
+    // x_raw / cond_raw arrive as [P, feat_dim] row-major (from the CFM
+    // solver's transpose). The graph's x_in tensor is column-major
+    // [feat_dim, P] (ne[0]=feat_dim, ne[1]=P), so the memcpy lays out
+    // x_raw[t, c] at byte offset (t * feat_dim + c) — which is exactly
+    // what the column-major tensor expects (ne[1] stride = feat_dim).
+    std::vector<float> x_buf(x_raw, x_raw + feat_dim * P);
+    std::vector<float> cond_buf(cond_raw, cond_raw + feat_dim * P);
+    std::vector<float> mu_buf(mu, mu + d * mu_toks); // 2048-vector viewed as [d, 2]
+    std::vector<float> t_sin = sinusoidal_time_emb(t_scalar, d);
+    std::vector<float> dt_sin = sinusoidal_time_emb(dt_scalar, d);
+    std::vector<int32_t> positions(T);
+    for (int i = 0; i < T; i++)
+        positions[i] = i;
+
+    ggml_cgraph* gf = build_locdit_graph(ctx);
+    if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
+        fprintf(stderr, "voxcpm2: locdit gallocr alloc failed\n");
+        return std::vector<float>(feat_dim * P, 0.0f);
+    }
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x_buf.data(), 0, x_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_in"), cond_buf.data(), 0, cond_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mu_in"), mu_buf.data(), 0, mu_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_sin"), t_sin.data(), 0, t_sin.size() * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "dt_sin"), dt_sin.data(), 0, dt_sin.size() * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), positions.data(), 0,
+                            positions.size() * sizeof(int32_t));
+
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
+    }
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "voxcpm2: locdit graph compute failed\n");
+        return std::vector<float>(feat_dim * P, 0.0f);
+    }
+
+    ggml_tensor* vel = ggml_graph_get_tensor(gf, "vel");
+    std::vector<float> out((size_t)feat_dim * P);
+    ggml_backend_tensor_get(vel, out.data(), 0, out.size() * sizeof(float));
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // CFM Euler solve — sway schedule (t: 1->0), CFG-zero-star
 //
 // mu:       [tslm_d_model=2048] conditioning from TSLM+RALM
@@ -1223,6 +1502,19 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
     if (initial_noise) {
         std::memcpy(x.data(), initial_noise, (size_t)state_size * sizeof(float));
     }
+
+    // VOXCPM2_USE_GRAPH=1 routes locdit through the per-call cgraph
+    // (build_locdit_graph + locdit_forward_graph) instead of the
+    // ~30 per-matmul tiny graphs. Same algebra; one graph build/alloc
+    // per locdit call instead of one per matmul.
+    const bool use_graph = vox_env_bool("VOXCPM2_USE_GRAPH");
+    auto locdit_call = [&](const float* x_tc, const float* mu_in, float t_cur, const float* cond_in,
+                           float dt_in) -> std::vector<float> {
+        if (use_graph) {
+            return locdit_forward_graph(ctx, x_tc, mu_in, t_cur, cond_in, dt_in);
+        }
+        return locdit_forward(ctx, x_tc, mu_in, t_cur, cond_in, dt_in, cpu_be);
+    };
 
     // Sway schedule: t_span = linspace(1, 0, steps+1) + sway*(cos(pi/2*t) - 1 + t)
     // with sway_sampling_coef = 1.0 (default in VoxCPM2). Python computes this in
@@ -1261,10 +1553,9 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
                     x_tc[t * feat_dim + c] = x[c * P + t];
 
             double tl = bench ? vox_now_ms() : 0;
-            std::vector<float> v_cond_tc = locdit_forward(ctx, x_tc.data(), mu, t_cur, cond_raw, dt_scalar, cpu_be);
+            std::vector<float> v_cond_tc = locdit_call(x_tc.data(), mu, t_cur, cond_raw, dt_scalar);
             std::vector<float> zero_mu(ctx->hp.tslm_d_model, 0.0f);
-            std::vector<float> v_uncond_tc =
-                locdit_forward(ctx, x_tc.data(), zero_mu.data(), t_cur, cond_raw, dt_scalar, cpu_be);
+            std::vector<float> v_uncond_tc = locdit_call(x_tc.data(), zero_mu.data(), t_cur, cond_raw, dt_scalar);
             if (bench)
                 sum_locdit += vox_now_ms() - tl;
 
@@ -1297,7 +1588,7 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
                 for (int c = 0; c < feat_dim; c++)
                     x_tc[t * feat_dim + c] = x[c * P + t];
             double tl = bench ? vox_now_ms() : 0;
-            auto v_tc = locdit_forward(ctx, x_tc.data(), mu, t_cur, cond_raw, dt_scalar, cpu_be);
+            auto v_tc = locdit_call(x_tc.data(), mu, t_cur, cond_raw, dt_scalar);
             if (bench)
                 sum_locdit += vox_now_ms() - tl;
             // Transpose velocity [T, C] → [C, T]
@@ -3194,12 +3485,43 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
         return nullptr;
     }
 
+    // VOXCPM2_USE_GRAPH backend pool. Weights stay on backend_cpu (legacy
+    // CPU paths read raw tensor->data); the per-step graphs live on the
+    // same CPU backend and pay one ggml_init + galloc per call instead of
+    // ~30 per LocDiT invocation. Switching to Metal is a follow-up — the
+    // legacy paths still dereference CPU memory and would SIGSEGV today.
+    ctx->backend_cpu = get_cpu_backend();
+    ctx->backend = ctx->backend_cpu;
+    // Generous arena: ~9 nodes/layer × 12 LocDiT layers + I/O ≈ 130 nodes;
+    // 28 TSLM layers ≈ 280 nodes. 4096 nodes leaves headroom for the
+    // largest graph (TSLM 28L step) without re-allocing per call.
+    const int max_nodes = 4096;
+    ctx->compute_meta.resize(ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    ctx->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ctx->galloc) {
+        fprintf(stderr, "voxcpm2: failed to create gallocr\n");
+        voxcpm2_free(ctx);
+        return nullptr;
+    }
+
     return ctx;
 }
 
 void voxcpm2_free(struct voxcpm2_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->tslm_kv_buf) {
+        ggml_backend_buffer_free(ctx->tslm_kv_buf);
+        ctx->tslm_kv_buf = nullptr;
+    }
+    if (ctx->tslm_kv_ctx) {
+        ggml_free(ctx->tslm_kv_ctx);
+        ctx->tslm_kv_ctx = nullptr;
+    }
+    if (ctx->galloc) {
+        ggml_gallocr_free(ctx->galloc);
+        ctx->galloc = nullptr;
+    }
     if (ctx->weight_buf) {
         ggml_backend_buffer_free(ctx->weight_buf);
         ctx->weight_buf = nullptr;
@@ -3208,6 +3530,7 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
         ggml_free(ctx->ggml_ctx);
         ctx->ggml_ctx = nullptr;
     }
+    // backend_cpu is the global g_cpu_backend — process-wide, do not free
     delete ctx;
 }
 

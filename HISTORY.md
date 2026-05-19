@@ -6,6 +6,46 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-19 voxcpm2-tts: LocDiT per-call ggml graph (PLAN #96 partial)
+
+**Problem.** `cfm_euler_solve` was the AR-step hotspot at 63.7% of
+per-step time (1186 ms / 1864 ms total on M1 CPU, "Hi" zero-shot
+Q4_K). Inside, `locdit_forward` called `matmul_mv_ggml` ~30 times per
+invocation; each matmul did its own `ggml_init` + `ggml_new_graph` +
+`ggml_backend_graph_compute` + `ggml_free`. CFM runs LocDiT ~19 times
+per AR step (2 × CFG × 10 timesteps − the CFG-zero-star skip), so
+~570 graph builds per AR step just for CFM.
+
+**Fix.** Added a backend pool (`backend`, `backend_cpu`, `galloc`,
+4 MB `compute_meta` arena) to `voxcpm2_context`, plus
+`build_locdit_graph` (a single 12-layer DiT cgraph: time MLPs, in/cond
+projections, concat to T=11, bidirectional GQA flash-attn with
+LongRoPE, SwiGLU FFN, final norm + out_proj on the last 4 positions)
+and `locdit_forward_graph` (precomputes bf16-rounded `t_sin` /
+`dt_sin` in C++ to preserve commit `52622dc2`'s bug-#24 fix, then
+runs the graph). `cfm_euler_solve` picks the graph or legacy path via
+a `locdit_call` lambda gated on `VOXCPM2_USE_GRAPH=1`. Weights stay
+on `backend_cpu` for now — moving them to Metal requires the matching
+TSLM-step graph (otherwise legacy `matmul_mv_ggml` would SIGSEGV
+reading Metal-resident weights).
+
+**Validation.** Diff harness on `voxcpm2-q4_k.gguf` zero-shot ref:
+14 pass / 0 fail / 3 skip. Critical stages — `cfm_step0_result
+cos_mean=0.9826` (PLAN #96 gate ≥ 0.93), `dit_input_seq
+cos_mean=0.9984`. Voice-cloning smoke ("Hello world" + jfk.wav)
+still ASR-roundtrips to "Hello world."
+
+**Speedup** (M1 CPU, OMP=8, "Hello world" zero-shot, 6 AR steps):
+AR loop 15 306 → 6 815 ms (2.3×), CFM/step 2 398 → 1 035 ms (2.3×),
+total wall 24.2 → 18.5 s. Below the plan's `~400 ms` CPU target —
+remaining overhead is per-call graph build / gallocr alloc, not the
+matmul work. Caching the graph across CFM Euler iterations (qwen3_tts
+bucket pattern) is the next CPU win; Metal is gated on the matching
+TSLM-step graph (PLAN #96 still-TODO).
+
+---
+
+
 ## 2026-05-19 Issue #89 — chunking, overlap-save, CTC decode path
 
 **Problem:** parakeet-tdt-0.6b-ja (and other non-whisper backends with

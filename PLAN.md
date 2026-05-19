@@ -212,7 +212,7 @@ share enough that landing one substantially de-risks the other.
 
 ---
 
-## 96. voxcpm2-tts perf — switch to per-step ggml graph (Metal-ready) — open
+## 96. voxcpm2-tts perf — switch to per-step ggml graph (Metal-ready) — partial
 
 ### Where we are (2026-05-19)
 
@@ -296,6 +296,43 @@ rewrite must keep that number at ≥ 0.93 (current value with
 Python-supplied mu+noise). If it drops, the graph has a numerical bug —
 bisect by stage. Re-run `VOXCPM2_BENCH=1` to confirm the per-AR-step
 times collapse to the targets above.
+
+### Progress (2026-05-19)
+
+LocDiT graph done (`VOXCPM2_USE_GRAPH=1`). Backend pool + per-call
+`build_locdit_graph` + `locdit_forward_graph` wrapper added; CFM
+`locdit_call` lambda picks the graph or legacy path per env. Diff
+harness on `voxcpm2-q4_k.gguf` zero-shot ref: 14 pass / 0 fail / 3 skip
+— `cfm_step0_result cos_mean=0.9826` (above the 0.93 gate);
+`dit_input_seq cos_mean=0.9984`; all TSLM/RALM stages unchanged
+(0.99+). Voice-cloning smoke test ("Hello world" + jfk.wav) still
+ASR-roundtrips to "Hello world."
+
+Bench (M1, OMP=8, "Hello world" zero-shot, 6 AR steps):
+
+| Path  | AR loop (ms) | CFM/step (ms) | Wall (ms) |
+| ----- | -----------: | ------------: | --------: |
+| legacy | 15 306      | 2 398         | 24 211    |
+| graph  |  6 815      | 1 035         | 18 519    |
+
+→ 2.3× CFM speedup on CPU. Below the `~400 ms` CPU target from the
+plan — remaining overhead is per-call `ggml_init` / `gallocr_alloc`,
+not the per-matmul work; caching the graph across CFM Euler iterations
+(qwen3_tts bucket pattern) is the next CPU win. Metal still requires
+moving weights off `backend_cpu`, blocked on the matching TSLM-step
+graph (otherwise the legacy CPU paths SIGSEGV reading Metal memory).
+
+### Still TODO
+
+- `build_tslm_step_graph` (28L MiniCPM-4 step with backend-resident KV
+  cache) — same shape as `qwen3_tts.cpp build_graph_talker_kv`.
+- KV cache sync from `vox_kv_cache` (CPU `std::vector<float>`) into a
+  backend tensor before the AR loop's first graph step.
+- Graph-cache the LocDiT cgraph across CFM Euler iterations (build /
+  gallocr-alloc once per init, just `tensor_set` + `compute` per call).
+- Once both step graphs are on the backend, switch default to
+  `VOXCPM2_USE_GRAPH=1`, load weights on `c->backend` (Metal-capable),
+  and drop the legacy `matmul_mv_ggml` path entirely.
 
 ---
 
