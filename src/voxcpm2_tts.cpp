@@ -2177,25 +2177,90 @@ static void causal_conv1d(const float* weight, const float* bias, const float* x
     int in_per_grp = in_ch / groups;
     int out_per_grp = out_ch / groups;
 
+    // Depthwise (groups == in_ch == out_ch, in_per_grp == 1) gets the
+    // simple loop — there's nothing to vectorise on ic_inner. Same for
+    // 1x1 conv: weight stride across ic is 1 already, so the inner loop
+    // is contiguous in weight (x is still strided but transpose overhead
+    // dominates the small inner work). All other cases (the dilated k=7
+    // residual-unit convs at the deep upsample blocks) benefit from
+    // laying weight as [k, oc, ic_inner] + transposing x to [t, ic_inner]
+    // so the inner ic dot product is contiguous + NEON-auto-vectorisable.
+    const bool use_transpose = (in_per_grp > 1 && ksize > 1);
+    if (!use_transpose) {
+#if defined(_OPENMP)
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+        for (int oc_abs = 0; oc_abs < out_ch; oc_abs++) {
+            for (int ot = 0; ot < T_out; ot++) {
+                int g = oc_abs / out_per_grp;
+                float b_val = bias ? bias[oc_abs] : 0.0f;
+                float acc = b_val;
+                int it_center = ot * stride;
+                for (int k = 0; k < ksize; k++) {
+                    int it = it_center - pad + k * dilation;
+                    if (it < 0 || it >= T_in)
+                        continue;
+                    for (int ic = 0; ic < in_per_grp; ic++) {
+                        int ic_abs = g * in_per_grp + ic;
+                        float x_val = x_in[(size_t)ic_abs * T_in + it];
+                        float w_val = weight[(size_t)oc_abs * in_per_grp * ksize + (size_t)ic * ksize + k];
+                        acc += x_val * w_val;
+                    }
+                }
+                x_out[(size_t)oc_abs * T_out + ot] = acc;
+            }
+        }
+        return;
+    }
+
+    // Transpose weight from [oc, ic_per_grp, ksize] to [ksize, oc, ic_inner]
+    // (each [oc, ic_per_grp, ksize] block stays self-contained per group).
+    std::vector<float> w_kio((size_t)ksize * (size_t)out_ch * (size_t)in_per_grp);
+#if defined(_OPENMP)
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int k = 0; k < ksize; k++) {
+        for (int oc = 0; oc < out_ch; oc++) {
+            float* dst = w_kio.data() + ((size_t)k * out_ch + oc) * in_per_grp;
+            for (int ic = 0; ic < in_per_grp; ic++) {
+                dst[ic] = weight[(size_t)oc * in_per_grp * ksize + (size_t)ic * ksize + k];
+            }
+        }
+    }
+
+    // Transpose x from [in_ch, T_in] to [T_in, in_ch] (within each group's
+    // ic slice, contiguous in ic).
+    std::vector<float> x_tic((size_t)T_in * (size_t)in_ch);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < T_in; t++) {
+        float* dst = x_tic.data() + (size_t)t * in_ch;
+        for (int ic = 0; ic < in_ch; ic++) {
+            dst[ic] = x_in[(size_t)ic * T_in + t];
+        }
+    }
+
 #if defined(_OPENMP)
 #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int oc_abs = 0; oc_abs < out_ch; oc_abs++) {
         for (int ot = 0; ot < T_out; ot++) {
             int g = oc_abs / out_per_grp;
-            float b_val = bias ? bias[oc_abs] : 0.0f;
-            float acc = b_val;
+            float acc = bias ? bias[oc_abs] : 0.0f;
             int it_center = ot * stride;
             for (int k = 0; k < ksize; k++) {
                 int it = it_center - pad + k * dilation;
-                if (it < 0 || it >= T_in)
+                if (it < 0 || it >= T_in) {
                     continue;
-                for (int ic = 0; ic < in_per_grp; ic++) {
-                    int ic_abs = g * in_per_grp + ic;
-                    float x_val = x_in[(size_t)ic_abs * T_in + it];
-                    float w_val = weight[(size_t)oc_abs * in_per_grp * ksize + (size_t)ic * ksize + k];
-                    acc += x_val * w_val;
                 }
+                const float* x_row = x_tic.data() + (size_t)it * in_ch + (size_t)g * in_per_grp;
+                const float* w_row = w_kio.data() + ((size_t)k * out_ch + oc_abs) * in_per_grp;
+                float dot = 0.0f;
+                for (int ic = 0; ic < in_per_grp; ic++) {
+                    dot += x_row[ic] * w_row[ic];
+                }
+                acc += dot;
             }
             x_out[(size_t)oc_abs * T_out + ot] = acc;
         }
@@ -2219,32 +2284,63 @@ static void causal_transposed_conv1d(const float* weight, const float* bias, con
                                      int out_ch, int ksize, int T_in, int stride) {
     int T_out = T_in * stride;
     int trim = ksize - 1; // causal: shift output left by ksize-1
+
+    // Inner ic loop in the natural layout reads x[ic*T_in+it] (stride T_in)
+    // and weight[ic*out_ch*ksize+oc*ksize+k] (stride out_ch*ksize) — strided
+    // on both axes, so the compiler can't auto-vectorise. Transpose once
+    // per call so the inner dot product becomes contiguous + NEON-friendly:
+    //   weight: [in_ch, out_ch, ksize] -> w_kio [ksize, out_ch, in_ch]
+    //   x_in:   [in_ch, T_in]          -> x_tic [T_in, in_ch]
+    // The transposes are O(in_ch * (out_ch * ksize + T_in)) which is small
+    // compared to the inner work — block 0 (in=2048, out=1024, k=16, T=28)
+    // transposes ~16 K x floats + ~32 M weight floats vs ~940 M dot-product
+    // floats below. Auto-vectorisation makes the dot ~4-8× faster on M1.
+    std::vector<float> w_kio((size_t)ksize * (size_t)out_ch * (size_t)in_ch);
+#if defined(_OPENMP)
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int k = 0; k < ksize; k++) {
+        for (int oc = 0; oc < out_ch; oc++) {
+            float* dst = w_kio.data() + ((size_t)k * out_ch + oc) * in_ch;
+            for (int ic = 0; ic < in_ch; ic++) {
+                dst[ic] = weight[((size_t)ic * out_ch + oc) * ksize + k];
+            }
+        }
+    }
+
+    std::vector<float> x_tic((size_t)T_in * (size_t)in_ch);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < T_in; t++) {
+        float* dst = x_tic.data() + (size_t)t * in_ch;
+        for (int ic = 0; ic < in_ch; ic++) {
+            dst[ic] = x_in[(size_t)ic * T_in + t];
+        }
+    }
+
 #if defined(_OPENMP)
 #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int oc = 0; oc < out_ch; oc++) {
         for (int ot = 0; ot < T_out; ot++) {
             float acc = bias ? bias[oc] : 0.0f;
-            // For each kernel tap k, the corresponding input position is
-            // it = (ot + trim - k) / stride; the dilated-zero rule says
-            // x is 0 unless (ot + trim - k) is divisible by stride.
-            // The valid k's form an arithmetic progression starting at
-            // k0 = (ot + trim) mod stride with step `stride`, so we walk
-            // those directly instead of testing the modulus on every k.
             int ot_plus_trim = ot + trim;
             int k0 = ot_plus_trim % stride;
+            // Valid k's form an arithmetic progression at step `stride`
+            // (other k's fall on dilated-zero positions of the input).
             for (int k = k0; k < ksize; k += stride) {
                 int it = (ot_plus_trim - k) / stride;
                 if (it < 0 || it >= T_in) {
                     continue;
                 }
-                const float* x_col = x_in + (size_t)it; // stride T_in across channels
-                // weight layout [in_ch, out_ch, ksize]: w[ic*out_ch*ksize + oc*ksize + k]
+                const float* x_row = x_tic.data() + (size_t)it * in_ch;
+                const float* w_row = w_kio.data() + ((size_t)k * out_ch + oc) * in_ch;
+                float dot = 0.0f;
                 for (int ic = 0; ic < in_ch; ic++) {
-                    float x_val = x_col[(size_t)ic * T_in];
-                    float w_val = weight[((size_t)ic * out_ch + oc) * ksize + k];
-                    acc += x_val * w_val;
+                    dot += x_row[ic] * w_row[ic];
                 }
+                acc += dot;
             }
             x_out[(size_t)oc * T_out + ot] = acc;
         }

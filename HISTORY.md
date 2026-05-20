@@ -6,6 +6,54 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-20 voxcpm2-tts: SIMD-friendly transposed conv + causal conv layout (PLAN #96 follow-on)
+
+**Change.** The OMP-parallelised `causal_transposed_conv1d` and
+`causal_conv1d` still ran scalar inner ic loops because both x
+(stride `T_in` across ic) and weight (stride `out_ch*ksize`)
+were strided in the inner axis — the compiler can't NEON-vectorise
+strided loads. Per-call we now:
+
+1. Reshape the weight from `[in_ch, out_ch, ksize]` to
+   `[ksize, out_ch, in_ch_inner]`. Inner ic is contiguous.
+2. Transpose x from `[in_ch, T_in]` to `[T_in, in_ch_inner]`.
+3. Run the inner ic dot product contiguous on both axes — auto-
+   vectorisable.
+
+For `causal_conv1d` the transpose path is gated on
+`in_per_grp > 1 && ksize > 1` (depthwise and 1×1 convs skip it —
+no SIMD opportunity, transpose would be pure overhead).
+
+The transposes are `O(in_ch × (out_ch × ksize + T))` per call,
+small compared to the inner dot product work — block 0's 32 M
+weight floats + 16 K x floats vs ~940 M dot floats.
+
+**Validation.** Diff harness `voxcpm2-q4_k.gguf` (CPU path): still
+14 pass / 0 fail / 3 skip (VAE isn't probed by the harness — the
+`decoded_audio` stage is SKIPPED in the zero-shot ref archive).
+Both zero-shot ("Hello world") and voice clone (jfk.wav ref)
+smoke tests ASR-roundtrip correctly.
+
+**Bench** (M1, OMP=8, "Hello world" zero-shot, 6 AR steps):
+
+|                       | OMP only | + SIMD layout |
+| --------------------- | -------: | ------------: |
+| Block 0 upsample (ms) |   2 957  |          615  |
+| VAE decode total (ms) |   8 772  |        3 875  |
+| Synth wall total (ms) |  14 766  |        6 800  |
+
+≈4.8× on the deepest block-0 upsample; ≈2.3× on total VAE;
+≈2.2× on total synth wall.
+
+**Also: README.md.** Removed the stale `(beta)` tag and
+"garbled-but-recognisable" / "voice cloning falls back" warnings;
+the path is now end-to-end functional. Added a short status block
+documenting `VOXCPM2_USE_GRAPH=1` and the current ~7 s wall on M1
+for "Hello world" zero-shot Q4_K.
+
+---
+
+
 ## 2026-05-20 voxcpm2-tts: parallelise VAE decode hot paths (PLAN #96 follow-on)
 
 **Change.** VAE decode was the dominant remaining wall-clock cost

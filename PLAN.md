@@ -453,16 +453,30 @@ strided (ic-stride T_in across x, ic-stride out_ch×ksize across
 weight) so the compiler can't auto-vectorise. The arithmetic is
 already OMP-parallelised across (oc, ot).
 
+### Progress (SIMD-friendly conv layouts, 2026-05-20)
+
+Rewrote `causal_transposed_conv1d` and `causal_conv1d` (non-depthwise,
+ksize>1 path) to lay the reconstructed weight as `[k, oc, ic_inner]`
+and transpose x to `[t, ic_inner]` per call. The inner ic dot product
+is now contiguous on both axes — auto-vectorisable via NEON on M1.
+
+Bench (M1, OMP=8, "Hello world" zero-shot, 6 AR steps):
+
+|                       |  Old (b94)  | New (SIMD layout) |
+| --------------------- | ----------: | ----------------: |
+| Block 0 upsample (ms) |      2 957  |              615  |
+| VAE decode total (ms) |      8 772  |            3 875  |
+| Synth wall total (ms) |     14 766  |            6 800  |
+
+~4.8× on the deepest block-0 upsample; ~2.3× on total VAE; ~2.2× on
+total synth wall. Block 5 residual gets noisier (transpose cost
+shows up at large T_in with small in_per_grp); future work could
+gate the transpose on `in_per_grp >= 128`.
+
 ### Still TODO
 
-- The real next win is making the transposed conv inner loop
-  contiguous in `ic`. Two paths: (a) lay the reconstructed weight
-  out as `[k, oc, ic]` and transpose x to `[t, ic]` per call so
-  the inner dot product is contiguous + auto-vectorisable; (b)
-  graph-ify the conv layers via `ggml_conv_transpose_1d` so they
-  run on Metal. (a) is small (~50 LOC) and CPU-only; (b) is the
-  Metal-class win and ~500-1000 LOC.
-- Graph-ify the snake1d / residual unit / final-conv tail.
+- Graph-ify the VAE convs via `ggml_conv_transpose_1d` /
+  `ggml_conv_1d` for Metal-class wins on top of the SIMD baseline.
 - Once all paths are graph, drop the legacy `matmul_mv_ggml` +
   CPU-only fallback and flip default to `VOXCPM2_USE_GRAPH=1`.
 
