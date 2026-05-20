@@ -5766,6 +5766,34 @@ infrastructure on our side stays exactly the same — they extend
 the query-embed table + the CTC vocab; we just read whichever new
 special-token IDs get emitted from position 0..3.
 
+### SenseVoice output-token order ≠ input query order — classify by content, not position
+
+The four query embeds are prepended to the LFR features in input
+order `[language, event_query, emotion_query, textnorm]` (see
+`sensevoice_gather_query_rows` and the upstream Python ref
+`tools/reference_backends/sensevoice.py`). The intuitive assumption
+is that the encoder output's four prefix tokens come back in the
+same order — they don't. On `samples/jfk.wav` the encoder emits
+`<|en|><|ANGRY|><|Speech|><|withitn|>`: position 1 is the **emotion**
+(`ANGRY`), position 2 is the **audio event** (`Speech`). The
+"event_query" and "emo_query" names in upstream refer to the
+embedding-table row IDs (1 and 2), not to which slot they decode
+into; the trained model has those slots swapped relative to the
+input naming.
+
+This bit when wiring `sensevoice_transcribe_structured()`. Positional
+parsing populated `audio_event` with `"ANGRY"` and `emotion` with
+`"Speech"`. The fix is content-based classification: maintain three
+small static sets (languages, emotions, itn flags) and classify each
+`<|…|>` against them; whatever doesn't match those three is the
+audio event (which is open-ended — Speech / Music / BGM / Laughter
+/ Cough / Sneeze / Sigh / ... so a positive enum is brittle).
+
+Bonus robustness: on degenerate audio the model can emit fewer than
+four prefix markers. Positional parsing would mislabel everything
+downstream; content-based classification just leaves the missing
+field empty.
+
 ### SentencePiece detokenise without linking libsentencepiece
 
 For CTC-decode-only consumers, we don't need full SentencePiece —

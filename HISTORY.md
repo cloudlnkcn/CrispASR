@@ -6,6 +6,34 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-20 sensevoice: structured output (C ABI + segment fields + JSON)
+
+**Change.** SenseVoice's multi-task transcript embeds four rich-annotation
+tokens as a prefix (`<|en|><|ANGRY|><|Speech|><|withitn|>...`). Until
+this commit, the only public API was `sensevoice_transcribe()` which
+returned the whole prefixed string and made the caller parse the
+markers themselves. Now there's a structured surface.
+
+- **C ABI** (`src/sensevoice.h`): `struct sensevoice_result {
+  language, emotion, audio_event, itn, text, raw }` +
+  `sensevoice_transcribe_structured()` + `sensevoice_result_free()`.
+- **Segment fields** (`crispasr_segment`): four new optional strings
+  `lang_id` / `emotion` / `audio_event` / `itn_flag`. Empty for
+  non-SenseVoice backends (other backends are unaffected).
+- **CLI**: stdout now shows the clean transcript without the `<|…|>`
+  prefix. The active JSON writer (`crispasr_output.cpp:473`) emits
+  `language`, `audio_event`, `emotion`, `itn_flag` siblings after
+  `text` when present.
+
+The parser is content-based, not positional. Upstream output ordering
+is `[lang, emo, event, itn]` — different from the input query-embed
+ordering `[lang, event, emo, textnorm]` — and degenerate audio can
+drop trailing markers. Each `<|…|>` is classified against known
+language / emotion / itn sets; anything else is the audio event.
+LEARNINGS entry under "SenseVoice query-embed pattern".
+
+---
+
 ## 2026-05-20 cosyvoice3: Fun-CosyVoice3-0.5B-2512 TTS port — Phase 1 (recon + converter)
 
 **Change.** Tier 2 of the FunAudioLLM-family work (after funasr +

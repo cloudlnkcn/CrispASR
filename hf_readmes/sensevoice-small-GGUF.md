@@ -40,21 +40,42 @@ SenseVoiceSmall is Alibaba's **multi-task encoder-only ASR**: one forward pass t
 
 ## What you get in the output
 
-The transcript carries the 4-token rich-annotation prefix as readable
-special tokens followed by the SentencePiece-detokenised transcript:
+By default, stdout shows the clean transcript:
 
 ```text
-<|en|><|HAPPY|><|Speech|><|withitn|>And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
-<|zh|><|NEUTRAL|><|Speech|><|withitn|>开饭时间早上9点至下午5点。
-<|yue|><|NEUTRAL|><|Speech|><|withitn|>呢几个字都表达唔到我想讲嘅意思。
-<|ja|><|NEUTRAL|><|Speech|><|withitn|>うちの中学は弁当制で持っていけない場合は、50円の学校販売の パンを買う。
-<|ko|><|NEUTRAL|><|Speech|><|withitn|>조금만 생각을 하면서 살면 훨씬 편할 거야.
+And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
 ```
 
-Languages: `<|zh|>` / `<|en|>` / `<|yue|>` / `<|ja|>` / `<|ko|>` / `<|nospeech|>`.
-Emotions: `<|HAPPY|>` / `<|SAD|>` / `<|ANGRY|>` / `<|NEUTRAL|>` / `<|EMO_UNKNOWN|>`.
-Audio events: `<|Speech|>` / `<|Music|>` / `<|Applause|>` / `<|Laughter|>` / `<|Cry|>` / `<|BGM|>`.
-Text norm: `<|withitn|>` (Arabic digits, punctuation) or `<|woitn|>` (raw).
+With `-oj` the JSON output exposes the four rich-annotation tags as
+explicit fields:
+
+```json
+{
+  "text":        "And so my fellow Americans...",
+  "language":    "en",
+  "audio_event": "Speech",
+  "emotion":     "ANGRY",
+  "itn_flag":    "withitn"
+}
+```
+
+The legacy `sensevoice_transcribe()` C ABI still returns the original
+prefixed string for callers that want it that way:
+
+```text
+<|en|><|HAPPY|><|Speech|><|withitn|>And so my fellow Americans...
+<|zh|><|NEUTRAL|><|Speech|><|withitn|>开饭时间早上9点至下午5点。
+```
+
+New callers should use `sensevoice_transcribe_structured()` which
+returns the same six fields as a `struct sensevoice_result`.
+
+Tag value sets:
+
+- Languages: `zh` / `en` / `yue` / `ja` / `ko` / `nospeech`
+- Emotions: `HAPPY` / `SAD` / `ANGRY` / `NEUTRAL` / `EMO_UNKNOWN`
+- Audio events: `Speech` / `Music` / `Applause` / `Laughter` / `Cry` / `BGM` (and more — the upstream set is open-ended)
+- Text norm: `withitn` (Arabic digits, punctuation) or `woitn` (raw)
 
 ## Files
 
