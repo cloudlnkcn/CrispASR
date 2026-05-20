@@ -6,6 +6,64 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-20 parakeet: 4 new variants — v2 + tdt-1.1b + tdt_ctc-{110m,1.1b}
+
+**Goal.** Bring NVIDIA's remaining Parakeet TDT / TDT+CTC variants
+onto the existing C++ runtime. The converter (`models/convert-parakeet-to-gguf.py`)
+and the runtime (`src/parakeet.cpp`) already supported the full TDT +
+CTC dispatch shape; the only gaps were per-checkpoint quirks and the
+"how does the CLI find this by name" plumbing.
+
+**Variants shipped** (all CC-BY-4.0, English-only, English BPE 1024):
+
+| Name | -m key | F16 / Q4_K | M1 realtime (Q4_K) | Notes |
+| --- | --- | ---: | ---: | --- |
+| nvidia/parakeet-tdt-0.6b-v2     | `parakeet-v2`           | 1.24 GB / 468 MB | 11.4× | Original Open ASR Leaderboard topper; pred_layers=2, n_mels=128 |
+| nvidia/parakeet-tdt-1.1b        | `parakeet-tdt-1.1b`     | 2.14 GB / 808 MB | 16×   | 42-layer encoder, lowercase output |
+| nvidia/parakeet-tdt_ctc-110m    | `parakeet-tdt_ctc-110m` | 230 MB / 91 MB   | 45×   | 17L d=512, pred_layers=1, CTC head; runtime auto-flips to CTC |
+| nvidia/parakeet-tdt_ctc-1.1b    | `parakeet-tdt_ctc-1.1b` | 2.15 GB / 810 MB | 14.8× | 42L hybrid, mixed-case + punct vocab |
+
+All uploaded to `cstr/<name>-GGUF` with READMEs. Each repo has three
+precisions (F16, Q8_0, Q4_K).
+
+**Two C++ fixes** rolled in alongside:
+
+1. **`parakeet_init_from_file` auto-flips to CTC when `pred_layers <
+   2 && has_ctc`** (commit `0a902517`). The 110m has a single-LSTM
+   predictor (`pred_layers=1`), so the TDT decoder's 2-LSTM
+   requirement made `require()` return nullptr for the missing
+   `decoder.lstm.1.*` tensors and then `parakeet_tdt_decode`
+   segfaulted silently after the encoder pass. Now `lstm.1.*` are
+   optional under `pred_layers < 2`, and the constructor sets
+   `decode_ctc=true` automatically for that case. 110m no longer
+   needs `--parakeet-decoder ctc`.
+
+2. **`crispasr_resolve_model{,_cli}` sub-variant lookup priority**
+   (commit `d8325847`). The CLI's filename-heuristic always sets
+   `backend_name="parakeet"` for any `parakeet*` arg, so the old
+   lookup ordering — `lookup_by_filename` → `lookup(backend_name)` —
+   shadowed every sub-variant key to the default `parakeet` entry
+   (v3). Inserted a step `lookup(model_arg)` between the two so
+   `-m parakeet-v2` matches the `parakeet-v2` registry entry.
+
+**Wiring touches.** No new dispatch code — the parakeet backend
+already handles TDT and CTC, and the filename heuristic at
+`crispasr_backend.cpp:370-372` already routes `parakeet-tdt_ctc-*` to
+the parakeet backend via the `!contains_ci("tdt")` guard. The work was
+4 registry entries + the two priority fixes above + 4 READMEs.
+
+**C ABI parity.** `crispasr_registry_lookup_abi("parakeet-v2", ...)`
+returns filename + URL; existing init functions consume the path
+directly. Bindings (Go/Java/Ruby/JS/Python/Dart) get the new variants
+for free.
+
+PLAN crosswalk: PLAN #97 "More Parakeet variants" — TDT / TDT+CTC
+items all green. Deferred items in #97 (RNNT / realtime-EOU /
+unified-en) and #98 (hotwords / contextual biasing) untouched in this
+session.
+
+---
+
 ## 2026-05-20 sensevoice: structured output (C ABI + segment fields + JSON)
 
 **Change.** SenseVoice's multi-task transcript embeds four rich-annotation

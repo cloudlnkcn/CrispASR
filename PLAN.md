@@ -100,26 +100,29 @@ tensor shapes (line 314+). So most NVIDIA Parakeet checkpoints that share
 the FastConformer-encoder + TDT-or-CTC-decoder shape should be
 converter-runs with no new C++.
 
-### In progress — TDT / TDT+CTC (no new runtime code expected)
+### Shipped — TDT / TDT+CTC (2026-05-20)
 
-- [ ] `nvidia/parakeet-tdt-0.6b-v2` — English-only TDT, same arch as v3.
-  Cheapest English-quality win; baseline `parakeet-tdt-0.6b-v2 vs -v3`
-  WER head-to-head before any hotword work.
-- [ ] `nvidia/parakeet-tdt-1.1b` — larger pure TDT. May surface
-  hardcoded-d_model assumptions; cross-checks at converter:314+ should
-  catch them.
-- [ ] `nvidia/parakeet-tdt_ctc-110m` — smallest hybrid. Useful for low-RAM
-  hosts; validates the C++ `has_ctc` dispatch on a non-`-ja` hybrid.
-- [ ] `nvidia/parakeet-tdt_ctc-1.1b` — largest hybrid; bench against
-  canary-1b-v2 for the "big multilingual ASR" slot.
+All four converted, smoke-tested on JFK at M1 Metal, and uploaded to HF
+with READMEs. Registry entries + `-m <name>` lookup + C ABI surface all
+wired in `crispasr_model_registry.cpp` + `crispasr_model_mgr_cli.cpp`
+(fix landed on the same branch — see commit `d8325847`). One C++ fix
+along the way: `parakeet_init_from_file` now auto-flips to CTC decode
+when `pred_layers < 2 && has_ctc` (commit `0a902517`); without this
+the 110m's single-LSTM predictor would have failed silently.
 
-Per-variant work:
-1. Download `.nemo` from HF (`huggingface-cli download nvidia/<id>`).
-2. `python models/convert-parakeet-to-gguf.py --nemo <…>.nemo --output …`
-   then `--quant q4_k` / `q8_0` passes.
-3. Smoke test: `build-ninja-compile/bin/crispasr -m <gguf> <wav>`.
-4. If smoke OK, upload to `cstr/<id>-GGUF` per the
-   `hf upload-large-folder` recipe in `.claude/CLAUDE.md`.
+- [x] `nvidia/parakeet-tdt-0.6b-v2` → [`cstr/parakeet-tdt-0.6b-v2-GGUF`](https://huggingface.co/cstr/parakeet-tdt-0.6b-v2-GGUF) (468 MB Q4_K, 11.4× rt) — `-m parakeet-v2`
+- [x] `nvidia/parakeet-tdt-1.1b` → [`cstr/parakeet-tdt-1.1b-GGUF`](https://huggingface.co/cstr/parakeet-tdt-1.1b-GGUF) (808 MB Q4_K, 16× rt, lowercase) — `-m parakeet-tdt-1.1b`
+- [x] `nvidia/parakeet-tdt_ctc-110m` → [`cstr/parakeet-tdt_ctc-110m-GGUF`](https://huggingface.co/cstr/parakeet-tdt_ctc-110m-GGUF) (91 MB Q4_K, 45× rt, auto-CTC) — `-m parakeet-tdt_ctc-110m`
+- [x] `nvidia/parakeet-tdt_ctc-1.1b` → [`cstr/parakeet-tdt_ctc-1.1b-GGUF`](https://huggingface.co/cstr/parakeet-tdt_ctc-1.1b-GGUF) (810 MB Q4_K, mixed-case + punct) — `-m parakeet-tdt_ctc-1.1b`
+
+Each GGUF available in three precisions (F16, Q8_0, Q4_K). All work via:
+- the unified CLI: `crispasr -m <name> --auto-download -f audio.wav`
+- C ABI: `crispasr_registry_lookup_abi(<name>, ...)` returns
+  filename + URL; existing init functions consume the path directly.
+
+Filename-heuristic dispatch in `crispasr_backend.cpp:370-372`
+unchanged — `parakeet-tdt_ctc-*.gguf` matches "parakeet" with the
+`!contains_ci("tdt")` guard preventing accidental fc-ctc routing.
 
 ### Deferred — needs new decoder code or arch survey
 
