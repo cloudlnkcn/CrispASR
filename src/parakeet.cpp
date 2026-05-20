@@ -373,10 +373,14 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
     p.lstm0_w_hh = require(model, "decoder.lstm.0.w_hh");
     p.lstm0_b_ih = require(model, "decoder.lstm.0.b_ih");
     p.lstm0_b_hh = require(model, "decoder.lstm.0.b_hh");
-    p.lstm1_w_ih = require(model, "decoder.lstm.1.w_ih");
-    p.lstm1_w_hh = require(model, "decoder.lstm.1.w_hh");
-    p.lstm1_b_ih = require(model, "decoder.lstm.1.b_ih");
-    p.lstm1_b_hh = require(model, "decoder.lstm.1.b_hh");
+    // lstm.1 only exists when pred_layers >= 2 (v2/v3/0.6b-ja). Single-LSTM
+    // hybrids (e.g. parakeet-tdt_ctc-110m has pred_layers=1) keep them null
+    // and must use the CTC head — TDT decode requires a 2-LSTM predictor.
+    const bool has_lstm1 = model.hparams.pred_layers >= 2;
+    p.lstm1_w_ih = has_lstm1 ? require(model, "decoder.lstm.1.w_ih") : nullptr;
+    p.lstm1_w_hh = has_lstm1 ? require(model, "decoder.lstm.1.w_hh") : nullptr;
+    p.lstm1_b_ih = has_lstm1 ? require(model, "decoder.lstm.1.b_ih") : nullptr;
+    p.lstm1_b_hh = has_lstm1 ? require(model, "decoder.lstm.1.b_hh") : nullptr;
 
     // Joint
     auto& j = model.joint;
@@ -1323,6 +1327,14 @@ extern "C" struct parakeet_context* parakeet_init_from_file(const char* path_mod
     }
 
     parakeet_fold_batchnorm(ctx->model);
+
+    // Hybrid TDT+CTC models with a single-LSTM predictor (parakeet-tdt_ctc-110m
+    // has pred_layers=1) can only decode via the CTC head — TDT decode requires
+    // a 2-layer LSTM. Default to CTC so the model just works out of the box.
+    if (ctx->model.hparams.pred_layers < 2 && ctx->model.has_ctc) {
+        ctx->decode_ctc = true;
+        fprintf(stderr, "parakeet: single-LSTM predictor + CTC head detected → defaulting to CTC decode\n");
+    }
     return ctx;
 }
 
