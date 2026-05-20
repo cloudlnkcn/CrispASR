@@ -6,6 +6,65 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-20 cosyvoice3: Fun-CosyVoice3-0.5B-2512 TTS port — Phase 1 (recon + converter)
+
+**Change.** Tier 2 of the FunAudioLLM-family work (after funasr +
+sensevoice). Multilingual TTS, Apache-2.0, 9 languages + 18+ Chinese
+dialects, zero-shot voice cloning, 24 kHz output. Phase 1 lands the
+foundation only — recon, converter, and three F16 GGUFs at
+`/Volumes/backups/ai/crispasr-models/cosyvoice3-0.5b-2512/`. The C++
+runtime is in development (Phase 2 starts with the LLM forward + RAS
+sampling); the backend is **not yet user-facing**.
+
+CosyVoice3 is three sub-models tied together:
+
+  llm.pt    2.0 GB  Qwen2-0.5B (hidden=896, 24L, GQA 14/2, q/k/v biases,
+                    NEOX RoPE θ=1e6) + speech_embedding (6761, 896) +
+                    llm_decoder (6761, 896). AR-decodes speech tokens
+                    with RAS sampling (top_p=0.8, top_k=25, win_size=10,
+                    tau_r=0.1 — uniform-random fallback when last 10
+                    tokens are too repetitive).
+  flow.pt   1.3 GB  input_embedding (6561, 80) + pre_lookahead causal
+                    conv (3-frame lookahead) + DiT estimator (22 blocks,
+                    AdaLN-Zero modulation, dim=1024, heads=16,
+                    head_dim=64, ff_mult=2, RoPE in MHA) +
+                    CausalConditionalCFM (Euler ODE, 10 steps, cosine
+                    t-schedule, cfg_rate=0.7).
+  hift.pt    83 MB  CausalHiFTGenerator (HiFi-GAN-iSTFT hybrid):
+                    conv_pre 80→512, 3 upsample stages (rates [8,5,3],
+                    kernels [16,11,7]) with Snake activations + NSF
+                    source modulator chain, CausalConvRNNF0Predictor,
+                    conv_post 64→18, iSTFT (n_fft=16, hop=4) → 24 kHz.
+
+Plus CAMPPlus (192-dim spk embed, identical to chatterbox/campplus.onnx)
+and Qwen2 BPE tokenizer (vocab=151936, lives in CosyVoice-BlankEN/).
+
+Converter walks all three .pt files and materialises every
+`nn.utils.weight_norm` parametrisation in HiFT
+(`parametrizations.weight.original0` = g scale, `.original1` = v
+direction → plain `w = g·v/‖v‖`) so the runtime side never sees the
+parametrised form. Lifts voxcpm2's `wn_reconstruct` pattern into Python.
+
+Output GGUFs:
+
+  cosyvoice3-llm-f16.gguf    1.29 GB  Qwen2 + speech heads
+  cosyvoice3-flow-f16.gguf   0.67 GB  pre-lookahead + DiT
+  cosyvoice3-hift-f16.gguf     42 MB  causal HiFTGenerator vocoder
+
+**Reuse map.** Repo sweep confirmed almost every primitive needed for
+the C++ runtime already exists in tree: Qwen2 LLM via
+`core_attn::kv_self_attn`, CFM Euler with cosine schedule via
+`chatterbox_s3gen::cfm_euler_solve`, weight_norm resolver via
+voxcpm2's `wn_reconstruct`, iSTFT n_fft=16 hop=4 (exact-match
+parameters) via chatterbox_s3gen, F0 predictor / NSF SineGen / causal
+conv1d all via chatterbox_s3gen, CAMPPlus 100 % reusable, GPT-2 BPE
+via core/bpe.h. **Genuinely new C++ code** for Phase 2-4 estimates
+~360 LOC of primitives (AdaLN-Zero, Snake, pre-lookahead conv, RAS,
+causal upsample padding) + ~1500 LOC of glue. Realistic timeline:
+~1 week of focused work, revised down from the original "1-2 weeks".
+
+Multi-phase plan tracked in `PLAN.md` "CosyVoice3-0.5B-2512 TTS port".
+
 ## 2026-05-20 sensevoice: FunAudioLLM/SenseVoiceSmall — multi-task ASR + LID + emotion + audio-event
 
 **Change.** Encoder-only sibling of Fun-ASR-Nano: same
