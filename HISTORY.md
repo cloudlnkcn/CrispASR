@@ -6,6 +6,60 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-20 parakeet-ja kanji → hiragana regression (issue #114)
+
+`exn251` reported that `parakeet-tdt-0.6b-ja` produced visibly worse
+JA transcripts after v0.6.6: kanji compounds collapsed to bare
+hiragana (`名前も教えて` → `なまえもおしえて`), multiple short VAD
+slices were dropped entirely, and the runtime was ~30 % slower
+(53.23 s vs 40.87 s on the user's 600 s reference clip). Setting
+`--chunk-seconds 30` did not change the failing output, so chunking
+was ruled out as the proximate cause.
+
+**Root cause.** `cad4c28a feat(#89): overlap-save chunking with
+--chunk-overlap flag` extended every slice by ± `chunk_overlap_seconds`
+(default 3.0) of acoustic context on each side, gated only on
+`slices.size() > 1 && kChunkContextS > 0.0f`. The intent was to
+preserve bidirectional encoder context across explicit chunk
+boundaries, but the gate also fired for VAD-derived multi-slice
+runs. VAD slices are separated by silence — there is no boundary
+signal to recover. Adding 3 s of neighbour audio pulled the next
+utterance into the current encoder's context window, shifted the
+FastConformer features, and caused the TDT decoder to pick a
+different (worse) token path.
+
+The crispasr-diff harness still passed at cos_min=1.0 (mel),
+0.999994 (encoder) on the single-utterance baseball fixture, so the
+per-stage cosine sweep alone did not catch this. The regression is
+inherently a multi-slice + bidirectional-encoder + per-feature-z
+interaction; it only manifests when at least two VAD slices each
+have their own (slightly different) z-norm statistics.
+
+**Fix.** Gate `use_chunk_context` on `effective_chunk_seconds > 0`
+so the extension only fires when explicit chunking is in effect.
+VAD-derived multi-slice runs revert to the v0.6.6 behaviour:
+transcribe each slice's bare samples.
+
+The gate is extracted into
+`examples/cli/crispasr_chunk_context_gate.h` so
+`tests/test-issue-114-chunk-context-gate.cpp` can pin the invariant
+(`effective_chunk_seconds=0 && n_slices>1` must return false) as a
+unit test without standing up the full pipeline.
+
+Bisect timeline:
+- `5f1bb858` (v0.6.6): GOOD (kanji)
+- `8c895a7a~1`: GOOD (kanji, with spacing oddity from pre-617cd02)
+- `ae6be961` (post-drop_last_frame, pre-overlap-save): GOOD (kanji)
+- `992a5333`: GOOD (kanji)
+- **`cad4c28a` (overlap-save default-on): BAD (hiragana)**
+- `22ba4bce`/`a069018f`/`adaedb3e`/`HEAD`: BAD (hiragana)
+
+Note: `drop_last_frame=true` (07cfcffe) is unrelated — both
+true and false produced the regressed output once cad4c28a was
+in. The cos parity at mel/encoder is preserved by this fix.
+
+---
+
 ## 2026-05-20 voxcpm2-tts: cache wn_reconstruct across VAE encode/decode calls
 
 **Change.** VAE decode rebuilt every weight-norm-resolved conv tensor

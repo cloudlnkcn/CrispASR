@@ -476,6 +476,26 @@ catch_discover_tests(test_chunk_context
     PROPERTIES LABELS "unit;chunk-context"
 )
 
+# ─── test-issue-114-chunk-context-gate — issue #114 regression guard
+#
+# Pins crispasr_chunk_context::should_use_chunk_context so a future
+# refactor cannot silently re-introduce the cad4c28a gate that
+# extended VAD-derived slices with neighbour audio and produced
+# kanji → hiragana on parakeet-tdt-0.6b-ja. Pure CPU, no model load.
+add_executable(test-issue-114-chunk-context-gate
+    test-issue-114-chunk-context-gate.cpp
+)
+target_include_directories(test-issue-114-chunk-context-gate PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-issue-114-chunk-context-gate PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-114-chunk-context-gate
+    TEST_SPEC "[issue-114]"
+    PROPERTIES LABELS "unit;chunk-context;issue-114"
+)
+
 # ─── test - math - consistency — Catch2 unit tests for math constants ────────
 add_executable(test-math-consistency
     test-math-consistency.cpp

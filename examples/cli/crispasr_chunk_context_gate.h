@@ -1,0 +1,40 @@
+// crispasr_chunk_context_gate.h — gate for overlap-save context extension.
+//
+// Extracted from crispasr_run.cpp into a header so unit tests can exercise
+// the decision without standing up the full processing pipeline.
+//
+// The gate decides whether each slice should be transcribed with ±
+// chunk_overlap_seconds of acoustic context on each side ("overlap-save
+// chunking"), or with just the bare slice samples.
+//
+// Issue #114: VAD-derived slices are separated by silence, so there is
+// no boundary signal to recover. Adding context to a VAD slice pulls
+// the *next* speech segment into the current encoder's context window,
+// which shifts the FastConformer features and makes the TDT decoder
+// pick a different — and worse — token path. The user-visible symptom
+// on parakeet-tdt-0.6b-ja was kanji collapsing to bare hiragana plus
+// entire short slices being dropped.
+//
+// The fix is to gate overlap-save on `effective_chunk_seconds > 0`:
+// it's a chunking-only mitigation, and VAD slicing is not chunking.
+
+#pragma once
+
+#include <cstddef>
+
+namespace crispasr_chunk_context {
+
+// Returns true iff the per-slice transcribe call should be wrapped in an
+// overlap-save context window (`be.transcribe(samples + sl.start - ctx,
+// sl.size + 2*ctx, ...)`), then trimmed back via word-level filtering.
+//
+// Returns false (no context, transcribe the bare slice) when:
+//   - chunking is not in effect (effective_chunk_seconds == 0). The
+//     CAP_UNBOUNDED_INPUT default; covers VAD-derived multi-slice runs.
+//   - there is only one slice (no boundary to mitigate).
+//   - the user has set --chunk-overlap 0 explicitly.
+inline bool should_use_chunk_context(int effective_chunk_seconds, std::size_t n_slices, float chunk_overlap_seconds) {
+    return effective_chunk_seconds > 0 && n_slices > 1 && chunk_overlap_seconds > 0.0f;
+}
+
+} // namespace crispasr_chunk_context

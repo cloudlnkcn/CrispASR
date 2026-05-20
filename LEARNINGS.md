@@ -10,6 +10,41 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## VAD + chunking
+
+### Overlap-save context is for *chunks*, not for VAD slices (issue #114)
+
+`cad4c28a feat(#89): overlap-save chunking with --chunk-overlap flag`
+added a ± `chunk_overlap_seconds` (default 3.0) neighbour-audio
+extension to every per-slice transcribe call when `slices.size() >
+1`. That gate is correct for explicit `--chunk-seconds N` runs, where
+each cut falls in the middle of continuous speech and the encoder
+genuinely needs context to span the boundary. It is *wrong* for VAD-
+derived multi-slice runs: VAD slices are separated by silence, so
+there is no boundary signal to recover, and pulling 3 s of the next
+utterance into the current encoder context shifts the per-feature
+z-norm statistics + bidirectional self-attention enough to push the
+TDT decoder onto a different (worse) token path. The visible
+regression on parakeet-tdt-0.6b-ja was kanji compounds collapsing to
+bare hiragana plus entire short slices being dropped.
+
+The crispasr-diff harness did NOT catch this — the cos at mel /
+encoder stayed at 1.0 / 0.999994 on the single-utterance baseball
+fixture, because the bug only manifests once multiple VAD slices
+sit in the same long-form audio with realistic inter-slice silence.
+
+Fix: gate overlap-save on `effective_chunk_seconds > 0`. The gate
+lives in `examples/cli/crispasr_chunk_context_gate.h` so a unit test
+can pin the invariant without spinning up a model.
+
+Signature of the bug: per-slice transcripts that look "almost
+right" but consistently pick simpler (more conservative) tokens at
+the same boundaries — kanji → hiragana, multi-word phrases →
+chopped syllables. Single-shot diff against PyTorch reference looks
+fine because the diff harness only feeds one continuous segment.
+
+---
+
 ## mel / preprocessor
 
 ### STFT frame count: NeMo `feat_len` vs raw STFT output

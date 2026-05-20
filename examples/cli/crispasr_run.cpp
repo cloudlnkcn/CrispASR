@@ -9,6 +9,7 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
+#include "crispasr_chunk_context_gate.h"
 #include "crispasr_mic_cli.h"
 #include "crispasr_popen.h"
 #include "crispasr_vad_cli.h"
@@ -588,7 +589,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // appropriate).
     const float kChunkContextS = params.chunk_overlap_seconds;
     constexpr int64_t kBoundaryToleranceCs = 20; // 200 ms tolerance for TDT frame shift
-    const bool use_chunk_context = slices.size() > 1 && kChunkContextS > 0.0f;
+    // Issue #114 — gate lives in crispasr_chunk_context_gate.h so the
+    // unit test in tests/test-issue-114-chunk-context-gate.cpp can pin
+    // it without spinning up a model. See the header for the rationale.
+    const bool use_chunk_context =
+        crispasr_chunk_context::should_use_chunk_context(effective_chunk_seconds, slices.size(), kChunkContextS);
 
     auto process_slice = [&](size_t i, CrispasrBackend& be) {
         const auto& sl = slices[i];
