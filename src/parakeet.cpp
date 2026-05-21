@@ -1719,6 +1719,157 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
 }
 
 // ---------------------------------------------------------------------------
+// Chunked encode: split long audio into overlapping chunks, compute mel
+// with per-chunk z-norm (keeps features close to training distribution),
+// encode each chunk independently, and concatenate the encoder outputs
+// with overlap deduplication.  The result is a single contiguous encoder
+// buffer that can be decoded in one TDT pass — no decoder cold-start,
+// no content loss from chunk boundaries.  Issue #89 / PLAN #104.
+// ---------------------------------------------------------------------------
+
+static std::vector<float> parakeet_encode_chunked(parakeet_context* ctx, const float* samples, int n_samples,
+                                                   int chunk_seconds, int overlap_seconds, int* out_T_enc_total) {
+    const auto& hp = ctx->model.hparams;
+    const int SR = 16000;
+    const int d_model = (int)hp.d_model;
+    const int hop = (int)hp.hop_length;
+    const int sub = (int)hp.subsampling_factor;
+
+    const int chunk_samples = chunk_seconds * SR;
+    const int overlap_samples = overlap_seconds * SR;
+    const int shift_samples = chunk_samples - overlap_samples;
+
+    // How many encoder frames the overlap region produces.
+    // mel_frames = n_samples / hop;  encoder_frames = mel_frames / sub
+    // For the overlap region: overlap_samples / hop / sub
+    const int overlap_enc_frames = overlap_samples / (hop * sub);
+
+    std::vector<float> enc_all;
+    int T_enc_total = 0;
+
+    for (int offset = 0; offset < n_samples; offset += shift_samples) {
+        const int chunk_end = std::min(n_samples, offset + chunk_samples);
+        const int chunk_len = chunk_end - offset;
+        if (chunk_len <= 0)
+            break;
+
+        // Mel with per-chunk z-norm
+        int T_mel = 0;
+        auto mel = parakeet_compute_mel_impl(ctx, samples + offset, chunk_len, T_mel);
+        if (mel.empty())
+            continue;
+
+        // Encode
+        int T_enc = 0;
+        auto enc = parakeet_encode_mel(ctx, mel.data(), (int)hp.n_mels, T_mel, &T_enc);
+        if (enc.empty())
+            continue;
+
+        // For chunks after the first: skip the overlap encoder frames
+        // at the start (the previous chunk already covers those frames).
+        int skip_frames = 0;
+        if (offset > 0 && T_enc > overlap_enc_frames) {
+            skip_frames = overlap_enc_frames;
+        }
+
+        const int keep_frames = T_enc - skip_frames;
+        if (keep_frames <= 0)
+            continue;
+
+        enc_all.insert(enc_all.end(), enc.begin() + (size_t)skip_frames * d_model,
+                       enc.begin() + (size_t)(skip_frames + keep_frames) * d_model);
+        T_enc_total += keep_frames;
+
+        if (getenv("PARAKEET_DEBUG"))
+            fprintf(stderr, "parakeet: chunk @%d: %d samples → %d mel → %d enc (skip %d, keep %d)\n", offset,
+                    chunk_len, T_mel, T_enc, skip_frames, keep_frames);
+    }
+
+    if (out_T_enc_total)
+        *out_T_enc_total = T_enc_total;
+    return enc_all;
+}
+
+// Public API: chunked encode + single-pass TDT decode for long audio.
+// Internally splits audio into overlapping chunks (default 8 s with 2 s
+// overlap), encodes each with per-chunk z-norm, concatenates the encoder
+// output, and runs one TDT decode over the whole sequence.  This avoids
+// both the z-norm drift of single-pass encoding on long audio AND the
+// decoder cold-start of independent-chunk decoding.
+extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_context* ctx, const float* samples,
+                                                                int n_samples, int64_t t_offset_cs,
+                                                                int chunk_seconds, int overlap_seconds) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    if (chunk_seconds <= 0)
+        chunk_seconds = 8;
+    if (overlap_seconds < 0)
+        overlap_seconds = 2;
+    if (overlap_seconds >= chunk_seconds)
+        overlap_seconds = chunk_seconds / 4;
+
+    // 1. Chunked encode
+    int T_enc_total = 0;
+    auto enc_all = parakeet_encode_chunked(ctx, samples, n_samples, chunk_seconds, overlap_seconds, &T_enc_total);
+    if (enc_all.empty() || T_enc_total <= 0)
+        return nullptr;
+
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: chunked encode done: %d total encoder frames from %d samples\n", T_enc_total,
+                n_samples);
+
+    // 2. Single-pass TDT decode over the concatenated encoder output
+    const int d_model = (int)ctx->model.hparams.d_model;
+    const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
+    auto emitted = use_ctc ? parakeet_ctc_decode(ctx, enc_all.data(), T_enc_total, d_model)
+                           : parakeet_tdt_decode(ctx, enc_all.data(), T_enc_total, d_model);
+
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: %s decode OK (%d tokens from %d enc frames)\n", use_ctc ? "CTC" : "TDT",
+                (int)emitted.size(), T_enc_total);
+
+    // 3. Build result (reuse the same result-building code as transcribe_ex)
+    auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
+    r->n_tokens = (int)emitted.size();
+    r->tokens = (parakeet_token_data*)calloc(r->n_tokens > 0 ? r->n_tokens : 1, sizeof(parakeet_token_data));
+    std::string text;
+    const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
+    for (int i = 0; i < r->n_tokens; i++) {
+        const auto& e = emitted[i];
+        const std::string& piece =
+            (e.id >= 0 && e.id < (int)ctx->vocab.id_to_token.size()) ? ctx->vocab.id_to_token[e.id] : std::string("");
+        std::string vis = spiece_to_text(piece);
+
+        parakeet_token_data& td = r->tokens[i];
+        td.id = e.id;
+        td.t0 = t_offset_cs + (int64_t)e.t_start * frame_dur_cs;
+        td.t1 = t_offset_cs + (int64_t)e.t_end * frame_dur_cs;
+        td.p = e.p;
+        size_t n = std::min(vis.size(), sizeof(td.text) - 1);
+        memcpy(td.text, vis.data(), n);
+        td.text[n] = '\0';
+        text += vis;
+    }
+    if (!text.empty() && text[0] == ' ')
+        text = text.substr(1);
+    r->text = strdup(text.c_str());
+
+    // Word grouping — same code path as parakeet_transcribe_ex / parakeet_decode_frames.
+    // The grouping needs the full token list, so it runs after all encoding + decoding.
+    {
+        // Delegate to parakeet_decode_frames which does the same word grouping.
+        // We build a temporary to call the word-grouping path, or inline it.
+        // For now, call parakeet_decode_frames on the already-decoded data.
+        // Actually simpler: just use the existing word-grouping at lines below.
+    }
+    // Re-use the word-grouping from decode_frames: call it on enc_all.
+    // Actually, parakeet_decode_frames already does decode + word grouping.
+    // Let's just call it directly.
+    parakeet_result_free(r);
+    return parakeet_decode_frames(ctx, enc_all.data(), T_enc_total, d_model, t_offset_cs);
+}
+
+// ---------------------------------------------------------------------------
 
 extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_context* ctx, const float* samples,
                                                           int n_samples, int64_t t_offset_cs) {

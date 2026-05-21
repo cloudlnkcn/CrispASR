@@ -94,6 +94,9 @@ enum crispasr_capability : uint32_t {
     CAP_UNBOUNDED_INPUT = 1u << 19,     // encoder handles arbitrary-length audio without chunking
                                         // (FastConformer, CTC-only encoders). LLM-based backends
                                         // and whisper's fixed-window encoder do NOT set this.
+    CAP_INTERNAL_CHUNKING = 1u << 20,   // backend handles its own long-audio chunking internally
+                                        // (PLAN #104: parakeet uses chunked-encode + single-decode).
+                                        // Skip the crispasr_run.cpp auto-chunk fallback for these.
 };
 
 // ---------------------------------------------------------------------------

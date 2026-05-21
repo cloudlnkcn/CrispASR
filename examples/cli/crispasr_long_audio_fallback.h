@@ -40,6 +40,7 @@ namespace crispasr_long_audio {
 // participate in the build). Duplicated to keep this header dependency-
 // light for the unit test build.
 constexpr uint32_t CAP_UNBOUNDED_INPUT_FLAG = 1u << 19;
+constexpr uint32_t CAP_INTERNAL_CHUNKING_FLAG = 1u << 20;
 
 // Returns true iff the caller should set `effective_chunk_seconds =
 // kLongAudioFallbackChunkSeconds` to avoid encoding more than ~1 minute of
@@ -55,6 +56,8 @@ inline bool should_auto_chunk_long(int effective_chunk_seconds, bool wants_vad, 
         return false; // explicit chunking already chosen
     if (wants_vad)
         return false; // VAD-derived slices are silence-bounded; encoder is fine
+    if (capabilities & CAP_INTERNAL_CHUNKING_FLAG)
+        return false; // backend handles its own chunking (PLAN #104)
     if (!(capabilities & CAP_UNBOUNDED_INPUT_FLAG))
         return false; // bounded-input backends are not subject to this bug
     if (sample_rate <= 0 || threshold_seconds <= 0)

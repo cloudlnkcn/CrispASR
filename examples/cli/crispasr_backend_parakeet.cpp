@@ -32,7 +32,7 @@ public:
         // through the whisper-tiny pre-step.
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
                CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD |
-               CAP_UNBOUNDED_INPUT;
+               CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;
     }
 
     bool init(const whisper_params& p) override {
@@ -73,7 +73,14 @@ public:
         // sampling state from a prior file.
         parakeet_set_temperature(ctx_, params.temperature, params.seed);
 
-        parakeet_result* r = parakeet_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
+        // Issue #89 / PLAN #104: for long audio (>30 s), use chunked
+        // encode + single-pass decode to avoid both z-norm drift AND
+        // decoder cold-start.  Short audio still goes through the
+        // single-pass path for best quality.
+        constexpr int kChunkedThresholdSamples = 30 * 16000; // 30 s
+        parakeet_result* r = (n_samples > kChunkedThresholdSamples)
+                                 ? parakeet_transcribe_chunked(ctx_, samples, n_samples, t_offset_cs, 8, 2)
+                                 : parakeet_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
         if (!r)
             return out;
 

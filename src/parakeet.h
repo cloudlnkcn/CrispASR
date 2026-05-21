@@ -76,6 +76,16 @@ char* parakeet_transcribe(struct parakeet_context* ctx, const float* samples, in
 struct parakeet_result* parakeet_transcribe_ex(struct parakeet_context* ctx, const float* samples, int n_samples,
                                                int64_t t_offset_cs);
 
+// Like parakeet_transcribe_ex but splits long audio into overlapping
+// chunks (default 8 s with 2 s overlap), encodes each with per-chunk
+// z-norm, concatenates the encoder output, and runs one TDT decode
+// over the whole sequence.  Avoids both z-norm drift and decoder
+// cold-start.  Issue #89 / PLAN #104.
+//
+// chunk_seconds <= 0 → default 8;  overlap_seconds < 0 → default 2.
+struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_context* ctx, const float* samples, int n_samples,
+                                                     int64_t t_offset_cs, int chunk_seconds, int overlap_seconds);
+
 // Vocabulary helpers
 int parakeet_n_vocab(struct parakeet_context* ctx);
 int parakeet_blank_id(struct parakeet_context* ctx);
