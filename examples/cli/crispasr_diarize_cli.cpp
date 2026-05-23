@@ -289,8 +289,7 @@ std::string resolve_pyannote_model(const whisper_params& params) {
 // Assign speakers from a pre-computed global sherpa timeline.
 // Same logic as assign_speakers_from_sherpa but also splits segments
 // at speaker-turn boundaries when word timestamps are available.
-void assign_speakers_from_global_sherpa(std::vector<crispasr_segment>& segs,
-                                        const CrispasrSherpaCache& cache) {
+void assign_speakers_from_global_sherpa(std::vector<crispasr_segment>& segs, const CrispasrSherpaCache& cache) {
     if (!cache.valid() || segs.empty())
         return;
 
@@ -346,14 +345,20 @@ void assign_speakers_from_global_sherpa(std::vector<crispasr_segment>& segs,
         // Back-fill leading unknowns
         for (size_t i = 0; i < word_spk.size() && word_spk[i] < 0; i++) {
             for (size_t j = i + 1; j < word_spk.size(); j++) {
-                if (word_spk[j] >= 0) { word_spk[i] = word_spk[j]; break; }
+                if (word_spk[j] >= 0) {
+                    word_spk[i] = word_spk[j];
+                    break;
+                }
             }
         }
 
         // Check if all words have the same speaker — skip splitting if so
         bool all_same = true;
         for (size_t i = 1; i < word_spk.size(); i++) {
-            if (word_spk[i] != word_spk[0]) { all_same = false; break; }
+            if (word_spk[i] != word_spk[0]) {
+                all_same = false;
+                break;
+            }
         }
         if (all_same) {
             out.push_back(std::move(seg));
@@ -376,7 +381,8 @@ void assign_speakers_from_global_sherpa(std::vector<crispasr_segment>& segs,
             // Rebuild text from words
             std::string txt;
             for (size_t j = run_start; j < i; j++) {
-                if (!txt.empty()) txt += ' ';
+                if (!txt.empty())
+                    txt += ' ';
                 txt += seg.words[j].text;
             }
             sub.text = txt;
@@ -611,7 +617,8 @@ bool crispasr_compute_pyannote_cache(const float* full_audio, int n_samples, con
 bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const whisper_params& params,
                                    CrispasrSherpaCache& out) {
     out = {};
-    if (!full_audio || n_samples <= 0) return false;
+    if (!full_audio || n_samples <= 0)
+        return false;
 
     const std::string bin =
         params.sherpa_bin.empty() ? std::string("sherpa-onnx-offline-speaker-diarization") : params.sherpa_bin;
@@ -622,8 +629,8 @@ bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const
     }
 
     if (!params.no_prints)
-        fprintf(stderr, "crispasr[diarize]: computing global sherpa timeline over %d samples (%.1f s)...\n",
-                n_samples, (double)n_samples / 16000.0);
+        fprintf(stderr, "crispasr[diarize]: computing global sherpa timeline over %d samples (%.1f s)...\n", n_samples,
+                (double)n_samples / 16000.0);
 
     const std::string wav_path = write_temp_mono_wav(full_audio, n_samples);
     if (wav_path.empty()) {
@@ -632,11 +639,9 @@ bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const
     }
 
     std::ostringstream cmd;
-    cmd << bin
-        << " --clustering.num-clusters=" << params.sherpa_num_clusters
-        << " --segmentation.pyannote-model='" << params.sherpa_segment_model << "'"
-        << " --embedding.model='" << params.sherpa_embedding_model << "'"
-        << " '" << wav_path << "'";
+    cmd << bin << " --clustering.num-clusters=" << params.sherpa_num_clusters << " --segmentation.pyannote-model='"
+        << params.sherpa_segment_model << "'" << " --embedding.model='" << params.sherpa_embedding_model << "'" << " '"
+        << wav_path << "'";
     if (!params.no_prints)
         fprintf(stderr, "crispasr[diarize]: %s\n", cmd.str().c_str());
     cmd << " 2>/dev/null";
@@ -668,8 +673,7 @@ bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const
 
 bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<float>& right, bool is_stereo,
                             int64_t slice_t0_cs, std::vector<crispasr_segment>& segs, const whisper_params& params,
-                            const CrispasrPyannoteCache* pyannote_cache,
-                            const CrispasrSherpaCache* sherpa_cache) {
+                            const CrispasrPyannoteCache* pyannote_cache, const CrispasrSherpaCache* sherpa_cache) {
     if (segs.empty())
         return true;
 

@@ -69,8 +69,7 @@ struct CrispasrSherpaCache {
 /// Run sherpa-onnx-offline-speaker-diarization once over the full mono
 /// 16 kHz audio and parse the global speaker-turn timeline.
 /// Returns true on success; `out` is populated with speaker regions.
-bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples,
-                                   const whisper_params& params,
+bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const whisper_params& params,
                                    CrispasrSherpaCache& out);
 
 /// Top-level CLI diarize post-step.
