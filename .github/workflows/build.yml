@@ -667,12 +667,14 @@ jobs:
         with:
           name: ggml_${{ matrix.arch }}.dll
           path: build/bin/${{ matrix.build }}/ggml.dll
+          if-no-files-found: warn
 
       - name: Upload ggml base dll
         uses: actions/upload-artifact@v6
         with:
           name: ggml_base_${{ matrix.arch }}.dll
           path: build/bin/${{ matrix.build }}/ggml-base.dll
+          if-no-files-found: warn
 
       - name: Upload ggml cpu dll
         uses: actions/upload-artifact@v6
