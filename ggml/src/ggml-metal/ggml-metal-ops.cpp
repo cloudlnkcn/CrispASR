@@ -3904,22 +3904,34 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
     // CrispASR debug (#83 r9 follow-up #5): host-side readback of op->src[1]
     // for the FIRST UNet im2col call (signature IC==320, KH==1, KW==3).
     // Confirms whether host can read correct bytes at the kernel's input
-    // buffer address right before dispatch.
+    // buffer address right before dispatch. Reads from each channel group
+    // (noise/mu/spk/cond) so we can verify uncond zeros mu/spk/cond.
     {
         static const char * dbg_env = std::getenv("CRISPASR_IM2COL_DBG");
         static int dbg_n = 0;
         if (dbg_env && IC == 320 && KH == 1 && KW == 3 && dbg_n < 4) {
             ggml_tensor * t = op->src[1];
             ggml_metal_buffer_id bid = ggml_metal_get_buffer_id(t);
-            float host[8] = {0};
-            ggml_backend_tensor_get(t, host, 0, sizeof(host));
+            const size_t T_mel = (size_t) t->ne[0];
+            const size_t row_bytes = T_mel * sizeof(float);
+            float h_noise[4] = {0}, h_mu[4] = {0}, h_spk[4] = {0}, h_cond[4] = {0};
+            ggml_backend_tensor_get(t, h_noise, 0, sizeof(h_noise));
+            ggml_backend_tensor_get(t, h_mu,    80*row_bytes, sizeof(h_mu));
+            ggml_backend_tensor_get(t, h_spk,  160*row_bytes, sizeof(h_spk));
+            ggml_backend_tensor_get(t, h_cond, 240*row_bytes, sizeof(h_cond));
             fprintf(stderr,
-                "[im2col-dbg %d] src1='%s' ne=[%lld,%lld,%lld] data=%p buf=%p offs=%zu host[0..7]= "
-                "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                "[im2col-dbg %d] src1='%s' ne=[%lld,%lld,%lld] data=%p offs=%zu\n"
+                "  noise[0..3] = %.4f %.4f %.4f %.4f\n"
+                "  mu[0..3]    = %.4f %.4f %.4f %.4f\n"
+                "  spk[0..3]   = %.4f %.4f %.4f %.4f\n"
+                "  cond[0..3]  = %.4f %.4f %.4f %.4f\n",
                 dbg_n, t->name,
                 (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
-                t->data, (void*) bid.metal, bid.offs,
-                host[0], host[1], host[2], host[3], host[4], host[5], host[6], host[7]);
+                t->data, bid.offs,
+                h_noise[0], h_noise[1], h_noise[2], h_noise[3],
+                h_mu[0], h_mu[1], h_mu[2], h_mu[3],
+                h_spk[0], h_spk[1], h_spk[2], h_spk[3],
+                h_cond[0], h_cond[1], h_cond[2], h_cond[3]);
             dbg_n++;
         }
     }
