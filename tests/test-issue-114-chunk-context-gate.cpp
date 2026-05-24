@@ -51,7 +51,12 @@ TEST_CASE("single slice never gets context", "[unit][chunk-context][issue-114]")
     REQUIRE_FALSE(should_use_chunk_context(0, 1, 3.0f, false));
 }
 
-TEST_CASE("--chunk-overlap 0 disables overlap-save", "[unit][chunk-context][issue-114]") {
+// Name does not start with `--` so catch_discover_tests can pass it to the
+// Catch2 binary as a positional test-name without it being parsed as a CLI
+// option. The previous name ("--chunk-overlap 0 ...") was registered to
+// CTest as `test-issue-114-chunk-context-gate "--chunk-overlap 0 ..."`,
+// which Catch2 then rejected with `Unrecognised token: --chunk-overlap`.
+TEST_CASE("chunk-overlap=0 disables overlap-save", "[unit][chunk-context][issue-114]") {
     REQUIRE_FALSE(should_use_chunk_context(30, 10, 0.0f, false));
     REQUIRE_FALSE(should_use_chunk_context(30, 10, -1.0f, false));
 }
