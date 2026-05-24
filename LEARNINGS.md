@@ -6903,3 +6903,72 @@ hypotheses to try next:
   problematic.
 
 **Bug B remains open.** Workaround is still shipping.
+
+**MAJOR ISOLATION (2026-05-24, late) — Bug B is in the UNCOND pass only.**
+
+Each CFM step calls `run_denoiser` twice: first with the conditioned
+input `[noise, mu, spk, cond]` (cond pass), then with
+`[noise, 0, 0, 0]` (uncond pass) for the CFG combination. With a
+dup-named `dump_denoiser_out` tensor + `CRISPASR_S3GEN_UNET_PROBE_DENOISER_OUT=1`
+and a static-counter cond/uncond-tagged DUMP_UNET, the step-0
+denoiser_out comparison between Path X (workaround) and Path Y
+(Bug B) is:
+
+| Pass | bug rms | wrk rms | cos(bug, wrk) |
+| - | - | - | - |
+| cond   | 3.9634 | 3.9634 | **1.00000** |
+| uncond | 0.9474 | 5.0228 | **0.21431** |
+
+The cond pass is BIT-IDENTICAL between the two paths. Bug B only
+manifests on the **second** `graph_compute` call within a CFM step.
+The cond and uncond runs are structurally identical (same gf, same
+sched topology, same alloc plan); only the host-side input data
+differs.
+
+This rules out anything intrinsic to sched-copying `unet_input` — the
+first sched-copy + compute works perfectly. The bug is in what
+happens *between* the cond compute and the uncond compute, or
+specifically in the uncond compute reading the newly-memcpy'd
+unet_input data.
+
+Working hypothesis: on Apple Silicon, the GPU's L1/L2 caches retain
+shared-mode buffer state across consecutive command-buffer
+submissions. The cond compute leaves cached data; the uncond
+CPU memcpy overwrites system memory, but no Metal API invalidates
+the GPU's caches before the next dispatch. The uncond kernel then
+reads stale data the memcpy never reached. None of the tested
+barriers (`FORCE_DMB`, `FORCE_BLIT_COPY`, `FORCE_BARRIER`,
+`METAL_N_CB`) address this — they all run AFTER the memcpy but
+before the new compute, where they SHOULD trigger cache
+invalidation, but apparently don't on M1 for shared-storage
+buffers modified by CPU.
+
+Observation: Bug B's uncond denoiser_out has rms=0.95 (very small,
+near-bias-only) while workaround's is rms=5.02. The first 8 values
+have CONSISTENT SIGNS and gradients but ~5× smaller magnitude. This
+is what you'd expect if the model received near-zero or attenuated
+input on the GPU side (consistent with the kernel reading something
+other than the noise channel).
+
+Critical next experiment: instead of trying to fix the cache via
+barriers, **force MTL0#unet_input#0 onto a private-storage buffer**.
+Private mode requires explicit blit transfers (which Metal manages
+cache state around) — if Bug B disappears, the bug is confirmed as
+"M1 GPU caches shared-storage buffer reads across cmd-buf
+boundaries, no Metal API invalidates them when the CPU writes
+between cmd-bufs". A more surgical workaround would then be to
+keep `unet_input` on a private buffer specifically in this path.
+
+Knobs added this session:
+
+- `CRISPASR_S3GEN_UNET_PROBE_DENOISER_OUT=1` — emits a dup-named
+  `dump_denoiser_out` tensor so the existing DUMP_UNET filter
+  catches it.
+- `CRISPASR_S3GEN_DUMP_UNET=<tag>` — dump files now include
+  `<tag>-cond` / `<tag>-uncond` prefixes via a static call counter
+  inside `run_denoiser`.
+- `CRISPASR_S3GEN_RC_AS_MUL_MAT=1` — bypasses `ggml_conv_1d` for
+  the residual conv (the 1×1×1 im2col edge case). Confirmed
+  irrelevant to Bug B.
+
+**Bug B remains open.** Workaround is still shipping.
