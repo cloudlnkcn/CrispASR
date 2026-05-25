@@ -656,9 +656,8 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // per-call input over that boundary, then word-timestamp trimming drops
     // most follow-up chunks. Keep fixed no-VAD chunking, but use bare chunks.
     const bool backend_allows_chunk_context = std::strcmp(backend.name(), "cohere") != 0;
-    const bool use_chunk_context =
-        crispasr_chunk_context::should_use_chunk_context(effective_chunk_seconds, slices.size(), kChunkContextS,
-                                                         wants_vad, backend_allows_chunk_context);
+    const bool use_chunk_context = crispasr_chunk_context::should_use_chunk_context(
+        effective_chunk_seconds, slices.size(), kChunkContextS, wants_vad, backend_allows_chunk_context);
 
     auto process_slice = [&](size_t i, CrispasrBackend& be) {
         const auto& sl = slices[i];
