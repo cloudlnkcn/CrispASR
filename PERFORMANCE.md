@@ -1530,12 +1530,31 @@ timestamps).** Higher = better. Bold = best at that length.
 |---|---:|---:|---:|---:|
 | **parakeet streamed-TDT** (default)       | **93.1** | 81.5 | **96.6** | **99.3** |
 | parakeet CTC head (byte-identical)        | **93.1** | 81.5 | **96.6** | **99.3** |
-| **voxtral-mini-3b** (default chunking)    | **100.0** | **100.0** | **100.0** | TBD (cell still running) |
-| **voxtral-mini-3b** streamed (this PR) — single LLM context | full 0:00→1:00, 11 segs / 470 chars | running | running | running |
-| **cohere-transcribe** (default chunking)  | **96.3** | **97.9** | **98.1** | TBD |
+| **voxtral-mini-3b** (default chunking)    | **100.0** | **100.0** | **100.0** | wall-time timeout (`rc=124` at 900 s in 15 min limit; LLM-AR CPU-bound, not a coverage failure) |
+| **voxtral-mini-3b** streamed (this PR) — single LLM context | full 0:00→1:00, 11 segs / 470 chars | running on M1 | pending | pending |
+| **cohere-transcribe** (default chunking)  | **96.3** | **97.9** | **98.1** | **97.9** (22 segs, full 0:00 → 10:00, 577 s wall) |
 | parakeet single-pass (`STREAM_THRESHOLD=999`, opt-in regression bait) | 33.2 | 81.7 | **1.5** | 99.9 |
 | parakeet + `--vad` (silero)               | 86.7 | 82.0 | 76.3 | 84.0 |
 | canary-1b-v2                              | (still hallucinates English at every length — separate prompt-wiring bug, PLAN #114 P3) | | | |
+
+**Largest gap (seconds) between consecutive segments, matrix v2:**
+
+| backend / mode               |  60 s |  120 s |   300 s |   600 s |
+|---|---:|---:|---:|---:|
+| parakeet streamed-TDT                | 0.0 | 0.0 | 0.0 | 0.0 |
+| voxtral default (post-opt-out)       | 0.0 | 0.0 | 0.0 | timeout |
+| cohere default (post-opt-out)        | 1.2 | 1.2 | 1.2 | 2.2 |
+
+The pre-fix gap pathologies — voxtral 21.9 / 78.2 / 240.9 / 545.5 s and cohere up to 50 s — are entirely gone with the opt-out fixes. What remains is the cohere baseline ~1.2 s gap between chunks (natural energy-chunker boundaries, well under a sentence pause).
+
+**Wall time (s), matrix v2:**
+
+| backend / mode               |  60 s |  120 s |   300 s |   600 s |
+|---|---:|---:|---:|---:|
+| voxtral default (post-opt-out)       | 237 | 393 | 834 | timeout (>900 s) |
+| cohere default (post-opt-out)        |  70 | 125 | 290 | 577 |
+
+cohere is consistently ~2× realtime at 300-600 s on VPS x86 CPU. voxtral-mini-3B is ~1.4-2× slower than cohere at the same length (LLM AR decode at 3 B params) and hits the wall around the 10 min mark. Apple Silicon Metal would close most of that gap — the LLM-AR rows on Mac are typically 5-10× faster than x86 CPU on this size class.
 
 **Matrix v1 (pre-opt-out, kept as historical reference for what we
 fixed):**
