@@ -651,13 +651,15 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // Issue #114 — gate lives in crispasr_chunk_context_gate.h so the
     // unit test in tests/test-issue-114-chunk-context-gate.cpp can pin
     // it without spinning up a model. See the header for the rationale.
-    // Cohere already has model-internal chunking near the 30 s boundary.
-    // Wrapping each CLI fallback chunk in extra acoustic context can push the
-    // per-call input over that boundary, then word-timestamp trimming drops
-    // most follow-up chunks. Keep fixed no-VAD chunking, but use bare chunks.
-    const bool backend_allows_chunk_context = std::strcmp(backend.name(), "cohere") != 0;
+    // A handful of backends do their own internal chunking near the 30 s
+    // boundary. Wrapping their fallback chunks in extra acoustic context
+    // pushes the per-call input over that boundary, with backend-specific
+    // bad outcomes (truncation, LLM retry loops). The opt-out list lives
+    // in crispasr_chunk_context_gate.h; tools/check-overlap-save-bug.sh
+    // is the A/B sweep that surfaces new offenders.
+    const bool backend_ok = crispasr_chunk_context::backend_allows_chunk_context(backend.name());
     const bool use_chunk_context = crispasr_chunk_context::should_use_chunk_context(
-        effective_chunk_seconds, slices.size(), kChunkContextS, wants_vad, backend_allows_chunk_context);
+        effective_chunk_seconds, slices.size(), kChunkContextS, wants_vad, backend_ok);
 
     auto process_slice = [&](size_t i, CrispasrBackend& be) {
         const auto& sl = slices[i];

@@ -22,8 +22,29 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 
 namespace crispasr_chunk_context {
+
+// Backends whose own transcribe() does additional internal chunking near a
+// ~30 s boundary. Wrapping their fallback chunks in extra acoustic context
+// pushes the per-call input over that boundary, with backend-specific bad
+// outcomes: cohere drops follow-up chunks via word-timestamp trimming;
+// gemma4-e2b and glm-asr blow past a 15 min wallclock on a 5 min clip
+// (LLM-decode retry loop on the over-long buffer). All three were caught
+// by the A/B sweep in tools/check-overlap-save-bug.sh.
+inline bool backend_allows_chunk_context(const char* backend_name) {
+    if (backend_name == nullptr) {
+        return true;
+    }
+    static const char* const kBlocked[] = {"cohere", "gemma4-e2b", "glm-asr"};
+    for (const char* b : kBlocked) {
+        if (std::strcmp(backend_name, b) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // Returns true iff the per-slice transcribe call should be wrapped in an
 // overlap-save context window (`be.transcribe(samples + sl.start - ctx,

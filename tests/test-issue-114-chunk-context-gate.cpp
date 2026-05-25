@@ -20,6 +20,7 @@
 
 #include "crispasr_chunk_context_gate.h"
 
+using crispasr_chunk_context::backend_allows_chunk_context;
 using crispasr_chunk_context::should_use_chunk_context;
 
 TEST_CASE("issue #114: VAD-derived multi-slice run does NOT extend with context", "[unit][chunk-context][issue-114]") {
@@ -48,6 +49,35 @@ TEST_CASE("explicit --chunk-seconds with multiple non-VAD slices uses overlap-sa
 
 TEST_CASE("backend can opt out of external overlap-save context", "[unit][chunk-context][cohere]") {
     REQUIRE_FALSE(should_use_chunk_context(30, 6, 3.0f, false, false));
+}
+
+TEST_CASE("backend_allows_chunk_context: known offenders opt out, others do not",
+          "[unit][chunk-context][backend-list]") {
+    // Surfaced by tools/check-overlap-save-bug.sh A/B sweep.
+    REQUIRE_FALSE(backend_allows_chunk_context("cohere"));
+    REQUIRE_FALSE(backend_allows_chunk_context("gemma4-e2b"));
+    REQUIRE_FALSE(backend_allows_chunk_context("glm-asr"));
+
+    // Spot-check a few known-safe ASR backends from --list-backends-json.
+    REQUIRE(backend_allows_chunk_context("whisper"));
+    REQUIRE(backend_allows_chunk_context("parakeet"));
+    REQUIRE(backend_allows_chunk_context("canary"));
+    REQUIRE(backend_allows_chunk_context("funasr"));
+    REQUIRE(backend_allows_chunk_context("sensevoice"));
+    REQUIRE(backend_allows_chunk_context("moonshine"));
+    REQUIRE(backend_allows_chunk_context("qwen3"));
+
+    // Unknown backend names default to allowed (the gate is opt-out, not allow-list).
+    REQUIRE(backend_allows_chunk_context("some-future-backend"));
+    REQUIRE(backend_allows_chunk_context(""));
+
+    // Nullptr is treated as allowed (defensive — caller should never pass null).
+    REQUIRE(backend_allows_chunk_context(nullptr));
+
+    // Match is exact, not prefix/substring.
+    REQUIRE(backend_allows_chunk_context("cohere-v2"));
+    REQUIRE(backend_allows_chunk_context("glm-asr-streaming"));
+    REQUIRE(backend_allows_chunk_context("xglm-asr"));
 }
 
 TEST_CASE("backend_allows_chunk_context default preserves pre-opt-out behaviour", "[unit][chunk-context][cohere]") {
