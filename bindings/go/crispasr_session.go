@@ -27,6 +27,29 @@ int              crispasr_session_set_target_language(CrispasrSession* s, const 
 int              crispasr_session_set_punctuation(CrispasrSession* s, int enable);
 int              crispasr_session_set_translate(CrispasrSession* s, int enable);
 int              crispasr_session_set_temperature(CrispasrSession* s, float temperature, unsigned long long seed);
+int              crispasr_session_set_tts_seed(CrispasrSession* s, unsigned long long seed);
+int              crispasr_session_set_max_new_tokens(CrispasrSession* s, int max_new_tokens);
+int              crispasr_session_set_frequency_penalty(CrispasrSession* s, float penalty);
+int              crispasr_session_set_tts_steps(CrispasrSession* s, int steps);
+int              crispasr_session_set_top_p(CrispasrSession* s, float top_p);
+int              crispasr_session_set_min_p(CrispasrSession* s, float min_p);
+int              crispasr_session_set_repetition_penalty(CrispasrSession* s, float r);
+int              crispasr_session_set_cfg_weight(CrispasrSession* s, float cfg_weight);
+int              crispasr_session_set_exaggeration(CrispasrSession* s, float exaggeration);
+int              crispasr_session_set_max_speech_tokens(CrispasrSession* s, int n);
+int              crispasr_session_set_length_scale(CrispasrSession* s, float scale);
+int              crispasr_session_set_best_of(CrispasrSession* s, int n);
+int              crispasr_session_set_beam_size(CrispasrSession* s, int n);
+int              crispasr_session_set_grammar_text(CrispasrSession* s, const char* gbnf_text,
+                                                   const char* root_rule, float penalty);
+int              crispasr_session_set_fallback_thresholds(CrispasrSession* s, float entropy_thold,
+                                                          float logprob_thold, float no_speech_thold,
+                                                          float temperature_inc);
+int              crispasr_session_set_alt_n(CrispasrSession* s, int n);
+int              crispasr_session_set_whisper_decode_extras(CrispasrSession* s, int suppress_nst,
+                                                            const char* suppress_regex,
+                                                            int carry_initial_prompt);
+int              crispasr_session_set_ask(CrispasrSession* s, const char* prompt);
 int              crispasr_session_detect_language(CrispasrSession* s, const float* pcm, int n_samples,
                                                   const char* lid_model_path, int method,
                                                   char* out_lang, int out_lang_cap, float* out_prob);
@@ -252,6 +275,219 @@ func (s *CrispasrSession) SetTemperature(temperature float32, seed uint64) error
 	// rc == -2 means no backend in this session honours it — soft no-op.
 	if rc != 0 && rc != -2 {
 		return errors.New("crispasr_session_set_temperature failed")
+	}
+	return nil
+}
+
+// SetTTSSeed sets the seed on TTS session backends that support runtime
+// reseeding (chatterbox, vibevoice, qwen3-tts, orpheus). Other backends
+// silently no-op.
+func (s *CrispasrSession) SetTTSSeed(seed uint64) error {
+	rc := C.crispasr_session_set_tts_seed(s.handle, C.ulonglong(seed))
+	// rc == -2 means no backend in this session honours it — soft no-op.
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_tts_seed failed")
+	}
+	return nil
+}
+
+// SetMaxNewTokens sets a generated-token cap for autoregressive session
+// backends. Pass <= 0 to clear the override and use the backend default.
+func (s *CrispasrSession) SetMaxNewTokens(maxNewTokens int) error {
+	rc := C.crispasr_session_set_max_new_tokens(s.handle, C.int(maxNewTokens))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_max_new_tokens failed")
+	}
+	return nil
+}
+
+// SetFrequencyPenalty sets an opt-in repeated generated-token penalty for
+// autoregressive session backends. Pass <= 0 to disable it.
+func (s *CrispasrSession) SetFrequencyPenalty(penalty float32) error {
+	rc := C.crispasr_session_set_frequency_penalty(s.handle, C.float(penalty))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_frequency_penalty failed")
+	}
+	return nil
+}
+
+// SetTTSSteps sets the diffusion / CFM step count for diffusion-based TTS
+// backends (chatterbox today). Other backends silently no-op.
+func (s *CrispasrSession) SetTTSSteps(steps int) error {
+	rc := C.crispasr_session_set_tts_steps(s.handle, C.int(steps))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_tts_steps failed")
+	}
+	return nil
+}
+
+// SetTopP sets the top-p nucleus-sampling threshold. Honoured by chatterbox.
+func (s *CrispasrSession) SetTopP(topP float32) error {
+	rc := C.crispasr_session_set_top_p(s.handle, C.float(topP))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_top_p failed")
+	}
+	return nil
+}
+
+// SetMinP sets the min-p sampling threshold. Honoured by chatterbox.
+func (s *CrispasrSession) SetMinP(minP float32) error {
+	rc := C.crispasr_session_set_min_p(s.handle, C.float(minP))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_min_p failed")
+	}
+	return nil
+}
+
+// SetRepetitionPenalty sets the repetition penalty (1.0 = no penalty).
+// Honoured by chatterbox.
+func (s *CrispasrSession) SetRepetitionPenalty(r float32) error {
+	rc := C.crispasr_session_set_repetition_penalty(s.handle, C.float(r))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_repetition_penalty failed")
+	}
+	return nil
+}
+
+// SetCFGWeight sets the classifier-free-guidance weight (chatterbox).
+// 0 disables CFG; 0.5 is the upstream default.
+func (s *CrispasrSession) SetCFGWeight(cfgWeight float32) error {
+	rc := C.crispasr_session_set_cfg_weight(s.handle, C.float(cfgWeight))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_cfg_weight failed")
+	}
+	return nil
+}
+
+// SetExaggeration sets the emotion-exaggeration scalar (chatterbox).
+// 0.5 is the upstream default.
+func (s *CrispasrSession) SetExaggeration(exaggeration float32) error {
+	rc := C.crispasr_session_set_exaggeration(s.handle, C.float(exaggeration))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_exaggeration failed")
+	}
+	return nil
+}
+
+// SetMaxSpeechTokens sets the upper bound on speech tokens generated per
+// synthesize call (chatterbox). Default ≈1000 tokens ≈ 20 s.
+func (s *CrispasrSession) SetMaxSpeechTokens(n int) error {
+	rc := C.crispasr_session_set_max_speech_tokens(s.handle, C.int(n))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_max_speech_tokens failed")
+	}
+	return nil
+}
+
+// SetLengthScale sets the per-phoneme length-scale / speaking-rate scalar for
+// TTS backends with a duration model. Honoured by kokoro today; other backends
+// silently no-op. 1.0 = upstream default; >1.0 = slower; <1.0 = faster.
+func (s *CrispasrSession) SetLengthScale(scale float32) error {
+	rc := C.crispasr_session_set_length_scale(s.handle, C.float(scale))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_length_scale failed")
+	}
+	return nil
+}
+
+// SetBestOf sets the best-of-N sampling count for ASR backends.
+func (s *CrispasrSession) SetBestOf(n int) error {
+	rc := C.crispasr_session_set_best_of(s.handle, C.int(n))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_best_of failed")
+	}
+	return nil
+}
+
+// SetBeamSize sets the beam-search width for ASR backends that support it.
+func (s *CrispasrSession) SetBeamSize(n int) error {
+	rc := C.crispasr_session_set_beam_size(s.handle, C.int(n))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_beam_size failed")
+	}
+	return nil
+}
+
+// SetGrammarText sets a GBNF grammar for constrained whisper decoding.
+// Pass an empty gbnfText to clear the grammar. penalty is the grammar
+// penalty scalar (default 100.0).
+func (s *CrispasrSession) SetGrammarText(gbnfText, rootRule string, penalty float32) error {
+	var cgbnf *C.char
+	if gbnfText != "" {
+		cgbnf = C.CString(gbnfText)
+		defer C.free(unsafe.Pointer(cgbnf))
+	}
+	var croot *C.char
+	if rootRule != "" {
+		croot = C.CString(rootRule)
+		defer C.free(unsafe.Pointer(croot))
+	}
+	rc := C.crispasr_session_set_grammar_text(s.handle, cgbnf, croot, C.float(penalty))
+	if rc == -2 {
+		return errors.New("set_grammar_text: invalid GBNF or root rule not found")
+	}
+	if rc != 0 {
+		return errors.New("crispasr_session_set_grammar_text failed")
+	}
+	return nil
+}
+
+// SetFallbackThresholds sets whisper decoder fallback thresholds.
+// temperatureInc=0 disables fallback entirely (equivalent to --no-fallback).
+func (s *CrispasrSession) SetFallbackThresholds(entropyThold, logprobThold, noSpeechThold, temperatureInc float32) error {
+	rc := C.crispasr_session_set_fallback_thresholds(s.handle,
+		C.float(entropyThold), C.float(logprobThold),
+		C.float(noSpeechThold), C.float(temperatureInc))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_fallback_thresholds failed")
+	}
+	return nil
+}
+
+// SetAltN sets per-token top-N alternative-candidate capture for whisper
+// greedy decode. 0 disables it.
+func (s *CrispasrSession) SetAltN(n int) error {
+	rc := C.crispasr_session_set_alt_n(s.handle, C.int(n))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_alt_n failed")
+	}
+	return nil
+}
+
+// SetWhisperDecodeExtras sets whisper-only text-suppression and prompt-carry
+// extras. suppressRegex may be empty to clear any prior regex.
+func (s *CrispasrSession) SetWhisperDecodeExtras(suppressNST bool, suppressRegex string, carryInitialPrompt bool) error {
+	var cregex *C.char
+	if suppressRegex != "" {
+		cregex = C.CString(suppressRegex)
+		defer C.free(unsafe.Pointer(cregex))
+	} else {
+		cregex = C.CString("")
+		defer C.free(unsafe.Pointer(cregex))
+	}
+	snst := 0
+	if suppressNST {
+		snst = 1
+	}
+	carry := 0
+	if carryInitialPrompt {
+		carry = 1
+	}
+	rc := C.crispasr_session_set_whisper_decode_extras(s.handle, C.int(snst), cregex, C.int(carry))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_whisper_decode_extras failed")
+	}
+	return nil
+}
+
+// SetAsk sets a free-form prompt / question passed to the backend on the next
+// transcribe or synthesize call (used by LLM-style backends).
+func (s *CrispasrSession) SetAsk(prompt string) error {
+	cprompt := C.CString(prompt)
+	defer C.free(unsafe.Pointer(cprompt))
+	rc := C.crispasr_session_set_ask(s.handle, cprompt)
+	if rc != 0 {
+		return errors.New("crispasr_session_set_ask failed")
 	}
 	return nil
 }

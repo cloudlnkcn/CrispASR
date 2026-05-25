@@ -100,8 +100,41 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# .nemo unpacking
+# .nemo loading — disk-extract path and in-memory path
 # ---------------------------------------------------------------------------
+
+
+def load_nemo_inmem(nemo_path: Path) -> dict:
+    """Load .nemo tarball entirely in RAM — avoids writing extracted ckpt to disk.
+
+    Returns dict with keys: 'weights' (state_dict), 'config' (yaml str),
+    'spm' (bytes), 'vocab' (bytes or None).
+    """
+    import io as _io
+    result = {}
+    with tarfile.open(nemo_path, "r") as tf:
+        for m in tf.getmembers():
+            n = m.name
+            fobj = tf.extractfile(m)
+            if fobj is None:
+                continue
+            data = fobj.read()
+            if n.endswith("model_weights.ckpt"):
+                buf = _io.BytesIO(data)
+                del data
+                sd = torch.load(buf, map_location="cpu", weights_only=True)
+                if isinstance(sd, dict) and "state_dict" in sd:
+                    sd = sd["state_dict"]
+                result["weights"] = sd
+            elif n.endswith("model_config.yaml"):
+                result["config_str"] = data.decode()
+            elif n.endswith("_tokenizer.model"):
+                result["spm_bytes"] = data
+            elif n.endswith("_vocab.txt"):
+                result["vocab_bytes"] = data
+    if "weights" not in result or "spm_bytes" not in result:
+        sys.exit(f"could not find weights / tokenizer in {nemo_path}")
+    return result
 
 
 def unpack_nemo(nemo_path: Path, out_dir: Path) -> dict:
@@ -252,29 +285,29 @@ def model_d_for_layer(sd, layer_id: int) -> int:
     return int(sd[key].shape[0])
 
 
-def convert(nemo_path: Path, out_path: Path) -> None:
-    print(f"Loading: {nemo_path}")
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        paths = unpack_nemo(nemo_path, td_path)
-        print(f"  config: {paths['config']}")
-        print(f"  spm:    {paths['spm']}")
+_QUANT_TYPE_MAP: dict[str, gguf.GGMLQuantizationType] = {
+    "q4_k": gguf.GGMLQuantizationType.Q4_K,
+    "q8_0": gguf.GGMLQuantizationType.Q8_0,
+}
 
-        sd = torch.load(str(paths["weights"]), map_location="cpu", weights_only=True)
-        if isinstance(sd, dict) and "state_dict" in sd:
-            sd = sd["state_dict"]
 
-        # Load config
-        cfg = None
-        if "config" in paths:
-            import yaml
-            with open(paths["config"]) as f:
-                cfg = yaml.safe_load(f)
+def convert(nemo_path: Path, out_path: Path, quant: str | None = None) -> None:
+    quant_type = _QUANT_TYPE_MAP.get(quant.lower()) if quant else None
+    if quant and quant_type is None:
+        sys.exit(f"Unknown --quant type '{quant}'. Choices: {list(_QUANT_TYPE_MAP)}")
 
-        # Load tokenizer
-        sp = spm.SentencePieceProcessor(model_file=str(paths["spm"]))
-        vocab = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
-        print(f"  vocab:  {len(vocab)} pieces")
+    print(f"Loading: {nemo_path}  (in-memory, no disk extraction)")
+    nemo_data = load_nemo_inmem(nemo_path)
+    sd = nemo_data["weights"]
+
+    import yaml
+    cfg = yaml.safe_load(nemo_data["config_str"])
+
+    import io as _io
+    sp = spm.SentencePieceProcessor()
+    sp.LoadFromSerializedProto(nemo_data["spm_bytes"])
+    vocab = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
+    print(f"  vocab:  {len(vocab)} pieces")
 
     # ----- write GGUF -----
     print(f"Writing: {out_path}")
@@ -307,9 +340,42 @@ def convert(nemo_path: Path, out_path: Path) -> None:
     xscaling = bool(enc_cfg.get("xscaling", True))
     pred_hidden = pred_cfg.get("pred_hidden", 640)
     pred_layers = pred_cfg.get("pred_rnn_layers", 2)
-    joint_hidden = joint_net.get("encoder_hidden", joint_net.get("pred_hidden", 640))
+    # joint_hidden: RNNT uses jointnet.joint_hidden; TDT has encoder_hidden at
+    # joint top-level (joint_cfg) or pred_hidden in jointnet. Cross-check below
+    # against joint.pred.weight is the ultimate guard.
+    joint_hidden = (joint_net.get("joint_hidden")
+                    or joint_cfg.get("encoder_hidden")
+                    or joint_net.get("encoder_hidden")
+                    or joint_net.get("pred_hidden")
+                    or 640)
     n_tdt_durations = len(dec_cfg.get("durations", [0, 1, 2, 3, 4]))
     tdt_durations = list(dec_cfg.get("durations", [0, 1, 2, 3, 4]))
+
+    # RNNT models have no duration head: joint.out.weight rows == vocab+1.
+    # TDT models have joint.out.weight rows == vocab+1+n_tdt_durations.
+    # Cross-check the actual tensor shape and override n_tdt_durations=0 for RNNT
+    # so the runtime detects it correctly (n_tdt_durations==0 → RNNT decode path).
+    # Note: RNNT checkpoints may use joint.joint_net.2.weight (NeMo RNNTDecoder)
+    # instead of joint.out.weight (NeMo TDTDecoder).
+    joint_out_w = sd.get("joint.out.weight") or sd.get("joint.joint_net.2.weight")
+    if joint_out_w is not None:
+        actual_joint_out = int(joint_out_w.shape[0])
+        vocab_plus_blank = len(vocab) + 1
+        if actual_joint_out == vocab_plus_blank:
+            if n_tdt_durations != 0:
+                print(
+                    f"  [info] joint.out.weight rows={actual_joint_out} == vocab+blank"
+                    f" → standard RNNT (no duration head); overriding n_tdt_durations 0",
+                    file=sys.stderr,
+                )
+            n_tdt_durations = 0
+            tdt_durations = []
+        elif actual_joint_out != vocab_plus_blank + n_tdt_durations:
+            print(
+                f"  [warn] joint.out.weight rows={actual_joint_out} doesn't match"
+                f" vocab+blank+dur={vocab_plus_blank + n_tdt_durations}",
+                file=sys.stderr,
+            )
 
     # Cross-check the reported pred_hidden against the actual LSTM weight
     # shape — the surest defence against another silent hparam mismatch.
@@ -392,6 +458,7 @@ def convert(nemo_path: Path, out_path: Path) -> None:
     n_written = 0
     n_f16 = 0
     n_f32 = 0
+    n_quant = 0
     n_unmapped = 0
     layers_seen = set()
     layers_with_dw_bias = set()
@@ -406,17 +473,29 @@ def convert(nemo_path: Path, out_path: Path) -> None:
         if t.dtype == np.float64:
             t = t.astype(np.float32)
 
+        raw_dtype = None
         if is_f32_tensor(gguf_name, t.shape):
             t = t.astype(np.float32)
             n_f32 += 1
+        elif quant_type is not None:
+            t = t.astype(np.float32)
+            try:
+                t = gguf.quantize(t, quant_type)
+                raw_dtype = quant_type
+                n_quant += 1
+            except Exception:
+                # Shape not quantizable (e.g. last dim not divisible by QK_K=256)
+                t = t.astype(np.float16)
+                n_f16 += 1
         else:
             t = t.astype(np.float16)
             n_f16 += 1
 
-        writer.add_tensor(gguf_name, t)
+        writer.add_tensor(gguf_name, t, raw_dtype=raw_dtype)
         n_written += 1
         if n_written <= 30 or n_written % 50 == 0:
-            print(f"  {gguf_name:60s}  {str(t.shape):28s}  {t.dtype}")
+            dtype_label = str(quant_type.name) if raw_dtype else str(t.dtype)
+            print(f"  {gguf_name:60s}  {str(t.shape):28s}  {dtype_label}")
 
         # Track encoder layers so we can add a zero conv.dw.bias for each.
         if gguf_name.startswith("encoder.layers.") and ".conv.dw.weight" in gguf_name:
@@ -439,8 +518,9 @@ def convert(nemo_path: Path, out_path: Path) -> None:
         n_written += 1
         n_f32 += 1
 
+    quant_label = f", {quant_type.name}: {n_quant}" if quant_type else ""
     print(
-        f"\n  total tensors: {n_written}  (F16: {n_f16}, F32: {n_f32})  "
+        f"\n  total tensors: {n_written}  (F16: {n_f16}, F32: {n_f32}{quant_label})  "
         f"(+{len(layers_seen) - len(layers_with_dw_bias)} synthetic conv.dw.bias)"
     )
     if n_unmapped:
@@ -462,12 +542,13 @@ def convert(nemo_path: Path, out_path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Convert Parakeet TDT .nemo → GGUF F16")
+    p = argparse.ArgumentParser(description="Convert Parakeet .nemo → GGUF (F16 or quantized)")
     p.add_argument("--nemo", required=True, type=Path, help="path to .nemo file")
     p.add_argument("--output", required=True, type=Path, help="output GGUF path")
+    p.add_argument("--quant", default=None, help="quantize linear weights (e.g. q4_k, q8_0); default: F16")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    convert(args.nemo, args.output)
+    convert(args.nemo, args.output, quant=args.quant)

@@ -62,6 +62,15 @@ constexpr Entry k_registry[] = {
      "~3.2 GB", nullptr, nullptr},
     {"qwen3", "qwen3-asr-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-q4_k.gguf", "~500 MB", nullptr, nullptr},
+    {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
+     "~1.3 GB", nullptr, nullptr},
+    // Mega-ASR: Qwen3-ASR-1.7B with the upstream robustness LoRA merged
+    // offline. It uses the standard qwen3 backend at runtime; the upstream
+    // router is not required for this always-on robust path.
+    {"mega-asr", "mega-asr-1.7b-q4_k.gguf",
+     "https://huggingface.co/cstr/mega-asr-GGUF/resolve/main/mega-asr-1.7b-q4_k.gguf",
+     "~1.3 GB", nullptr, nullptr},
     // FunAudioLLM/Fun-ASR-Nano-2512: 70 SANM encoder blocks + 2-block
     // Transformer adaptor + Qwen3-0.6B LLM decoder. zh/yue/en/ja/ko.
     // Only F16 ships today (Q4_K + Q8_0 pending). Upstream code is
@@ -131,6 +140,45 @@ constexpr Entry k_registry[] = {
     {"wav2vec2", "wav2vec2-xlsr-en-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
      "~212 MB", nullptr, nullptr},
+    // Generic wav2vec2 CTC forced-aligner aliases. These use the same
+    // GGUFs as the wav2vec2 ASR backend, but resolve cleanly from
+    // `-am wav2vec2-aligner[-en|-de]`.
+    {"wav2vec2-aligner", "wav2vec2-xlsr-en-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
+     "~212 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-en", "wav2vec2-xlsr-en-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
+     "~212 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-fr", "wav2vec2-large-xlsr-53-french-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-french-GGUF/resolve/main/wav2vec2-large-xlsr-53-french-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-es", "wav2vec2-large-xlsr-53-spanish-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-spanish-GGUF/resolve/main/wav2vec2-large-xlsr-53-spanish-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-it", "wav2vec2-large-xlsr-53-italian-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-italian-GGUF/resolve/main/wav2vec2-large-xlsr-53-italian-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-ja", "wav2vec2-large-xlsr-53-japanese-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-japanese-GGUF/resolve/main/wav2vec2-large-xlsr-53-japanese-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-zh", "wav2vec2-large-xlsr-53-chinese-zh-cn-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-chinese-zh-cn-GGUF/resolve/main/wav2vec2-large-xlsr-53-chinese-zh-cn-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-nl", "wav2vec2-large-xlsr-53-dutch-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-dutch-GGUF/resolve/main/wav2vec2-large-xlsr-53-dutch-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-uk", "wav2vec2-xls-r-300m-uk-with-small-lm-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-xls-r-300m-uk-with-small-lm-GGUF/resolve/main/wav2vec2-xls-r-300m-uk-with-small-lm-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-pt", "wav2vec2-large-xlsr-53-portuguese-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-portuguese-GGUF/resolve/main/wav2vec2-large-xlsr-53-portuguese-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-ar", "wav2vec2-large-xlsr-53-arabic-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-arabic-GGUF/resolve/main/wav2vec2-large-xlsr-53-arabic-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-cs", "wav2vec2-xls-r-300m-cs-250-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-xls-r-300m-cs-250-GGUF/resolve/main/wav2vec2-xls-r-300m-cs-250-q4_k.gguf",
+     "~300 MB", nullptr, nullptr},
     {"mimo-asr", "mimo-asr-q4_k.gguf",
      "https://huggingface.co/cstr/mimo-asr-GGUF/resolve/main/mimo-asr-q4_k.gguf", "~4.2 GB", nullptr, nullptr},
     {"omniasr", "omniasr-ctc-1b-v2-q4_k.gguf",
@@ -175,6 +223,9 @@ constexpr Entry k_registry[] = {
      "tokenizer.bin", "https://huggingface.co/cstr/moonshine-tiny-de-fidoriel-GGUF/resolve/main/tokenizer.bin",
      "CC-BY-NC-SA-4.0"},
     {"wav2vec2-de", "wav2vec2-large-xlsr-53-german-q4_k.gguf",
+     "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-german-GGUF/resolve/main/wav2vec2-large-xlsr-53-german-q4_k.gguf",
+     "~222 MB", nullptr, nullptr},
+    {"wav2vec2-aligner-de", "wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-german-GGUF/resolve/main/wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "~222 MB", nullptr, nullptr},
     {"moonshine-streaming", "moonshine-streaming-tiny-q4_k.gguf",
@@ -234,6 +285,17 @@ constexpr Entry k_registry[] = {
     {"parakeet-tdt_ctc-1.1b", "parakeet-tdt_ctc-1.1b-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt_ctc-1.1b-GGUF/resolve/main/parakeet-tdt_ctc-1.1b-q4_k.gguf",
      "~810 MB", nullptr, nullptr},
+    // parakeet-rnnt-0.6b — standard RNN-Transducer (no TDT duration head).
+    // Same 24-layer FastConformer encoder as TDT variants; 80-mel input;
+    // 1024-token vocab (BPE, lowercase). Runtime auto-detects RNNT via
+    // n_tdt_durations==0 and uses the RNNT greedy decoder.
+    {"parakeet-rnnt-0.6b", "parakeet-rnnt-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-rnnt-0.6b-GGUF/resolve/main/parakeet-rnnt-0.6b-q4_k.gguf",
+     "~447 MB", nullptr, nullptr},
+    // parakeet-rnnt-1.1b — larger standard RNN-Transducer, 42-layer encoder.
+    {"parakeet-rnnt-1.1b", "parakeet-rnnt-1.1b-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-rnnt-1.1b-GGUF/resolve/main/parakeet-rnnt-1.1b-q4_k.gguf",
+     "~770 MB", nullptr, nullptr},
     // Qwen3-TTS: the talker LM and the codec live in two separate HF
     // repos. Default download is Q8_0 talker (the LEARNINGS-recommended
     // deployment quant — Q4_K drifts noticeably in strict diffs) paired

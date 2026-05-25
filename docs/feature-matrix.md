@@ -3,7 +3,7 @@
 
 # Feature matrix
 
-All 46 backends compiled into the `crispasr` binary, with their declared capability bits. For an interactive sortable/filterable view, open [`feature-matrix.html`](feature-matrix.html).
+All 52 backends compiled into the `crispasr` binary, with their declared capability bits. For an interactive sortable/filterable view, open [`feature-matrix.html`](feature-matrix.html).
 
 | Backend | TTS | Voice cloning | Translate | Src/Tgt language | Language detect | Auto-download | Timestamps (native) | Timestamps (CTC) | Word timestamps | Token confidence | Temperature | Beam search | Punctuation toggle | Flash attention | Diarize | GBNF grammar | VAD (internal) | Parallel processors | Punctuation Native |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
@@ -18,15 +18,17 @@ All 46 backends compiled into the `crispasr` binary, with their declared capabil
 | `voxtral` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
 | `voxtral4b` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ |  | ✓ | ✓ | ✓ |  |  | ✓ |  |
 | `qwen3` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
+| `qwen3-1.7b` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
+| `mega-asr` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
 | `fastconformer-ctc` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |
 | `wav2vec2` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |
 | `hubert` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |
 | `data2vec` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |
 | `vibevoice` | ✓ |  |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |
-| `qwen3-tts` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
+| `qwen3-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
 | `vibevoice-1.5b` | ✓ | ✓ |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |
 | `qwen3-tts-customvoice` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `qwen3-tts-1.7b-base` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
+| `qwen3-tts-1.7b-base` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
 | `qwen3-tts-1.7b-customvoice` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
 | `qwen3-tts-1.7b-voicedesign` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
 | `orpheus` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
@@ -53,5 +55,9 @@ All 46 backends compiled into the `crispasr` binary, with their declared capabil
 | `omniasr-llm` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |
 | `omniasr-llm-1b` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |
 | `mimo-asr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ |  |  | ✓ | ✓ |  |  |  |  |
+| `funasr` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
+| `fun-asr-mlt-nano` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
+| `paraformer` |  |  |  |  |  | ✓ |  |  |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
+| `sensevoice` |  |  |  |  | ✓ | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
 
 Regenerate with `python tools/gen-feature-matrix.py`.

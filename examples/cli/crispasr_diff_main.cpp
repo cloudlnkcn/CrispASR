@@ -716,6 +716,11 @@ static void print_row(const char* name, const crispasr_diff::Report& r, float co
                extra);
         return;
     }
+    if (r.n_nonfinite > 0) {
+        printf("%s %-22s shape=%-16s non_finite=%zu/%zu  (cos/max_abs unreliable when data has NaN/Inf)%s%s\n", tag,
+               name, shape_str.c_str(), r.n_nonfinite, r.n_elem, *extra ? "  " : "", extra);
+        return;
+    }
     printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  max_abs=%.2e  rms=%.2e%s%s\n", tag, name,
            shape_str.c_str(), r.cos_min, r.cos_mean, r.max_abs, r.rms, *extra ? "  " : "", extra);
 }
@@ -734,6 +739,10 @@ static crispasr_diff::Report compare_with_row_width(const crispasr_diff::Ref& re
         return r;
     double sum_abs = 0.0, sum_sq = 0.0;
     for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(data[i])) {
+            r.n_nonfinite++;
+            continue;
+        }
         const float d = data[i] - pair.first[i];
         const float ad = std::fabs(d);
         if (ad > r.max_abs)
@@ -886,7 +895,7 @@ int main(int argc, char** argv) {
         constexpr float CHATTERBOX_MEAN_THRESHOLD = 0.95f;
         auto print_row_mean = [&](const char* name, const crispasr_diff::Report& r, float cos_threshold,
                                   const char* extra = "") {
-            const bool pass = r.found && r.cos_mean >= cos_threshold;
+            const bool pass = r.found && r.n_nonfinite == 0 && r.cos_mean >= cos_threshold;
             const char* tag = r.found ? (pass ? "[PASS]" : "[FAIL]") : "[SKIP]";
             std::string shape_str = "[";
             for (size_t i = 0; i < r.shape.size(); i++) {
@@ -898,6 +907,11 @@ int main(int argc, char** argv) {
             if (!r.found) {
                 printf("%s %-22s %s  (reference not in archive)%s%s\n", tag, name, shape_str.c_str(),
                        *extra ? "  " : "", extra);
+                return pass;
+            }
+            if (r.n_nonfinite > 0) {
+                printf("%s %-22s shape=%-16s non_finite=%zu/%zu  (cos/max_abs unreliable when data has NaN/Inf)%s%s\n",
+                       tag, name, shape_str.c_str(), r.n_nonfinite, r.n_elem, *extra ? "  " : "", extra);
                 return pass;
             }
             printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  max_abs=%.2e  rms=%.2e%s%s\n", tag, name,

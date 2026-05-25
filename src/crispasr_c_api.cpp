@@ -32,6 +32,7 @@
 #include "crispasr_aligner.h"        // CTC / forced-aligner word timings (shared with CLI)
 #include "crispasr_cache.h"          // HF download + filesystem cache (shared with CLI)
 #include "crispasr_model_registry.h" // Known-model lookup (shared with CLI)
+#include "core/beam_decode.h"        // Shared autoregressive beam-search decode helper
 #include "core/greedy_decode.h"      // Shared autoregressive greedy decode helper
 #include "grammar-parser.h"          // GBNF parser for grammar-constrained sampling
 // Non-Whisper backend headers. Each of these lives in `src/` and is built as
@@ -227,6 +228,10 @@ CA_EXPORT void crispasr_params_set_suppress_blank(whisper_full_params* p, int v)
 CA_EXPORT void crispasr_params_set_temperature(whisper_full_params* p, float t) {
     if (p)
         p->temperature = t;
+}
+CA_EXPORT void crispasr_params_set_max_tokens(whisper_full_params* p, int n) {
+    if (p)
+        p->max_tokens = n > 0 ? n : 0;
 }
 CA_EXPORT void crispasr_params_set_initial_prompt(whisper_full_params* p, const char* prompt) {
     if (p)
@@ -966,7 +971,7 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "canary";
     else if (strcmp(arch, "cohere-transcribe") == 0)
         backend = "cohere";
-    else if (strcmp(arch, "qwen3-asr") == 0)
+    else if (strcmp(arch, "qwen3-asr") == 0 || strcmp(arch, "qwen3asr") == 0)
         backend = "qwen3";
     else if (strcmp(arch, "voxtral") == 0)
         backend = "voxtral";
@@ -1073,6 +1078,8 @@ struct crispasr_session {
     // Best-of-N: run N independent decodes and keep the lowest-perplexity
     // one. Only effective when temperature > 0. Default 1 (no resampling).
     int best_of = 1;
+    int max_new_tokens = 0;
+    float frequency_penalty = 0.0f;
 
     // Beam search width. Default 1 (= greedy, no beam search). When > 1
     // the dispatch path switches whisper into beam-search sampling
@@ -2014,7 +2021,7 @@ template <typename Ctx> struct VoxtralFamilyOps {
 template <typename Ctx>
 static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamilyOps<Ctx>& ops, const float* pcm,
                                                    int n_samples, const std::string& language,
-                                                   const std::string& ask = std::string()) {
+                                                   const std::string& ask = std::string(), int beam_size = 1) {
     auto* r = new crispasr_session_result();
     r->segments.reserve(1);
 
@@ -2110,47 +2117,14 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
         return nullptr;
     }
 
-    // 8. Greedy generation loop. Pick argmax at each step, capture the
-    //    softmax probability of the picked token (stable softmax over the
-    //    last position's logits), embed the new token, feed it through
-    //    run_llm_kv with n_past=total_tokens+step, stop on EOS or
-    //    kMaxNewTokens.
-    std::string generated;
-    generated.reserve(512);
-    std::vector<ca_token_record> toks;
-    toks.reserve(64);
-    int n_past = total_tokens;
-    for (int step = 0; step < kMaxNewTokens; ++step) {
-        // argmax over the last position's logits.
-        const float* last = logits + (size_t)(out_n_tok - 1) * (size_t)out_vocab;
-        int best = 0;
-        float best_score = last[0];
-        for (int i = 1; i < out_vocab; ++i) {
-            if (last[i] > best_score) {
-                best_score = last[i];
-                best = i;
-            }
-        }
-        // Numerically stable softmax: 1 / sum(exp(last[i] - best_score)).
-        float sum_exp = 0.f;
-        for (int i = 0; i < out_vocab; ++i)
-            sum_exp += expf(last[i] - best_score);
-        const float picked_p = (sum_exp > 0.f) ? (1.0f / sum_exp) : 0.0f;
-        std::free(logits);
-        logits = nullptr;
-
-        if (best == ops.eos_id)
-            break;
-
+    // 8. Decode: beam search (PLAN §90) or greedy, then detokenize.
+    // U+2581 (Tekken word-leading marker) → ASCII space, shared by both paths.
+    auto decode_piece = [&](int id, float p, std::string& out_text, std::vector<ca_token_record>& out_toks) {
         int tok_len = 0;
-        const uint8_t* tok_bytes = ops.token_text(ctx, best, &tok_len);
+        const uint8_t* tok_bytes = ops.token_text(ctx, id, &tok_len);
         std::string piece;
-        if (tok_bytes && tok_len > 0) {
+        if (tok_bytes && tok_len > 0)
             piece.assign(reinterpret_cast<const char*>(tok_bytes), (size_t)tok_len);
-        }
-        // Mistral / Tekken tokenizers emit ▁ (U+2581) as the word-leading
-        // marker. Convert to a normal ASCII space so emit_words_from_tokens
-        // sees the same convention as the other backends.
         std::string decoded;
         decoded.reserve(piece.size());
         for (size_t ci = 0; ci < piece.size(); ci++) {
@@ -2162,28 +2136,82 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
                 decoded += piece[ci];
             }
         }
-        generated += decoded;
-
+        out_text += decoded;
         ca_token_record tk;
-        tk.text = decoded;
+        tk.text = std::move(decoded);
         tk.t0 = -1;
         tk.t1 = -1;
-        tk.p = picked_p;
-        toks.push_back(std::move(tk));
+        tk.p = p;
+        out_toks.push_back(std::move(tk));
+    };
 
-        // Embed the newly-chosen token and step the KV cache.
-        int32_t next_id = best;
-        float* next_emb = ops.embed_tokens(ctx, &next_id, 1);
-        if (!next_emb)
-            break;
-        logits = ops.run_llm_kv(ctx, next_emb, 1, n_past, &out_n_tok, &out_vocab);
-        std::free(next_emb);
-        if (!logits)
-            break;
-        n_past += 1;
-    }
-    if (logits)
+    std::string generated;
+    generated.reserve(512);
+    std::vector<ca_token_record> toks;
+    toks.reserve(64);
+
+    if (beam_size > 1) {
+        // PLAN §90: session beam_size → voxtral beam decode.
+        const float* prefill_last = logits + (size_t)(out_n_tok - 1) * (size_t)out_vocab;
+        auto replay = [&](Ctx* c, const int32_t* tok_ids, int n, int pl) -> float* {
+            float* emb = ops.embed_tokens(c, tok_ids, n);
+            if (!emb)
+                return nullptr;
+            float* lg = ops.run_llm_kv(c, emb, n, pl, nullptr, nullptr);
+            std::free(emb);
+            return lg;
+        };
+        core_beam_decode::Config bcfg;
+        bcfg.max_new_tokens = kMaxNewTokens;
+        bcfg.eos_id = ops.eos_id;
+        bcfg.vocab_size = out_vocab;
+        bcfg.beam_size = beam_size;
+        bcfg.prompt_len = total_tokens;
+        auto br = core_beam_decode::run_with_probs(ctx, prefill_last, replay, bcfg);
+        ops.kv_reset(ctx);
         std::free(logits);
+        for (size_t i = 0; i < br.tokens.size(); i++) {
+            if (br.tokens[i] == ops.eos_id)
+                break;
+            decode_piece(br.tokens[i], i < br.probs.size() ? br.probs[i] : -1.0f, generated, toks);
+        }
+    } else {
+        int n_past = total_tokens;
+        for (int step = 0; step < kMaxNewTokens; ++step) {
+            const float* last = logits + (size_t)(out_n_tok - 1) * (size_t)out_vocab;
+            int best = 0;
+            float best_score = last[0];
+            for (int i = 1; i < out_vocab; ++i) {
+                if (last[i] > best_score) {
+                    best_score = last[i];
+                    best = i;
+                }
+            }
+            float sum_exp = 0.f;
+            for (int i = 0; i < out_vocab; ++i)
+                sum_exp += expf(last[i] - best_score);
+            const float picked_p = (sum_exp > 0.f) ? (1.0f / sum_exp) : 0.0f;
+            std::free(logits);
+            logits = nullptr;
+
+            if (best == ops.eos_id)
+                break;
+
+            decode_piece(best, picked_p, generated, toks);
+
+            int32_t next_id = best;
+            float* next_emb = ops.embed_tokens(ctx, &next_id, 1);
+            if (!next_emb)
+                break;
+            logits = ops.run_llm_kv(ctx, next_emb, 1, n_past, &out_n_tok, &out_vocab);
+            std::free(next_emb);
+            if (!logits)
+                break;
+            n_past += 1;
+        }
+        if (logits)
+            std::free(logits);
+    }
 
     crispasr_session_seg seg;
     seg.text = std::move(generated);
@@ -2565,17 +2593,42 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         std::free(eos_arr);
 
         const int last_off = (n_t - 1) * vocab;
-        const int first_tok = core_greedy_decode::argmax(logits + last_off, vocab);
-        const float first_p =
-            core_greedy_decode::softmax_of(logits + last_off, vocab, first_tok, logits[last_off + first_tok]);
-        std::free(logits);
+        const int prompt_len_q3 = (int)ids.size();
 
-        core_greedy_decode::Config dec_cfg;
-        dec_cfg.max_new_tokens = 256;
-        dec_cfg.eos_id = eos_id;
-        dec_cfg.vocab_size = vocab;
-        auto dec = core_greedy_decode::run_with_probs(s->qwen3_ctx, first_tok, first_p, (int)ids.size(),
-                                                      qwen3_asr_embed_tokens, qwen3_asr_run_llm_kv, dec_cfg);
+        core_greedy_decode::Result dec;
+        if (s->beam_size > 1) {
+            // PLAN §90: session beam_size → qwen3-asr beam decode.
+            auto replay = [](qwen3_asr_context* ctx, const int32_t* toks, int n, int pl) -> float* {
+                float* emb = qwen3_asr_embed_tokens(ctx, toks, n);
+                if (!emb)
+                    return nullptr;
+                float* lg = qwen3_asr_run_llm_kv(ctx, emb, n, pl, nullptr, nullptr);
+                std::free(emb);
+                return lg;
+            };
+            core_beam_decode::Config bcfg;
+            bcfg.max_new_tokens = s->max_new_tokens > 0 ? s->max_new_tokens : 256;
+            bcfg.eos_id = eos_id;
+            bcfg.vocab_size = vocab;
+            bcfg.beam_size = s->beam_size;
+            bcfg.prompt_len = prompt_len_q3;
+            auto br = core_beam_decode::run_with_probs(s->qwen3_ctx, logits + last_off, replay, bcfg);
+            qwen3_asr_kv_reset(s->qwen3_ctx);
+            dec.tokens = std::move(br.tokens);
+            dec.probs = std::move(br.probs);
+        } else {
+            const int first_tok = core_greedy_decode::argmax(logits + last_off, vocab);
+            const float first_p =
+                core_greedy_decode::softmax_of(logits + last_off, vocab, first_tok, logits[last_off + first_tok]);
+            core_greedy_decode::Config dec_cfg;
+            dec_cfg.max_new_tokens = s->max_new_tokens > 0 ? s->max_new_tokens : 256;
+            dec_cfg.eos_id = eos_id;
+            dec_cfg.vocab_size = vocab;
+            dec_cfg.frequency_penalty = s->frequency_penalty;
+            dec = core_greedy_decode::run_with_probs(s->qwen3_ctx, first_tok, first_p, prompt_len_q3,
+                                                     qwen3_asr_embed_tokens, qwen3_asr_run_llm_kv, dec_cfg);
+        }
+        std::free(logits);
 
         // Detokenize, filtering out qwen3's metadata wrapper tokens
         // (<|im_start|>, <asr_text>, "language <name>", etc.) the same
@@ -2633,6 +2686,8 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     if (s->backend == "cohere" && s->cohere_ctx) {
         // Cohere takes a single `lang` (source); per-call wins, sticky next.
         const std::string src = lang_set ? lang : (!s->source_language.empty() ? s->source_language : "en");
+        cohere_set_max_new_tokens(s->cohere_ctx, s->max_new_tokens);
+        cohere_set_frequency_penalty(s->cohere_ctx, s->frequency_penalty);
         cohere_result* cr = cohere_transcribe_ex(s->cohere_ctx, pcm, n_samples, src.c_str(), 0);
         if (!cr) {
             delete r;
@@ -2767,16 +2822,39 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             delete r;
             return nullptr;
         }
-        const int first_tok = core_greedy_decode::argmax(logits, vocab);
-        const float first_p = core_greedy_decode::softmax_of(logits, vocab, first_tok, logits[first_tok]);
+        core_greedy_decode::Result dec;
+        if (s->beam_size > 1) {
+            // PLAN §90: session beam_size → granite beam decode.
+            auto replay = [](granite_speech_context* ctx, const int32_t* toks, int n, int pl) -> float* {
+                float* emb = granite_speech_embed_tokens(ctx, toks, n);
+                if (!emb)
+                    return nullptr;
+                float* lg = granite_speech_run_llm_kv(ctx, emb, n, pl, nullptr, nullptr);
+                std::free(emb);
+                return lg;
+            };
+            core_beam_decode::Config bcfg;
+            bcfg.max_new_tokens = s->max_new_tokens > 0 ? s->max_new_tokens : 200;
+            bcfg.eos_id = eos_tok;
+            bcfg.vocab_size = vocab;
+            bcfg.beam_size = s->beam_size;
+            bcfg.prompt_len = total_prompt;
+            auto br = core_beam_decode::run_with_probs(s->granite_ctx, logits, replay, bcfg);
+            granite_speech_kv_reset(s->granite_ctx);
+            dec.tokens = std::move(br.tokens);
+            dec.probs = std::move(br.probs);
+        } else {
+            const int first_tok = core_greedy_decode::argmax(logits, vocab);
+            const float first_p = core_greedy_decode::softmax_of(logits, vocab, first_tok, logits[first_tok]);
+            core_greedy_decode::Config dec_cfg;
+            dec_cfg.max_new_tokens = s->max_new_tokens > 0 ? s->max_new_tokens : 200;
+            dec_cfg.eos_id = eos_tok;
+            dec_cfg.vocab_size = vocab;
+            dec_cfg.frequency_penalty = s->frequency_penalty;
+            dec = core_greedy_decode::run_with_probs(s->granite_ctx, first_tok, first_p, total_prompt,
+                                                     granite_speech_embed_tokens, granite_speech_run_llm_kv, dec_cfg);
+        }
         std::free(logits);
-
-        core_greedy_decode::Config dec_cfg;
-        dec_cfg.max_new_tokens = 200;
-        dec_cfg.eos_id = eos_tok;
-        dec_cfg.vocab_size = vocab;
-        auto dec = core_greedy_decode::run_with_probs(s->granite_ctx, first_tok, first_p, total_prompt,
-                                                      granite_speech_embed_tokens, granite_speech_run_llm_kv, dec_cfg);
 
         // Detokenize batch via granite's own merge logic for the segment
         // text. Per-token text comes from gpt2_byte_decode of single ids
@@ -2832,7 +2910,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         ops.token_text = &voxtral_token_text;
         ops.audio_pad_id = 24; // Tekken <audio_pad>
         ops.eos_id = 2;        // Tekken </s>
-        return run_voxtral_family(s->voxtral_ctx, ops, pcm, n_samples, lang, s->ask);
+        return run_voxtral_family(s->voxtral_ctx, ops, pcm, n_samples, lang, s->ask, s->beam_size);
     }
 #endif
 #ifdef CA_HAVE_VOXTRAL4B
@@ -4644,6 +4722,40 @@ CA_EXPORT int crispasr_session_set_temperature(crispasr_session* s, float temper
     return touched > 0 ? 0 : -2;
 }
 
+// Set the seed for sampling-capable TTS backends. This currently
+// covers chatterbox, vibevoice, qwen3-tts, and orpheus. Other
+// backends silently no-op (rc=-2).
+CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_CHATTERBOX
+    if (s->chatterbox_ctx) {
+        chatterbox_set_seed((chatterbox_context*)s->chatterbox_ctx, (uint32_t)seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx) {
+        vibevoice_set_seed((vibevoice_context*)s->vibevoice_ctx, (uint32_t)seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_QWEN3_TTS
+    if (s->qwen3_tts_ctx) {
+        qwen3_tts_set_seed((qwen3_tts_context*)s->qwen3_tts_ctx, seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_ORPHEUS
+    if (s->orpheus_ctx) {
+        orpheus_set_seed((orpheus_context*)s->orpheus_ctx, seed);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
 // ─────────────────────────────────────────────────────────────────
 // CrispASR 0.6.1 parity additions — TTS sampling knobs reachable at
 // runtime so the CrisperWeaver Synthesize screen can drive them
@@ -4792,6 +4904,28 @@ CA_EXPORT int crispasr_session_set_best_of(crispasr_session* s, int n) {
     if (!s)
         return -1;
     s->best_of = n > 0 ? n : 1;
+    return 0;
+}
+
+CA_EXPORT int crispasr_session_set_max_new_tokens(crispasr_session* s, int n) {
+    if (!s)
+        return -1;
+    s->max_new_tokens = n > 0 ? n : 0;
+#ifdef CA_HAVE_COHERE
+    if (s->cohere_ctx)
+        cohere_set_max_new_tokens(s->cohere_ctx, s->max_new_tokens);
+#endif
+    return 0;
+}
+
+CA_EXPORT int crispasr_session_set_frequency_penalty(crispasr_session* s, float penalty) {
+    if (!s)
+        return -1;
+    s->frequency_penalty = penalty > 0.0f ? penalty : 0.0f;
+#ifdef CA_HAVE_COHERE
+    if (s->cohere_ctx)
+        cohere_set_frequency_penalty(s->cohere_ctx, s->frequency_penalty);
+#endif
     return 0;
 }
 

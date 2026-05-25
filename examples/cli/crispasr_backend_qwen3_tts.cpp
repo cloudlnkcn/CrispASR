@@ -66,12 +66,17 @@ static std::string discover_codec(const std::string& model_path) {
 
 class Qwen3TtsBackend : public CrispasrBackend {
 public:
-    Qwen3TtsBackend() = default;
+    explicit Qwen3TtsBackend(bool is_base) : is_base_(is_base) {}
     ~Qwen3TtsBackend() override { Qwen3TtsBackend::shutdown(); }
 
     const char* name() const override { return "qwen3-tts"; }
 
-    uint32_t capabilities() const override { return CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN; }
+    uint32_t capabilities() const override {
+        uint32_t caps = CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN;
+        if (is_base_)
+            caps |= CAP_VOICE_CLONING;
+        return caps;
+    }
 
     std::vector<crispasr_segment> transcribe(const float* /*samples*/, int /*n_samples*/, int64_t /*t_offset_cs*/,
                                              const whisper_params& /*params*/) override {
@@ -126,6 +131,8 @@ public:
     std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
         if (!ctx_ || text.empty())
             return {};
+        qwen3_tts_set_temperature(ctx_, params.temperature);
+        qwen3_tts_set_seed(ctx_, params.seed);
 
         // Voice prompt: re-load only when the requested identity changes.
         // Four mutually-exclusive paths (gated by the loaded model variant):
@@ -289,6 +296,7 @@ public:
     }
 
 private:
+    bool is_base_ = false;
     qwen3_tts_context* ctx_ = nullptr;
     std::string last_voice_key_;
 };
@@ -296,5 +304,9 @@ private:
 } // namespace
 
 std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_tts_backend() {
-    return std::unique_ptr<CrispasrBackend>(new Qwen3TtsBackend());
+    return std::unique_ptr<CrispasrBackend>(new Qwen3TtsBackend(false));
+}
+
+std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_tts_base_backend() {
+    return std::unique_ptr<CrispasrBackend>(new Qwen3TtsBackend(true));
 }

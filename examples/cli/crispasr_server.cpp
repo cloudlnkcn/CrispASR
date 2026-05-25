@@ -208,6 +208,36 @@ static float form_float(const httplib::Request& req, const std::string& key, flo
     }
 }
 
+static int form_int(const httplib::Request& req, const std::string& key, int def) {
+    if (!req.has_file(key) && !req.has_param(key))
+        return def;
+    const std::string v = req.has_file(key) ? req.get_file_value(key).content : req.get_param_value(key);
+    try {
+        size_t pos = 0;
+        int n = std::stoi(v, &pos);
+        if (pos != v.size())
+            return def;
+        return n;
+    } catch (...) {
+        return def;
+    }
+}
+
+static uint64_t form_u64(const httplib::Request& req, const std::string& key, uint64_t def) {
+    if (!req.has_file(key) && !req.has_param(key))
+        return def;
+    const std::string v = req.has_file(key) ? req.get_file_value(key).content : req.get_param_value(key);
+    try {
+        size_t pos = 0;
+        uint64_t n = std::stoull(v, &pos);
+        if (pos != v.size())
+            return def;
+        return n;
+    } catch (...) {
+        return def;
+    }
+}
+
 // JSON error response helper. Shape matches OpenAI's:
 //   { "error": { "message": ..., "type": ..., "code": ..., "param": ... } }
 // `code` is a stable machine-readable enum-string the client can switch on
@@ -426,10 +456,32 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
         params.model = resolved;
 
+        if (params.aligner_model == "auto" || params.aligner_model == "default") {
+            const std::string resolved_aligner = crispasr_resolve_model_cli(
+                params.aligner_model, "canary-ctc-aligner", params.no_prints, params.cache_dir, params.auto_download);
+            if (resolved_aligner.empty()) {
+                fprintf(stderr, "crispasr-server: failed to resolve aligner '%s'\n", params.aligner_model.c_str());
+                return 1;
+            }
+            params.aligner_model = resolved_aligner;
+        } else if (!params.aligner_model.empty()) {
+            params.aligner_model = crispasr_resolve_model_cli(params.aligner_model, "", params.no_prints,
+                                                              params.cache_dir, params.auto_download);
+        }
+
         backend = crispasr_create_backend(backend_name);
         if (!backend || !backend->init(params)) {
             fprintf(stderr, "crispasr-server: failed to init backend '%s'\n", backend_name.c_str());
             return 1;
+        }
+        // #80e: warmup in server mode — always enabled (amortized over
+        // many requests).  Skipped if --no-prints is set and warmup takes
+        // < 10 ms (no point logging a trivial warmup).
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            backend->warmup();
+            auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr, "crispasr-server: warmup completed in %.0f ms\n", dt * 1000.0);
         }
         ready.store(true);
         fprintf(stderr, "crispasr-server: backend '%s' loaded, model '%s'\n", backend_name.c_str(),
@@ -514,6 +566,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //   prompt           (optional) — initial prompt / context
     //   response_format  (optional) — json|verbose_json|text|srt|vtt
     //   temperature      (optional) — sampling temperature
+    //   seed             (optional) — RNG seed for sampling
+    //   max_tokens       (optional) — generated-token cap for AR backends
+    //   max_new_tokens   (optional) — alias for max_tokens
+    //   frequency_penalty (optional) — opt-in repeated-token penalty for AR backends
     //   timestamp_granularities[] (optional) — word|segment (verbose_json)
     // -----------------------------------------------------------------------
     svr.Post("/v1/audio/transcriptions", [&](const Request& req, Response& res) {
@@ -537,6 +593,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         std::string language = form_string(req, "language", params.language);
         std::string prompt = form_string(req, "prompt", "");
         float temperature = form_float(req, "temperature", params.temperature);
+        uint64_t seed = form_u64(req, "seed", params.seed);
+        int max_new_tokens = form_int(req, "max_new_tokens", params.max_new_tokens);
+        max_new_tokens = form_int(req, "max_tokens", max_new_tokens);
+        float frequency_penalty = form_float(req, "frequency_penalty", params.frequency_penalty);
 
         // Validate response_format early.
         if (response_format != "json" && response_format != "verbose_json" && response_format != "text" &&
@@ -551,6 +611,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         whisper_params rp = params;
         rp.language = language;
         rp.temperature = temperature;
+        rp.seed = seed;
+        rp.max_new_tokens = max_new_tokens;
+        rp.frequency_penalty = frequency_penalty;
         if (!prompt.empty())
             rp.prompt = prompt;
 
@@ -813,6 +876,12 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             rp.tts_instruct = instructions;
         if (body.contains("seed") && body["seed"].is_number_integer())
             rp.seed = body["seed"].get<uint64_t>();
+        if (body.contains("temperature") && body["temperature"].is_number())
+            rp.temperature = body["temperature"].get<float>();
+        if (body.contains("max_new_tokens") && body["max_new_tokens"].is_number_integer())
+            rp.max_new_tokens = body["max_new_tokens"].get<int>();
+        if (body.contains("frequency_penalty") && body["frequency_penalty"].is_number())
+            rp.frequency_penalty = body["frequency_penalty"].get<float>();
 
         // Long-form chunking (PLAN §75d / issue #66): split input on
         // sentence boundaries before dispatching to the backend so each
@@ -826,6 +895,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         auto t0 = std::chrono::steady_clock::now();
         const std::vector<std::string> sentences = crispasr_tts_plan_chunks_for_backend(text, backend->name());
 
+        // Backend-declared output rate. Most TTS backends emit 24 kHz;
+        // voxcpm2-tts emits 48 kHz. Hard-coding 24 kHz here is why
+        // voxcpm2 output played at half speed before this fix (#122).
+        const int sr_out = backend->tts_sample_rate();
+
         std::vector<std::vector<float>> chunks;
         chunks.reserve(sentences.size());
         {
@@ -836,10 +910,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                     chunks.push_back(std::move(chunk));
             }
         }
-        // 200 ms silence at 24 kHz between chunks. Inaudible click
-        // suppression at boundaries; long enough that the listener
-        // perceives a natural sentence pause without dragging.
-        std::vector<float> pcm = crispasr_tts_concat_with_silence(chunks, 4800);
+        // 200 ms silence between chunks (scaled to the backend rate).
+        // Inaudible click suppression at boundaries; long enough that
+        // the listener perceives a natural sentence pause without dragging.
+        std::vector<float> pcm = crispasr_tts_concat_with_silence(chunks, sr_out / 5);
         auto t1 = std::chrono::steady_clock::now();
 
         if (pcm.empty()) {
@@ -867,25 +941,27 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
 
         const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-        const double audio_s = (double)pcm.size() / 24000.0;
+        const double audio_s = (double)pcm.size() / (double)sr_out;
         fprintf(stderr,
                 "crispasr-server: synthesized %.1fs audio in %.2fs (RTF=%.2f) "
-                "voice='%s' speed=%.2f format=%s model='%s' chunks=%zu\n",
+                "voice='%s' speed=%.2f format=%s model='%s' chunks=%zu sr=%dHz\n",
                 audio_s, elapsed_s, elapsed_s > 0 ? elapsed_s / audio_s : 0.0,
                 voice_name.empty() ? "<startup>" : voice_name.c_str(), speed, response_format.c_str(),
-                requested_model.empty() ? "<unset>" : requested_model.c_str(), chunks.size());
+                requested_model.empty() ? "<unset>" : requested_model.c_str(), chunks.size(), sr_out);
 
         if (response_format == "f32") {
             std::string buf((const char*)pcm.data(), pcm.size() * sizeof(float));
             res.set_content(std::move(buf), "application/octet-stream");
         } else if (response_format == "pcm") {
-            // OpenAI's pcm: 24 kHz signed 16-bit LE mono raw bytes, no
-            // header. Content-Type is documented as audio/pcm; clients
-            // know the rate out-of-band from the spec.
+            // OpenAI's pcm: signed 16-bit LE mono raw bytes, no header.
+            // Spec is 24 kHz; we emit at the backend's native rate
+            // (voxcpm2 = 48 kHz) — clients must know the rate
+            // out-of-band. Use response_format=wav if the client needs
+            // a self-describing container.
             std::string raw = crispasr_make_pcm_int16_le(pcm.data(), (int)pcm.size());
             res.set_content(std::move(raw), "audio/pcm");
         } else {
-            std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), 24000);
+            std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
             res.set_content(std::move(wav), "audio/wav");
         }
     });

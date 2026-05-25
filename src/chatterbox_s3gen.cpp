@@ -247,11 +247,37 @@ struct chatterbox_s3gen_context {
     int n_threads = 4;
     int verbosity = 1;
     bool istft_full_idft = false; // CRISPASR_HIFT_FULL_IDFT=1 → torch.istft-compatible path
+    // When true, UNet mul_mat compute nodes are automatically routed to CPU to
+    // prevent compound FP16 rounding through the 10-step CFM Euler solver.
+    // Bisected cross-backend: Metal (round 7) + CUDA P100 (round 8, 2026-05-23).
+    // GPU mul_mat kernels accumulate in F16 even for F32-type inputs (Metal
+    // simdgroup tiles, CUDA wmma fragments); CPU mul_mat uses genuine F32 dequant
+    // + F32 accumulation and fully restores s3gen_mel cos_min from 0.858→1.000.
+    //
+    // NOT auto-enabled: the ggml GPU-backed scheduler + CPU-pinned compute
+    // produces NaN in full-pipeline runs at large T_mel (≥392) due to Metal/CUDA
+    // synchronization issues with GPU→CPU tensor copies. The fix is mathematically
+    // correct (diff harness cos_min=1.000 at T=102) but not yet safe for production.
+    // Use CRISPASR_S3GEN_UNET_PIN_CPU_OP=mul_mat to opt in for testing.
+    bool unet_pin_mm_cpu = false;
+
+    // True when the UNet weights are GPU-resident (opt-in via
+    // CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1). In that mode the cfm_euler_solve
+    // run_denoiser path also pins `unet_input` to the GPU backend (see the
+    // PLAN #83 r9 follow-up #4 comment there). The ggml-side mutation log
+    // patch in ggml-backend.cpp handles the related src[j] dangling-pointer
+    // issue for any other inputs that cross backends.
+    bool unet_on_gpu = false;
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
+    // PLAN #83 r9: when backend != backend_cpu, UNet weights (s3.fd.*) are
+    // loaded into a separate CPU buffer so the ggml scheduler auto-routes
+    // the 396 mul_mat calls in the CFM denoiser to CPU. Avoids the GPU FP16
+    // accumulator drift that compounds 1000× through 10 Euler steps.
+    ggml_backend_buffer_t buf_cpu_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
 
     ggml_backend_sched_t sched = nullptr;
@@ -279,6 +305,8 @@ struct chatterbox_s3gen_context {
             ggml_free(ctx_w);
         if (buf_w)
             ggml_backend_buffer_free(buf_w);
+        if (buf_cpu_w)
+            ggml_backend_buffer_free(buf_cpu_w);
         if (backend && backend != backend_cpu)
             ggml_backend_free(backend);
         if (backend_cpu)
@@ -363,13 +391,29 @@ static bool s3gen_match_keep_op(const ggml_tensor* node, const char* keep) {
 static void s3gen_maybe_pin_graph_to_cpu(chatterbox_s3gen_context* c, ggml_cgraph* gf, s3gen_subgraph which) {
     if (c->backend == c->backend_cpu)
         return; // already on CPU — no-op
-    const char* keep_env = (which == s3gen_subgraph::unet) ? std::getenv("CRISPASR_S3GEN_UNET_KEEP_GPU_OP") : nullptr;
-    const char* pin_only_env =
-        (which == s3gen_subgraph::unet) ? std::getenv("CRISPASR_S3GEN_UNET_PIN_CPU_OP") : nullptr;
+
+    const bool is_unet = (which == s3gen_subgraph::unet);
+    const char* keep_env = is_unet ? std::getenv("CRISPASR_S3GEN_UNET_KEEP_GPU_OP") : nullptr;
+    const char* pin_only_env = is_unet ? std::getenv("CRISPASR_S3GEN_UNET_PIN_CPU_OP") : nullptr;
     const bool keep_mode = keep_env && *keep_env;
     const bool pin_only_mode = pin_only_env && *pin_only_env;
-    if (!s3gen_env_force_cpu(which) && !keep_mode && !pin_only_mode)
+
+    // Auto-pin mul_mat to CPU for the UNet when on GPU unless the user has
+    // explicitly opted into a KEEP_GPU or PIN_CPU env override, or force-CPU is set.
+    // GPU mul_mat kernels (Metal simdgroup tiles, CUDA wmma fragments) accumulate
+    // in F16 and introduce ~1e-4 per-element drift that compounds 1000x through
+    // the 10-step CFM Euler solver → cos_min 0.858 on both M1 and CUDA P100.
+    // CPU mul_mat uses genuine F32 dequant + F32 accumulation and restores
+    // cos_min = 1.000 (bisected rounds 7 + 8, 2026-05-23).
+    // Override: set CRISPASR_S3GEN_UNET_PIN_CPU_OP, CRISPASR_S3GEN_UNET_KEEP_GPU_OP,
+    // or CRISPASR_S3GEN_UNET_CPU=1 to take manual control.
+    // force_cpu takes full priority — auto_pin_mm does not apply when UNET_CPU=1.
+    const bool force_cpu = s3gen_env_force_cpu(which);
+    const bool auto_pin_mm = is_unet && c->unet_pin_mm_cpu && !keep_mode && !pin_only_mode && !force_cpu;
+
+    if (!force_cpu && !keep_mode && !pin_only_mode && !auto_pin_mm)
         return;
+
     if (c->verbosity >= 1) {
         const char* tag = which == s3gen_subgraph::encoder ? "ENCODER"
                           : which == s3gen_subgraph::unet  ? "UNET"
@@ -377,7 +421,12 @@ static void s3gen_maybe_pin_graph_to_cpu(chatterbox_s3gen_context* c, ggml_cgrap
         static int log_seen[3] = {0, 0, 0};
         int idx = which == s3gen_subgraph::encoder ? 0 : which == s3gen_subgraph::unet ? 1 : 2;
         if (!log_seen[idx]) {
-            if (keep_mode) {
+            if (auto_pin_mm) {
+                fprintf(stderr,
+                        "s3gen: [%s] auto-pinning mul_mat to CPU (GPU FP16 compound drift fix; "
+                        "override with CRISPASR_S3GEN_UNET_PIN_CPU_OP or CRISPASR_S3GEN_UNET_KEEP_GPU_OP)\n",
+                        tag);
+            } else if (keep_mode) {
                 fprintf(stderr, "s3gen: [%s] keeping op type \"%s\" on GPU; pinning all other compute nodes to CPU\n",
                         tag, keep_env);
             } else {
@@ -386,6 +435,7 @@ static void s3gen_maybe_pin_graph_to_cpu(chatterbox_s3gen_context* c, ggml_cgrap
             log_seen[idx] = 1;
         }
     }
+
     const int n_nodes = ggml_graph_n_nodes(gf);
     int n_pinned = 0;
     int n_kept_gpu = 0;
@@ -395,6 +445,15 @@ static void s3gen_maybe_pin_graph_to_cpu(chatterbox_s3gen_context* c, ggml_cgrap
             continue;
         if (node->op == GGML_OP_NONE)
             continue;
+        if (auto_pin_mm) {
+            if (node->op == GGML_OP_MUL_MAT) {
+                ggml_backend_sched_set_tensor_backend(c->sched, node, c->backend_cpu);
+                n_pinned++;
+            } else {
+                n_kept_gpu++;
+            }
+            continue;
+        }
         if (pin_only_mode) {
             // Inverse bisect: pin only the named op type to CPU; leave
             // everything else on GPU (default backend). Identifies the
@@ -421,7 +480,10 @@ static void s3gen_maybe_pin_graph_to_cpu(chatterbox_s3gen_context* c, ggml_cgrap
         static int logged_count[3] = {0, 0, 0};
         int idx = which == s3gen_subgraph::encoder ? 0 : which == s3gen_subgraph::unet ? 1 : 2;
         if (logged_count[idx] < 1) {
-            if (keep_mode) {
+            if (auto_pin_mm) {
+                fprintf(stderr, "s3gen: [%s] pinned %d mul_mat nodes to CPU, %d other nodes on GPU\n", tag, n_pinned,
+                        n_kept_gpu);
+            } else if (keep_mode) {
                 fprintf(stderr, "s3gen: [%s] pinned %d nodes to CPU, kept %d nodes on GPU (filter \"%s\")\n", tag,
                         n_pinned, n_kept_gpu, keep_env);
             } else {
@@ -477,6 +539,8 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         }
         c->backend = c->backend_cpu;
     }
+    // unet_pin_mm_cpu intentionally left false: partial GPU→CPU pinning causes
+    // NaN via ggml scheduler sync issues at large T_mel. See unet_pin_mm_cpu comment.
 
     // Load weights — issue #94: print before the load too, since the
     // 366 MB chatterbox-turbo s3gen-q8_0 file can take 10-30 s on slow
@@ -486,12 +550,43 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         std::fflush(stderr);
     }
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path, c->backend, "s3gen", wl)) {
+    bool loaded = false;
+    // PLAN #83 r9 (2026-05-23): two layered fixes for GPU FP16 compound drift
+    // through the 10-step CFM Euler solver (cos_min 0.858 on CUDA P100,
+    // 0.923 on M1 Metal vs 1.000 on CPU — see LEARNINGS Rounds 7 + 8).
+    //
+    //   1. Default: load ConditionalDecoder weights (s3.fd.*) on the CPU
+    //      backend buffer. The ggml scheduler routes ops to the backend
+    //      where weights live, so the UNet runs entirely on CPU
+    //      (genuine F32 dequant + F32 accumulation). Encoder (s3.fe.*),
+    //      flow front-end (s3.flow.*), tokenizer (s3.tok.*), speaker
+    //      encoder (s3.se.*), and HiFT vocoder (s3.v.*) keep GPU residency.
+    //
+    //   2. CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 opts out of #1: all weights
+    //      go on GPU, and the UNet relies instead on the per-op
+    //      GGML_PREC_F32 hints set by mul_mat_hp() (above). Validates
+    //      the kernel-level high-precision path (Metal: _hp kernels;
+    //      CUDA cuBLAS: CUBLAS_COMPUTE_32F).
+    const char* gpu_res_env = std::getenv("CRISPASR_S3GEN_UNET_GPU_RESIDENCY");
+    const bool unet_on_gpu = gpu_res_env && (gpu_res_env[0] == '1' || gpu_res_env[0] == 'y' || gpu_res_env[0] == 'Y');
+    c->unet_on_gpu = unet_on_gpu && (c->backend != c->backend_cpu);
+    if (c->backend != c->backend_cpu && !unet_on_gpu) {
+        auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "s3.fd.", 6) != 0; };
+        loaded = core_gguf::load_weights_split(path, c->backend, c->backend_cpu, is_gpu, nullptr, "s3gen", wl);
+    } else {
+        if (c->backend != c->backend_cpu && verbosity >= 1) {
+            fprintf(stderr, "s3gen: CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 — UNet weights on GPU; "
+                            "relying on GGML_PREC_F32 mul_mat hints\n");
+        }
+        loaded = core_gguf::load_weights(path, c->backend, "s3gen", wl);
+    }
+    if (!loaded) {
         delete c;
         return nullptr;
     }
     c->ctx_w = wl.ctx;
     c->buf_w = wl.buf;
+    c->buf_cpu_w = wl.buf_cpu;
     c->tensors = std::move(wl.tensors);
 
     if (verbosity >= 1) {
@@ -515,7 +610,19 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         backends[n_be++] = c->backend;
         if (c->backend != c->backend_cpu)
             backends[n_be++] = c->backend_cpu;
-        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, false, false);
+        // PLAN #83 r9 follow-up #5: parallel=true is required to fix Bug B (CFG
+        // uncond pass divergence on M1 Metal when UNet is GPU-resident). With
+        // parallel=true sched uses n_copies=4 input-copy slots and event-based
+        // synchronisation (ggml_backend_event_record / event_wait) between
+        // backends. On Metal that goes through encodeSignalEvent /
+        // encodeWaitForEvent commands which carry GPU-cache invalidation
+        // semantics; with parallel=false sched falls back to a plain
+        // [cmd_buf_last waitUntilCompleted] which does NOT invalidate the
+        // GPU's view of a shared-storage Metal buffer that was overwritten
+        // by a CPU memcpy between consecutive command-buffer submissions.
+        // Verified no regression on CPU-residency (default production) smoke
+        // (rms=5.139 in both configurations).
+        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, true, false);
         c->compute_meta.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
     }
 
@@ -713,6 +820,13 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     }
 
     return c;
+}
+
+extern "C" void chatterbox_s3gen_set_seed(struct chatterbox_s3gen_context* ctx, uint32_t seed) {
+    if (!ctx)
+        return;
+    ctx->noise_seed = seed;
+    mt19937_seed(ctx->noise_rng, seed);
 }
 
 // ── Conformer encoder via ggml graph ────────────────────────────
@@ -1431,21 +1545,87 @@ static ggml_tensor* ggml_mish(ggml_context* ctx, ggml_tensor* x) {
 
 static ggml_tensor* causal_block1d(ggml_context* ctx, ggml_tensor* x, // (C, T)
                                    ggml_tensor* conv_w, ggml_tensor* conv_b, ggml_tensor* ln_w, ggml_tensor* ln_b) {
-    x = causal_conv1d(ctx, x, conv_w, conv_b);
-    // LayerNorm over channel dim: transpose (C, T) → (T, C), norm, transpose back
-    // After conv1d: x is (T, C) in ggml layout
-    // LayerNorm over C dimension (ne[0]=T, ne[1]=C → norm over C)
-    // ggml_norm normalizes over ne[0] by default. We need to normalize over C (ne[1]).
-    // Transpose to (C, T), norm over C (now ne[0]), transpose back.
+    // PLAN #83 r9 follow-up #3: probe intermediates of one specific causal_block1d
+    // call to bisect within the first resnet block. Set
+    // CRISPASR_S3GEN_UNET_PROBE_BLOCK1=<N> where N is the (0-based) sequential
+    // index of the causal_block1d call within ONE UNet graph build. The first
+    // call (db.0.0.b1) is N=0; the second (db.0.0.b2) is N=1; etc. Each call
+    // names + marks 5 intermediates as dump_probe_*; combine with
+    // CRISPASR_S3GEN_DUMP_UNET + CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK to
+    // capture the values without the implicit mark cascade.
+    static int s_block1d_call_idx = 0;
+    const char* probe_env = std::getenv("CRISPASR_S3GEN_UNET_PROBE_BLOCK1");
+    const int probe_target = probe_env ? std::atoi(probe_env) : -1;
+    bool probe_this = (probe_target >= 0 && s_block1d_call_idx == probe_target);
+    s_block1d_call_idx++;
+
+    auto probe_name = [&](ggml_tensor* t, const char* stage) {
+        if (!probe_this)
+            return;
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "dump_probe_%s", stage);
+        ggml_set_name(t, nm);
+        ggml_set_output(t);
+    };
+
+    if (probe_this) {
+        // Inline causal_conv1d's body to expose im2col + mul_mat intermediates.
+        int K = (int)conv_w->ne[0];
+        int pad = K - 1;
+        const enum ggml_type im2col_type =
+            (conv_w->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+        ggml_tensor* im2col = ggml_im2col(ctx, conv_w, x, 1, 0, pad, 0, 1, 0, false, im2col_type);
+        probe_name(im2col, "after_im2col");
+        ggml_tensor* a_mat = (im2col_type == GGML_TYPE_F32 && conv_w->type != GGML_TYPE_F32)
+                                 ? ggml_cast(ctx, conv_w, GGML_TYPE_F32)
+                                 : conv_w;
+        ggml_tensor* mm = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+                                       ggml_reshape_2d(ctx, a_mat, a_mat->ne[0] * a_mat->ne[1], a_mat->ne[2]));
+        probe_name(mm, "after_mul_mat");
+        ggml_tensor* y = ggml_reshape_3d(ctx, mm, im2col->ne[1], conv_w->ne[2], im2col->ne[2]);
+        int T_out = (int)y->ne[0];
+        int T_want = (int)x->ne[0];
+        if (T_out > T_want) {
+            y = ggml_view_2d(ctx, y, T_want, (int)y->ne[1], y->nb[1], 0);
+            y = ggml_cont(ctx, y);
+        }
+        if (conv_b) {
+            ggml_tensor* b2d = ggml_reshape_2d(ctx, conv_b, 1, (int)conv_b->ne[0]);
+            y = ggml_add(ctx, y, b2d);
+        }
+        x = y;
+    } else {
+        x = causal_conv1d(ctx, x, conv_w, conv_b);
+    }
+    probe_name(x, "after_conv1d");
     x = ggml_cont(ctx, ggml_transpose(ctx, x)); // (C, T)
+    probe_name(x, "after_transpose_in");
     x = ggml_norm(ctx, x, 1e-5f);
-    if (ln_w)
+    probe_name(x, "after_norm");
+    if (ln_w) {
         x = ggml_mul(ctx, x, ln_w);
-    if (ln_b)
+        probe_name(x, "after_ln_mul");
+    }
+    if (ln_b) {
         x = ggml_add(ctx, x, ln_b);
+        probe_name(x, "after_ln_bias");
+    }
     x = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C)
+    probe_name(x, "after_transpose_out");
     x = ggml_mish(ctx, x);
+    probe_name(x, "after_mish");
     return x;
+}
+
+// PLAN #83 r9: F32-precision mul_mat for the UNet1D denoiser. The CFM solver
+// runs 10 Euler steps × 396 mul_mats through the UNet; the ~1e-4 per-element
+// drift from FP16 GPU accumulators compounds 1000× into garbled audio. Setting
+// GGML_PREC_F32 on each call dispatches to the high-precision kernel variant
+// (Metal: kernel_mul_mm_*_hp; CUDA cuBLAS path: CUBLAS_COMPUTE_32F).
+static ggml_tensor* mul_mat_hp(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
+    ggml_tensor* r = ggml_mul_mat(ctx, a, b);
+    ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+    return r;
 }
 
 // Helper: CausalResnetBlock1D — block1 + time_mlp + block2 + residual.
@@ -1464,7 +1644,7 @@ static ggml_tensor* causal_resnet_block(ggml_context* ctx, ggml_tensor* x, ggml_
 
     // Time MLP: Mish → linear(1024 → C_out) → add broadcast over T
     ggml_tensor* t_proj_in = ggml_mish(ctx, t_emb);
-    ggml_tensor* t_proj = ggml_mul_mat(ctx, W("mlp.1.weight"), t_proj_in);
+    ggml_tensor* t_proj = mul_mat_hp(ctx, W("mlp.1.weight"), t_proj_in);
     ggml_tensor* t_b = W("mlp.1.bias");
     if (t_b)
         t_proj = ggml_add(ctx, t_proj, t_b);
@@ -1478,9 +1658,36 @@ static ggml_tensor* causal_resnet_block(ggml_context* ctx, ggml_tensor* x, ggml_
     ggml_tensor* rc_w = W("rc.weight");
     if (rc_w) {
         ggml_tensor* rc_b = W("rc.bias");
-        residual = ggml_conv_1d(ctx, rc_w, residual, 1, 0, 1);
+        // PLAN #83 r9 follow-up #5: rc.weight is a kernel-size-1 conv (a
+        // pointwise channel-mix matmul wrapped in conv1d). For KW=1, the
+        // im2col step that ggml_conv_1d generates dispatches Metal's
+        // kernel_im2col_f32 with a 1×1×1 threadgroup — a rare edge case
+        // that appears to be the manifestation of Bug B (R9 follow-up #5
+        // localized the cos=0.022 divergence between Path X and Path Y
+        // to this op specifically). Bypass the conv1d wrapper and emit
+        // a direct mul_mat: transpose residual (T, IC) → (IC, T), then
+        // mul_mat(res_T, rc_w_2d) → (T, OC). Gated on
+        // CRISPASR_S3GEN_RC_AS_MUL_MAT=1 for the experiment.
+        const char* rc_alt = std::getenv("CRISPASR_S3GEN_RC_AS_MUL_MAT");
+        if (rc_w->ne[0] == 1 && rc_alt && rc_alt[0] == '1') {
+            ggml_tensor* rc_w_2d = ggml_reshape_2d(ctx, rc_w, rc_w->ne[1], rc_w->ne[2]); // (IC, OC)
+            ggml_tensor* res_T = ggml_cont(ctx, ggml_transpose(ctx, residual));          // (T, IC) → (IC, T)
+            residual = ggml_mul_mat(ctx, res_T, rc_w_2d);                                // → (T, OC)
+        } else {
+            residual = ggml_conv_1d(ctx, rc_w, residual, 1, 0, 1);
+        }
         if (rc_b)
             residual = ggml_add(ctx, residual, ggml_reshape_2d(ctx, rc_b, 1, (int)rc_b->ne[0]));
+    }
+
+    // PLAN #83 r9 follow-up #5: probe the residual conv (rc) output specifically.
+    // Bug B investigation showed dump_db_resnet diverges between Path X and Y
+    // while b1/b2 outputs are identical, implicating the residual conv path.
+    // CRISPASR_S3GEN_UNET_PROBE_RC_OUT=1 marks rc's output as a dump tensor.
+    if (std::strcmp(prefix, "s3.fd.db.0.0") == 0 && rc_w &&
+        std::getenv("CRISPASR_S3GEN_UNET_PROBE_RC_OUT") != nullptr) {
+        ggml_set_name(residual, "dump_rc_out_db00");
+        ggml_set_output(residual);
     }
 
     return ggml_add(ctx, x, residual);
@@ -1514,9 +1721,9 @@ static ggml_tensor* basic_transformer_block(ggml_context* ctx, ggml_tensor* x, /
         xn = ggml_add(ctx, xn, n1b);
 
     // Q/K/V projections (no bias on Q/K/V, bias on output)
-    ggml_tensor* Q = ggml_mul_mat(ctx, W("attn1.q.weight"), xn);
-    ggml_tensor* K = ggml_mul_mat(ctx, W("attn1.k.weight"), xn);
-    ggml_tensor* V = ggml_mul_mat(ctx, W("attn1.v.weight"), xn);
+    ggml_tensor* Q = mul_mat_hp(ctx, W("attn1.q.weight"), xn);
+    ggml_tensor* K = mul_mat_hp(ctx, W("attn1.k.weight"), xn);
+    ggml_tensor* V = mul_mat_hp(ctx, W("attn1.v.weight"), xn);
 
     // Multi-head attention: reshape (T, n_heads*2*hd) → (2*hd, T, n_heads)
     // Wait: Q/K/V are (T, 512) where 512 = n_heads(8) * head_dim(64)
@@ -1534,7 +1741,7 @@ static ggml_tensor* basic_transformer_block(ggml_context* ctx, ggml_tensor* x, /
     attn = ggml_reshape_2d(ctx, attn, proj_dim, TT); // (T, 512)
 
     // Output projection
-    attn = ggml_mul_mat(ctx, W("attn1.o.weight"), attn);
+    attn = mul_mat_hp(ctx, W("attn1.o.weight"), attn);
     ggml_tensor* o_b = W("attn1.o.bias");
     if (o_b)
         attn = ggml_add(ctx, attn, o_b);
@@ -1552,14 +1759,14 @@ static ggml_tensor* basic_transformer_block(ggml_context* ctx, ggml_tensor* x, /
         xn = ggml_add(ctx, xn, n3b);
 
     // FF up: Linear(C → 4C) + GELU (not GEGLU — decoder uses act_fn="gelu")
-    ggml_tensor* ff_up = ggml_mul_mat(ctx, W("ff.up.weight"), xn);
+    ggml_tensor* ff_up = mul_mat_hp(ctx, W("ff.up.weight"), xn);
     ggml_tensor* ff_up_b = W("ff.up.bias");
     if (ff_up_b)
         ff_up = ggml_add(ctx, ff_up, ff_up_b);
     ff_up = ggml_gelu(ctx, ff_up);
 
     // FF down: Linear(4C → C)
-    ggml_tensor* ff_out = ggml_mul_mat(ctx, W("ff.down.weight"), ff_up);
+    ggml_tensor* ff_out = mul_mat_hp(ctx, W("ff.down.weight"), ff_up);
     ggml_tensor* ff_down_b = W("ff.down.bias");
     if (ff_down_b)
         ff_out = ggml_add(ctx, ff_out, ff_down_b);
@@ -1594,16 +1801,76 @@ static ggml_cgraph* build_graph_unet1d(chatterbox_s3gen_context* c, int T_mel) {
 
     ggml_tensor* x = x_in;
 
+    // PLAN #83 r9 follow-up #5: snapshot unet_input via a dup at graph start
+    // so we can dump what the GPU actually sees (post-compute readback)
+    // and compare to host-side unet_input. Gated on env so production
+    // doesn't pay the dup cost.
+    if (std::getenv("CRISPASR_S3GEN_UNET_PROBE_INPUT_SNAPSHOT") != nullptr) {
+        ggml_tensor* snap = ggml_dup(ctx0, x);
+        ggml_set_name(snap, "dump_unet_input_snapshot");
+        ggml_set_output(snap);
+        ggml_build_forward_expand(gf, snap);
+    }
+
     // ---- Down blocks (1 block) ----
+    const bool dump_unet = std::getenv("CRISPASR_S3GEN_DUMP_UNET") != nullptr;
+    // PLAN #83 r9 bisect: CRISPASR_S3GEN_UNET_PRESERVE_INTERMEDIATES=1
+    // forces ggml_set_output on per-block intermediates. Disables
+    // ggml-alloc in-place buffer reuse for those tensors.
+    // PRESERVE_INTERMEDIATES alone marks only block outputs (~14
+    // tensors). DUMP_UNET marks every per-resnet/transformer dump
+    // point (62) for the diff-bisect.
+    const bool preserve_intermediates = std::getenv("CRISPASR_S3GEN_UNET_PRESERVE_INTERMEDIATES") != nullptr;
+    // CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK lets DUMP_UNET dump only the
+    // tensors that other MARK_* knobs (or PRESERVE_INTERMEDIATES) have kept
+    // live. Useful for narrowing which marks cause the Metal NaN — without
+    // this, DUMP_UNET implicitly marks all 62 dump points and triggers it.
+    const bool dump_unet_auto_mark = dump_unet && std::getenv("CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK") == nullptr;
+    const bool mark_output_all = dump_unet_auto_mark; // every dump point
+    // PLAN #83 r9 sub-bisect (May 2026 session): the 17 extra marks DUMP_UNET adds
+    // on top of PRESERVE_INTERMEDIATES tip smoke into NaN. Split everything into
+    // 5 groups gated independently to find the minimum trigger set.
+    const bool mark_db_resnet = mark_output_all || std::getenv("CRISPASR_S3GEN_UNET_MARK_DB_RESNET") != nullptr;
+    const bool mark_db_tb = mark_output_all || std::getenv("CRISPASR_S3GEN_UNET_MARK_DB_TB") != nullptr;
+    const bool mark_mb_resnet = mark_output_all || std::getenv("CRISPASR_S3GEN_UNET_MARK_MB_RESNET") != nullptr;
+    const bool mark_db_out =
+        mark_output_all || preserve_intermediates || std::getenv("CRISPASR_S3GEN_UNET_MARK_DB_OUT") != nullptr;
+    const bool mark_mb_out =
+        mark_output_all || preserve_intermediates || std::getenv("CRISPASR_S3GEN_UNET_MARK_MB_OUT") != nullptr;
+    // PLAN #83 r9 sub-bisect: how many / which of the 12 mb_*_out marks tips
+    // into NaN when combined with MARK_DB_RESNET. MAX takes priority over INDEX.
+    int mb_out_max = -1;
+    int mb_out_index = -1;
+    if (const char* env = std::getenv("CRISPASR_S3GEN_UNET_MARK_MB_OUT_MAX")) {
+        mb_out_max = std::atoi(env);
+    }
+    if (const char* env = std::getenv("CRISPASR_S3GEN_UNET_MARK_MB_OUT_INDEX")) {
+        mb_out_index = std::atoi(env);
+    }
+    auto should_mark_mb_out = [&](int i) -> bool {
+        if (mb_out_max >= 0)
+            return i < mb_out_max;
+        if (mb_out_index >= 0)
+            return i == mb_out_index;
+        return mark_mb_out;
+    };
     ggml_tensor* hidden = nullptr;
     {
         x = causal_resnet_block(ctx0, x, t_emb, c, "s3.fd.db.0.0", mask);
+        ggml_set_name(x, "dump_db_resnet");
+        if (mark_db_resnet)
+            ggml_set_output(x);
         // 4 transformer blocks
         ggml_tensor* xt = ggml_cont(ctx0, ggml_transpose(ctx0, x));
         for (int j = 0; j < 4; j++) {
             char prefix[48];
             std::snprintf(prefix, sizeof(prefix), "s3.fd.db.0.1.%d", j);
             x = basic_transformer_block(ctx0, x, c, prefix, nullptr, 8, 64);
+            char dump_name[32];
+            std::snprintf(dump_name, sizeof(dump_name), "dump_db_tb_%d", j);
+            ggml_set_name(x, dump_name);
+            if (mark_db_tb)
+                ggml_set_output(x);
         }
         hidden = x; // save for skip connection
         // Downsample: CausalConv1d(k=3) — halves T
@@ -1611,6 +1878,9 @@ static ggml_cgraph* build_graph_unet1d(chatterbox_s3gen_context* c, int T_mel) {
         ggml_tensor* ds_b = T(c, "s3.fd.db.0.2.bias");
         if (ds_w)
             x = causal_conv1d(ctx0, x, ds_w, ds_b);
+        ggml_set_name(x, "dump_db_out");
+        if (mark_db_out)
+            ggml_set_output(x);
         // Note: the Python code uses Downsample1D which actually halves T
         // For CausalConv1d with stride=1, T stays the same
         // The actual downsample uses mask[:, :, ::2] to halve
@@ -1622,12 +1892,22 @@ static ggml_cgraph* build_graph_unet1d(chatterbox_s3gen_context* c, int T_mel) {
         char prefix[48];
         std::snprintf(prefix, sizeof(prefix), "s3.fd.mb.%d.0", i);
         x = causal_resnet_block(ctx0, x, t_emb, c, prefix, mask);
+        char dump_resnet[32];
+        std::snprintf(dump_resnet, sizeof(dump_resnet), "dump_mb_%d_resnet", i);
+        ggml_set_name(x, dump_resnet);
+        if (mark_mb_resnet)
+            ggml_set_output(x);
 
         for (int j = 0; j < 4; j++) {
             char tb_prefix[48];
             std::snprintf(tb_prefix, sizeof(tb_prefix), "s3.fd.mb.%d.1.%d", i, j);
             x = basic_transformer_block(ctx0, x, c, tb_prefix, nullptr, 8, 64);
         }
+        char dump_block[32];
+        std::snprintf(dump_block, sizeof(dump_block), "dump_mb_%d_out", i);
+        ggml_set_name(x, dump_block);
+        if (should_mark_mb_out(i))
+            ggml_set_output(x);
     }
 
     // ---- Up blocks (1 block) ----
@@ -1682,6 +1962,14 @@ static ggml_cgraph* build_graph_unet1d(chatterbox_s3gen_context* c, int T_mel) {
     if (mask)
         x = ggml_mul(ctx0, x, mask);
     ggml_set_name(x, "denoiser_out");
+    // PLAN #83 r9 follow-up #5: env-gated dump of denoiser_out via a
+    // dup-named tensor so the existing DUMP_UNET filter picks it up.
+    if (std::getenv("CRISPASR_S3GEN_UNET_PROBE_DENOISER_OUT") != nullptr) {
+        ggml_tensor* dump_x = ggml_dup(ctx0, x);
+        ggml_set_name(dump_x, "dump_denoiser_out");
+        ggml_set_output(dump_x);
+        ggml_build_forward_expand(gf, dump_x);
+    }
     ggml_build_forward_expand(gf, x);
     ggml_free(ctx0);
     return gf;
@@ -1818,6 +2106,11 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
         auto run_denoiser = [&](const std::vector<float>& input) -> std::vector<float> {
             ggml_backend_sched_reset(c->sched);
             s3gen_maybe_pin_graph_to_cpu(c, gf, s3gen_subgraph::unet);
+            // PLAN #83 r9 follow-up #5: Bug B (CFG uncond divergence) is fixed
+            // at the sched level by `parallel=true` in ggml_backend_sched_new
+            // (see the sched_new call near the top of this file). The earlier
+            // workaround of pinning `unet_input` to the GPU backend is no
+            // longer needed and was removed; CRISPASR_NO_INPUT_PIN is gone.
             if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
                 fprintf(stderr, "s3gen: failed to alloc UNet1D graph\n");
                 return {};
@@ -1834,9 +2127,64 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
                                     t_sin.size() * sizeof(float));
             ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mask"), mask_data.data(), 0,
                                     mask_data.size() * sizeof(float));
+            // PLAN #83 r9 follow-up: dump per-node allocator decisions on step 0
+            // so we can diff 1-mark vs 2-mark configs and spot the address
+            // collision that causes Metal NaN. Format: "name @ data_ptr size bytes".
+            if (step == 0) {
+                const char* dump_addr = std::getenv("CRISPASR_S3GEN_DUMP_UNET_ADDR");
+                if (dump_addr && *dump_addr) {
+                    const int n_nodes_addr = ggml_graph_n_nodes(gf);
+                    fprintf(stderr, "s3gen: [DUMP_UNET_ADDR=%s] %d nodes\n", dump_addr, n_nodes_addr);
+                    for (int i = 0; i < n_nodes_addr; ++i) {
+                        ggml_tensor* node = ggml_graph_node(gf, i);
+                        if (!node)
+                            continue;
+                        fprintf(stderr, "s3gen: [addr] %4d  %p  %8zu  %s\n", i, node->data, ggml_nbytes(node),
+                                node->name);
+                    }
+                }
+            }
             if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "s3gen: UNet1D compute failed\n");
                 return {};
+            }
+            // PLAN #83 r9 per-segment drift bisect: when CRISPASR_S3GEN_DUMP_UNET=<tag>
+            // is set, dump every "dump_*" named intermediate from step 0 to
+            // /tmp/cb-unet-dump-<tag>-<name>.bin. Run twice (weight-residency
+            // vs gpu-residency), compare per-block.
+            if (step == 0) {
+                const char* dump_tag = std::getenv("CRISPASR_S3GEN_DUMP_UNET");
+                if (dump_tag && *dump_tag) {
+                    // PLAN #83 r9 follow-up #5: run_denoiser fires twice per
+                    // CFM step (cond + uncond). Without disambiguation the
+                    // second call overwrites the first. Use a local static
+                    // counter to tag dumps "cond"/"uncond".
+                    static int dump_call_idx = 0;
+                    const char* pass_tag = (dump_call_idx % 2 == 0) ? "cond" : "uncond";
+                    dump_call_idx++;
+                    const int n_nodes = ggml_graph_n_nodes(gf);
+                    int n_dumped = 0;
+                    for (int i = 0; i < n_nodes; ++i) {
+                        ggml_tensor* node = ggml_graph_node(gf, i);
+                        if (!node || std::strncmp(node->name, "dump_", 5) != 0)
+                            continue;
+                        const size_t nb_node = ggml_nbytes(node);
+                        std::vector<char> buf(nb_node);
+                        ggml_backend_tensor_get(node, buf.data(), 0, nb_node);
+                        char path[256];
+                        std::snprintf(path, sizeof(path), "/tmp/cb-unet-dump-%s-%s-%s.bin", dump_tag, pass_tag,
+                                      node->name);
+                        FILE* fp = std::fopen(path, "wb");
+                        if (fp) {
+                            std::fwrite(buf.data(), 1, nb_node, fp);
+                            std::fclose(fp);
+                            n_dumped++;
+                        }
+                    }
+                    fprintf(stderr,
+                            "s3gen: [DUMP_UNET=%s pass=%s] dumped %d intermediates to /tmp/cb-unet-dump-%s-%s-*.bin\n",
+                            dump_tag, pass_tag, n_dumped, dump_tag, pass_tag);
+                }
             }
             ggml_tensor* out = ggml_graph_get_tensor(gf, "denoiser_out");
             if (step == 0 && c->verbosity >= 1) {

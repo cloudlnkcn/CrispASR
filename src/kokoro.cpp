@@ -2981,6 +2981,26 @@ bool phonemize_popen(const std::string& lang, const std::string& text, std::stri
     return !out.empty();
 }
 
+// Post-process Mandarin/Chinese phonemes from espeak-ng.  espeak emits
+// tone numbers (1-5) after each syllable (e.g. "ni2xˈɑu3") which
+// Kokoro's 178-symbol IPA tokenizer can't represent.  Strip them so
+// the IPA tokens map cleanly.  Also strip numeric stress markers that
+// espeak sometimes emits for CJK (e.g. "ˈ1" sequences).  (PLAN #56)
+static void strip_cmn_tone_numbers(std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] >= '0' && s[i] <= '9')
+            continue; // drop tone number
+        r += s[i];
+    }
+    s = std::move(r);
+}
+
+static bool is_cmn_lang(const std::string& lang) {
+    return lang == "cmn" || lang == "zh" || lang == "zh-cn" || lang == "zh_cn" || lang == "cmn-latn-pinyin";
+}
+
 bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::string& text, std::string& out) {
     std::string key = lang;
     key.push_back('\0');
@@ -2989,11 +3009,15 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
         return true;
 #ifdef CRISPASR_HAVE_ESPEAK_NG
     if (phonemize_espeak_lib(lang, text, out)) {
+        if (is_cmn_lang(lang))
+            strip_cmn_tone_numbers(out);
         ctx->phon_cache.insert(key, out);
         return true;
     }
 #endif
     if (phonemize_popen(lang, text, out)) {
+        if (is_cmn_lang(lang))
+            strip_cmn_tone_numbers(out);
         ctx->phon_cache.insert(key, out);
         return true;
     }

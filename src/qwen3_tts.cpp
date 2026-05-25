@@ -4877,6 +4877,12 @@ extern "C" void qwen3_tts_set_temperature(struct qwen3_tts_context* ctx, float t
     ctx->params.temperature = temperature;
 }
 
+extern "C" void qwen3_tts_set_seed(struct qwen3_tts_context* ctx, uint64_t seed) {
+    if (!ctx)
+        return;
+    ctx->params.seed = seed;
+}
+
 static void build_embd_caches(qwen3_tts_context* c) {
     c->token_embd_cache.init(c->talker.token_embd_w);
     auto& cp = c->code_pred;
@@ -5015,12 +5021,11 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
     build_embd_caches(c);   // CPU copies for AR-loop embed lookups
 
     // Fuse Q+K+V weights for the talker so each layer's attention does a
-    // single mul_mat instead of three. Only applies to F16/F32 talkers —
-    // quantized formats (Q8_0/Q4_K) keep the 3-matmul path because their
-    // block layout would need a converter-side fuse to be safe.
-    // Off by default: a first (contended-machine) bench suggested the
-    // fused path regresses at T=1 on M1 Metal; flip on with
-    // QWEN3_TTS_FUSED_QKV=1 to A/B test on a quiet machine.
+    // single mul_mat instead of three. Type gate dropped (PLAN #60d) —
+    // Q8_0/Q4_K byte-concat is safe; buffer on default backend.
+    // Off by default: interleaved A/B bench 2026-05-23 (M1, Q8_0 0.6B,
+    // 94 frames) shows neutral for Q8_0 — ~129 ms/frame with and without.
+    // F16 case untested locally; flip with QWEN3_TTS_FUSED_QKV=1 to bench.
     if (env_bool("QWEN3_TTS_FUSED_QKV")) {
         auto& blocks = c->talker.blocks;
         // PLAN #60d: type gate dropped May 2026 — Q-format byte-concat
@@ -5758,11 +5763,13 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
     }
     const int eos = (int)hp.codec_eos_id;
 
-    // PRNG seed — context params take priority, then env, then default 42.
-    uint64_t rng = ctx->params.seed != 0 ? ctx->params.seed : 42;
+    // PRNG seed — explicit request / CLI params take priority, then env, then default 42.
+    uint64_t rng = 42;
     if (const char* s = env_str("QWEN3_TTS_SEED")) {
         rng = (uint64_t)std::strtoull(s, nullptr, 10);
     }
+    if (ctx->params.seed != 0)
+        rng = ctx->params.seed;
 
     // ---- prefill builder: CustomVoice (no ref) or Base ICL (ref WAV) ----
     double t0 = bench ? now_ms() : 0.0;

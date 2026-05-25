@@ -103,6 +103,9 @@ struct VoxtralOps {
             const std::string tgt = p.target_lang.empty() ? std::string("English") : to_eng(p.target_lang);
             return "[/INST]lang:" + lang + " Translate the audio to " + tgt + ".[TRANSCRIBE]";
         }
+        // PLAN #98 Phase B: hotword prompt injection
+        if (!p.hotwords.empty())
+            return "[/INST]lang:" + lang + " The following words may appear: " + p.hotwords + ".[TRANSCRIBE]";
         return "[/INST]lang:" + lang + "[TRANSCRIBE]";
     }
 };

@@ -228,6 +228,12 @@ public:
                 params.target_lang.empty() ? std::string("English") : iso_to_english(params.target_lang);
             sys_instruction = "Translate the speech to " + tgt + ".";
         }
+        // PLAN #98 Phase B: hotword prompt injection
+        if (!params.hotwords.empty()) {
+            if (!sys_instruction.empty() && sys_instruction.back() != ' ')
+                sys_instruction += ' ';
+            sys_instruction += "The following words may appear in the audio: " + params.hotwords + ".";
+        }
 
         std::string text = "<|im_start|>system\n" + sys_instruction +
                            "<|im_end|>\n"
@@ -397,6 +403,7 @@ public:
         dec_cfg.max_new_tokens = max_new;
         dec_cfg.eos_id = eos_id;
         dec_cfg.temperature = params.temperature;
+        dec_cfg.frequency_penalty = params.frequency_penalty;
         dec_cfg.seed = params.seed;
 
         const int n_runs = (params.temperature > 0.0f && params.best_of > 1) ? params.best_of : 1;

@@ -84,7 +84,7 @@ struct parakeet_result* parakeet_transcribe_ex(struct parakeet_context* ctx, con
 //
 // chunk_seconds <= 0 → default 8;  overlap_seconds < 0 → default 2.
 struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_context* ctx, const float* samples, int n_samples,
-                                                     int64_t t_offset_cs, int chunk_seconds, int overlap_seconds);
+                                                    int64_t t_offset_cs, int chunk_seconds, int overlap_seconds);
 
 // NeMo-style streamed pipeline: compute mel over the FULL audio with
 // global z-norm (identical to single-pass), then encode in overlapping
@@ -92,7 +92,7 @@ struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_context* ctx
 // z-norm matches single-pass exactly, and the encoder gets per-chunk
 // context windows while the decoder sees a continuous sequence.
 struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_context* ctx, const float* samples, int n_samples,
-                                                      int64_t t_offset_cs, int chunk_seconds, int overlap_seconds);
+                                                     int64_t t_offset_cs, int chunk_seconds, int overlap_seconds);
 
 // Vocabulary helpers
 int parakeet_n_vocab(struct parakeet_context* ctx);
@@ -109,6 +109,11 @@ void parakeet_set_temperature(struct parakeet_context* ctx, float temperature, u
 // CTC decode mode (hybrid TDT+CTC models only).
 void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc);
 bool parakeet_has_ctc(struct parakeet_context* ctx);
+
+// CTC-WS hotword phrase boost (PLAN #98). Builds an Aho-Corasick trie
+// from the hotword strings; during CTC/TDT decode, tokens that continue
+// an active hotword prefix get a log-prob boost. Call before transcribe.
+void parakeet_set_hotwords(struct parakeet_context* ctx, const char** hotwords, int n_hotwords, float boost);
 
 // Split encode / decode for full-audio-encode + chunked-decode.
 // parakeet_encode: mel → encoder, returns malloc'd float[T_enc * d_model].

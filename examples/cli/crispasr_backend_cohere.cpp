@@ -52,6 +52,15 @@ public:
         return true;
     }
 
+    void warmup() override {
+        if (!ctx_)
+            return;
+        std::vector<float> silence(8000, 0.0f);
+        cohere_result* r = cohere_transcribe_ex(ctx_, silence.data(), (int)silence.size(), "en", 0);
+        if (r)
+            cohere_result_free(r);
+    }
+
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                              const whisper_params& params) override {
         std::vector<crispasr_segment> out;
@@ -60,6 +69,8 @@ public:
 
         // Sticky decode-time sampling controls.
         cohere_set_temperature(ctx_, params.temperature, params.seed);
+        cohere_set_max_new_tokens(ctx_, params.max_new_tokens);
+        cohere_set_frequency_penalty(ctx_, params.frequency_penalty);
 
         cohere_result* r = cohere_transcribe_ex(ctx_, samples, n_samples, params.language.c_str(), t_offset_cs);
         if (!r)

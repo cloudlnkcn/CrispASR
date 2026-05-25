@@ -26,6 +26,7 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+#include "core/asr_context_bias.h"
 #include "core/fastconformer.h"
 
 #ifndef M_PI
@@ -197,6 +198,10 @@ struct parakeet_context {
     // Set via parakeet_set_temperature(); the field is sticky on the ctx.
     float decode_temperature = 0.0f;
     uint64_t decode_seed = 0;
+
+    // CTC-WS phrase-boost trie (PLAN #98). Set via parakeet_set_hotwords().
+    core_context_bias::Trie hotword_trie;
+    float hotword_boost = 2.0f; // per-frame prefix continuation boost
 };
 
 // ---------------------------------------------------------------------------
@@ -523,7 +528,7 @@ static std::vector<float> parakeet_compute_mel_impl(parakeet_context* ctx, const
 // Compute mel WITHOUT z-norm — returns raw log-mel in (T, n_mels) layout.
 // Caller accumulates statistics across chunks and normalizes at the end.
 static std::vector<float> parakeet_compute_mel_raw(parakeet_context* ctx, const float* samples, int n_samples,
-                                                    int& T_out) {
+                                                   int& T_out) {
     const auto& hp = ctx->model.hparams;
     const int n_fft = (int)hp.n_fft;
     const int hop = (int)hp.hop_length;
@@ -545,7 +550,7 @@ static std::vector<float> parakeet_compute_mel_raw(parakeet_context* ctx, const 
     p.win_length = win;
     p.n_mels = n_mels;
     p.log_base = core_mel::LogBase::Ln;
-    p.norm = core_mel::Normalization::None;  // <-- NO z-norm
+    p.norm = core_mel::Normalization::None; // <-- NO z-norm
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
@@ -1104,6 +1109,9 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     const bool sampling = ctx->decode_temperature > 0.0f;
     std::mt19937_64 rng(ctx->decode_seed != 0 ? ctx->decode_seed : (uint64_t)std::random_device{}());
 
+    const bool has_hotwords = !ctx->hotword_trie.empty();
+    core_context_bias::MatchState hw_state;
+
     int t = 0;
     int total_steps = 0;
     while (t < T_enc) {
@@ -1112,6 +1120,11 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
         int n_inner = 0;
         while (n_inner < max_per_step) {
             joint_step(J, proj_e.data(), pred_out.data(), logits);
+
+            // CTC-WS phrase boost on vocab logits (not duration logits)
+            if (has_hotwords)
+                core_context_bias::apply_bias(ctx->hotword_trie, hw_state, logits.data(), n_vocab_blk,
+                                              ctx->hotword_boost);
 
             if (getenv("PARAKEET_DEBUG") && total_steps < 5) {
                 // Show first few logits
@@ -1220,6 +1233,8 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
             // Real token: emit and advance the predictor
             int t_end = std::min(T_enc, t + std::max(0, dur_skip));
             emitted.push_back({tok, t, t_end, tok_p});
+            if (has_hotwords)
+                core_context_bias::advance(ctx->hotword_trie, hw_state, tok);
             predictor_step(W, tok, state, pred_out);
 
             // Diagnostic: dump predictor stats for the first few emissions
@@ -1263,6 +1278,94 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
 }
 
 // ===========================================================================
+// Standard RNNT greedy decode (n_tdt_durations == 0)
+// ===========================================================================
+// Identical predictor / joint infrastructure to TDT but no duration head:
+//   - joint.out.weight rows = vocab+1 (vocab + blank only)
+//   - blank → advance encoder frame by 1, reset inner counter
+//   - real token → advance predictor, stay on same frame
+//   - max_per_step cap forces frame advance to guarantee progress
+
+static std::vector<parakeet_emitted_token> parakeet_rnnt_decode(parakeet_context* ctx, const float* enc, int T_enc,
+                                                                int d_model) {
+    parakeet_init_pred_weights(ctx);
+    parakeet_init_joint_weights(ctx);
+
+    const auto& hp = ctx->model.hparams;
+    const int blank_id = (int)hp.blank_id; // vocab_size
+    const int n_vocab_blk = blank_id + 1;  // vocab + blank
+    const int max_per_step = 10;
+
+    auto& W = ctx->pred_w;
+    auto& J = ctx->joint_w;
+    if (J.vocab_total != n_vocab_blk) {
+        fprintf(stderr, "parakeet: RNNT joint vocab_total mismatch (%d vs expected %d)\n", J.vocab_total, n_vocab_blk);
+    }
+
+    std::vector<parakeet_emitted_token> emitted;
+    emitted.reserve(256);
+
+    parakeet_lstm_state state;
+    lstm_init_state(state, W.H);
+
+    std::vector<float> pred_out;
+    predictor_step(W, blank_id, state, pred_out);
+
+    std::vector<float> proj_e(J.joint_hidden);
+    std::vector<float> logits(J.vocab_total);
+
+    const bool has_hotwords = !ctx->hotword_trie.empty();
+    core_context_bias::MatchState hw_state;
+
+    int t = 0;
+    while (t < T_enc) {
+        joint_proj_enc(J, enc + (size_t)t * d_model, proj_e);
+
+        int n_inner = 0;
+        while (n_inner < max_per_step) {
+            joint_step(J, proj_e.data(), pred_out.data(), logits);
+
+            if (has_hotwords)
+                core_context_bias::apply_bias(ctx->hotword_trie, hw_state, logits.data(), n_vocab_blk,
+                                              ctx->hotword_boost);
+
+            int tok = 0;
+            float tok_lp = logits[0];
+            for (int v = 1; v < n_vocab_blk; v++) {
+                if (logits[v] > tok_lp) {
+                    tok_lp = logits[v];
+                    tok = v;
+                }
+            }
+
+            if (tok == blank_id) {
+                t++;
+                break;
+            }
+
+            float tok_p = 1.0f;
+            {
+                double sum = 0.0;
+                for (int v = 0; v < n_vocab_blk; v++)
+                    sum += std::exp((double)(logits[v] - tok_lp));
+                tok_p = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
+            }
+
+            emitted.push_back({tok, t, t, tok_p});
+            if (has_hotwords)
+                core_context_bias::advance(ctx->hotword_trie, hw_state, tok);
+            predictor_step(W, tok, state, pred_out);
+            n_inner++;
+        }
+
+        if (n_inner >= max_per_step)
+            t++;
+    }
+
+    return emitted;
+}
+
+// ===========================================================================
 // CTC greedy decode (for hybrid TDT+CTC models)
 // ===========================================================================
 
@@ -1295,6 +1398,8 @@ static std::vector<parakeet_emitted_token> parakeet_ctc_decode(parakeet_context*
     // For each encoder frame: logits = w @ enc[t] + b, then argmax.
     std::vector<float> logits((size_t)ctc_vocab);
     int prev_tok = ctc_blank;
+    const bool has_hotwords = !ctx->hotword_trie.empty();
+    core_context_bias::MatchState hw_state;
     for (int t = 0; t < T_enc; t++) {
         const float* e = enc + (size_t)t * d_model;
         for (int v = 0; v < ctc_vocab; v++) {
@@ -1304,6 +1409,9 @@ static std::vector<parakeet_emitted_token> parakeet_ctc_decode(parakeet_context*
                 s += wv[k] * e[k];
             logits[v] = s;
         }
+        // CTC-WS phrase boost (PLAN #98): bias logits toward hotword tokens
+        if (has_hotwords)
+            core_context_bias::apply_bias(ctx->hotword_trie, hw_state, logits.data(), ctc_vocab, ctx->hotword_boost);
         // Argmax
         int tok = 0;
         float tok_lp = logits[0];
@@ -1324,6 +1432,9 @@ static std::vector<parakeet_emitted_token> parakeet_ctc_decode(parakeet_context*
                 tok_p = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
             }
             emitted.push_back({tok, t, t, tok_p});
+            // Advance hotword trie state on non-blank, non-repeat tokens
+            if (has_hotwords)
+                core_context_bias::advance(ctx->hotword_trie, hw_state, tok);
         }
         prev_tok = tok;
     }
@@ -1423,6 +1534,59 @@ extern "C" void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc) {
 
 extern "C" bool parakeet_has_ctc(struct parakeet_context* ctx) {
     return ctx && ctx->model.has_ctc;
+}
+
+extern "C" void parakeet_set_hotwords(struct parakeet_context* ctx, const char** hotwords, int n_hotwords,
+                                      float boost) {
+    if (!ctx || !hotwords || n_hotwords <= 0)
+        return;
+    // Build a tokenizer that maps strings to SentencePiece token IDs
+    // using the already-loaded vocab.
+    auto tokenize = [&](const std::string& word) -> std::vector<int32_t> {
+        // Simple: look up each SentencePiece token. For multi-token words,
+        // we do a greedy forward-maximum-match against the vocab.
+        // This is good enough for hotwords (typically 1-3 tokens each).
+        std::vector<int32_t> ids;
+        const auto& pieces = ctx->vocab.id_to_token;
+        std::string remaining = word;
+        while (!remaining.empty()) {
+            int best_len = 0;
+            int32_t best_id = -1;
+            for (int i = 0; i < (int)pieces.size(); i++) {
+                const auto& p = pieces[i];
+                if ((int)p.size() > best_len && remaining.compare(0, p.size(), p) == 0) {
+                    best_len = (int)p.size();
+                    best_id = i;
+                }
+            }
+            if (best_id < 0) {
+                // Skip unknown character
+                size_t skip = 1;
+                if ((unsigned char)remaining[0] >= 0x80) {
+                    // UTF-8 multi-byte
+                    if ((unsigned char)remaining[0] >= 0xF0)
+                        skip = 4;
+                    else if ((unsigned char)remaining[0] >= 0xE0)
+                        skip = 3;
+                    else
+                        skip = 2;
+                }
+                remaining.erase(0, std::min(skip, remaining.size()));
+            } else {
+                ids.push_back(best_id);
+                remaining.erase(0, best_len);
+            }
+        }
+        return ids;
+    };
+
+    std::vector<std::string> hw_list;
+    for (int i = 0; i < n_hotwords; i++)
+        if (hotwords[i])
+            hw_list.push_back(hotwords[i]);
+
+    ctx->hotword_boost = boost;
+    ctx->hotword_trie = core_context_bias::build_trie(hw_list, tokenize, boost);
 }
 
 extern "C" float* parakeet_compute_mel(struct parakeet_context* ctx, const float* samples, int n_samples,
@@ -1726,8 +1890,10 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
         return nullptr;
 
     const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
-    auto emitted = use_ctc ? parakeet_ctc_decode(ctx, enc_frames, T_enc, d_model)
-                           : parakeet_tdt_decode(ctx, enc_frames, T_enc, d_model);
+    const bool use_rnnt = !use_ctc && ctx->model.hparams.n_tdt_durations == 0;
+    auto emitted = use_ctc    ? parakeet_ctc_decode(ctx, enc_frames, T_enc, d_model)
+                   : use_rnnt ? parakeet_rnnt_decode(ctx, enc_frames, T_enc, d_model)
+                              : parakeet_tdt_decode(ctx, enc_frames, T_enc, d_model);
 
     // Build result (same as the tail of parakeet_transcribe_ex)
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
@@ -1775,7 +1941,7 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
 // ---------------------------------------------------------------------------
 
 static std::vector<float> parakeet_encode_chunked(parakeet_context* ctx, const float* samples, int n_samples,
-                                                   int chunk_seconds, int overlap_seconds, int* out_T_enc_total) {
+                                                  int chunk_seconds, int overlap_seconds, int* out_T_enc_total) {
     const auto& hp = ctx->model.hparams;
     const int SR = 16000;
     const int d_model = (int)hp.d_model;
@@ -1828,8 +1994,8 @@ static std::vector<float> parakeet_encode_chunked(parakeet_context* ctx, const f
         T_enc_total += keep_frames;
 
         if (getenv("PARAKEET_DEBUG"))
-            fprintf(stderr, "parakeet: chunk @%d: %d samples → %d mel → %d enc (skip %d, keep %d)\n", offset,
-                    chunk_len, T_mel, T_enc, skip_frames, keep_frames);
+            fprintf(stderr, "parakeet: chunk @%d: %d samples → %d mel → %d enc (skip %d, keep %d)\n", offset, chunk_len,
+                    T_mel, T_enc, skip_frames, keep_frames);
     }
 
     if (out_T_enc_total)
@@ -1844,8 +2010,8 @@ static std::vector<float> parakeet_encode_chunked(parakeet_context* ctx, const f
 // both the z-norm drift of single-pass encoding on long audio AND the
 // decoder cold-start of independent-chunk decoding.
 extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_context* ctx, const float* samples,
-                                                                int n_samples, int64_t t_offset_cs,
-                                                                int chunk_seconds, int overlap_seconds) {
+                                                               int n_samples, int64_t t_offset_cs, int chunk_seconds,
+                                                               int overlap_seconds) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
     if (chunk_seconds <= 0)
@@ -1868,11 +2034,16 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
     // 2. Single-pass TDT decode over the concatenated encoder output
     const int d_model = (int)ctx->model.hparams.d_model;
     const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
-    auto emitted = use_ctc ? parakeet_ctc_decode(ctx, enc_all.data(), T_enc_total, d_model)
-                           : parakeet_tdt_decode(ctx, enc_all.data(), T_enc_total, d_model);
+    const bool use_rnnt = !use_ctc && ctx->model.hparams.n_tdt_durations == 0;
+    auto emitted = use_ctc    ? parakeet_ctc_decode(ctx, enc_all.data(), T_enc_total, d_model)
+                   : use_rnnt ? parakeet_rnnt_decode(ctx, enc_all.data(), T_enc_total, d_model)
+                              : parakeet_tdt_decode(ctx, enc_all.data(), T_enc_total, d_model);
 
     if (getenv("PARAKEET_DEBUG"))
-        fprintf(stderr, "parakeet: %s decode OK (%d tokens from %d enc frames)\n", use_ctc ? "CTC" : "TDT",
+        fprintf(stderr, "parakeet: %s decode OK (%d tokens from %d enc frames)\n",
+                use_ctc    ? "CTC"
+                : use_rnnt ? "RNNT"
+                           : "TDT",
                 (int)emitted.size(), T_enc_total);
 
     // 3. Build result (reuse the same result-building code as transcribe_ex)
@@ -1934,8 +2105,8 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
 // ---------------------------------------------------------------------------
 
 extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_context* ctx, const float* samples,
-                                                                 int n_samples, int64_t t_offset_cs,
-                                                                 int chunk_seconds, int overlap_seconds) {
+                                                                int n_samples, int64_t t_offset_cs, int chunk_seconds,
+                                                                int overlap_seconds) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
     if (chunk_seconds <= 0)
@@ -2049,10 +2220,16 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
 
     // 3. Greedy decode (TDT or CTC)
     const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
-    auto emitted = use_ctc ? parakeet_ctc_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model)
-                           : parakeet_tdt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model);
+    const bool use_rnnt = !use_ctc && ctx->model.hparams.n_tdt_durations == 0;
+    auto emitted = use_ctc    ? parakeet_ctc_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model)
+                   : use_rnnt ? parakeet_rnnt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model)
+                              : parakeet_tdt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model);
     if (getenv("PARAKEET_DEBUG"))
-        fprintf(stderr, "parakeet: %s decode OK (%d tokens)\n", use_ctc ? "CTC" : "TDT", (int)emitted.size());
+        fprintf(stderr, "parakeet: %s decode OK (%d tokens)\n",
+                use_ctc    ? "CTC"
+                : use_rnnt ? "RNNT"
+                           : "TDT",
+                (int)emitted.size());
 
     // 4. Build result
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));

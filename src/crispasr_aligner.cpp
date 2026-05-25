@@ -6,13 +6,18 @@
 // through one function call.
 
 #include "crispasr_aligner.h"
+#include "align.h"
 #include "canary_ctc.h"
+#include "gguf.h"
 #include "qwen3_asr.h"
+#include "wav2vec2-ggml.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 namespace {
 
@@ -82,6 +87,33 @@ bool path_contains_ci(const std::string& p, const char* needle) {
     return lo.find(needle) != std::string::npos;
 }
 
+std::string gguf_architecture(const std::string& path) {
+    struct gguf_init_params gip = {/*.no_alloc=*/true, /*.ctx=*/nullptr};
+    gguf_context* gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx)
+        return {};
+
+    std::string arch;
+    const int key = gguf_find_key(gctx, "general.architecture");
+    if (key >= 0) {
+        if (const char* s = gguf_get_val_str(gctx, key))
+            arch = s;
+    }
+    gguf_free(gctx);
+
+    for (char& c : arch)
+        c = (char)std::tolower((unsigned char)c);
+    return arch;
+}
+
+bool is_wav2vec2_aligner_model(const std::string& model_path, const std::string& arch) {
+    return path_contains_ci(model_path, "wav2vec2") || path_contains_ci(model_path, "wav2vec") ||
+           path_contains_ci(model_path, "xlsr") || path_contains_ci(model_path, "xls-r") ||
+           path_contains_ci(model_path, "hubert") || path_contains_ci(model_path, "data2vec") || arch == "wav2vec2" ||
+           arch == "wav2vec2-ctc" || arch == "hubert" || arch == "hubert-ctc" || arch == "data2vec" ||
+           arch == "data2vec-audio" || arch == "data2vec_audio";
+}
+
 std::vector<CrispasrAlignedWord> align_qwen3_fa(const std::string& model_path, const std::vector<std::string>& words,
                                                 const float* samples, int n_samples, int64_t t_offset_cs,
                                                 int n_threads) {
@@ -133,6 +165,45 @@ std::vector<CrispasrAlignedWord> align_qwen3_fa(const std::string& model_path, c
     return out;
 }
 
+std::vector<CrispasrAlignedWord> align_wav2vec2_ctc(const std::string& model_path,
+                                                    const std::vector<std::string>& words, const float* samples,
+                                                    int n_samples, int64_t t_offset_cs, int n_threads) {
+    std::vector<CrispasrAlignedWord> out;
+    if (words.empty())
+        return out;
+
+    wav2vec2_model model;
+    if (!wav2vec2_load(model_path.c_str(), model)) {
+        fprintf(stderr, "crispasr[aligner-wav2vec2]: failed to load '%s'\n", model_path.c_str());
+        return out;
+    }
+
+    auto logits = wav2vec2_compute_logits(model, samples, n_samples, n_threads);
+    if (logits.empty()) {
+        fprintf(stderr, "crispasr[aligner-wav2vec2]: compute_logits failed\n");
+        return out;
+    }
+
+    const int V = (int)model.hparams.vocab_size;
+    const int T = (int)(logits.size() / V);
+    auto aligned = ctc_forced_align(logits.data(), T, V, words, model.vocab, (int)model.hparams.pad_token_id,
+                                    wav2vec2_frame_dur(model));
+    if (aligned.empty()) {
+        fprintf(stderr, "crispasr[aligner-wav2vec2]: align_words failed\n");
+        return out;
+    }
+
+    out.reserve(aligned.size());
+    for (const auto& w : aligned) {
+        CrispasrAlignedWord cw;
+        cw.text = w.word;
+        cw.t0_cs = t_offset_cs + (int64_t)std::llround((double)w.t0 * 100.0);
+        cw.t1_cs = t_offset_cs + (int64_t)std::llround((double)w.t1 * 100.0);
+        out.push_back(std::move(cw));
+    }
+    return out;
+}
+
 } // namespace
 
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
@@ -148,6 +219,12 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
     if (is_qwen3_fa) {
         const auto words = tokenise_words(transcript);
         return align_qwen3_fa(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
+    }
+
+    const std::string arch = gguf_architecture(aligner_model);
+    if (is_wav2vec2_aligner_model(aligner_model, arch)) {
+        const auto words = tokenise_words(transcript);
+        return align_wav2vec2_ctc(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
     }
 
     canary_ctc_context_params acp = canary_ctc_context_default_params();

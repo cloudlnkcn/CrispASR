@@ -20,6 +20,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_wav2vec2_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_1p5b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_tts_base_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_orpheus_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_chatterbox_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_indextts_backend();
@@ -69,7 +70,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_voxtral_backend();
     if (name == "voxtral4b")
         return crispasr_make_voxtral4b_backend();
-    if (name == "qwen3")
+    if (name == "qwen3" || name == "qwen3-1.7b" || name == "qwen3_1.7b" || name == "qwen3_17b" || name == "mega-asr" ||
+        name == "mega_asr" || name == "megaasr")
         return crispasr_make_qwen3_backend();
     if (name == "fastconformer-ctc")
         return crispasr_make_fastconformer_ctc_backend();
@@ -79,10 +81,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_vibevoice_backend();
     if (name == "vibevoice-1.5b" || name == "vibevoice-tts-1.5b" || name == "vibevoice-tts-base")
         return crispasr_make_vibevoice_1p5b_backend();
-    if (name == "qwen3-tts" || name == "qwen3_tts" || name == "qwen3tts" || name == "qwen3-tts-customvoice" ||
-        name == "qwen3tts-customvoice" || name == "qwen3-tts-cv" || name == "qwen3-tts-1.7b-base" ||
-        name == "qwen3-tts-1.7b" || name == "qwen3-tts-1.7b-customvoice" || name == "qwen3-tts-1.7b-cv" ||
-        name == "qwen3-tts-1.7b-voicedesign" || name == "qwen3-tts-voicedesign" || name == "qwen3-tts-vd")
+    if (name == "qwen3-tts" || name == "qwen3_tts" || name == "qwen3tts" || name == "qwen3-tts-1.7b-base" ||
+        name == "qwen3-tts-1.7b")
+        return crispasr_make_qwen3_tts_base_backend();
+    if (name == "qwen3-tts-customvoice" || name == "qwen3tts-customvoice" || name == "qwen3-tts-cv" ||
+        name == "qwen3-tts-1.7b-customvoice" || name == "qwen3-tts-1.7b-cv" || name == "qwen3-tts-1.7b-voicedesign" ||
+        name == "qwen3-tts-voicedesign" || name == "qwen3-tts-vd")
         return crispasr_make_qwen3_tts_backend();
     if (name == "orpheus" || name == "orpheus-tts" || name == "orpheus3b" || name == "kartoffel-orpheus" ||
         name == "kartoffel_orpheus" || name == "kartoffel-orpheus-de-natural" ||
@@ -145,6 +149,8 @@ std::vector<std::string> crispasr_list_backends() {
         "voxtral",
         "voxtral4b",
         "qwen3",
+        "qwen3-1.7b",
+        "mega-asr",
         "fastconformer-ctc",
         "wav2vec2",
         "hubert",
@@ -396,6 +402,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "canary";
     if (contains_ci("cohere"))
         return "cohere";
+    if (contains_ci("mega-asr") || contains_ci("mega_asr") || contains_ci("megaasr"))
+        return "mega-asr";
     if (contains_ci("qwen3") && contains_ci("asr"))
         return "qwen3";
     if (contains_ci("qwen3") && contains_ci("tts"))

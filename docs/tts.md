@@ -38,12 +38,21 @@ each run can produce a different prosody or phrasing.
     --tts "Good morning." --seed 2 --tts-output variant2.wav
 ```
 
-The seed is wired through every TTS backend that samples: qwen3-tts,
-chatterbox, indextts, orpheus (via temperature), voxcpm2 (CFM noise),
-and vibevoice. It also works for ASR backends with temperature
-sampling (parakeet, canary, cohere, qwen3-asr, voxtral4b, granite,
-glm-asr, kyutai-stt, moonshine). The server API accepts `"seed"` in
-the `/v1/audio/speech` JSON body.
+The seed is wired through the sampling-capable TTS backends:
+qwen3-tts, chatterbox, vibevoice, orpheus, indextts, and voxcpm2. It
+also works for ASR backends with temperature sampling (parakeet,
+canary, cohere, qwen3-asr, voxtral4b, granite, glm-asr, kyutai-stt,
+moonshine). The server API accepts `"seed"` in the `/v1/audio/speech`
+JSON body.
+
+Local live checks on `/Volumes/backups/ai/crispasr` confirmed the visible
+effect on `qwen3-tts-customvoice`, `chatterbox`, `vibevoice-tts`, and
+`vibevoice-1.5b`: same seed = bit-identical WAV, different seed =
+different WAV hash. `IndexTTS` accepts the seed too, but on the tested
+prompt/reference pair the default beam-search path stayed identical
+across seeds, so treat it as a low-visibility knob unless you expose a
+stochastic decode path. `Kokoro` uses `KOKORO_SEED` instead of
+`--seed`.
 
 For HTTP usage, see [`docs/server.md`](server.md) — `POST
 /v1/audio/speech` is the OpenAI-compatible TTS endpoint, available on
@@ -99,6 +108,12 @@ Python it surfaces as
 `crispasr.kokoro_resolve_for_lang(model_path, lang)` returning a
 `KokoroResolved(model_path, voice_path, voice_name, backbone_swapped)`
 record.
+
+Kokoro supports runtime speaking-rate control via the session API:
+
+| Setter | Default | Purpose |
+|---|---|---|
+| `set_length_scale(s)` | 1.0 | Per-phoneme duration multiplier. `> 1.0` = slower; `< 1.0` = faster. Clamped to `[0.25, 4.0]`. |
 
 ### Kokoro environment switches
 
@@ -449,8 +464,21 @@ Sampling controls:
 | Flag | Default | Purpose |
 |---|---|---|
 | `--temperature` | runtime default 0.8 | AR sampling temperature (0 = greedy; runtime falls back to 0.8 when global default 0.0) |
-| `--tts-steps` | 10 (base/lahgtna) / 2 (turbo/kartoffelbox-turbo meanflow) | CFM Euler steps |
-| `--codec-model` | sibling autodetect | explicit S3Gen GGUF path (overrides `-m auto` companion) |
+| `--seed N` | 0 (non-deterministic) | RNG seed — same seed + same text = bit-identical audio |
+| `--tts-steps N` | 10 (base/lahgtna) / 2 (turbo/kartoffelbox-turbo meanflow) | CFM Euler steps for the S3Gen mel-decoder |
+| `--codec-model FNAME` | sibling autodetect | Explicit S3Gen GGUF path (overrides `-m auto` companion) |
+
+Session-API knobs (runtime-settable via the session API, not CLI flags):
+
+| Setter | Default | Purpose |
+|---|---|---|
+| `set_top_p(p)` | 1.0 | Top-p nucleus-sampling threshold for the AR T3 token loop |
+| `set_min_p(p)` | 0.0 | Min-p sampling threshold |
+| `set_repetition_penalty(r)` | 1.0 | Repetition penalty (1.0 = no penalty; > 1 discourages repeated tokens) |
+| `set_cfg_weight(w)` | 0.5 | Classifier-free-guidance weight. 0 = unconditional; 0.5 = upstream default |
+| `set_exaggeration(e)` | 0.5 | Emotion-exaggeration scalar. Raise for dramatic delivery, lower for monotone |
+| `set_max_speech_tokens(n)` | 1000 | Upper bound on AR speech tokens per call (≈ 20 s at 50 Hz codes) |
+| `set_tts_steps(n)` | (see CLI table) | Same as `--tts-steps`; settable without reloading the session |
 
 **Quantized variants** (Q8_0, Q4_K) are supported — the
 `crispasr-quantize` tool skips vocoder, F0-predictor, and embedding

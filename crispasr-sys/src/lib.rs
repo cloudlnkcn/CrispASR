@@ -469,6 +469,49 @@ extern "C" {
         temperature: c_float,
         seed: u64,
     ) -> c_int;
+    pub fn crispasr_session_set_tts_seed(s: *mut CrispasrSession, seed: u64) -> c_int;
+    pub fn crispasr_session_set_max_new_tokens(
+        s: *mut CrispasrSession,
+        max_new_tokens: c_int,
+    ) -> c_int;
+    pub fn crispasr_session_set_frequency_penalty(
+        s: *mut CrispasrSession,
+        penalty: c_float,
+    ) -> c_int;
+    pub fn crispasr_session_set_tts_steps(s: *mut CrispasrSession, steps: c_int) -> c_int;
+    pub fn crispasr_session_set_top_p(s: *mut CrispasrSession, top_p: c_float) -> c_int;
+    pub fn crispasr_session_set_min_p(s: *mut CrispasrSession, min_p: c_float) -> c_int;
+    pub fn crispasr_session_set_repetition_penalty(s: *mut CrispasrSession, r: c_float) -> c_int;
+    pub fn crispasr_session_set_cfg_weight(s: *mut CrispasrSession, cfg_weight: c_float) -> c_int;
+    pub fn crispasr_session_set_exaggeration(
+        s: *mut CrispasrSession,
+        exaggeration: c_float,
+    ) -> c_int;
+    pub fn crispasr_session_set_max_speech_tokens(s: *mut CrispasrSession, n: c_int) -> c_int;
+    pub fn crispasr_session_set_length_scale(s: *mut CrispasrSession, scale: c_float) -> c_int;
+    pub fn crispasr_session_set_best_of(s: *mut CrispasrSession, n: c_int) -> c_int;
+    pub fn crispasr_session_set_beam_size(s: *mut CrispasrSession, n: c_int) -> c_int;
+    pub fn crispasr_session_set_grammar_text(
+        s: *mut CrispasrSession,
+        gbnf_text: *const c_char,
+        root_rule: *const c_char,
+        penalty: c_float,
+    ) -> c_int;
+    pub fn crispasr_session_set_fallback_thresholds(
+        s: *mut CrispasrSession,
+        entropy_thold: c_float,
+        logprob_thold: c_float,
+        no_speech_thold: c_float,
+        temperature_inc: c_float,
+    ) -> c_int;
+    pub fn crispasr_session_set_alt_n(s: *mut CrispasrSession, n: c_int) -> c_int;
+    pub fn crispasr_session_set_whisper_decode_extras(
+        s: *mut CrispasrSession,
+        suppress_nst: c_int,
+        suppress_regex: *const c_char,
+        carry_initial_prompt: c_int,
+    ) -> c_int;
+    pub fn crispasr_session_set_ask(s: *mut CrispasrSession, prompt: *const c_char) -> c_int;
     pub fn crispasr_session_detect_language(
         s: *mut CrispasrSession,
         pcm: *const c_float,

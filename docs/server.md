@@ -90,6 +90,10 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `prompt` | Initial prompt / context |
 | `response_format` | `json` (default), `verbose_json`, `text`, `srt`, `vtt` |
 | `temperature` | Sampling temperature (default: 0.0) |
+| `seed` | RNG seed for sampling (`0` = non-deterministic) |
+| `max_tokens` | Generated-token cap for supported autoregressive ASR backends |
+| `max_new_tokens` | Alias for `max_tokens` |
+| `frequency_penalty` | Opt-in repeated generated-token penalty for supported autoregressive ASR backends (`0.0` disabled) |
 
 `GET /v1/models` returns an OpenAI-compatible model list with the
 currently loaded model.
@@ -124,6 +128,10 @@ curl http://localhost:8080/v1/audio/speech \
 | `model` | (ignored) | Read but not validated — we serve whatever was loaded via `-m` or `POST /load`. Surfaced in the synth log line. |
 | `voice` | server's `--voice` | Passed through verbatim to the backend's `params.tts_voice`. Each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`). |
 | `instructions` | empty | Voice-direction prose for backends that support it (qwen3-tts VoiceDesign). Silently ignored on other backends so OpenAI clients targeting `gpt-4o-mini-tts` don't see 4xx errors. |
+| `seed` | `0` | RNG seed for sampling. `0` = non-deterministic. Same-seed + same-text produces bit-identical audio on all sampling-capable TTS backends (qwen3-tts, chatterbox, vibevoice, orpheus). |
+| `temperature` | server's `--temperature` | Sampling temperature for AR TTS backends. `0` = greedy; backends apply their own default (e.g. 0.8 for qwen3-tts) when the global default of 0.0 is unchanged. |
+| `max_new_tokens` | server's `--max-new-tokens` | AR token generation cap. `<= 0` clears the override and uses the backend default. |
+| `frequency_penalty` | `0.0` | Opt-in repeated generated-token penalty for AR TTS backends. `0.0` disabled. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), or `f32` (crispasr-specific raw float32 for downstream DSP). |
 
@@ -263,7 +271,9 @@ curl http://localhost:8080/health
 curl http://localhost:8080/v1/audio/transcriptions \
   -H "Authorization: Bearer $CRISPASR_API_KEY" \
   -F "file=@audio.wav" \
-  -F "response_format=verbose_json"
+  -F "response_format=verbose_json" \
+  -F "max_tokens=256" \
+  -F "frequency_penalty=0.4"
 ```
 
 By default the compose stack:

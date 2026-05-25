@@ -81,6 +81,7 @@ namespace crispasr_diff {
 struct Report {
     bool found = false;         // the name existed in the archive
     size_t n_elem = 0;          // number of elements compared
+    size_t n_nonfinite = 0;     // count of NaN / Inf in the C++ data array
     float max_abs = 0.0f;       // max |cpp[i] - ref[i]|
     float mean_abs = 0.0f;      // mean |cpp[i] - ref[i]|
     float rms = 0.0f;           // sqrt(mean((cpp-ref)^2))
@@ -90,7 +91,11 @@ struct Report {
     int top1_total = 0;         // logits only: total tokens compared
     std::vector<int64_t> shape; // shape of the ref tensor
 
-    bool is_pass(float cos_threshold = 0.999f) const { return found && cos_min >= cos_threshold; }
+    // Non-finite data always fails, regardless of cos: NaN-vs-finite comparisons
+    // silently scored as cos=1.000 max_abs=0 because IEEE-754 NaN comparisons
+    // all return false. PLAN #83 r9 (May 2026): caught a Metal allocator bug
+    // that was hidden behind these bogus PASSes.
+    bool is_pass(float cos_threshold = 0.999f) const { return found && n_nonfinite == 0 && cos_min >= cos_threshold; }
 };
 
 // Ground-truth archive loaded from a crispasr reference GGUF.

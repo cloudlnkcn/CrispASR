@@ -5,6 +5,35 @@ All wrappers are thin shells over the same C-ABI surface in
 diarize, LID, align, download — is one function call in every
 language.
 
+## Session setter reference
+
+All generation-control setters are available in every binding. Each
+call is a thin proxy over the C-ABI function of the same name.
+Setters that return an error code `-2` are soft no-ops — the active
+backend doesn't expose that knob, but the call is safe to make.
+
+| C-ABI setter | Bindings name (Python/Rust/Go/Java) | Notes |
+|---|---|---|
+| `set_temperature(temp, seed)` | `set_temperature` / `set_temperature` / `SetTemperature` / `setTemperature` | ASR + TTS backends that sample; rc=-2 = no backend supports it |
+| `set_tts_seed(seed)` | `set_tts_seed` / `set_tts_seed` / `SetTTSSeed` / `setTtsSeed` | Chatterbox, vibevoice, qwen3-tts, orpheus; rc=-2 for others |
+| `set_max_new_tokens(n)` | `set_max_new_tokens` / `set_max_new_tokens` / `SetMaxNewTokens` / `setMaxNewTokens` | AR backends; ≤ 0 clears override |
+| `set_frequency_penalty(f)` | `set_frequency_penalty` / `set_frequency_penalty` / `SetFrequencyPenalty` / `setFrequencyPenalty` | AR backends; ≤ 0 disables |
+| `set_tts_steps(n)` | `set_tts_steps` / `set_tts_steps` / `SetTTSSteps` / `setTtsSteps` | Chatterbox S3Gen CFM steps; vibevoice DPM-Solver++ steps |
+| `set_top_p(p)` | `set_top_p` / `set_top_p` / `SetTopP` / `setTopP` | Chatterbox AR T3 loop |
+| `set_min_p(p)` | `set_min_p` / `set_min_p` / `SetMinP` / `setMinP` | Chatterbox AR T3 loop |
+| `set_repetition_penalty(r)` | `set_repetition_penalty` / `set_repetition_penalty` / `SetRepetitionPenalty` / `setRepetitionPenalty` | Chatterbox (1.0 = no penalty) |
+| `set_cfg_weight(w)` | `set_cfg_weight` / `set_cfg_weight` / `SetCFGWeight` / `setCfgWeight` | Chatterbox (0.5 = upstream default; 0 = unconditional) |
+| `set_exaggeration(e)` | `set_exaggeration` / `set_exaggeration` / `SetExaggeration` / `setExaggeration` | Chatterbox emotion scalar (0.5 = upstream default) |
+| `set_max_speech_tokens(n)` | `set_max_speech_tokens` / `set_max_speech_tokens` / `SetMaxSpeechTokens` / `setMaxSpeechTokens` | Chatterbox AR loop token budget (default 1000 ≈ 20 s) |
+| `set_length_scale(s)` | `set_length_scale` / `set_length_scale` / `SetLengthScale` / `setLengthScale` | Kokoro phoneme duration multiplier (1.0 = normal) |
+| `set_best_of(n)` | `set_best_of` / `set_best_of` / `SetBestOf` / `setBestOf` | Best-of-N sampling for temperature > 0 |
+| `set_beam_size(n)` | `set_beam_size` / `set_beam_size` / `SetBeamSize` / `setBeamSize` | Beam search width |
+| `set_grammar_text(gbnf, root, penalty)` | `set_grammar_text` / `set_grammar_text` / `SetGrammarText` / `setGrammarText` | GBNF constrained decoding (whisper); empty string clears |
+| `set_fallback_thresholds(...)` | `set_fallback_thresholds` / `set_fallback_thresholds` / `SetFallbackThresholds` / `setFallbackThresholds` | Whisper entropy/logprob/no-speech thresholds + temp-inc |
+| `set_alt_n(n)` | `set_alt_n` / `set_alt_n` / `SetAltN` / `setAltN` | Per-token alternative candidates (whisper greedy) |
+| `set_whisper_decode_extras(...)` | `set_whisper_decode_extras` / `set_whisper_decode_extras` / `SetWhisperDecodeExtras` / `setWhisperDecodeExtras` | suppress_nst, suppress_regex, carry_initial_prompt |
+| `set_ask(prompt)` | `set_ask` / `set_ask` / `SetAsk` / `setAsk` | Free-form prompt for LLM-style backends |
+
 > **Tip — chunk-boundary dedup for bindings.** When a binding drives a
 > CAP_UNBOUNDED_INPUT backend (parakeet, canary, …) chunk-by-chunk and
 > needs to stitch the output, call `crispasr_lcs_dedup_prefix_count`
@@ -38,6 +67,8 @@ from crispasr import (
 
 # Transcribe (any of the 24 ASR backends via one session object)
 sess = Session("parakeet-tdt-0.6b-v3-q4_k.gguf")
+sess.set_max_new_tokens(256)       # AR backends; <= 0 clears
+sess.set_frequency_penalty(0.4)    # AR backends; <= 0 disables
 segs = sess.transcribe_vad(pcm, "silero-v5.1.2.bin")  # stitched VAD pass
 
 # Run each shared post-step standalone
@@ -71,6 +102,8 @@ use crispasr::{
 };
 
 let sess = Session::open("cohere-transcribe-q4_k.gguf", 4)?;
+sess.set_max_new_tokens(256)?;
+sess.set_frequency_penalty(0.4)?;
 let segs = sess.transcribe_vad(&pcm, "silero-v5.1.2.bin", None)?;
 
 let entry = registry_lookup("canary")?.unwrap();
@@ -122,6 +155,8 @@ import "github.com/CrispStrobe/CrispASR/bindings/go/crispasr"
 
 sess, _ := crispasr.OpenSession("parakeet.gguf", crispasr.SessionOpts{Threads: 4})
 defer sess.Close()
+_ = sess.SetMaxNewTokens(256)
+_ = sess.SetFrequencyPenalty(0.4)
 segs, _ := sess.Transcribe(pcm, crispasr.TranscribeOpts{Vad: true})
 ```
 
@@ -133,6 +168,8 @@ Module: `bindings/go/crispasr/`.
 import org.crispasr.CrispASR;
 
 try (var sess = CrispASR.openSession("granite-speech.gguf")) {
+    sess.setMaxNewTokens(256);
+    sess.setFrequencyPenalty(0.4f);
     var segs = sess.transcribe(pcm);
 }
 ```

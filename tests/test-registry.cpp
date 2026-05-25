@@ -76,6 +76,36 @@ TEST_CASE("registry: vibevoice has entry", "[unit][registry]") {
     REQUIRE(found);
 }
 
+TEST_CASE("registry: wav2vec2 aligner aliases resolve", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("wav2vec2-aligner", e));
+    REQUIRE(e.backend == "wav2vec2-aligner");
+    REQUIRE(e.filename.find("wav2vec2") != std::string::npos);
+
+    REQUIRE(crispasr_registry_lookup("wav2vec2-aligner-en", e));
+    REQUIRE(e.filename == "wav2vec2-xlsr-en-q4_k.gguf");
+
+    REQUIRE(crispasr_registry_lookup("wav2vec2-aligner-de", e));
+    REQUIRE(e.filename.find("german") != std::string::npos);
+
+    for (const auto& [alias, filename_part] : {
+             std::pair{"wav2vec2-aligner-fr", "french"},
+             std::pair{"wav2vec2-aligner-es", "spanish"},
+             std::pair{"wav2vec2-aligner-it", "italian"},
+             std::pair{"wav2vec2-aligner-ja", "japanese"},
+             std::pair{"wav2vec2-aligner-zh", "chinese-zh-cn"},
+             std::pair{"wav2vec2-aligner-nl", "dutch"},
+             std::pair{"wav2vec2-aligner-uk", "uk-with-small-lm"},
+             std::pair{"wav2vec2-aligner-pt", "portuguese"},
+             std::pair{"wav2vec2-aligner-ar", "arabic"},
+             std::pair{"wav2vec2-aligner-cs", "cs-250"},
+         }) {
+        REQUIRE(crispasr_registry_lookup(alias, e));
+        REQUIRE(std::string(e.filename).find(filename_part) != std::string::npos);
+        REQUIRE(e.backend == alias);
+    }
+}
+
 TEST_CASE("registry: preferred quant rewrites primary filename", "[unit][registry]") {
     CrispasrRegistryEntry e;
     bool found = crispasr_registry_lookup("chatterbox", e, "q4_k");

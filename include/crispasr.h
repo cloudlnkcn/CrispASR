@@ -80,6 +80,7 @@ extern "C" {
 struct whisper_context;
 struct whisper_state;
 struct whisper_full_params;
+struct crispasr_session;
 
 typedef int32_t whisper_pos;
 typedef int32_t whisper_token;
@@ -564,6 +565,37 @@ CRISPASR_API struct whisper_context_params whisper_context_default_params(void);
 
 CRISPASR_API struct whisper_full_params* whisper_full_default_params_by_ref(enum whisper_sampling_strategy strategy);
 CRISPASR_API struct whisper_full_params whisper_full_default_params(enum whisper_sampling_strategy strategy);
+CRISPASR_API void crispasr_params_set_max_tokens(struct whisper_full_params* p, int n);
+CRISPASR_API void crispasr_params_set_temperature(struct whisper_full_params* p, float t);
+
+// Unified session decode / sampling controls.
+// set_temperature: rc=-2 = no backend supports runtime temperature (soft no-op).
+// set_tts_seed:    rc=-2 = no TTS backend supports runtime reseeding (soft no-op).
+// max_new_tokens <= 0 clears the cap override; frequency_penalty <= 0 disables it.
+CRISPASR_API int crispasr_session_set_temperature(struct crispasr_session* s, float temperature, uint64_t seed);
+CRISPASR_API int crispasr_session_set_tts_seed(struct crispasr_session* s, uint64_t seed);
+CRISPASR_API int crispasr_session_set_tts_steps(struct crispasr_session* s, int steps);
+CRISPASR_API int crispasr_session_set_max_new_tokens(struct crispasr_session* s, int n);
+CRISPASR_API int crispasr_session_set_frequency_penalty(struct crispasr_session* s, float penalty);
+CRISPASR_API int crispasr_session_set_top_p(struct crispasr_session* s, float top_p);
+CRISPASR_API int crispasr_session_set_min_p(struct crispasr_session* s, float min_p);
+CRISPASR_API int crispasr_session_set_repetition_penalty(struct crispasr_session* s, float r);
+CRISPASR_API int crispasr_session_set_cfg_weight(struct crispasr_session* s, float cfg_weight);
+CRISPASR_API int crispasr_session_set_exaggeration(struct crispasr_session* s, float exaggeration);
+CRISPASR_API int crispasr_session_set_max_speech_tokens(struct crispasr_session* s, int n);
+CRISPASR_API int crispasr_session_set_length_scale(struct crispasr_session* s, float scale);
+CRISPASR_API int crispasr_session_set_best_of(struct crispasr_session* s, int n);
+CRISPASR_API int crispasr_session_set_beam_size(struct crispasr_session* s, int n);
+CRISPASR_API int crispasr_session_set_grammar_text(struct crispasr_session* s, const char* gbnf_text,
+                                                    const char* root_rule, float penalty);
+CRISPASR_API int crispasr_session_set_fallback_thresholds(struct crispasr_session* s, float entropy_thold,
+                                                           float logprob_thold, float no_speech_thold,
+                                                           float temperature_inc);
+CRISPASR_API int crispasr_session_set_alt_n(struct crispasr_session* s, int n);
+CRISPASR_API int crispasr_session_set_whisper_decode_extras(struct crispasr_session* s, int suppress_nst,
+                                                             const char* suppress_regex,
+                                                             int carry_initial_prompt);
+CRISPASR_API int crispasr_session_set_ask(struct crispasr_session* s, const char* prompt);
 
 // Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
 // Not thread safe for same context

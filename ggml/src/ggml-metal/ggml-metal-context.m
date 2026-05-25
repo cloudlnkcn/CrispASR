@@ -661,6 +661,14 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    // CrispASR debug (#83 r9 follow-up #5): override n_cb via env to test
+    // hypothesis that cross-cmd-buf concurrency violates mem_ranges tracking.
+    {
+        const char * env = getenv("CRISPASR_METAL_N_CB");
+        if (env && *env) {
+            n_cb = atoi(env);
+        }
+    }
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 

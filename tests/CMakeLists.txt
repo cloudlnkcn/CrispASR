@@ -345,6 +345,56 @@ catch_discover_tests(test-punctuation-policy
     PROPERTIES LABELS "unit"
 )
 
+# ─── test - diarize - global — Catch2 unit tests for global diarization logic (#110)
+add_executable(test-diarize-global
+    test_diarize_global.cpp
+)
+target_include_directories(test-diarize-global PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-diarize-global PRIVATE
+    Catch2::Catch2WithMain
+    common
+)
+catch_discover_tests(test-diarize-global
+    TEST_SPEC "[diarize]"
+    PROPERTIES LABELS "unit;diarize"
+)
+
+# ─── test - paraformer — live integration tests for paraformer backend
+add_executable(test-paraformer
+    test_paraformer.cpp
+)
+target_include_directories(test-paraformer PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-paraformer PRIVATE
+    Catch2::Catch2WithMain
+    paraformer
+)
+catch_discover_tests(test-paraformer
+    TEST_SPEC "[paraformer]"
+    PROPERTIES LABELS "live;paraformer"
+)
+
+# ─── test - context - bias — Catch2 unit tests for CTC-WS phrase-boost trie (PLAN #98)
+add_executable(test-context-bias
+    test_context_bias.cpp
+)
+target_include_directories(test-context-bias PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-context-bias PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-context-bias
+    TEST_SPEC "[context_bias]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test - windows - mic — regression test for Windows dshow mic selection
 add_executable(test-windows-mic
     test_windows_mic.cpp
@@ -518,6 +568,26 @@ catch_discover_tests(test-issue-89-long-audio-fallback
     PROPERTIES LABELS "unit;long-audio;issue-89"
 )
 
+# ─── test-internal-chunking-gate — CAP_INTERNAL_CHUNKING regression guard
+#
+# Pins the auto-chunk fallback skip for backends that declare
+# CAP_INTERNAL_CHUNKING (parakeet, canary, fastconformer-ctc).
+# These backends handle their own long-audio chunking internally via
+# parakeet_transcribe_streamed or single-pass encoding.
+add_executable(test-internal-chunking-gate
+    test-internal-chunking-gate.cpp
+)
+target_include_directories(test-internal-chunking-gate PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-internal-chunking-gate PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-internal-chunking-gate
+    TEST_SPEC "[internal-chunking]"
+    PROPERTIES LABELS "unit;internal-chunking;issue-89"
+)
+
 # ─── test-lcs-chunk-merge — Catch2 unit tests for LCS chunk-merge dedup
 #
 # Ports of NeMo's `longest_common_subsequence_merge` test cases
@@ -619,6 +689,27 @@ target_link_libraries(test-issue-79 PRIVATE
 #Note : No add_test() here as it requires a large VibeVoice GGUF model path as an argument.
 #Usage :./ bin / test - issue - 79 / path / to / vibevoice - asr - 7b.gguf
 
+# ─── test-session-setters — Catch2 unit tests for every generation-control
+# session setter declared in include/crispasr.h (PLAN §88 parity sweep).
+#
+# Verifies the null-handle guard (return -1) for all 19 setters.
+# No model loaded — pure null-arg path, sub-millisecond.
+add_executable(test-session-setters
+    test-session-setters.cpp
+)
+target_include_directories(test-session-setters PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-session-setters PRIVATE
+    Catch2::Catch2WithMain
+    crispasr
+)
+catch_discover_tests(test-session-setters
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test - registry — Catch2 unit tests for crispasr_model_registry
 #
 #Verifies registry lookup by backend name, reverse lookup by filename,
@@ -707,6 +798,24 @@ target_link_libraries(test-core-decode PRIVATE
 catch_discover_tests(test-core-decode
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# ─── test-audio-chunking — Catch2 unit tests for audio_chunking::find_energy_min_split
+#
+# Covers the energy-minimum detection helper directly: quiet window selection,
+# tie-breaking, search range, degenerate spans.  Complements test_chunk_context
+# which tests the higher-level split_at_energy_minima wrapper.
+# Pure CPU, no model load, sub-millisecond.
+add_executable(test-audio-chunking test-audio-chunking.cpp)
+target_include_directories(test-audio-chunking PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-audio-chunking PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-audio-chunking
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;chunking"
 )
 
 # ─── test_slice_timestamps — Catch2 unit tests for crispasr_fixed_chunk_slices

@@ -132,6 +132,7 @@ struct whisper_params {
     // DTW path (no second forward pass, no ~442 MB download).
     bool no_auto_aligner = false;
     int32_t max_new_tokens = 512;
+    float frequency_penalty = 0.0f;
     int32_t chunk_seconds = 30;
     bool chunk_seconds_explicit = false; // true when user passed --chunk-seconds
     float chunk_overlap_seconds = 3.0f;  // overlap context on each side of chunk boundary
@@ -144,7 +145,10 @@ struct whisper_params {
     // 3-4 if your audio has long-silence regions where blank tokens
     // dominate the boundary token run (avoids over-slicing).
     int lcs_min_length = 1;
+    bool warmup = false;          // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
+    std::string hotwords;         // comma-separated hotword list (PLAN #98)
+    float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches
     std::string lid_backend;
     std::string lid_model;
     // Post-ASR text LID: when set, after transcription completes, run

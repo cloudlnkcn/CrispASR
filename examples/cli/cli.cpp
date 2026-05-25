@@ -388,6 +388,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.no_auto_aligner = true;
     } else if (arg == "-n" || arg == "--max-new-tokens") {
         params.max_new_tokens = std::stoi(ARGV_NEXT);
+    } else if (arg == "--frequency-penalty") {
+        params.frequency_penalty = std::stof(ARGV_NEXT);
     } else if (arg == "-ck" || arg == "--chunk-seconds") {
         params.chunk_seconds = std::stoi(ARGV_NEXT);
         params.chunk_seconds_explicit = true;
@@ -407,6 +409,34 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
             return false;
         }
         params.lcs_min_length = v;
+    } else if (arg == "--hotwords") {
+        params.hotwords = ARGV_NEXT;
+    } else if (arg == "--hotwords-file") {
+        // Read one hotword per line from a file
+        std::string path = ARGV_NEXT;
+        FILE* f = fopen(path.c_str(), "r");
+        if (f) {
+            char line[1024];
+            std::string acc;
+            while (fgets(line, sizeof(line), f)) {
+                std::string s(line);
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+                    s.pop_back();
+                if (!s.empty()) {
+                    if (!acc.empty())
+                        acc += ",";
+                    acc += s;
+                }
+            }
+            fclose(f);
+            params.hotwords = acc;
+        } else {
+            fprintf(stderr, "warning: cannot open hotwords file '%s'\n", path.c_str());
+        }
+    } else if (arg == "--hotwords-boost") {
+        params.hotwords_boost = std::stof(ARGV_NEXT);
+    } else if (arg == "--warmup") {
+        params.warmup = true;
     } else if (arg == "--parakeet-decoder") {
         params.parakeet_decoder = ARGV_NEXT;
     } else if (arg == "--lid-backend") {
@@ -802,7 +832,7 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "\ncrispasr backend options (select a non-whisper model):\n");
     fprintf(stderr,
             "  --backend NAME                    [%-7s] backend: "
-            "whisper|parakeet|canary|cohere|qwen3|voxtral|voxtral4b|granite\n",
+            "whisper|parakeet|canary|cohere|qwen3|qwen3-1.7b|mega-asr|voxtral|voxtral4b|granite\n",
             params.backend.c_str());
     fprintf(stderr, "  --list-backends                   list backends compiled into this binary and exit\n");
     fprintf(stderr, "  --list-backends-json              same as --list-backends but JSON-formatted, for tooling\n");
@@ -937,6 +967,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.firered_vad_debug ? "true" : "false");
     fprintf(stderr, "  -n N,      --max-new-tokens N     [%-7d] max new tokens for LLM backends\n",
             params.max_new_tokens);
+    fprintf(stderr, "             --frequency-penalty F  [%-7.2f] penalize repeated generated tokens on AR backends\n",
+            params.frequency_penalty);
     fprintf(stderr, "  -ck N,     --chunk-seconds N      [%-7d] fallback chunk size when VAD is disabled\n",
             params.chunk_seconds);
     fprintf(stderr, "             --chunk-overlap F      [%-7.1f] overlap context (sec) at chunk boundaries\n",

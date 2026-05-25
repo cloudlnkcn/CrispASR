@@ -6,6 +6,731 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-24 PLAN #83 Round 9 follow-up #5 — Bug B FIXED via sched parallel=true
+
+After eliminating ~10 hypotheses (cache barriers, blit copies,
+concurrency, fusion, optimize, n_cb variants, private-storage
+buffers, im2col 1×1×1 edge case, rc-as-mul_mat) and conclusively
+proving the divergence is between the host's view and the GPU's
+view of the same shared-storage Metal buffer in the second (uncond)
+graph_compute call, the fix turned out to live in
+`ggml_backend_sched_new`'s `parallel` flag.
+
+With `parallel=false` (chatterbox default until this fix), sched's
+between-backend synchronisation is `ggml_backend_synchronize` →
+`[cmd_buf_last waitUntilCompleted]`. That blocks for the prior
+command buffer's completion but does NOT invalidate the GPU's L1/L2
+cached view of a shared-storage `MTLBuffer` that the CPU just
+memcpy'd between consecutive command-buffer submissions.
+
+With `parallel=true`, sched allocates 4× input-copy slots per input
+and uses `ggml_backend_event_record` / `event_wait` for ordering.
+On Metal that maps to `MTLSharedEvent`'s `encodeSignalEvent` /
+`encodeWaitForEvent` commands, which carry proper GPU cache
+invalidation between submissions.
+
+Switched `chatterbox_s3gen_init_from_file` to call
+`ggml_backend_sched_new(..., /*parallel=*/true, ...)`. Removed the
+unet_input GPU pin workaround in `cfm_euler_solve::run_denoiser`
+(no longer needed). Removed the `CRISPASR_NO_INPUT_PIN` env
+override.
+
+Verification on M1 (smoke, "Hello.", seed 42):
+
+| Configuration | rms (vs ref 5.115) |
+| - | - |
+| GPU residency, sched parallel=true (this fix) | **5.143** ✓ |
+| GPU residency, sched parallel=false (Bug B, removed) | 16.x ✗ |
+| CPU residency, sched parallel=true (this fix) | **5.139** ✓ |
+| CPU residency, sched parallel=false (prior baseline) | 5.139 (unchanged) |
+
+Diff harness `s3gen_mel`: `cos_min = 0.999976` (matches the
+previous workaround's baseline).
+
+The Bug A fix (sched src-mutation log) from R9 #4 is INDEPENDENT
+and continues to be required.
+
+LEARNINGS R9 #5 closes Bug B with two new lessons: 7' replaces the
+old "Pinning fixes it is not a root cause" with a more nuanced
+"Pinning addressed a real symptom but not the root cause", and 8
+("Check `ggml_backend_sched_new`'s `parallel` flag for Metal
+cache-coherency-shaped bugs").
+
+---
+
+## 2026-05-24 PLAN #83 Round 9 follow-up #5 — Bug B narrowed to rc residual conv (superseded by fix above)
+
+Investigated open Bug B from follow-up #4 (workaround in place: pinning
+`unet_input` to GPU when UNet runs GPU-resident). Eliminated five
+hypotheses, localized the divergence point, but did not identify the
+root cause. The workaround keeps shipping.
+
+**Localized the divergence.** Block-by-block probe of the UNet's
+first resnet pass shows b1 and b2 produce bit-identical
+(cos=1.000) intermediates between Path X (pinned) and Path Y
+(no-pin). The first divergent tensor is the **residual conv
+output** (`rc.weight` × `unet_input` inside `causal_resnet_block`
+at `s3.fd.db.0.0`). Added a new probe knob
+`CRISPASR_S3GEN_UNET_PROBE_RC_OUT=1` that dumps it as
+`dump_rc_out_db00`. Comparison:
+
+- Path X (workaround): `rc_out_db00 rms=0.3631`
+- Path Y (Bug B): `rc_out_db00 rms=0.0645`
+- cos(X, Y) = **0.022**
+
+So the rc kernel sees ~zero input in Bug B, even though the host
+`tensor_get` on the same Metal compute-buffer offset returns the
+correct Gaussian-noise bytes. b1 and b2 reading the same offset see
+correct data and produce identical output.
+
+**Eliminated:**
+
+1. CPU store-buffer / cache coherency — `CRISPASR_FORCE_DMB=1`
+   (full `__sync_synchronize` after the memcpy) doesn't help.
+2. GPU-side cache invalidation — `CRISPASR_FORCE_BLIT_COPY=1`
+   (blit-encoder copy in its own committed cb instead of host
+   memcpy) doesn't help.
+3. Intra-encoder concurrency — `GGML_METAL_CONCURRENCY_DISABLE=1`
+   and `GGML_METAL_GRAPH_OPTIMIZE=0` don't help.
+4. Cross-cmd-buf race — `CRISPASR_METAL_N_CB=2` doesn't worsen the
+   bug.
+5. Missing `mem_ranges` barrier — `CRISPASR_METAL_FORCE_BARRIER=1`
+   (emit a Metal `memoryBarrierWithScope:Buffers` before every
+   single op) doesn't help.
+
+All five experiments leave Bug B's smoke at `rms ≈ 16.1` vs the
+workaround's 5.14. No measurable improvement from any of them.
+
+**Operational note discovered along the way.** `ggml_set_output` on
+a probe target preserves that slot but introduces an implicit
+"(transposed) (cont)" follow-up tensor that shifts subsequent
+gallocr offsets — which is enough to BREAK the workaround under
+certain marking patterns (saw `MARK_DB_RESNET + PROBE_BLOCK1=1`
+push the workaround to `rms=17.355`). So future investigators
+should probe Path X and Path Y as separate runs with **identical
+marking config**, and avoid trusting "extra-mark" runs for
+end-to-end correctness.
+
+**Diagnostic knobs added** (env-gated, no runtime impact when
+unset; committed as WIP for the next investigator):
+
+- `CRISPASR_NO_INPUT_PIN` — gates off the `unet_input` pin workaround
+  in `cfm_euler_solve::run_denoiser` to reproduce Bug B.
+- `CRISPASR_IM2COL_DBG` — prints first 8 host bytes of `op->src[1]`
+  at the FIRST UNet `kernel_im2col_f32` dispatch.
+- `CRISPASR_FORCE_DMB`, `CRISPASR_FORCE_BLIT_COPY`,
+  `CRISPASR_METAL_FORCE_BARRIER`, `CRISPASR_METAL_N_CB` — the
+  hypothesis-elimination knobs above.
+- `CRISPASR_S3GEN_UNET_PROBE_RC_OUT` — marks the residual conv output
+  at `s3.fd.db.0.0` as a dump tensor.
+
+LEARNINGS Round 9 follow-up #5 records the full hypothesis table
+and the next experiment to run (custom Metal kernel that captures
+per-thread `x[offset_src]` reads to a side buffer).
+
+---
+
+## 2026-05-24 PLAN #83 Round 9 follow-up #4 — S3Gen UNet GPU drift: TWO bugs in tandem
+
+Three rounds of bisect (#83 R9 follow-ups #1–#3) had ruled out gallocr,
+per-op pin workarounds, the GGML_PREC_F32 hint on conv1d, Metal
+concurrency, every flash-attn variant, and concluded the bug was
+"at the Metal kernel layer, address-dependent, no in-tree workaround."
+Follow-up #4 found the actual root cause(s) — there are TWO independent
+bugs that both have to be fixed to make GPU-residency UNet work.
+
+**Method.** Captured CPU vs GPU bytes at every probe point in the first
+`causal_block1d` (`s3.fd.db.0.0.b1`) via `CRISPASR_S3GEN_UNET_PROBE_BLOCK1=0
++ CRISPASR_S3GEN_DUMP_UNET=<tag> + CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK=1`.
+`tools/compare_probe_dumps.py` showed `after_im2col` already at
+cos=-0.085 between CPU and GPU — the very first GPU kernel of the
+UNet was producing structurally wrong output. `tools/inspect_im2col_dump.py`
+confirmed the kernel logic (causal zero-padding) was correct, but it
+was reading the wrong values from x.
+
+A small `CRISPASR_S3GEN_LOG_INPUT=1` diagnostic + an inline
+`ggml_backend_tensor_get` right before im2col dispatch and an
+`fprintf` in `ggml_backend_sched_compute_splits` confirmed:
+
+- On the FIRST call per CFM step (the CFG conditional pass), sched
+  detects `unet_input` as a split input and copies CPU→Metal correctly.
+- On the SECOND call (the CFG unconditional pass), `split[0].n_inputs`
+  is 0 — sched fails to detect `unet_input` as needing a copy. The
+  Metal kernel reads stale data left over from a previous compute.
+
+**Root cause #1 — sched src[j] dangling pointer across alloc_graph calls.**
+In `ggml_backend_sched_split_graph`, the input-detection loop walks
+each node's `src[j]` and, when crossing backends, rewires
+`node->src[j] = tensor_id_copy(...)`. This mutates the user's graph
+in place. The input_cpy tensors live in `sched->ctx`, which is freed
+and re-initialised at the top of the very NEXT split_graph call
+(`ggml_free(sched->ctx); sched->ctx = ggml_init(params)`). So after
+the cond call's compute returns, the user's `gf->nodes[i]->src[j]`
+points at memory that the next split_graph will reclaim. The uncond
+call's split_graph then walks the user's graph, reads dangling src
+pointers, and silently skips creating new input copies because the
+garbage flags rarely match `GGML_TENSOR_FLAG_INPUT`.
+
+Patch: `ggml/src/ggml-backend.cpp` keeps a mutation log of every
+`node->src[j]` rewire; `ggml_backend_sched_compute_splits` restores
+the originals at the end of compute so the user's graph is left
+exactly as they built it. `MUST RE-APPLY` after ggml bumps.
+
+**Root cause #2 — `unet_input` divergence: NOT FIXED, only sidestepped.**
+Even with the dangling-pointer bug patched and the sched copy
+correctly delivering the user's bytes to `MTL0#unet_input#0` on
+every call (verified by inline `ggml_backend_tensor_get` right
+before im2col dispatch — kernel reads CORRECT input bytes),
+downstream compute still produces `rms ~16` instead of the
+expected ~5.1. The cause was not traced; it is sidestepped by
+placing `unet_input` on the consuming Metal backend via
+`ggml_backend_sched_set_tensor_backend(sched, unet_input, c->backend)`
+in `cfm_euler_solve::run_denoiser`. The handover at
+`handover-prompts/issue83-r9-followup-5-unet-input-routing.md`
+collects everything we know about Bug #2 and what's been ruled
+out, for a follow-up agent to chase to root cause.
+
+Bisect findings on which inputs to pin:
+
+| Pinned to GPU | Smoke `vocoder mel rms` | Verdict |
+| - | - | - |
+| (none) | 14.6 | broken |
+| `unet_input` only | **5.14** | works ✓ |
+| `time_emb` only | 14.4 | broken |
+| `mask` only | 16.0 | broken |
+| `unet_input` + `time_emb` | 209 | catastrophic |
+| `unet_input` + `mask` | 5.14 | works ✓ |
+| all three | 5.14 | works ✓ |
+
+Pinning `time_emb` forces `mish` onto Metal which changes the
+resnet block's cross-backend topology in a way that interacts badly
+with the rest of the graph. Pinning just `unet_input` is the
+minimal correct fix.
+
+**Verification (M1 Metal):**
+
+| Config | Before | After |
+| - | - | - |
+| baseline GPU residency, `--tts "Hello."` | `rms=13.938` | `rms=5.143` (ref 5.115) |
+| 2-mark NaN trigger | `rms=NaN` | `rms=5.291` |
+| diff harness `s3gen_mel` | `cos_min=0.940` | `cos_min=0.999976` |
+| long text (~9 s) | `rms=13.045` | `rms=4.741` |
+| production CPU residency (default) | `rms=5.139` | `rms=5.139` (no change) |
+
+`s3gen_mel cos_min=0.999976` matches the production weight-residency
+split (0.999980); the residual ~1e-2 max_abs is FP16/F32 round-off.
+The GPU-residency path is now correct AND ~22% faster than the
+CPU-residency split on M1 (median 34 s vs 43.7 s on the smoke run,
+3-run wall clock).
+
+**Verification that both fix halves are necessary:** ran with each
+half disabled in isolation:
+
+| Configuration | smoke rms | result |
+| - | - | - |
+| neither fix | 13.938 | broken (pre-fix baseline) |
+| ggml mutation log only | 16.154 | broken |
+| app-side pin of `unet_input` only | 14.640 | broken |
+| both | **5.143** | works ✓ |
+
+So both bugs are real and independent. Bug #1 fix is upstream-quality;
+Bug #2 fix is a workaround pending follow-up #5.
+
+**Lessons replacing R9 follow-up #3's 2''':**
+
+2''''. **A backend-pin diagnostic ("does forcing input to GPU fix it?")
+should be tried before declaring a Metal kernel bug.** Three rounds
+chased shader-level address-dependence; the fix was a one-line pin
+plus a small ggml sched patch. When CPU vs GPU bytes differ at the
+FIRST kernel, the suspect chain is: host upload → sched input
+placement → sched copy → kernel dispatch. Verify each step's outputs
+before assuming kernel correctness is at fault.
+
+5. **ggml sched mutates the user's graph in place and depends on the
+mutations persisting across alloc_graph calls — but doesn't.** The
+implicit contract "you give me a fresh gf each call, I rewire it"
+breaks when the same gf is reused (e.g. CFG's cond+uncond passes).
+Always restore mutations at end of compute. The patched
+`ggml-backend.cpp` does this via a mutation log.
+
+6. **For long, mixed-residency GPU sub-graphs, the input-pinning
+choice is non-obvious.** Pinning everything to the consuming backend
+isn't always right — pinning `time_emb` to GPU here was actively
+catastrophic. Pin minimally (just the inputs that need to live on
+the consuming side) and verify with end-to-end diff.
+
+---
+
+## 2026-05-24 PLAN #83 Round 9 — S3Gen UNet weight-residency ships; Metal kernel bisect
+
+Production fix for the chatterbox S3Gen UNet GPU drift (see PLAN #83
+rounds 7–8 for the prior bisects) plus an upstream-PR-quality bisect
+of the residual drift on M1 Metal.
+
+**What shipped:**
+
+1. **Weight residency split** (commit `b84af324`) —
+   `src/chatterbox_s3gen.cpp` loads the 910 `s3.fd.*` UNet weight
+   tensors (79 MiB) on the CPU backend buffer via
+   `core_gguf::load_weights_split`; the encoder (`s3.fe.*`), flow
+   front-end (`s3.flow.*`), tokenizer (`s3.tok.*`), speaker encoder
+   (`s3.se.*`), and HiFT vocoder (`s3.v.*`) keep GPU residency. The
+   ggml scheduler auto-routes UNet ops to CPU based on weight residency
+   — no per-op pinning, no GPU↔CPU sync inside the UNet graph (which
+   is what caused the Round 8 NaN at T_mel ≥ 200). M1 Metal:
+   `s3gen_mel cos_min 0.940 → 0.999980` in diff harness; intelligible
+   audio in smoke at all T. Wall-time on M1 is comparable to pure CPU
+   (the encoder/vocoder are a small fraction of total time, UNet does
+   the same work).
+
+   Two layered fixes: `CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1` opts out
+   of the split and falls back to a per-op `mul_mat_hp` helper that
+   tags every UNet `mul_mat` with `GGML_PREC_F32`. Used as the
+   testbed for the kernel-level path.
+
+2. **Q8_0 × F32 bit-match Metal kernel** (commit `752baecf`) —
+   `ggml/src/ggml-metal/ggml-metal.metal` gains `kernel_quantize_q8_0_f32`
+   (mirrors `quantize_row_q8_0` ARM NEON path bit-for-bit) +
+   `kernel_mul_mv_q8_0_q8_0` (mirrors `ggml_vec_dot_q8_0_q8_0_generic`).
+   Same dispatch pattern as the existing Q4_K × Q8_K
+   `GGML_PREC_F32` path. Verified bit-identical to CPU mul_mat for
+   all 350 UNet Q8_0 mul_mats. Drafted as upstream PR 09 at
+   `tools/upstream-prs/09-metal-q8_0-bit-match.{md,patch}`.
+
+3. **Three upstream-PR drafts** (commit `d7d859a2`) in
+   `tools/upstream-prs/`:
+   - **09** Q8_0 × F32 bit-match kernel (concrete patch).
+   - **10** ggml-alloc buffer-reuse drift report (no patch — bug
+     report with bisect evidence). Expanded in commit `b6a0b610` with
+     all 11 fix attempts and the diff-vs-smoke divergence finding.
+   - **11** Scheduler NaN at T_mel ≥ 200 with mixed CPU+GPU ops (no
+     patch — bug report).
+   All three strip CrispASR-internal markers (no `(#83)` refs, no
+   internal language).
+
+4. **Per-segment dump hook + PRESERVE_INTERMEDIATES bisect knob**
+   (commits `c00c1493`, `2daf2a19`) — env-gated debug instrumentation
+   in `src/chatterbox_s3gen.cpp`. `CRISPASR_S3GEN_DUMP_UNET=<tag>`
+   dumps step-0 intermediates from each sub-block to
+   `/tmp/cb-unet-dump-<tag>-<name>.bin` for per-block diff.
+   `CRISPASR_S3GEN_UNET_PRESERVE_INTERMEDIATES=1` forces `set_output`
+   on 14 block-level intermediates (subset of dump points). Neither
+   affects default behavior.
+
+**The unresolved finding** (now in PR 10): `set_output` on **all 62**
+UNet sub-block intermediates restores **bit-perfect** parity
+(`cos_min = 1.000`, `max_abs = 0`) in the diff-harness call context
+but produces NaN in the smoke call context with the *exact same*
+model, graph topology, and seed. The diff-vs-smoke divergence is
+invariant against: random seed, T_mel value, S3-tokenizer presence,
+Metal concurrency on/off, `GGML_NO_INPLACE=1`, F32-tile Q in
+flash_attn. Something structural in `ggml-alloc`'s state across
+multi-graph sched invocations differs between the two call paths in
+a way the bisect couldn't isolate within this session. Standalone
+handover prompt prepared for further investigation.
+
+**(2026-05-24 evening follow-up)** The unresolved finding above
+was *partially a measurement bug*. The diff harness's cosine
+comparison silently scored all-NaN data as `cos=1.000, max_abs=0`
+(IEEE-754 NaN comparisons all return false). Fixed in commit
+`4c2e54c0`. With the comparison fixed: both diff and smoke
+produce all-NaN under `set_output` on 62; there is **no path
+divergence**. Bisected with new granular env knobs (commit
+`1a37f4c8`): the minimum trigger is **2 specific `set_output`
+marks** (`dump_db_resnet` + any even-indexed `mb_*_out`, or
+`mb_11_out`). The same parity pattern reproduces on both paths.
+`tools/upstream-prs/10` rewritten to the tighter repro. The
+production fix is unchanged and unaffected.
+
+**Linux CPU smoke** validated on Hetzner VPS (`168.119.190.252`,
+no GPU): build clean, `s3gen_mel cos_min = 0.918695,
+cos_mean = 0.992655` in diff harness; intelligible TTS in smoke. The
+production fix runs the same on Linux as on macOS. Branch
+`plan-83-r9-s3gen-gpu-prec-hints` on the VPS at
+`/mnt/storage/whisper.cpp`.
+
+Updated: PLAN.md #57/#83 status, LEARNINGS Round 9.
+
+**(2026-05-24 night follow-up #2)** Added a per-node gallocr
+trace (`CRISPASR_GGML_ALLOC_TRACE=1`, commit `2f4961d6`). Compared
+1-mark and 2-mark UNet allocator passes (n_nodes=2715 each, 3044
+events). 2108 lines diverge but **zero overlapping live ranges in
+either run** — the allocator is correct in both cases. The parity
+mechanism is geometric: in the 1-mark control trace, even-indexed
+`mb_*_out` tensors land at `offset=0` and odd-indexed at
+`offset=1271296`. `FREE_SKIP_OUTPUT` on the low-offset slot blocks
+~1300 downstream allocations into shifted positions; the same
+output marked on the mid-offset slot only blocks a small hole.
+The cascade is a layout shift, not aliasing. So the prior
+follow-up's "buffer aliasing in `ggml_gallocr`" hypothesis is
+ruled out. The bug must be in the Metal kernel layer (kernel
+correctness sensitive to specific address patterns, or output-path
+staging, or sched/OUTPUT-flag interaction). `tools/upstream-prs/10`
+to be revised; LEARNINGS Round 9 follow-up #2 records the
+methodology and pivots the investigation.
+
+**(2026-05-24 late follow-up #3)** Pushed the bisect inside the
+first UNet block. Added `CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK=1`
+to decouple `DUMP_UNET` from its implicit "mark every dump point"
+behavior, and `CRISPASR_S3GEN_UNET_PROBE_BLOCK1=<N>` to inline-
+probe one specific `causal_block1d` call (names + marks
+intermediate stages: im2col, mul_mat, conv1d, transpose_in, norm,
+ln_mul, ln_bias, transpose_out, mish). With clean A/B against
+CPU: GPU's first `causal_resnet_block` output (`dump_db_resnet`,
+shape (T=382, C=256)) is structurally wrong, not drifted —
+cos similarity to CPU is **-0.09**, magnitude is 10× off. Under
+the 2-mark trigger, 1280 NaN values appear at 5 contiguous time
+frames (t=260..264) × all 256 channels; bisect localizes the
+3-frame NaN slice to the conv1d output in block1 of the very
+first resnet block, then block2's `K=3` conv expands it to 5.
+
+Tested `GGML_PREC_F32` on conv1d's internal `mul_mat` — no effect
+(rms 13.938 → 13.942). Re-tested per-op CPU pin workarounds with
+the fixed `crispasr-diff`: `PIN_CPU_OP=norm/mul_mat/add/cont` all
+FAIL with `non_finite=8160/8160`. The handover's earlier "pinning
+any frequent op restores cos=1.0" was the same `PASS`-of-NaN
+artifact that `4c2e54c0` fixed; with it gone, **no per-op pin
+fixes the GPU baseline**. Only working config remains the
+production weight-residency split.
+
+Conclusion: GPU-residency UNet on Apple Metal is fundamentally
+broken in a way no in-tree workaround addresses. A real fix needs
+shader-level Metal investigation against the address pattern this
+graph produces — out of scope for a normal session. Until then
+`CRISPASR_S3GEN_UNET_GPU_RESIDENCY` remains an investigation-only
+knob; production keeps the `s3.fd.*` split on CPU.
+
+LEARNINGS Round 9 follow-up #3 records the methodology and the
+updated lesson 2'''.
+
+---
+
+## 2026-05-23 PLAN #52 — Qwen3-TTS perf bench (FUSED_QKV Q8_0 decision)
+
+Ran interleaved A/B bench for `QWEN3_TTS_FUSED_QKV=1` on M1 Metal,
+Q8_0 0.6B CustomVoice, 94-frame synthesis:
+
+| Condition | ms/frame |
+|---|---|
+| Baseline (normal load) | ~129 |
+| `FUSED_QKV=1` Q8_0 (interleaved A/B) | ~129 — **neutral** |
+| `CP_STEP0_CACHE=1` (normal load) | ~128 — **neutral** |
+| Baseline (quiet window) | ~79 — already under 80 ms/frame RT budget |
+
+**Decision:** `FUSED_QKV` stays default-OFF for Q8_0 — confirmed
+neutral, not beneficial on Metal. The first bench in the PLAN history
+was a cold-cache artifact (model warmed into RAM by the preceding run,
+making the FUSED_QKV run appear faster). `CP_STEP0_CACHE` also neutral
+at normal load; quiet-machine confirmation still pending.
+
+**F16 FUSED_QKV bench 2026-05-24:** F16 GGUF downloaded; resampled jfk.wav to 24 kHz (codec requires 24 kHz voice ref). Interleaved A/B (1 warm-up + 3A + 3B, 73 frames each): warm-up baseline 133 ms/frame; A mean 212 ms/frame, B mean 191 ms/frame, σ≈47 ms/frame — **inconclusive** (machine loaded: model download + build running concurrently dominated variance). Consistent with Q8_0 result (neutral). **Decision: keep F16 FUSED_QKV default-OFF.** Quiet-machine retest still open.
+
+**Still open:** F16 FUSED_QKV quiet-machine bench; Q4_K bench; fusing 15 cp steps into one graph; Q8_0 KV cache (blocked on Metal `cont(Q8_0)` kernel patch).
+
+Updated: PLAN.md #52 perf notes + `src/qwen3_tts.cpp:5023` comment.
+See LEARNINGS.md §Qwen3-TTS FUSED_QKV.
+
+---
+
+## 2026-05-24 PLAN #97 — parakeet-rnnt-0.6b RNNT decoder
+
+**Problem.** `nvidia/parakeet-rnnt-0.6b` is a standard RNN-Transducer (no
+TDT duration head). The existing parakeet decoder only handled TDT + CTC
+variants; RNNT needed a separate greedy loop.
+
+**Fix.** Added `parakeet_rnnt_decode` in `src/parakeet.cpp`:
+- blank token → advance encoder frame by 1 (standard RNNT blank semantics)
+- real token → stay on same frame, emit token, update predictor state
+- `max_per_step=10` per-frame cap prevents infinite loops on degenerate inputs
+- Dispatch: `use_rnnt = !use_ctc && n_tdt_durations==0`; all 3 call sites
+  (frame, chunk, full-file) updated to 3-way CTC/RNNT/TDT.
+
+**Converter** (`models/convert-parakeet-to-gguf.py`) gained:
+- In-memory nemo loading via BytesIO + torch.load (avoids disk extraction of 2.4 GB tarball)
+- RNNT key detection: `joint.joint_net.2.weight` (not `joint.out.weight`)
+- `joint_hidden` priority chain: `joint_hidden` → `encoder_hidden` → 640
+- Q4_K quantization with F16 fallback for LSTM-shaped tensors (last dim not divisible by 256)
+
+**Model:** downloaded `nvidia/parakeet-rnnt-0.6b` (2.3 GB nemo) to internal disk.
+Converted to F16 (1235 MB) then `crispasr-quantize` to Q4_K (447 MB).
+
+**Smoke test:** JFK 11 s → *"and so my fellow americans ask not what your country can do for you ask what you can do for your country"* — correct.
+
+**Upload:** Q4_K + F16 + README to `cstr/parakeet-rnnt-0.6b-GGUF`.
+
+**Registry:** `parakeet-rnnt-0.6b` entry added to `crispasr_model_registry.cpp` (~447 MB).
+
+Committed `48ac6f06` to main. Worktree `CrispASR-parakeet-rnnt` (branch `parakeet-rnnt`) rebased + fast-forwarded into main.
+
+**Follow-up — parakeet-rnnt-1.1b (same day):** External disk freed after the 0.6b cleanup; downloaded 1.1b nemo (4.0 GB), converted to F16 (2144 MB) + Q4_K (770 MB) with the same converter (42-layer encoder vs 24 for 0.6b — auto-handled by `n_layers` lookup). Smoke test on JFK: correct transcript at 5.4× realtime (caches warm). Uploaded to `cstr/parakeet-rnnt-1.1b-GGUF`; registry entry added. Committed `b9509548`.
+
+**Still open in #97:** realtime-EOU; unified-en-0.6b.
+
+---
+
+## 2026-05-23 Global diarization timeline (issue #110)
+
+**Problem.** The `sherpa`/`ecapa` diarization path ran the subprocess
+once per VAD slice, producing local speaker IDs that reset or swapped
+across slices. Long-file diarization was unreliable — `speaker_00` in
+slice 1 might be a different person from `speaker_00` in slice 3.
+
+**Fix.** Mirror the pyannote global-cache pattern (issue #107):
+
+1. New `CrispasrSherpaCache` struct holds the pre-computed global
+   speaker-turn timeline with absolute timestamps.
+2. `crispasr_compute_sherpa_cache()` writes the full mono audio to
+   one temp WAV, runs the sherpa subprocess once, parses all speaker
+   regions.
+3. `crispasr_run.cpp` pre-computes the cache alongside the existing
+   pyannote cache block and threads it through every `process_slice`.
+4. `assign_speakers_from_global_sherpa()` assigns each ASR segment
+   its dominant speaker from the global timeline AND splits segments
+   at speaker-turn boundaries using per-word timestamp overlap scoring.
+   Segments without word timestamps get a single dominant-speaker label.
+
+**Tests.** 13 Catch2 unit tests (38 assertions) + 8-assertion live
+integration test suite (`test_diarize_live.sh`). All pass.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `examples/cli/crispasr_diarize_cli.{h,cpp}` | `CrispasrSherpaCache` + `crispasr_compute_sherpa_cache()` + `assign_speakers_from_global_sherpa()` with word-level splitting |
+| `examples/cli/crispasr_run.cpp` | Global sherpa pre-compute block + cache threading |
+| `tests/test_diarize_global.cpp` | 13 Catch2 unit tests |
+| `tests/test_diarize_live.sh` | 8-assertion live integration suite |
+
+---
+
+## 2026-05-23 Hotwords / contextual biasing (PLAN #98)
+
+**Phase A — CTC-WS phrase-boost trie.** New shared helper
+`src/core/asr_context_bias.h` implements an Aho-Corasick multi-pattern
+trie over token-ID sequences. During CTC/TDT decode, tokens that
+continue an active hotword prefix match get a configurable log-prob
+boost (shallow fusion). Wired into parakeet CTC decode + TDT decode
+paths. CLI flags: `--hotwords "word1,word2"`, `--hotwords-file <path>`,
+`--hotwords-boost <float>` (default 2.0). Per-word boost suffix
+supported: `"Berenz^5.0"`.
+
+**Phase B — LLM prompt injection.** For LLM-based ASR backends that
+accept free-text instructions, `--hotwords` appends a hint to the
+system/instruction prompt:
+- **qwen3-asr:** appends to ChatML system instruction
+- **voxtral:** inserts into `[INST]` turn before `[TRANSCRIBE]`
+
+Not wired (architecture reasons): voxtral4b (fixed streaming prompt),
+granite-nle (non-autoregressive, no text prompt), funasr (prompt
+hardcoded in library).
+
+**Phase C** (TDT joint-net boost) deferred — Phase A on TDT already
+covers the path via shallow fusion.
+
+**Tests.** 13 Catch2 unit tests (34 assertions) for the trie +
+4 paraformer integration tests (init, Chinese byte-match, English
+byte-match, Q4_K==F16 parity).
+
+### Files
+
+| File | Change |
+|------|--------|
+| `src/core/asr_context_bias.h` | 182-LOC Aho-Corasick trie (insert, build failure links, apply_bias, advance, parse_hotwords, build_trie) |
+| `src/parakeet.{h,cpp}` | `parakeet_set_hotwords()` API + CTC/TDT decode wiring |
+| `examples/cli/cli.cpp` | `--hotwords`, `--hotwords-file`, `--hotwords-boost` |
+| `examples/cli/whisper_params.h` | `hotwords` + `hotwords_boost` fields |
+| `examples/cli/crispasr_backend_{parakeet,qwen3,voxtral}.cpp` | Wire hotwords into each backend |
+| `tests/test_context_bias.cpp` | 13 unit tests |
+| `tests/test_paraformer.cpp` | 4 live integration tests |
+
+---
+
+## 2026-05-23 Issue #89 cross-backend validation + PLAN #80d/#105 closure
+
+**Validated** the NeMo-style streamed pipeline on current main
+(`0c24178e`). Full chunk-size sweep (4-30 s) and overlap sweep (0-4 s)
+confirm byte-identical output to single-pass across all configurations.
+300 s Japanese: 98.6 % coverage, 0 gaps.
+
+**Extended `CAP_INTERNAL_CHUNKING`** to canary-1b-v2 and
+fastconformer-ctc (`1dd247a7`). Both suffered the same 30 s auto-chunk
+z-norm drift as parakeet:
+
+| backend | coverage (old 30 s chunks) | coverage (new) |
+|---|---:|---:|
+| parakeet-tdt 0.6b JA | 59.7 % | 99.5 % |
+| parakeet-ctc 1.1b EN | 74.6 % | 98.5 % |
+| canary-1b-v2 Q4_K EN | broken | 96.8 % |
+
+**PLAN #80d** (cross-backend chunking audit): audited all 13 AR backends
+— no fixes needed, all use `split_at_energy_minima` via the global
+slicer. Cohere's API path also calls it directly.
+
+**PLAN #105** (WhisperX aligner zoo): confirmed all 10 language-specific
+wav2vec2 CTC aligner GGUFs uploaded and in the registry (fr/es/it/ja/zh/
+nl/uk/pt/ar/cs). Added the full alias table to `docs/cli.md`.
+
+**Issue triage:** closed #115 (hotwords, shipped), #111 (seed, shipped),
+#119 (Mega-ASR, in registry), #120 (max_tokens, shipped). Triaged #121
+(Pentium Gold crash — build artifact exists, likely user error or
+runtime issue). Commented #85 (noise-robust ASR recommendations).
+
+---
+
+## 2026-05-23 Session beam_size wired for all remaining backends (PLAN #90 complete)
+
+**Commit:** `0c24178e`
+
+`crispasr_session_set_beam_size` now threads through every session backend.
+Three remaining backend families were wired using `core_beam_decode::run_with_probs`
+alongside the existing greedy path (unchanged when `beam_size == 1`):
+
+| Backend | Replay lambda | KV reset |
+|---|---|---|
+| qwen3-asr | `qwen3_asr_embed_tokens` + `qwen3_asr_run_llm_kv` | `qwen3_asr_kv_reset` |
+| granite / granite-4.1 / granite-4.1-plus / granite-4.1-nar | `granite_speech_embed_tokens` + `granite_speech_run_llm_kv` | `granite_speech_kv_reset` |
+| voxtral | `run_voxtral_family` gained a `beam_size` parameter; a shared `decode_piece` lambda handles U+2581→space detokenisation for both paths | `ops.kv_reset(ctx)` |
+
+`voxtral4b` (streaming path) is not in scope. Implementation is in
+`src/crispasr_c_api.cpp`. The `#include "core/beam_decode.h"` is the only new dependency.
+
+---
+
+## 2026-05-23 PLAN #74: feature-matrix uplift round 2 (commit `b848152a`)
+
+Four items completed in one session:
+
+**74a — chatterbox language routing** (already in commit `c88306fa`):
+`-l de` with `--backend chatterbox` auto-routes to `kartoffelbox-turbo`;
+`-l ar` routes to `lahgtna-chatterbox`. Only fires when `-m auto` is active.
+
+**74b — capability regression gate** (`tests/test_backend_caps.py`, new):
+`TestCapabilityJSON` runs `crispasr --list-backends-json` and asserts:
+- known translate backends declare `translate`
+- known src-tgt backends declare `src-tgt-language`
+- known voice-cloning backends declare `voice-cloning`
+- preset-speaker backends (`qwen3-tts-customvoice`, `voicedesign`, `vibevoice`) do NOT declare `voice-cloning`
+- whisper does NOT declare `src-tgt-language` (uses `-l` for target, not `-sl/-tl`)
+
+`TestTranslateLive` is a live smoke-test (whisper-tiny on `samples/jfk.wav`) that auto-skips when the model is absent. 6/6 tests pass.
+
+**74c — `CAP_VOICE_CLONING` for qwen3-tts base variants**:
+`Qwen3TtsBackend` gained an `is_base_` constructor flag. The two base aliases
+(`qwen3-tts`, `qwen3-tts-1.7b-base`) dispatch to a new `crispasr_make_qwen3_tts_base_backend()`
+factory that sets `is_base_=true` and includes `CAP_VOICE_CLONING` in `capabilities()`.
+The customvoice/voicedesign aliases keep the original factory (`is_base_=false`).
+
+**74d — feature matrix regenerated** (`docs/feature-matrix.md` + `.html`):
+`python tools/gen-feature-matrix.py` — 52 backends × 19 caps. `qwen3-tts`
+and `qwen3-tts-1.7b-base` now show ✓ in the Voice cloning column.
+
+---
+
+## 2026-05-23 tts: `--seed` parity across sampled TTS backends
+
+**Outcome.** Routed the CLI/server `--seed` knob through the TTS paths
+that actually sample, then verified the behavior on the local backup
+models in `/Volumes/backups/ai/crispasr`.
+
+**What changed.**
+- `qwen3-tts-customvoice` now lets an explicit request/CLI seed win
+  over `QWEN3_TTS_SEED`.
+- Chatterbox now reseeds both the T3 sampler and the S3Gen diffusion
+  noise path from `--seed`.
+- VibeVoice now seeds both the realtime and base TTS paths from
+  `--seed`, while still honoring the env defaults when the CLI seed is
+  zero.
+- IndexTTS, Orpheus, and VoxCPM2 all have seed setters wired through
+  the CLI surface; their visible impact depends on the backend's actual
+  decode path.
+
+**Live verification.**
+- `qwen3-tts-customvoice`: same request seed is bit-identical even when
+  `QWEN3_TTS_SEED=999`; different request seed changes the WAV hash.
+- `chatterbox`: same seed is bit-identical; different seed changes the
+  WAV hash.
+- `vibevoice-tts` and `vibevoice-1.5b`: same seed is bit-identical;
+  different seed changes the WAV hash.
+- `IndexTTS`: the seed is accepted, but the tested prompt/reference
+  produced identical WAVs across seeds, so the default beam-search path
+  is effectively deterministic here.
+- `Orpheus`: live check was blocked by the available local SNAC codec
+  mismatch / runtime cost on this turn.
+- `VoxCPM2`: seed plumbing is present, but there was no local VoxCPM2
+  GGUF in the backup set to exercise it here.
+
+**Files.**
+- `src/qwen3_tts.{cpp,h}`
+- `src/chatterbox.{cpp,h}` / `src/chatterbox_s3gen.{cpp,h}`
+- `src/vibevoice.{cpp,h}`
+- `src/indextts.{cpp,h}`
+- `src/orpheus.{cpp,h}`
+- `src/voxcpm2_tts.{cpp,h}`
+- `examples/cli/crispasr_backend_*.cpp`
+- `docs/cli.md`
+- `docs/tts.md`
+
+## 2026-05-21 fix(#89): parakeet long-audio NeMo-style streamed pipeline
+
+**Outcome.** The issue #89 reporter's 300 s Japanese YouTube clip
+(`o_9dWkRPYC0`, parakeet-tdt-0.6b-ja on Vulkan/AMD) went from 35
+tokens covering 0-5 s → full coverage.  The 60 s case went from 0 chars
+(with the original 60 s auto-chunk) to 294 chars / 99.5 % coverage.
+
+**Root cause.** Three layered problems:
+
+1. Per-feature z-norm drift: the TDT decoder emits blanks when mel
+   statistics computed over >30 s shift from the training distribution.
+2. Decoder cold-start: each independently-chunked slice resets the LSTM
+   predictor to SOS, losing 5-20 s of interior content per chunk.
+3. `crispasr_run.cpp` auto-chunked at 60 s → 30 s before the backend
+   could handle it internally.
+
+**Fix (6 commits).**
+
+| Commit | Change | Impact |
+|--------|--------|--------|
+| `bdc8175` | Reduce auto-chunk 60 → 30 s | Prevents 0-output catastrophe |
+| `1037bcb` | PR #116: VAD slices out of chunk-context path | Fixes VAD + cohere/granite regressions |
+| `9488223` | Chunked-encode + single-decode (PLAN #104 v1) | 93 % coverage without VAD |
+| `300149e` | NeMo-style: global z-norm + chunked encode | Feature-identical to single-pass |
+| `97d2b4f` | Raise threshold to 60 s + env knobs | 99.5 % on 60 s, tuneable |
+| `1dd247a7` | `CAP_INTERNAL_CHUNKING` for canary + fastconformer-ctc | 74.6 → 98.5 % (CTC), broken → 96.8 % (canary) |
+
+**Architecture.** Audio ≤60 s: single-pass `parakeet_transcribe_ex` (best
+quality, 99.5 %).  Audio >60 s: `parakeet_transcribe_streamed` — compute
+mel with global z-norm over the full audio, encode in overlapping 8 s
+chunks, concatenate encoder outputs, decode in one TDT pass.  The
+encoder is bidirectional so each 8 s chunk gets independent context; the
+decoder sees a single continuous sequence (no LSTM reset).
+
+**Env knobs:** `CRISPASR_PARAKEET_STREAM_THRESHOLD` (default 60 s),
+`CRISPASR_PARAKEET_STREAM_CHUNK` (default 8 s),
+`CRISPASR_PARAKEET_STREAM_OVERLAP` (default 2 s).
+
+**Benchmark framework.** New `tests/benchmark_asr.py` driver + audio
+corpus in `/mnt/storage/test-audio/` (en/de/ja/zh × 4 durations from
+FLEURS + reporter's audio).  14 pytest unit tests for metric computation
+(`tests/test_benchmark_metrics.py`).
+
+**Files.**
+
+| File | Change |
+|------|--------|
+| `src/parakeet.cpp` | `parakeet_encode_chunked`, `parakeet_transcribe_chunked`, `parakeet_transcribe_streamed`, `parakeet_compute_mel_raw`, `parakeet_apply_znorm` |
+| `src/parakeet.h` | New public API declarations |
+| `examples/cli/crispasr_backend_parakeet.cpp` | Path selection + env knobs, `CAP_INTERNAL_CHUNKING` |
+| `examples/cli/crispasr_backend.h` | `CAP_INTERNAL_CHUNKING` flag |
+| `examples/cli/crispasr_long_audio_fallback.h` | `CAP_INTERNAL_CHUNKING_FLAG` gate |
+| `examples/cli/crispasr_run.cpp` | 30 s auto-chunk default |
+| `tests/benchmark_asr.py` | Multi-backend benchmark driver |
+| `tests/benchmark_metrics.py` | Coverage metric computation |
+| `tests/benchmark_corpus.py` | FLEURS audio corpus builder |
+| `tests/test_benchmark_metrics.py` | 14 pytest unit tests |
+| `tests/run-benchmark.sh` | CTest smoke wrapper |
+
+---
+
 ## 2026-05-21 paraformer: FunASR Paraformer-zh NAR-ASR port
 
 **Outcome.** Ported FunASR Paraformer-zh (220M params, non-autoregressive,
@@ -5631,3 +6356,70 @@ C++ dump via `VIBEVOICE_TTS_DUMP=<dir>` writes `tts_voice_embeds.bin`.
 | Python | ✓ | ✓ (inherited) | via C ABI |
 | Dart/Flutter | ✓ | ✓ (inherited) | via C ABI |
 | Server `/v1/audio/speech` | ✓ | ✓ | via CLI adapter |
+
+### §92 — issue #81 Phase 1 #06: FA per-head mask lands on CUDA (2026-05-24)
+
+`tools/upstream-prs/06-cuda-fa-perhead-mask.md` implemented and
+validated on feature branch `issue81-fa-perhead-mask`
+(commit `60bc4294`, +87 LOC across 4 files). Closes the remaining
+72 CPU splits per chunk on parakeet / canary / FastConformer-CTC —
+the dominant CPU-fallback cost left after `d758fe69` cleared the
+UNARY splits (see PERFORMANCE.md "Phase 1 update (2026-05-23) —
+fused siglu/norm_affine A1000 verdict").
+
+**The patch:**
+
+| file | LOC | what |
+|---|---:|---|
+| `ggml/CMakeLists.txt` | 3 | `GGML_CUDA_CRISPASR_FA_PERHEAD_MASK` option (default OFF) |
+| `ggml/src/ggml-cuda/CMakeLists.txt` | 4 | wire option to `add_compile_definitions` |
+| `ggml/src/ggml-cuda/fattn-mma-f16.cuh` | 14 | consume `nb32` in `mask_h` offset at both kbc loop sites |
+| `ggml/src/ggml-cuda/fattn.cu` | 66 | gate relaxation: VEC/TILE/WMMA returns fall through to MMA-F16 for per-head masks; safety net + `gqa_ratio > 1` hard gate |
+
+The MMA-F16 kernel signature **already** took `nb32` as a parameter
+(the launcher plumbed all six mask dims/strides through) but the
+kernel body only offset by sequence (`nb33 * (sequence % ne33)`).
+The patch adds the missing per-head term `nb32 * (zt_Q % ne32)`.
+When `ne32 == 1` (broadcast mask — upstream's only supported case)
+`zt_Q % 1 == 0` and the result is byte-identical, so default-OFF
+builds stay bit-equal to upstream. Build with
+`cmake -DGGML_CUDA_CRISPASR_FA_PERHEAD_MASK=ON` to enable.
+
+**Validation (parakeet-tdt-0.6b-v3 q8_0 on A1000, sm_86, driver 596.36):**
+
+| check | OFF (`dll-postsiglu`) | ON (`dll-faon`) | verdict |
+|---|---|---|---|
+| JFK transcript | "And so, my fellow Americans, ask Not what your country can do for you. Ask what you can do for your country." | byte-identical | ✓ |
+| sched splits per chunk | 49 (24 CPU + 25 CUDA0) | **1 (0 CPU + 1 CUDA0)** | ✓ |
+| `FLASH_ATTN_EXT` on CPU | 24/chunk | **0/chunk** | ✓ |
+| short-clip mean (11 s JFK, 9 calls) | 2.526 s | **1.587 s** (−37 %) | ✓ |
+| long-clip mean (60 s tiled, 150 calls, cold-GPU) | 12.450 s | 12.204 s (−2 %) | partial — see caveat |
+
+**Cold-GPU caveat:** the long-clip A/B ran with the GPU stuck in
+P8 (315/405 MHz) for both runs — both numbers are ~4.6× slower
+than the postsiglu warm baseline (2.7 s mean). The
+probe-then-bench two-process warmup pattern doesn't keep WDDM in
+P0 across the second script's Python startup + model mmap + JIT
+prewarm phase. Short-clip is less sensitive because per-call
+overhead dominates; long-clip shows the cold-clock effect. The
+architectural and correctness signals are unambiguous. Warm-GPU
+wallclock target: ~2.4 s long-clip mean / ~150 ms p50 / RTx ~24×.
+
+**Deferred to follow-up PRs:**
+
+- `ncols2 > 1` GQA-folded mask case — current patch is correct
+  for `ncols2 == 1` only; safety gate at `gqa_ratio > 1` falls
+  back to CPU (== upstream pre-patch behaviour, no regression).
+  No current CrispASR model has GQA-conformer attention with
+  per-head masks.
+- VEC / TILE / WMMA-F16 kernel patches — these still don't
+  consume `nb32`; per-head masks force the MMA-F16 path or NONE.
+- `test-backend-ops` validation on sm_75 / sm_86 / sm_89 — only
+  `ggml/src/` is vendored in CrispASR (not `ggml/tests/`), so the
+  canonical FA backend test will run as part of the upstream
+  `ggml-org/llama.cpp` PR step rather than locally.
+- Upstream PR to `ggml-org/llama.cpp` — gated on the items above.
+
+Sidecars: `bench-issue81/results/wer-{off,on}.json` (correctness),
+`bench-issue81/results/a1000-fa-{off,on}.json` (wallclock cold-GPU),
+`bench-issue81/sched-debug-fa{off,on}.log` (split-count A/B).

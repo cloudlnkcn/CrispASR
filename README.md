@@ -15,11 +15,21 @@ $ crispasr --backend kokoro -m auto --tts "Hello world" --tts-output out.wav  # 
 
 No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one C++ binary and a GGUF file.
 
+### What's new (v0.6.9+)
+
+- **Long-audio fix (issue #89):** NeMo-style streamed pipeline (global z-norm + 8 s chunked encode + single TDT decode) is now the default path for parakeet / canary / fastconformer-ctc at any duration. The single-pass-over-the-whole-clip encoder was numerically unstable to codec-level audio perturbations and could drop most of a 60 s clip; the streamed path is stable. Tuneable via `CRISPASR_PARAKEET_STREAM_THRESHOLD` (escape hatch back to single-pass) / `_CHUNK` / `_OVERLAP` env vars.
+- **Paraformer-zh:** non-autoregressive Mandarin+English ASR backend (220M params, single-pass CIF decode). `--backend paraformer -m auto`.
+- **Hotwords (PLAN #98):** `--hotwords "Tokyo,CrispASR"` for CTC/TDT contextual biasing + LLM prompt injection on supported backends.
+- **Global diarization (#110):** `--diarize-method sherpa` / `pyannote` now runs once on the full audio, producing consistent speaker IDs across the entire file.
+- **WhisperX aligner zoo:** 12 language-specific wav2vec2 CTC forced aligners (`-am wav2vec2-aligner-ja`, `-am wav2vec2-aligner-de`, etc.) with auto-download.
+- **Generation controls:** `--seed`, `--beam-size`, `--frequency-penalty`, `--max-new-tokens` wired through all ASR + TTS backends.
+- **Benchmark framework:** `python tests/benchmark_asr.py --audio file.wav --backend parakeet` for structured multi-backend comparison.
+
 ### Ecosystem
 
 | Project | What it does |
 |---|---|
-| **[CrispASR](https://github.com/CrispStrobe/CrispASR)** | This repo — C++ speech recognition engine. 24 ASR backends + 8 TTS backends, CLI + HTTP server + C-ABI + Python/Rust/Dart bindings. |
+| **[CrispASR](https://github.com/CrispStrobe/CrispASR)** | This repo — C++ speech recognition engine. 26 ASR backends + 8 TTS backends, CLI + HTTP server + C-ABI + Python/Rust/Dart bindings. |
 | **[CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver)** | Cross-platform Flutter transcription app built on CrispASR. Desktop + mobile, all 10 backends, model browser with download queue, mic capture, SRT/VTT/JSON export, diarization, batch processing. Fully offline. |
 | **[CrispEmbed](https://github.com/CrispStrobe/CrispEmbed)** | Text embedding engine via ggml — same philosophy as CrispASR but for retrieval. 10 architectures (XLM-R, Qwen3-Embed, Gemma3, ModernBERT, ...), dense + sparse + ColBERT + reranking. 9.5x faster than ONNX on CPU, GPU via CUDA/Metal/Vulkan. Python/Rust/Dart bindings. |
 | **[Susurrus](https://github.com/CrispStrobe/Susurrus)** | Python ASR GUI with 9 backends (faster-whisper, mlx-whisper, voxtral, insanely-fast-whisper, ...). The Python counterpart to CrispASR's C++ approach. |
@@ -49,7 +59,7 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 
 ## Supported backends
 
-CrispASR ships **24 ASR backends** for transcription/translation and
+CrispASR ships **26 ASR backends** for transcription/translation and
 **eight TTS engines** for synthesis. Pick at the CLI with `--backend NAME`,
 or omit it to let the binary auto-detect from the GGUF metadata. Jump
 to the [TTS table](#text-to-speech-models) for the synthesis side.
@@ -78,6 +88,8 @@ to the [TTS table](#text-to-speech-models) for the synthesis side.
 | **voxtral** | [`mistralai/Voxtral-Mini-3B-2507`](https://huggingface.co/mistralai/Voxtral-Mini-3B-2507) | Whisper encoder + Mistral 3B LLM | 8 | Apache-2.0 |
 | **voxtral4b** | [`mistralai/Voxtral-Mini-4B-Realtime-2602`](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) | Causal encoder + 3.4B LLM, sliding window | 13, realtime streaming | Apache-2.0 |
 | **qwen3** | [`Qwen/Qwen3-ASR-0.6B`](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | Whisper-style audio encoder + Qwen3 0.6B LLM | 30 + 22 Chinese dialects | Apache-2.0 |
+| **qwen3-1.7b** | [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Whisper-style audio encoder + Qwen3 1.7B LLM | 30 + 22 Chinese dialects | Apache-2.0 |
+| **mega-asr** | [`zhifeixie/Mega-ASR`](https://huggingface.co/zhifeixie/Mega-ASR) | Qwen3-ASR-1.7B + merged robustness LoRA; always-on robust path | noisy / degraded speech | Apache-2.0 |
 | **wav2vec2** | [`jonatasgrosman/wav2vec2-large-xlsr-53-english`](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-english) | CNN + 24L transformer + CTC head (any Wav2Vec2ForCTC) | per-model | Apache-2.0 |
 | **wav2vec2** | [`facebook/data2vec-audio-base-960h`](https://huggingface.co/cstr/data2vec-audio-960h-GGUF) | Data2Vec Audio (79 MB Q4_K) | English | Apache-2.0 |
 | **wav2vec2** | [`facebook/hubert-large-ls960-ft`](https://huggingface.co/cstr/hubert-large-ls960-ft-GGUF) | HuBERT Large (212 MB Q4_K) | English | Apache-2.0 |
@@ -230,7 +242,7 @@ The matrix above covers ASR backends. **TTS-only backends** (`kokoro`, `qwen3-tt
 **Speaker diarization** as a post-processing step via `--diarize`:
 - `energy` / `xcorr` — stereo-only, no extra deps
 - `pyannote` — native GGUF (no Python, no sherpa-onnx); add `--diarize-embedder auto` (TitaNet) or `--diarize-embedder indextts` (ECAPA-TDNN) for globally stable speaker IDs across long files
-- `sherpa` / `ecapa` — external [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) subprocess
+- `sherpa` / `ecapa` — external [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) subprocess; runs once globally on full audio for consistent speaker IDs (#110)
 - `vad-turns` — mono-friendly gap-based proxy
 
 Full reference + tuning knobs (cluster threshold, max speakers, pluggable embedder adapters): see [`docs/cli.md#diarization`](docs/cli.md#diarization).
@@ -588,7 +600,9 @@ crispasr -m auto --backend parakeet -f audio.wav --vad -osrt --split-on-punct
 | `-osrt` / `-ovtt` / `-otxt` / `-oj` / `-ojf` | Output formats (also `-ocsv`, `-olrc`) |
 | `-am FNAME` | CTC aligner GGUF for word-level timestamps on LLM backends |
 | `-tp F` / `-bs N` | Sampling temperature / beam search width |
+| `-n N` / `--frequency-penalty F` | Generated-token cap / opt-in repeated-token penalty for supported autoregressive ASR backends |
 | `-l auto` / `--detect-language` | LID pre-step for backends without native lang detect |
+| `--hotwords "A,B,C"` | Contextual biasing — boost named terms during CTC/TDT decode or LLM prompt |
 | `-ck N` | Fallback chunk size when VAD is off (default 30 s) |
 | `--list-backends` | Print the capability matrix and exit |
 

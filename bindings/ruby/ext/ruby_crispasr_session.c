@@ -50,6 +50,31 @@ extern int                     crispasr_session_set_punctuation(struct CrispasrS
 extern int                     crispasr_session_set_translate(struct CrispasrSession* s, int enable);
 extern int                     crispasr_session_set_temperature(struct CrispasrSession* s, float temperature,
                                                                 unsigned long long seed);
+extern int                     crispasr_session_set_tts_seed(struct CrispasrSession* s, unsigned long long seed);
+extern int                     crispasr_session_set_max_new_tokens(struct CrispasrSession* s, int n);
+extern int                     crispasr_session_set_frequency_penalty(struct CrispasrSession* s, float penalty);
+extern int                     crispasr_session_set_tts_steps(struct CrispasrSession* s, int steps);
+extern int                     crispasr_session_set_top_p(struct CrispasrSession* s, float top_p);
+extern int                     crispasr_session_set_min_p(struct CrispasrSession* s, float min_p);
+extern int                     crispasr_session_set_repetition_penalty(struct CrispasrSession* s, float r);
+extern int                     crispasr_session_set_cfg_weight(struct CrispasrSession* s, float cfg_weight);
+extern int                     crispasr_session_set_exaggeration(struct CrispasrSession* s, float exaggeration);
+extern int                     crispasr_session_set_max_speech_tokens(struct CrispasrSession* s, int n);
+extern int                     crispasr_session_set_length_scale(struct CrispasrSession* s, float scale);
+extern int                     crispasr_session_set_best_of(struct CrispasrSession* s, int n);
+extern int                     crispasr_session_set_beam_size(struct CrispasrSession* s, int n);
+extern int                     crispasr_session_set_grammar_text(struct CrispasrSession* s, const char* gbnf_text,
+                                                                  const char* root_rule, float penalty);
+extern int                     crispasr_session_set_fallback_thresholds(struct CrispasrSession* s,
+                                                                         float entropy_thold, float logprob_thold,
+                                                                         float no_speech_thold,
+                                                                         float temperature_inc);
+extern int                     crispasr_session_set_alt_n(struct CrispasrSession* s, int n);
+extern int                     crispasr_session_set_whisper_decode_extras(struct CrispasrSession* s,
+                                                                           int suppress_nst,
+                                                                           const char* suppress_regex,
+                                                                           int carry_initial_prompt);
+extern int                     crispasr_session_set_ask(struct CrispasrSession* s, const char* prompt);
 extern int                     crispasr_session_detect_language(struct CrispasrSession* s, const float* pcm,
                                                                 int n_samples, const char* lid_model_path, int method,
                                                                 char* out_lang, int out_lang_cap, float* out_prob);
@@ -192,6 +217,147 @@ static VALUE rb_session_set_temperature(VALUE self, VALUE handle, VALUE temperat
                                               (unsigned long long)NUM2ULL(seed));
     // rc == -2 = no backend supports it; soft no-op.
     if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_temperature failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_tts_seed(VALUE self, VALUE handle, VALUE seed) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_tts_seed(s, (unsigned long long)NUM2ULL(seed));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_tts_seed failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_max_new_tokens(VALUE self, VALUE handle, VALUE n) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_max_new_tokens(s, NUM2INT(n));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_max_new_tokens failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_frequency_penalty(VALUE self, VALUE handle, VALUE penalty) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_frequency_penalty(s, (float)NUM2DBL(penalty));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_frequency_penalty failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_tts_steps(VALUE self, VALUE handle, VALUE steps) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_tts_steps(s, NUM2INT(steps));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_tts_steps failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_top_p(VALUE self, VALUE handle, VALUE top_p) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_top_p(s, (float)NUM2DBL(top_p));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_top_p failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_min_p(VALUE self, VALUE handle, VALUE min_p) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_min_p(s, (float)NUM2DBL(min_p));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_min_p failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_repetition_penalty(VALUE self, VALUE handle, VALUE r) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_repetition_penalty(s, (float)NUM2DBL(r));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_repetition_penalty failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_cfg_weight(VALUE self, VALUE handle, VALUE cfg) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_cfg_weight(s, (float)NUM2DBL(cfg));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_cfg_weight failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_exaggeration(VALUE self, VALUE handle, VALUE exag) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_exaggeration(s, (float)NUM2DBL(exag));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_exaggeration failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_max_speech_tokens(VALUE self, VALUE handle, VALUE n) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_max_speech_tokens(s, NUM2INT(n));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_max_speech_tokens failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_length_scale(VALUE self, VALUE handle, VALUE scale) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_length_scale(s, (float)NUM2DBL(scale));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_length_scale failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_best_of(VALUE self, VALUE handle, VALUE n) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_best_of(s, NUM2INT(n));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_best_of failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_beam_size(VALUE self, VALUE handle, VALUE n) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_beam_size(s, NUM2INT(n));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_beam_size failed (rc=%d)", rc);
+    return Qnil;
+}
+
+// set_grammar_text(handle, gbnf_text, root_rule, penalty)
+// Pass nil or "" for gbnf_text to clear the grammar.
+static VALUE rb_session_set_grammar_text(VALUE self, VALUE handle, VALUE gbnf, VALUE root, VALUE penalty) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    const char* gbnf_str  = NIL_P(gbnf)  ? NULL : StringValueCStr(gbnf);
+    const char* root_str  = NIL_P(root)  ? NULL : StringValueCStr(root);
+    int rc = crispasr_session_set_grammar_text(s, gbnf_str, root_str, (float)NUM2DBL(penalty));
+    if (rc == -2) rb_raise(rb_eArgError, "set_grammar_text: invalid GBNF or root rule not found");
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_grammar_text failed (rc=%d)", rc);
+    return Qnil;
+}
+
+// set_fallback_thresholds(handle, entropy_thold, logprob_thold, no_speech_thold, temperature_inc)
+static VALUE rb_session_set_fallback_thresholds(VALUE self, VALUE handle,
+                                                VALUE entropy, VALUE logprob,
+                                                VALUE no_speech, VALUE temp_inc) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_fallback_thresholds(s,
+        (float)NUM2DBL(entropy), (float)NUM2DBL(logprob),
+        (float)NUM2DBL(no_speech), (float)NUM2DBL(temp_inc));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_fallback_thresholds failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_alt_n(VALUE self, VALUE handle, VALUE n) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_alt_n(s, NUM2INT(n));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_alt_n failed (rc=%d)", rc);
+    return Qnil;
+}
+
+// set_whisper_decode_extras(handle, suppress_nst, suppress_regex, carry_initial_prompt)
+static VALUE rb_session_set_whisper_decode_extras(VALUE self, VALUE handle,
+                                                  VALUE suppress_nst, VALUE suppress_regex,
+                                                  VALUE carry_prompt) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    const char* regex = NIL_P(suppress_regex) ? "" : StringValueCStr(suppress_regex);
+    int rc = crispasr_session_set_whisper_decode_extras(s,
+        RTEST(suppress_nst) ? 1 : 0, regex, RTEST(carry_prompt) ? 1 : 0);
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_whisper_decode_extras failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_ask(VALUE self, VALUE handle, VALUE prompt) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_ask(s, StringValueCStr(prompt));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_ask failed (rc=%d)", rc);
     return Qnil;
 }
 
@@ -688,8 +854,26 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_target_language",  rb_session_set_target_language, 2);
     rb_define_singleton_method(mSession, "set_punctuation",      rb_session_set_punctuation, 2);
     rb_define_singleton_method(mSession, "set_translate",        rb_session_set_translate, 2);
-    rb_define_singleton_method(mSession, "set_temperature",      rb_session_set_temperature, 3);
-    rb_define_singleton_method(mSession, "detect_language",      rb_session_detect_language, 4);
+    rb_define_singleton_method(mSession, "set_temperature",           rb_session_set_temperature,           3);
+    rb_define_singleton_method(mSession, "set_tts_seed",              rb_session_set_tts_seed,              2);
+    rb_define_singleton_method(mSession, "set_max_new_tokens",        rb_session_set_max_new_tokens,        2);
+    rb_define_singleton_method(mSession, "set_frequency_penalty",     rb_session_set_frequency_penalty,     2);
+    rb_define_singleton_method(mSession, "set_tts_steps",             rb_session_set_tts_steps,             2);
+    rb_define_singleton_method(mSession, "set_top_p",                 rb_session_set_top_p,                 2);
+    rb_define_singleton_method(mSession, "set_min_p",                 rb_session_set_min_p,                 2);
+    rb_define_singleton_method(mSession, "set_repetition_penalty",    rb_session_set_repetition_penalty,    2);
+    rb_define_singleton_method(mSession, "set_cfg_weight",            rb_session_set_cfg_weight,            2);
+    rb_define_singleton_method(mSession, "set_exaggeration",          rb_session_set_exaggeration,          2);
+    rb_define_singleton_method(mSession, "set_max_speech_tokens",     rb_session_set_max_speech_tokens,     2);
+    rb_define_singleton_method(mSession, "set_length_scale",          rb_session_set_length_scale,          2);
+    rb_define_singleton_method(mSession, "set_best_of",               rb_session_set_best_of,               2);
+    rb_define_singleton_method(mSession, "set_beam_size",             rb_session_set_beam_size,             2);
+    rb_define_singleton_method(mSession, "set_grammar_text",          rb_session_set_grammar_text,          4);
+    rb_define_singleton_method(mSession, "set_fallback_thresholds",   rb_session_set_fallback_thresholds,   5);
+    rb_define_singleton_method(mSession, "set_alt_n",                 rb_session_set_alt_n,                 2);
+    rb_define_singleton_method(mSession, "set_whisper_decode_extras", rb_session_set_whisper_decode_extras, 4);
+    rb_define_singleton_method(mSession, "set_ask",                   rb_session_set_ask,                   2);
+    rb_define_singleton_method(mSession, "detect_language",           rb_session_detect_language,           4);
     rb_define_singleton_method(mSession, "kokoro_resolve_for_lang", rb_kokoro_resolve_for_lang, 2);
 
     // Streaming (PLAN #62b) — CrispASR::Session::Stream.{open, feed, get_text, flush, close}.

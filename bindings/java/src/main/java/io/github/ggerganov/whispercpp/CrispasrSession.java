@@ -48,6 +48,27 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_punctuation(Pointer session, int enable);
         int     crispasr_session_set_translate(Pointer session, int enable);
         int     crispasr_session_set_temperature(Pointer session, float temperature, long seed);
+        int     crispasr_session_set_tts_seed(Pointer session, long seed);
+        int     crispasr_session_set_max_new_tokens(Pointer session, int maxNewTokens);
+        int     crispasr_session_set_frequency_penalty(Pointer session, float penalty);
+        int     crispasr_session_set_tts_steps(Pointer session, int steps);
+        int     crispasr_session_set_top_p(Pointer session, float topP);
+        int     crispasr_session_set_min_p(Pointer session, float minP);
+        int     crispasr_session_set_repetition_penalty(Pointer session, float r);
+        int     crispasr_session_set_cfg_weight(Pointer session, float cfgWeight);
+        int     crispasr_session_set_exaggeration(Pointer session, float exaggeration);
+        int     crispasr_session_set_max_speech_tokens(Pointer session, int n);
+        int     crispasr_session_set_length_scale(Pointer session, float scale);
+        int     crispasr_session_set_best_of(Pointer session, int n);
+        int     crispasr_session_set_beam_size(Pointer session, int n);
+        int     crispasr_session_set_grammar_text(Pointer session, String gbnfText, String rootRule, float penalty);
+        int     crispasr_session_set_fallback_thresholds(Pointer session, float entropyThold,
+                                                          float logprobThold, float noSpeechThold,
+                                                          float temperatureInc);
+        int     crispasr_session_set_alt_n(Pointer session, int n);
+        int     crispasr_session_set_whisper_decode_extras(Pointer session, int suppressNst,
+                                                            String suppressRegex, int carryInitialPrompt);
+        int     crispasr_session_set_ask(Pointer session, String prompt);
         int     crispasr_session_detect_language(Pointer session, float[] pcm, int n_samples,
                                                   String lid_model_path, int method,
                                                   byte[] out_lang, int out_lang_cap, float[] out_prob);
@@ -204,6 +225,117 @@ public final class CrispasrSession implements AutoCloseable {
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_temperature failed (rc=" + rc + ")");
     }
 
+    /** Reseed TTS backends that support runtime seed control (soft no-op otherwise). */
+    public void setTtsSeed(long seed) {
+        int rc = Lib.INSTANCE.crispasr_session_set_tts_seed(handle, seed);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_tts_seed failed (rc=" + rc + ")");
+    }
+
+    /** Generated-token cap for autoregressive session backends. Pass <= 0 to clear. */
+    public void setMaxNewTokens(int maxNewTokens) {
+        int rc = Lib.INSTANCE.crispasr_session_set_max_new_tokens(handle, maxNewTokens);
+        if (rc != 0) throw new IllegalStateException("set_max_new_tokens failed (rc=" + rc + ")");
+    }
+
+    /** Opt-in repeated generated-token penalty for autoregressive session backends. Pass <= 0 to disable. */
+    public void setFrequencyPenalty(float penalty) {
+        int rc = Lib.INSTANCE.crispasr_session_set_frequency_penalty(handle, penalty);
+        if (rc != 0) throw new IllegalStateException("set_frequency_penalty failed (rc=" + rc + ")");
+    }
+
+    /** Diffusion / CFM step count for diffusion-based TTS backends (chatterbox). Soft no-op otherwise. */
+    public void setTtsSteps(int steps) {
+        int rc = Lib.INSTANCE.crispasr_session_set_tts_steps(handle, steps);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_tts_steps failed (rc=" + rc + ")");
+    }
+
+    /** Top-p nucleus-sampling threshold. Honoured by chatterbox; other backends no-op. */
+    public void setTopP(float topP) {
+        int rc = Lib.INSTANCE.crispasr_session_set_top_p(handle, topP);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_top_p failed (rc=" + rc + ")");
+    }
+
+    /** Min-p sampling threshold. Honoured by chatterbox; other backends no-op. */
+    public void setMinP(float minP) {
+        int rc = Lib.INSTANCE.crispasr_session_set_min_p(handle, minP);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_min_p failed (rc=" + rc + ")");
+    }
+
+    /** Repetition penalty (1.0 = no penalty). Honoured by chatterbox. */
+    public void setRepetitionPenalty(float r) {
+        int rc = Lib.INSTANCE.crispasr_session_set_repetition_penalty(handle, r);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_repetition_penalty failed (rc=" + rc + ")");
+    }
+
+    /** Classifier-free-guidance weight (chatterbox). 0 disables CFG; 0.5 is the upstream default. */
+    public void setCfgWeight(float cfgWeight) {
+        int rc = Lib.INSTANCE.crispasr_session_set_cfg_weight(handle, cfgWeight);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_cfg_weight failed (rc=" + rc + ")");
+    }
+
+    /** Emotion-exaggeration scalar (chatterbox). 0.5 is the upstream default. */
+    public void setExaggeration(float exaggeration) {
+        int rc = Lib.INSTANCE.crispasr_session_set_exaggeration(handle, exaggeration);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_exaggeration failed (rc=" + rc + ")");
+    }
+
+    /** Upper bound on speech tokens per synthesize call (chatterbox). Default 1000 ≈ 20 s. */
+    public void setMaxSpeechTokens(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_max_speech_tokens(handle, n);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_max_speech_tokens failed (rc=" + rc + ")");
+    }
+
+    /** Per-phoneme length-scale / speaking-rate scalar. Honoured by kokoro today; other backends no-op. */
+    public void setLengthScale(float scale) {
+        int rc = Lib.INSTANCE.crispasr_session_set_length_scale(handle, scale);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_length_scale failed (rc=" + rc + ")");
+    }
+
+    /** Best-of-N sampling count for ASR backends. */
+    public void setBestOf(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_best_of(handle, n);
+        if (rc != 0) throw new IllegalStateException("set_best_of failed (rc=" + rc + ")");
+    }
+
+    /** Beam-search width for ASR backends that support it. */
+    public void setBeamSize(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_beam_size(handle, n);
+        if (rc != 0) throw new IllegalStateException("set_beam_size failed (rc=" + rc + ")");
+    }
+
+    /** Set a GBNF grammar for constrained whisper decoding. Pass null or "" to clear. */
+    public void setGrammarText(String gbnfText, String rootRule, float penalty) {
+        int rc = Lib.INSTANCE.crispasr_session_set_grammar_text(handle, gbnfText, rootRule, penalty);
+        if (rc == -2) throw new IllegalArgumentException("set_grammar_text: invalid GBNF or root rule not found");
+        if (rc != 0) throw new IllegalStateException("set_grammar_text failed (rc=" + rc + ")");
+    }
+
+    /** Set whisper decoder fallback thresholds. temperatureInc=0 disables fallback. */
+    public void setFallbackThresholds(float entropyThold, float logprobThold, float noSpeechThold, float temperatureInc) {
+        int rc = Lib.INSTANCE.crispasr_session_set_fallback_thresholds(handle,
+                entropyThold, logprobThold, noSpeechThold, temperatureInc);
+        if (rc != 0) throw new IllegalStateException("set_fallback_thresholds failed (rc=" + rc + ")");
+    }
+
+    /** Per-token top-N alternative-candidate capture for whisper greedy decode. 0 = off. */
+    public void setAltN(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_alt_n(handle, n);
+        if (rc != 0) throw new IllegalStateException("set_alt_n failed (rc=" + rc + ")");
+    }
+
+    /** Whisper-only text-suppression and prompt-carry extras. suppressRegex may be null or "". */
+    public void setWhisperDecodeExtras(boolean suppressNst, String suppressRegex, boolean carryInitialPrompt) {
+        int rc = Lib.INSTANCE.crispasr_session_set_whisper_decode_extras(handle,
+                suppressNst ? 1 : 0, suppressRegex != null ? suppressRegex : "", carryInitialPrompt ? 1 : 0);
+        if (rc != 0) throw new IllegalStateException("set_whisper_decode_extras failed (rc=" + rc + ")");
+    }
+
+    /** Free-form prompt passed to the backend on the next transcribe/synthesize call. */
+    public void setAsk(String prompt) {
+        int rc = Lib.INSTANCE.crispasr_session_set_ask(handle, prompt);
+        if (rc != 0) throw new IllegalStateException("set_ask failed (rc=" + rc + ")");
+    }
+
     /** Auto-detect spoken language on raw 16 kHz mono PCM. method:
      *  0=Whisper, 1=Silero, 2=Firered, 3=Ecapa. Returns the ISO code; the
      *  confidence is written to {@code outConfidence[0]} (length 1 array).
@@ -219,6 +351,11 @@ public final class CrispasrSession implements AutoCloseable {
         while (n < outLang.length && outLang[n] != 0) n++;
         return new String(outLang, 0, n, java.nio.charset.StandardCharsets.UTF_8);
     }
+
+    // PLAN #59: translateText, enhanceAudioRnnoise, textDetectLanguage,
+    // detectBackendFromGguf — deferred to a separate PR after JNA ABI
+    // testing. The JNA interface eagerly resolves all declared symbols,
+    // and type mismatches cause "Invalid memory access" at load time.
 
     /**
      * Load a separate codec GGUF. Required for qwen3-tts (12 Hz tokenizer)

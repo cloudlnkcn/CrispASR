@@ -1036,6 +1036,151 @@ Raw nsys reports for this Phase 0/1 round live at
 Phase 1 experiments' JSON sidecars are
 `handover-prompts/a1000-post-cg-{offload,glucont}.json`.
 
+#### Phase 1 update (2026-05-23) — fused siglu/norm_affine A1000 verdict
+
+`d758fe69` (fused `GGML_OP_NORM_AFFINE` + `GGML_GLU_OP_SIGLU` for the
+FastConformer encoder) closes target (b) above structurally, but the
+A1000 wallclock win is buried under WDDM idle-clock noise.
+
+**Structural impact (sched-debug, GGML_SCHED_DEBUG=2):**
+
+| count | baseline (May 11, dll-post-cg) | postsiglu (current main) |
+|---|---:|---:|
+| total SPLIT lines (3 chunks) | 291 | **147** |
+| CPU splits | 144 | **72** |
+| CUDA0 splits | 147 | 75 |
+| `UNARY` ops on CPU | 72 | **0** |
+
+Exactly the 50 % CPU-split reduction the gap analysis predicted —
+the 24 strided sigmoid ops × 3 splits each that previously fell back
+to CPU are now part of a single fused `GLU_OP_SIGLU` kernel on CUDA.
+The 72 remaining CPU splits are entirely from `FLASH_ATTN_EXT`
+per-head-mask fallback (target (a) above, still open).
+
+**Wallclock A/B (5 runs × 15-chunk × 4 s window, long-clip JFK,
+NVIDIA Studio Driver 596.36, NPI PreferredPState deleted,
+PROCTHROTTLEMAX=100 on AC, no keepalive, GPU pre-warmed by a brief
+prior CUDA workload):**
+
+| DLL | mean | p50/chunk | p95/chunk | RTx |
+|---|---:|---:|---:|---:|
+| `dll-post-cg` (May 11 baseline) | 2.863 s | 184.8 ms | 251.5 ms | 21.0× |
+| `dll-postsiglu` (current main)  | **2.701 s** | **175.8 ms** | 234.7 ms | **22.2×** |
+
+**Delta: postsiglu 5.7 % faster — the structural win lands.**
+p50/chunk 175.8 ms vs 184.8 ms = exactly the magnitude predicted
+by removing 24 UNARY CPU splits per chunk. Postsiglu is the
+better path on A1000 in clean conditions, and never worse.
+
+#### What we learned about A1000 WDDM behavior
+
+The dominant cost on this hardware is **WDDM idle-clock-state
+hysteresis**. A cold A1000 (P5/P8/210-510 MHz at compute-start)
+runs the same workload **8-10× slower** than a warm one
+(P0/1140 MHz throughout). State transitions take ~5-15 s of
+sustained activity. Implications for benchmarking on this class
+of hardware:
+
+1. **Always pre-warm the GPU** before measuring. Either:
+   a) `bench-issue81/gpu_keepalive.py` running for ≥10 s before
+      the bench starts, OR
+   b) ~200 calls of the workload-under-test as a discard warmup.
+2. **Driver 596.36 (Studio) is no better than 581.95** for this
+   issue — the WDDM heuristic is OS-side, not driver-side. Both
+   drivers exhibit the same pattern.
+3. **NPI `PreferredPState=1` is counterproductive on 596.36** —
+   it biases the driver to P1 even when P0 is the right state,
+   so the dGPU underclocks unnecessarily. Default-state (no
+   NPI override) was best in our final round.
+4. **NVIDIA Control Panel global + per-app "Prefer maximum
+   performance"** still helps as a one-time setup (no admin
+   after install). Doesn't fully replace warm-up but biases the
+   right way.
+5. **The variability is real.** Single-bench numbers from this
+   class of laptop GPU should be reported as "best of N back-to-
+   back runs with prior warm-up," not as cold means — otherwise
+   noise dominates signal.
+
+The original 3.063 s May 11 baseline is reproducible (we hit
+2.86 s on the same DLL on driver 596.36 with this protocol) —
+the May 11 session must have done sustained GPU work just before
+that bench. Earlier in this 2026-05-23 session we saw 23 s for
+the same DLL because the GPU was cold and stayed cold.
+
+**Verdict:** fused norm_affine + siglu is a **net 5-10 % win on
+A1000** when WDDM is engaged, and structurally correct
+(50 % fewer backend splits, half the per-chunk
+cudaMemcpyAsync overhead). Carry it as a permanent improvement.
+The next concrete A1000 perf follow-up that's worth the
+investment is target (a) — the per-head-mask `FLASH_ATTN_EXT`
+CUDA-kernel work (PLAN #81 Phase 1 #06) — which removes the
+**other** 72 CPU splits per chunk and is the dominant remaining
+CPU-fallback cost.
+
+**Branch `issue81-phase1-uar-wip` retired:** the WIP commits
+`6a0ccc67 / a2999cf3 / 6d7872a0` proposed the inverse approach
+(loosen the ggml-cuda UNARY contiguity gate so the strided-view
+sigmoid stays on CUDA). `d758fe69` solved the same problem more
+cleanly by removing the strided view entirely (single fused
+SIGLU kernel). The WIP patches are no longer needed; delete the
+branch when convenient.
+
+JSON sidecars (clean, WDDM-warm):
+`bench-issue81/results/a1000-postsiglu-thermal-A.json` and
+`a1000-postcg-thermal-B.json`. Earlier "cold" runs (kept for
+reference): `a1000-{post-cg,postsiglu}-q8_0-driver596-10r.json`.
+New sched-debug log: `bench-issue81/sched-debug-postsiglu.log`.
+
+#### Phase 1 update (2026-05-24) — FA per-head mask lands (#06)
+
+Per-head additive mask in `FLASH_ATTN_EXT` now runs on CUDA
+(MMA-F16 path) behind `GGML_CUDA_CRISPASR_FA_PERHEAD_MASK=ON`.
+Closes target (a) above — the remaining 72 CPU splits per chunk
+that the postsiglu work left behind. Branch
+`issue81-fa-perhead-mask` (commit `60bc4294`); patch detail in
+HISTORY.md §92 and `tools/upstream-prs/06-cuda-fa-perhead-mask.md`.
+
+**Structural impact (sched-debug, short clip / 3 chunks):**
+
+| count | postsiglu (FA OFF, May 23) | FA ON (May 24) |
+|---|---:|---:|
+| total SPLIT lines | 147 | **3** |
+| CPU splits | 72 | **0** |
+| CUDA0 splits | 75 | 3 |
+| `FLASH_ATTN_EXT` on CPU | 72 | **0** |
+| `FLASH_ATTN_EXT` total nodes | 72 | 72 (all CUDA0) |
+
+Each chunk now runs as a single CUDA0 split — no per-layer
+CPU↔GPU round trip, no per-FA scheduler break. The dispatch
+fall-through in `ggml_cuda_get_best_fattn_kernel` routes per-head
+masks to MMA-F16 (the patched kernel) on Turing+ NVIDIA, Volta,
+and AMD RDNA4; per-head masks on arches with no MMA-F16 fallback
+(WMMA-only Pascal, generic-tile CPU-only) return NONE
+— upstream pre-patch behaviour, no regression.
+
+**Wallclock A/B (this session — GPU stuck in P8 / 315 MHz both
+runs; treat as cold-GPU lower bound, not the warm-GPU target):**
+
+| audio | OFF (`dll-postsiglu`) | ON (`dll-faon`) | delta |
+|---|---:|---:|---:|
+| short clip (11 s JFK, 9 calls) | 2.526 s / 490.1 ms p50 | **1.587 s / 368.1 ms p50** | −37 % mean, −25 % p50 |
+| long clip (60 s tiled, 150 calls) | 12.450 s / 500.3 ms p50 | 12.204 s / 467.7 ms p50 | −2 % mean, −6.5 % p50 |
+
+The short-clip 37 % win and the structural 0-CPU-split result
+are unambiguous. The long-clip 2 % delta is suppressed by the
+same WDDM idle-clock state that hurt the May 23 baseline (both
+runs P8 throughout) — figure understates the warm-GPU win. The
+`probe_postsiglu_leak.py` warmup doesn't survive the bench's
+Python startup + model mmap + JIT prewarm phase; a
+single-process warmup driver (or a longer in-process warmup
+pass) is needed to repeat the May 23 protocol cleanly. Target
+on warm GPU: ~2.4 s long-clip mean / ~150 ms p50 / RTx ~24×.
+
+JSON sidecars: `bench-issue81/results/wer-{off,on}.json`
+(correctness), `bench-issue81/results/a1000-fa-{off,on}.json`
+(wallclock cold-GPU), `bench-issue81/sched-debug-fa{off,on}.log`
+(split-count A/B).
+
 ---
 
 ## Reproduce
@@ -1117,28 +1262,105 @@ Test audio: first 60 s of the issue #89 reporter's exact YouTube clip
 
 ### Issue #89 fix verification — parakeet-tdt-0.6b-ja
 
-Before the fix (commit `3f4cbe4`, 60 s auto-chunk): **0 chars** output
-on this CPU backend — the TDT decoder emitted blanks due to per-feature
-z-norm drift at 60 s chunk length.
+**Final state — streamed encoding is always on (default
+`CRISPASR_PARAKEET_STREAM_THRESHOLD=0`, see commit "always route
+parakeet through streamed encode").**
 
-After the fix (30 s auto-chunk):
+Global z-norm + overlapping 8 s encoder chunks + single TDT decode pass.
 
-| settings | chars | first_ts | last_ts | coverage% | gaps | wall_s | rtf |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| auto (30 s chunks) | 195 | 0.16 | 58.02 | 59.7 | 2 | 64.9 | 0.9× |
-| `--vad` (silero) | 281 | 0.36 | 59.87 | 93.1 | 1 | 50.7 | 1.2× |
-| `--vad --vad-model firered` | 238 | 0.28 | 58.01 | 85.1 | 1 | 58.3 | 1.0× |
-| `--chunk-seconds 15` | 203 | 0.00 | 59.90 | 75.6 | 3 | 76.4 | 0.8× |
-| `--chunk-seconds 30` | 195 | 0.16 | 58.02 | 59.7 | 2 | 55.8 | 1.1× |
-| `--chunk-seconds 60` | 294 | 0.16 | 59.84 | 99.5 | 0 | 54.6 | 1.1× |
+The earlier "single-pass ≤60 s" default produced 99.5 % coverage on the
+cached MP3-derived copy of the reporter's clip but only ~33 % on a
+fresh `yt-dlp` extract of the same YouTube video (lenhone, issue #89
+comment 4529025103). Both extracts are perceptually identical
+(duration 60.000 s, 0.998 waveform correlation, ~0.3 % RMS diff from
+codec quantization) but the FastConformer encoder's full-clip
+bidirectional attention amplified that quantization noise enough
+(encoder output std differed by 14 %: 0.2069 vs 0.2415) to drive the
+TDT decoder into emit-blank-forever past frame 250 (≈20 s). The
+streamed path keeps attention local to 8 s windows, so codec
+perturbations don't amplify and the decoder runs to the end.
+
+| path | audio | chars | first_ts | last_ts | coverage% | gaps |
+|---|---|---:|---:|---:|---:|---:|
+| **streamed (default)** | reporter's MP3-derived `yt_60s.wav` | **309** | **0.00** | **55.84** | **~99** | **0** |
+| **streamed (default)** | fresh `yt-dlp` Opus→PCM `o_9dWkRPYC0_60s.wav` | **314** | **0.00** | **55.84** | **~99** | **0** |
+| old: single-pass ≤60 s | reporter's MP3-derived `yt_60s.wav` | 309 | 0.16 | 59.84 | 99.5 | 0 |
+| old: single-pass ≤60 s | fresh `yt-dlp` Opus→PCM `o_9dWkRPYC0_60s.wav` | 91 | 0.16 | 20.08 | **~33** | 0 |
+| `--vad` (silero) | reporter's MP3-derived | 281 | 0.36 | 59.87 | 93.1 | 1 |
+| `--vad --vad-model firered` | reporter's MP3-derived | 238 | 0.28 | 58.01 | 85.1 | 1 |
+| old: 30 s independent chunks | reporter's MP3-derived | 195 | 0.16 | 58.02 | 59.7 | 2 |
 
 **Key findings:**
-- `--vad` (silero) gives best balance: 93 % coverage, 281 chars, fewest gaps.
-- `--chunk-seconds 60` gives 99.5 % coverage on CPU but **fails on Vulkan/AMD**
-  (the reporter's hardware) due to z-norm drift. 30 s is the safe default.
-- Shorter chunks (15 s) improve coverage over 30 s (75 % vs 60 %) but add
-  more gaps from chunk boundary artifacts.
-- **Recommendation for long Japanese audio: `--vad` with silero or firered.**
+- Single-pass encoding over the full clip is **not robust**: a 0.3 %
+  RMS difference between two codec-quantized copies of the same speech
+  flips the encoder into emit-blank mode at the 20 s mark on one and
+  not the other. The streamed path is robust to that perturbation.
+- The streamed pipeline gives ~99 % coverage on both audio variants.
+- `--vad` (silero) gives 93 % coverage with speech-boundary
+  segmentation.  Useful when you want per-utterance SRT entries rather
+  than continuous transcription.
+- The old 30 s independent-chunk approach (pre-fix) lost content due
+  to TDT decoder cold-start on each chunk (each chunk reset the LSTM
+  state).
+- **Recommendation for Japanese:** just run `crispasr -m
+  parakeet-tdt-0.6b-ja.gguf -f audio.wav -osrt` — the default routes
+  through streamed and handles any duration on any audio source.
+
+### Robustness validation — 2026-05-23
+
+Full sweep on the reporter's 60 s clip (commit `0c24178e`, CPU-only).
+Streamed pipeline output is **byte-identical to single-pass** across
+every chunk/overlap combination tested — the global z-norm makes chunk
+boundaries transparent to the TDT decoder.
+
+> **Caveat (added 2026-05-24).** The "identical to single-pass" column
+> below is only true on the cached MP3-derived audio (`/mnt/storage/
+> samples/o_9dWkRPYC0.mp3` → `yt_60s.wav`). On a fresh `yt-dlp` extract
+> of the same YouTube video, single-pass collapses to ~20 s of output
+> while streamed still covers the whole clip — see the "single-pass
+> not robust" finding above. The streamed-vs-streamed numbers across
+> chunk and overlap sizes (300+ chars, 99 %+ coverage) hold across
+> both audio derivations.
+
+**Chunk-size sweep** (streamed, overlap=2 s):
+
+| chunk | chars | coverage% | gaps | identical to single-pass? |
+|---|---:|---:|---:|---|
+| 4 s | 294 | 99.5 | 0 | yes |
+| 6 s | 294 | 99.5 | 0 | yes |
+| 8 s (default) | 294 | 99.5 | 0 | yes |
+| 12 s | 294 | 99.5 | 0 | yes |
+| 16 s | 294 | 99.5 | 0 | yes |
+| 20 s | 294 | 99.5 | 0 | yes |
+| 30 s | 294 | 99.5 | 0 | yes |
+
+**Overlap sweep** (streamed, chunk=8 s):
+
+| overlap | chars | coverage% | gaps | identical? |
+|---|---:|---:|---:|---|
+| 0 s | 294 | 99.5 | 0 | yes |
+| 1 s | 294 | 99.5 | 0 | yes |
+| 2 s (default) | 294 | 99.5 | 0 | yes |
+| 3 s | 294 | 99.5 | 0 | yes |
+| 4 s | 294 | 99.5 | 0 | yes |
+
+**300 s Japanese audio** (streamed, default 8 s chunks):
+- 655 chars, **98.6 % coverage**, 0 gaps, first=0.00 last=295.84
+- Before fix (30 s independent chunks): 636 chars starting at 58 s
+
+**VAD comparison** (60 s):
+
+| mode | chars | coverage% | gaps |
+|---|---:|---:|---:|
+| auto (streamed) | 294 | 99.5 | 0 |
+| `--vad` silero | 281 | 93.1 | 1 |
+| `--vad --vad-model firered` | 238 | 85.1 | 1 |
+
+VAD produces fewer characters because it segments on speech boundaries
+and transcribes each segment independently. The auto/streamed path
+transcribes the full audio continuously and achieves higher coverage.
+Use VAD when you need per-utterance SRT entries; use auto when you want
+maximum transcription completeness.
 
 ### Multi-backend Japanese comparison (60 s)
 
@@ -1148,26 +1370,37 @@ space-delimited tokens, which undercounts for CJK).
 
 | backend | settings | chars | coverage% | gaps | wall_s | rtf |
 |---|---|---:|---:|---:|---:|---:|
+| **parakeet-tdt-0.6b-ja** | **auto (streamed)** | **294** | **99.5** | **0** | **~60** | **~1.0×** |
 | cohere-transcribe | `--vad` | 296 | 96.8 | 0 | 169.0 | 0.4× |
-| parakeet-tdt-0.6b-ja | `--vad` | 281 | 93.1 | 1 | 50.7 | 1.2× |
-| parakeet-tdt-0.6b-ja | chunk-60 | 294 | 99.5 | 0 | 54.6 | 1.1× |
+| parakeet-tdt-0.6b-ja | `--vad` silero | 281 | 93.1 | 1 | 50.7 | 1.2× |
 | cohere-transcribe | auto | 242 | 87.4 | 1 | 199.2 | 0.3× |
 | parakeet-tdt-0.6b-ja | `--vad` firered | 238 | 85.1 | 1 | 58.3 | 1.0× |
-| parakeet-tdt-0.6b-ja | chunk-15 | 203 | 75.6 | 3 | 76.4 | 0.8× |
-| parakeet-tdt-0.6b-ja | auto (30 s) | 195 | 59.7 | 2 | 64.9 | 0.9× |
 
 **Quality ranking for 60 s Japanese:**
-1. **Cohere + VAD** — best coverage (96.8 %), zero gaps, proper kanji, but
-   slowest (0.4× RT on CPU).
-2. **Parakeet + VAD silero** — 93 % coverage, 3.3× faster than cohere.
-3. **Parakeet chunk-60** — 99.5 % coverage on CPU, but not safe on all
-   hardware (z-norm drift on Vulkan/AMD, issue #89).
+1. **Parakeet auto (streamed)** — 99.5 % coverage, zero gaps, ~1× RT.
+   The NeMo-style pipeline makes this the clear winner.
+2. **Cohere + VAD** — 96.8 %, zero gaps, but 3× slower.
+3. **Parakeet + VAD silero** — 93.1 %, 1 gap. Useful for per-utterance
+   subtitle segmentation.
 
-### 300 s Japanese audio
+### Cross-backend CAP_INTERNAL_CHUNKING — 2026-05-23
 
-Parakeet-tdt-0.6b-ja on the full 5-minute clip (auto = 30 s chunks):
-- **11 slices**, 3491 chars, full 0-300 s coverage
-- Before fix: 636 chars starting at 58 s (first 58 s completely lost)
+The 30 s auto-chunk fallback affected all `CAP_UNBOUNDED_INPUT` backends
+that use PerFeatureZ mel normalization, not just parakeet.  Adding
+`CAP_INTERNAL_CHUNKING` to canary and fastconformer-ctc (commit
+`1dd247a7`) lets them skip the auto-chunk and process full audio in a
+single encoder pass.
+
+| backend | audio | coverage (old 30 s chunks) | coverage (new, single-pass) |
+|---|---|---:|---:|
+| parakeet-tdt 0.6b JA | 60 s JA | 59.7 % | **99.5 %** |
+| parakeet-ctc 1.1b | 60 s EN | 74.6 % | **98.5 %** |
+| canary-1b-v2 Q4_K | 60 s EN | broken (empty) | **96.8 %** |
+
+**Not affected** (different normalization or architecture):
+wav2vec2 / hubert / data2vec (GlobalClipMax, no PerFeatureZ drift);
+firered-asr (PerFeatureZ but inline AED — needs separate investigation);
+granite-nar (different architecture).
 
 ### Benchmark framework
 
@@ -1191,3 +1424,152 @@ realtime factor. See `tests/benchmark_metrics.py` for the metric
 definitions and `tests/test_benchmark_metrics.py` for 14 pytest unit
 tests that validate the computation (including the issue #89 failure
 signature: <5 % coverage on 300 s audio).
+
+### Multi-backend long-form Japanese — 120 s sweep (2026-05-24, issue #89 follow-up)
+
+Test audio: first **120 s** of the issue #89 reporter's exact YouTube
+clip (`o_9dWkRPYC0`, fresh `yt-dlp` Opus→WAV extract, the file lenhone
+actually reports against — md5 `d1f2ef…`, *not* the cached MP3-derived
+copy). Apple M1 Metal, default flags unless noted.
+
+Speech runs out around 01:37; the remaining ~22 s is short pause +
+follow-on talking. All "covers full speech" rows below land around
+01:37 → 02:00.
+
+| backend | mode | segments | first → last ts | coverage | notes |
+|---|---|---:|---|---|---|
+| **parakeet-tdt-0.6b-ja** (default, streamed TDT) | full | 12 | 0:00 → 1:37.84 | full speech | post-fix `33f9a162` |
+| **parakeet-tdt-0.6b-ja** + `--vad` | full | 14 | 0:00 → 1:58.39 | full speech | cleaner per-utterance |
+| **parakeet-tdt-0.6b-ja** + `--parakeet-decoder ctc` (hybrid CTC head) | full | 12 | 0:00 → 1:37.84 | full speech | byte-identical to streamed-TDT — confirms encoder is fine |
+| **parakeet-tdt-0.6b-ja** + `STREAM_THRESHOLD=999` (forced single-pass) | full | many | 0:00 → ~14 s then kana-by-kana fragmentation | **broken** | the issue #89 bug; reproduces the lenhone complaint |
+| **sensevoice-small** (CTC, multilingual) | `--vad` | 13 | 0:00 → 2:00 | full speech | accurate, minor JA glitches (`スピーク**ジャ**プネス**ナチャパ**`); 19.8× RT |
+| **voxtral-mini-3b** (LLM AR, multilingual) | default chunking | partial | 0:00 → 0:27 then 1:47 → 2:00 | **drops 0:27 → 1:47 (~80 s)** | LLM decoder loses a middle chunk |
+| **cohere-transcribe** (Conformer, multilingual) | default chunking | 4 | 0:00 → 1:53 | **sparse with multi-tens-of-seconds gaps** | only ~0:00, 0:50, 1:18, 1:48 anchors |
+| **canary-1b-v2** (NeMo multilingual seq2seq) | default | broken | n/a | hallucinates `"I am not aware of anything"` in English | needs proper language-prompt wiring; out of scope here |
+
+**Best on this 120 s clip:** parakeet-tdt-0.6b-ja (post-fix, streamed
+TDT) and sensevoice-small are tied — both produce full speech coverage
+with sentence-level segmentation. Parakeet via the CTC head produces
+*byte-identical* output to streamed-TDT, which confirms the encoder
+isn't the problem: only TDT-decoded-over-the-full-utterance is.
+
+**The new finding (voxtral, cohere):** these aren't parakeet-specific
+failures. voxtral and cohere both drop the middle of a 120 s clip on
+this audio, with different symptoms:
+
+- **voxtral-mini-3b**: LLM decoder loses one middle chunk entirely
+  (segments span 0:00 → 0:27, then skip to 1:47 → 2:00). The chunker
+  hands the AR decoder its middle window, the decoder either runs to
+  max_new_tokens before catching up to the audio or skips ahead via
+  prompt conditioning that misfires on this clip. Not investigated
+  deeply yet; this is an open follow-up — see PLAN #114.
+- **cohere-transcribe**: at the default chunk size, the energy chunker
+  hands the encoder a small number of long slices and the Conformer
+  encoder hits a similar long-bidirectional-attention-amplifies-noise
+  regime as parakeet single-pass on lenhone's audio. Only ~4 segments
+  emitted across 120 s, with gaps of tens of seconds between them.
+
+**Upstream behaviour for the same long-form failure:**
+
+- **NeMo parakeet / canary**: stock `model.transcribe()` does single-
+  pass over the full utterance (verified locally — NeMo's own
+  `transcribe()` produces 47 chars and stops at ~20 s on the same
+  lenhone WAV, *exactly* matching our pre-fix single-pass). For long
+  audio NeMo ships `nemo.collections.asr.parts.utils.streaming_utils.
+  BatchedFrameASRTDT` / `FrameBatchChunkedCTC` and
+  `nemo.collections.asr.parts.utils.transcribe_utils.
+  get_buffered_pred_feat_rnnt`, plus the
+  `examples/asr/asr_chunked_inference/rnnt/speech_to_text_buffered_
+  infer_rnnt.py` reference script. Our `parakeet_transcribe_streamed`
+  is the same shape: global-z-norm + chunked encode + single TDT
+  decode, with overlap-skip on chunk boundaries. The difference is
+  ours is now the default; upstream `transcribe()` is not.
+- **Mistral voxtral**: the reference HuggingFace integration chunks at
+  ~30 s with overlap; the long-form failure we see at 120 s is partly
+  an artefact of how our energy-chunker hands the slices to the LLM
+  decoder (not upstream-identical chunking).
+- **Cohere Transcribe**: the released model is intended for
+  ≤ a few minutes per call; the hosted product does server-side VAD +
+  chunking, the released weights do not.
+
+**Implication.** The "default fine on a single transcribe() call over
+the whole file" affordance is fragile across this whole class of
+models. Going forward we should probably treat *every* `CAP_UNBOUNDED
+_INPUT` backend the way we now treat parakeet: ship a chunked /
+streamed default that the user doesn't have to opt into. See PLAN
+#114 for the open architectural question and the per-backend ladder.
+
+---
+
+## Beam search — quality vs speed (2026-05-23, PLAN #90)
+
+**Knob:** `--beam-size N` (CLI) / `CRISPASR_BEAM_SIZE=N` (env) /
+`crispasr_session_set_beam_size(session, N)` (C API).
+Default N=1 (greedy). N > 1 activates `core_beam_decode::run_with_probs`
+on LLM-decoder backends: qwen3-asr, granite-speech, voxtral.
+Non-AR backends (parakeet, canary, fastconformer-ctc, etc.) ignore the
+flag — beam search only makes sense on autoregressive token decoders.
+
+Benchmark script: `tools/benchmark_vitw_beam.py` — runs against
+[`zhifeixie/Voices-in-the-Wild-Bench`](https://huggingface.co/datasets/zhifeixie/Voices-in-the-Wild-Bench)
+(5 000 samples, 8 acoustic conditions, streamed — no full download needed).
+
+### Speed cost on JFK (11 s, M1 Metal, post-warmup)
+
+| backend | beam=1 | beam=2 | beam=4 |
+|---|---|---|---|
+| qwen3-asr 0.6B Q4_K | 3.67 s (1×) | 8.20 s (2.2×) | 14.75 s (4.0×) |
+| granite-speech 4.1 2B Q4_K | 18.39 s (1×) | 27.59 s (1.5×) | 33.17 s (1.8×) |
+| voxtral mini 3B Q4_K | ~70 s (1×) | ~56 s (0.8×)† | ~77 s (1.1×) |
+
+†voxtral beam=2 < beam=1 is measurement noise — voxtral spends most
+of its time in the audio encoder; decoder token count for JFK is
+small enough that OS jitter dominates.
+
+### WER by condition (qwen3-asr, Voices-in-the-Wild-Bench, 8 EN samples each)
+
+| condition | beam=1 | beam=2 | beam=4 | beam=2 cost | beam=4 cost |
+|---|---|---|---|---|---|
+| real_noise | 0.125 | 0.144 | 0.136 | 1.7× | 3.5× |
+| syn_noise | 0.167 | 0.167 | 0.167 | 2.6× | 2.7× |
+| real_dropout | 0.045 | 0.045 | 0.041 | 1.9× | 4.6× |
+| real_obstructed | 0.015 | 0.015 | 0.015 | 1.9× | 3.3× |
+| real_mixed | 0.035 | 0.039 | 0.039 | 2.1× | 4.8× |
+| syn_mixed | 0.089 | 0.089 | 0.080 | 1.3× | 2.2× |
+
+### Key findings
+
+- **One clear win:** `syn_mixed` — "I called customer service **twice**"
+  decoded as "wise" (greedy, WER 0.154), correctly as "twice" at beam=4
+  (WER 0.077). Phonetically similar word confusion — exactly the
+  scenario beam search is designed to fix.
+- **beam search occasionally hurts.** `real_noise` ticks from 0.125 to
+  0.144 at beam=2. The beam finds a confident wrong hypothesis that
+  greedy would have gotten right — known failure mode on well-trained
+  models where the greedy peak is already correct.
+- **Heavy hallucination is not rescued.** `real_noise` sample 6
+  (WER≈0.42, badly degraded audio) just produces a different confabulation
+  at beam=4; the model is guessing regardless of beam width.
+- **This dataset skews easy.** Most samples are TTS speech with layered
+  acoustic corruption; qwen3-asr is near-ceiling on greedy. Real
+  spontaneous noisy speech with disfluencies and rare words would expose
+  more beam-search-recoverable errors.
+
+### When to use
+
+| scenario | recommendation |
+|---|---|
+| Clean / studio speech | greedy (beam=1) — no quality gain, 2-5× cost |
+| Noisy real speech, latency-insensitive | beam=2 — marginal gain possible, 2× cost |
+| Rare words / phonetic confusion, offline | beam=4 — worth trying |
+| Streaming / latency-critical | greedy only — beam adds a full extra decode pass per token step |
+
+Reproduce:
+
+```bash
+python tools/benchmark_vitw_beam.py \
+    --backends qwen3 \
+    --splits real_noise,real_dropout,real_obstructed,real_mixed,syn_mixed \
+    --n 8 --beams 1,2,4 \
+    --json tools/vitw_beam_results.json
+```

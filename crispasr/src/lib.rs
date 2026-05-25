@@ -830,6 +830,237 @@ impl Session {
         Ok(())
     }
 
+    /// Set the RNG seed for sampling-capable TTS backends that expose a
+    /// session-level seed override (chatterbox, vibevoice, qwen3-tts,
+    /// orpheus). Other backends silently no-op.
+    pub fn set_tts_seed(&self, seed: u64) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_tts_seed(self.handle, seed) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_tts_seed failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set a generated-token cap for autoregressive session backends.
+    /// Pass `<= 0` to clear the override and use the backend default.
+    pub fn set_max_new_tokens(&self, max_new_tokens: i32) -> Result<(), String> {
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_max_new_tokens(self.handle, max_new_tokens)
+        };
+        if rc != 0 {
+            return Err(format!("set_max_new_tokens failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set an opt-in repeated generated-token penalty for autoregressive
+    /// session backends. Pass `<= 0.0` to disable it.
+    pub fn set_frequency_penalty(&self, penalty: f32) -> Result<(), String> {
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_frequency_penalty(self.handle, penalty)
+        };
+        if rc != 0 {
+            return Err(format!("set_frequency_penalty failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the diffusion / CFM step count for diffusion-based TTS backends
+    /// (chatterbox today). Other backends silently no-op.
+    pub fn set_tts_steps(&self, steps: i32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_tts_steps(self.handle, steps) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_tts_steps failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the top-p nucleus-sampling threshold. Honoured by chatterbox.
+    pub fn set_top_p(&self, top_p: f32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_top_p(self.handle, top_p) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_top_p failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the min-p sampling threshold. Honoured by chatterbox.
+    pub fn set_min_p(&self, min_p: f32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_min_p(self.handle, min_p) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_min_p failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the repetition penalty (1.0 = no penalty). Honoured by chatterbox.
+    pub fn set_repetition_penalty(&self, r: f32) -> Result<(), String> {
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_repetition_penalty(self.handle, r) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_repetition_penalty failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the classifier-free-guidance weight (chatterbox). 0 disables CFG;
+    /// 0.5 is the upstream default.
+    pub fn set_cfg_weight(&self, cfg_weight: f32) -> Result<(), String> {
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_cfg_weight(self.handle, cfg_weight) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_cfg_weight failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the emotion-exaggeration scalar (chatterbox). 0.5 is the upstream default.
+    pub fn set_exaggeration(&self, exaggeration: f32) -> Result<(), String> {
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_exaggeration(self.handle, exaggeration)
+        };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_exaggeration failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the upper bound on speech tokens per synthesize call (chatterbox).
+    /// Default ≈1000 tokens ≈ 20 s.
+    pub fn set_max_speech_tokens(&self, n: i32) -> Result<(), String> {
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_max_speech_tokens(self.handle, n) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_max_speech_tokens failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the per-phoneme length-scale / speaking-rate scalar. Honoured by
+    /// kokoro today; other backends silently no-op. 1.0 = upstream default.
+    pub fn set_length_scale(&self, scale: f32) -> Result<(), String> {
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_length_scale(self.handle, scale) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_length_scale failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the best-of-N sampling count for ASR backends.
+    pub fn set_best_of(&self, n: i32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_best_of(self.handle, n) };
+        if rc != 0 {
+            return Err(format!("set_best_of failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the beam-search width for ASR backends that support it.
+    pub fn set_beam_size(&self, n: i32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_beam_size(self.handle, n) };
+        if rc != 0 {
+            return Err(format!("set_beam_size failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set a GBNF grammar for constrained whisper decoding. Pass an empty
+    /// string for `gbnf_text` to clear the grammar. `penalty` defaults to 100.0.
+    pub fn set_grammar_text(
+        &self,
+        gbnf_text: &str,
+        root_rule: &str,
+        penalty: f32,
+    ) -> Result<(), String> {
+        let cgbnf = CString::new(gbnf_text).map_err(|e| e.to_string())?;
+        let croot = CString::new(root_rule).map_err(|e| e.to_string())?;
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_grammar_text(
+                self.handle,
+                cgbnf.as_ptr(),
+                croot.as_ptr(),
+                penalty,
+            )
+        };
+        if rc == -2 {
+            return Err("set_grammar_text: invalid GBNF or root rule not found".into());
+        }
+        if rc != 0 {
+            return Err(format!("set_grammar_text failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set whisper decoder fallback thresholds. `temperature_inc = 0.0`
+    /// disables fallback entirely (equivalent to `--no-fallback`).
+    pub fn set_fallback_thresholds(
+        &self,
+        entropy_thold: f32,
+        logprob_thold: f32,
+        no_speech_thold: f32,
+        temperature_inc: f32,
+    ) -> Result<(), String> {
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_fallback_thresholds(
+                self.handle,
+                entropy_thold,
+                logprob_thold,
+                no_speech_thold,
+                temperature_inc,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("set_fallback_thresholds failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set per-token top-N alternative-candidate capture for whisper greedy
+    /// decode. 0 disables it.
+    pub fn set_alt_n(&self, n: i32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_alt_n(self.handle, n) };
+        if rc != 0 {
+            return Err(format!("set_alt_n failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set whisper-only text-suppression and prompt-carry extras.
+    /// `suppress_regex` may be empty to clear any prior regex.
+    pub fn set_whisper_decode_extras(
+        &self,
+        suppress_nst: bool,
+        suppress_regex: &str,
+        carry_initial_prompt: bool,
+    ) -> Result<(), String> {
+        let cregex = CString::new(suppress_regex).map_err(|e| e.to_string())?;
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_whisper_decode_extras(
+                self.handle,
+                suppress_nst as c_int,
+                cregex.as_ptr(),
+                carry_initial_prompt as c_int,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("set_whisper_decode_extras failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set a free-form prompt / question passed to the backend on the next
+    /// transcribe or synthesize call (used by LLM-style backends).
+    pub fn set_ask(&self, prompt: &str) -> Result<(), String> {
+        let cprompt = CString::new(prompt).map_err(|e| e.to_string())?;
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_ask(self.handle, cprompt.as_ptr()) };
+        if rc != 0 {
+            return Err(format!("set_ask failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
     /// Auto-detect spoken language on raw 16 kHz mono PCM.
     ///
     /// `method`: 0=Whisper, 1=Silero (default), 2=Firered, 3=Ecapa.

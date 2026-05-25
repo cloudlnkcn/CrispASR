@@ -8,6 +8,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
 #include "whisper_params.h"
+#include "core/asr_context_bias.h"
 
 #include "parakeet.h"
 
@@ -60,6 +61,17 @@ public:
         return true;
     }
 
+    void warmup() override {
+        if (!ctx_)
+            return;
+        // 0.5 s of silence at 16 kHz — touches mel, encoder, and decoder
+        // graphs once so subsequent calls hit pre-allocated buffers.
+        std::vector<float> silence(8000, 0.0f);
+        parakeet_result* r = parakeet_transcribe_ex(ctx_, silence.data(), (int)silence.size(), 0);
+        if (r)
+            parakeet_result_free(r);
+    }
+
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                              const whisper_params& params) override {
         std::vector<crispasr_segment> out;
@@ -73,22 +85,52 @@ public:
         // sampling state from a prior file.
         parakeet_set_temperature(ctx_, params.temperature, params.seed);
 
-        // Issue #89 / PLAN #104: encoding path selection.
+        // PLAN #98: CTC-WS hotword phrase boost
+        if (!params.hotwords.empty()) {
+            auto hw = core_context_bias::parse_hotwords(params.hotwords);
+            std::vector<const char*> ptrs;
+            for (auto& s : hw)
+                ptrs.push_back(s.c_str());
+            parakeet_set_hotwords(ctx_, ptrs.data(), (int)ptrs.size(), params.hotwords_boost);
+        }
+
+        // Issue #89: encoding-path selection.
         //
-        // transcribe_ex (single-pass): best quality — bidirectional encoder
-        // sees full context.  99.5% coverage on the reporter's 60 s JA clip.
-        // Fails past ~60 s on some hardware (z-norm drift on Vulkan/AMD).
+        // parakeet_transcribe_ex (single-pass) routes the full audio through
+        // one bidirectional FastConformer encoder pass. The attention is
+        // numerically unstable past ~10-20 s in a way that depends on
+        // per-feature z-norm statistics: two codec-quantized copies of the
+        // same speech (≈0.3% RMS diff, 0.998 waveform corr) can flip the
+        // encoder output std by 10-15 % and drive the TDT decoder into
+        // emit-blank-forever past a few seconds. Repro: lenhone's clip in
+        // issue #89, comment 4529025103 (60 s file → 20 s of output).
         //
-        // transcribe_streamed (chunked encode): safe for any length — global
-        // z-norm + 8 s encoder chunks + single TDT decode.  ~93% coverage
-        // (encoder sees only 8 s context per chunk → slightly worse features).
+        // parakeet_transcribe_streamed encodes the (globally-z-normed) mel
+        // in overlapping 8 s windows and concatenates encoder outputs
+        // before a single TDT decode. The attention is local-bounded so
+        // codec-level perturbations don't amplify, and the decoder still
+        // sees one contiguous encoder sequence (no LSTM cold-start).
+        // On audio where single-pass works, streamed produces byte-
+        // identical or near-identical text. On audio where single-pass
+        // collapses, streamed still covers ~99 % of the clip.
         //
-        // Default: single-pass up to 60 s, streamed above.  Tuneable via env:
-        //   CRISPASR_PARAKEET_STREAM_THRESHOLD=0  → always streamed
-        //   CRISPASR_PARAKEET_STREAM_THRESHOLD=999 → always single-pass
-        //   CRISPASR_PARAKEET_STREAM_CHUNK=16      → 16 s encoder chunks
-        //   CRISPASR_PARAKEET_STREAM_OVERLAP=4     → 4 s encoder overlap
-        int stream_threshold_s = 60;
+        // We therefore always go through the streamed path. Single-pass
+        // is preserved as an opt-in escape hatch for callers who really
+        // want the bidirectional-over-everything behaviour (e.g. for
+        // bit-exact reproduction of upstream NeMo on test data) — set
+        // `CRISPASR_PARAKEET_STREAM_THRESHOLD=999` to bypass streaming
+        // for audio shorter than that.
+        //
+        // Env knobs:
+        //   CRISPASR_PARAKEET_STREAM_THRESHOLD : single-pass for audio ≤
+        //       this duration (seconds). Default 0 = always streamed.
+        //   CRISPASR_PARAKEET_STREAM_CHUNK     : encoder chunk size (s).
+        //       Default 8. Smaller is more stable but more compute.
+        //   CRISPASR_PARAKEET_STREAM_OVERLAP   : encoder overlap (s).
+        //       Default 2. Covers FastConformer's receptive field at the
+        //       chunk boundary; overlap frames from later chunks are
+        //       discarded before decode.
+        int stream_threshold_s = 0;
         int stream_chunk_s = 8;
         int stream_overlap_s = 2;
         if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD"))
@@ -99,11 +141,11 @@ public:
             stream_overlap_s = std::max(0, atoi(e));
 
         parakeet_result* r;
-        if (stream_threshold_s > 0 && n_samples > stream_threshold_s * 16000) {
-            r = parakeet_transcribe_streamed(ctx_, samples, n_samples, t_offset_cs,
-                                             stream_chunk_s, stream_overlap_s);
-        } else {
+        const bool use_single_pass = stream_threshold_s > 0 && n_samples <= stream_threshold_s * 16000;
+        if (use_single_pass) {
             r = parakeet_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
+        } else {
+            r = parakeet_transcribe_streamed(ctx_, samples, n_samples, t_offset_cs, stream_chunk_s, stream_overlap_s);
         }
         if (!r)
             return out;

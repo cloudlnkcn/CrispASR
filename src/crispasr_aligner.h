@@ -2,7 +2,7 @@
 //
 // LLM-based backends (qwen3, voxtral, voxtral4b, granite) emit plain text
 // without per-word timestamps. A second pass through a CTC aligner
-// produces frame-aligned word timings. Two models are supported behind
+// produces frame-aligned word timings. Three model families are supported behind
 // one entry point:
 //
 //   * canary-ctc-aligner   FastConformer + CTC head, 16k SentencePiece
@@ -16,6 +16,11 @@
 //                          per-token timestamps. Selected automatically
 //                          when the aligner filename contains "forced-
 //                          aligner" / "qwen3-fa" / "qwen3-forced".
+//
+//   * wav2vec2-aligner     Any GGUF accepted by the wav2vec2 backend
+//                          (wav2vec2, HuBERT, data2vec CTC). Selected when
+//                          the filename or GGUF architecture identifies that
+//                          family. Uses the shared CTC Viterbi DP.
 //
 // Shared by the CLI, the C-ABI wrapper `crispasr_align_words_abi` in
 // crispasr_c_api.cpp, and every language binding that reaches through
@@ -36,9 +41,10 @@ struct CrispasrAlignedWord {
 
 /// Run CTC forced alignment.
 ///
-/// Dispatches to canary-ctc-aligner by default and to qwen3-fa when
+/// Dispatches to canary-ctc-aligner by default, to qwen3-fa when
 /// `aligner_model` filename contains "forced-aligner" / "qwen3-fa" /
-/// "qwen3-forced". Both model types load and free inside the call —
+/// "qwen3-forced", and to wav2vec2/hubert/data2vec CTC when the filename
+/// or GGUF architecture identifies that family. Models load and free inside the call —
 /// cost is dominated by the ASR pass upstream, not the aligner load.
 ///
 /// Returns an empty vector on any failure (error printed to stderr).

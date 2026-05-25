@@ -2590,6 +2590,40 @@ class CrispasrSession {
     }
   }
 
+  /// Reseed TTS backends that support runtime seed control (chatterbox,
+  /// vibevoice, qwen3-tts, orpheus). Other backends silently no-op.
+  void setTtsSeed(int seed) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_seed')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Uint64),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_tts_seed');
+    final rc = fn(_handle, seed);
+    if (rc != 0 && rc != -2) throw Exception('setTtsSeed failed (rc=$rc)');
+  }
+
+  /// Set a generated-token cap for autoregressive session backends.
+  /// Pass <= 0 to clear the override and use the backend default.
+  void setMaxNewTokens(int n) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_max_new_tokens')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_max_new_tokens');
+    final rc = fn(_handle, n);
+    if (rc != 0) throw Exception('setMaxNewTokens failed (rc=$rc)');
+  }
+
+  /// Opt-in repeated-token penalty for autoregressive session backends.
+  /// Pass <= 0 to disable.
+  void setFrequencyPenalty(double penalty) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_frequency_penalty')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+            int Function(Pointer<Void>, double)>(
+        'crispasr_session_set_frequency_penalty');
+    final rc = fn(_handle, penalty);
+    if (rc != 0) throw Exception('setFrequencyPenalty failed (rc=$rc)');
+  }
+
   /// Text-to-text translation via this session's backend.
   ///
   /// Routes through the C-side `crispasr_session_translate_text`, which
