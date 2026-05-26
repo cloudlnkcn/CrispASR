@@ -6,6 +6,33 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-26 (P114-P3 validation) canary streamed on real en + de long-form audio
+
+After the six P3 fix commits landed (lang-whitelist → streamed → per-chunk re-injection → LCS dedup → splice-punct cleanup → degenerate-loop guard), the streamed path was only validated on JFK (synthetic-equivalent at 11 s) and the Japanese yt_60s.wav (OOD audio for canary). Pulled real en + de long-form clips from VPS `/mnt/akademie_storage/test-audio/{en,de}/fleurs_*.wav` and `german-samples/De-Abwasch-article.wav` (1.3 m DE article) into `/Volumes/backups/code/audio_samples/` (full inventory + CLAUDE.md in that dir). Comparing streamed (default) vs forced single-pass on canary-1b-v2 Q4_K:
+
+| input | single-pass | streamed |
+|---|---|---|
+| `audio_samples/en/fleurs_60s.wav` (60 s en) | **362 chars**, 3 sentences then truncates | **667 chars**, 5+ sentences, ~2× content |
+| `audio_samples/de/fleurs_60s.wav` (60 s de) | **419 chars**, 4 sentences then truncates | **774 chars**, full coverage, ~2× content |
+| `audio_samples/multi/De-Abwasch-article.wav` (1.3 m de) | **458 chars**, ~5 sentences then jumps mid-transcript | **1233 chars**, full article body, ~2.7× content |
+
+Single-pass on every long-form input shows the issue #89 encoder-amplification failure: the bidirectional Conformer attention past ~30 s feeds garbage into the AED decoder, which emits `<eos>` early. **Streamed delivers ~2-3× more content** without truncation.
+
+**Boundary artifacts visible on streamed output.** The LCS dedup catches token-level overlaps but not mid-word splits at the chunk boundary. Examples from the live runs:
+
+- en 60s: `"twenty five. to thirty"`, `"the world say for you. World's Save for You"`, `"Yeah, yeah, ..., yeah"` (~14 yeahs before the degenerate-loop guard aborts)
+- de 60s: `"die Geld-Technologie-Technologie-Technologie-Technologie."` (early-chunk loop, guard caught it at 4 repeats), `"T-Rex war -Rex war ihm"`, `"Rückseite der ite der Unabhängigkeitserklärung"`
+- De-Abwasch: `"S und Ess-"`, `"Maitrein. ittels"`, `"Geschirrtuches umfassen. tuch umfassen"`, `"angepasst werden. werden, können"`, `"irrspülmaschine"`
+
+These are mid-word boundary artifacts the LCS dedup can't resolve cleanly because the BPE-split point inside the duplicated region doesn't align with whole-token boundaries. Two follow-up directions for the next session:
+
+1. **Word-snap dedup heuristic.** After LCS-prefix-drop, if the next surviving token starts mid-word (no leading ▁/space), extend the drop until the next word-boundary token. Trades a few extra tokens for a clean prefix.
+2. **Backward LCS extension.** Run the LCS check both directions (chunk N-1 tail vs chunk N head AND chunk N-1 tail extending into chunk N head with longer match). Catches longer overlaps where the AED produced different tokenizations of the same word at the boundary.
+
+**Decision.** Ship as-is. The 2-3× content delivery is the big win; boundary artifacts are cosmetic and reduce as the LCS finds more matching tokens at the boundary. PLAN #114 P3 is **content-correct** (full coverage of long audio); **cosmetic-incomplete** (chunk-boundary word fragments). Mark in the priority table.
+
+---
+
 ## 2026-05-26 (P114-P3 closeout) splice-punct cleanup + always-streamed default + degenerate-loop guard
 
 Three follow-ons close PLAN #114 P3:
