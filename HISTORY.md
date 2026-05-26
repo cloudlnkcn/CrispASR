@@ -6,6 +6,23 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-26 (P114-P3 + harness kernel) canary lang-whitelist + Kaggle audit kernel
+
+Two more landings this session:
+
+- **`dfe1af3b` canary lang-whitelist (PLAN #114 P3 first half).** canary-1b-v2's BPE vocab carries every ISO-639 `<|xx|>` language token (200+) — only en/de/fr/es are actually trained. The current build_prompt path treated the token's existence in the vocab as evidence the model could speak that language, so `-l ja` built the prompt cleanly, ran the decoder, and produced hallucinated mixed-Cyrillic/Greek garbage on JFK ("И така, мои сънародници, не питайте, τι может да направи ваша страна, ..."). Add a `{"en", "de", "fr", "es"}` whitelist in `crispasr_backend_canary.cpp` that refuses unsupported langs before invoking `canary_transcribe_ex`, with a message pointing at parakeet-tdt-0.6b-ja/zh for Japanese/Mandarin and qwen3/voxtral for the broader multilingual set. Smoke: `-l en` JFK unchanged; `-l ja` now errors out cleanly. **Second half** (`canary_transcribe_streamed` — parakeet-shape long-audio port for canary's 4 supported langs) is queued for a future session, less urgent now that the JA failure mode is closed off.
+- **`fe44abd2` Kaggle harness kernel for the granite-4.1/omniasr-llm chunk-context audit (PLAN #114 follow-up).** The local-M1 `tools/check-overlap-save-bug.sh` run on 2026-05-25 came back inconclusive for `granite-4.1` and `omniasr-llm` because the 20-min/run budget on M1 wasn't enough for those two LLM-AR backends to finish a 5-min clip. Kaggle CPU has 4 vCPUs + 30 GB RAM + a 9-hour wall budget. The kernel at `tools/kaggle/overlap-save-bug-check/`:
+  - Builds crispasr CPU-only from main.
+  - Downloads granite-speech-4.1-2b-q4_k.gguf + omniasr-llm-300m-v2-q4_k.gguf from `cstr/*` on HF.
+  - Synthesises ~88 s audio by concatenating `samples/jfk.wav` 8×.
+  - Runs each backend twice (default `--chunk-overlap 3.0` vs `--chunk-overlap 0`).
+  - Parses the SRT outputs, computes char + last-timestamp deltas, prints a verdict (OK / SUSPECTED-BUG / BOTH-FAIL / DEFAULT-FAILS) per backend.
+  Patterns lifted from `tools/kaggle/mimo-asr-cpu-vs-gpu/` (progress.jsonl + HF mirror, sh_with_progress ninja-progress streamer, HF auth via `chr1str/crispasr-hf-token` dataset). User triggers manually via `kaggle kernels push`. Result feeds the next pass of `examples/cli/crispasr_chunk_context_gate.h::kBlocked`.
+
+**Lesson** for canary P3: "the token is in the vocab" is not the same as "the model supports the language." Multi-language ASR backends with a fixed-size token table that's shared across families need an *explicit* whitelist of what was actually trained on, not a soft check on the embedding lookup. Same trap likely lurks in any future canary-3/-flash variants; the whitelist should be a load-time GGUF KV if upstream NeMo starts publishing the supported set.
+
+---
+
 ## 2026-05-26 (P6b + gemma4 chunking) PLAN #125 follow-on — kyutai-stt internal chunking + gemma4 env-gated auto-chunk
 
 Continuation of the same session as the P1-P6 fix train below; two more commits land on top:
