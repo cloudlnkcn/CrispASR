@@ -389,9 +389,14 @@ timestamps, diarization, hotwords) and TTS (DPM-Solver++ flow matching).
 ### mimo-asr
 
 6L input_local_transformer (1024d) + 36L Qwen2 LM (4096d, 32Q/8KV);
-8-channel RVQ codes from separate MiMo-Audio-Tokenizer GGUF
-(`--codec-model`). Mandarin (Wu/Cantonese/Hokkien/Sichuanese dialects)
-+ English + code-switching.
+8-channel RVQ codes from separate MiMo-Audio-Tokenizer GGUF. Mandarin
+(Wu/Cantonese/Hokkien/Sichuanese dialects) + English + code-switching.
+
+**Tokenizer is a separate file.** `--auto-download` fetches both the LM
+(`cstr/mimo-asr-GGUF`) and the tokenizer (`cstr/mimo-tokenizer-GGUF`)
+into `~/.cache/crispasr/`; the runtime auto-discovers
+`mimo-tokenizer-q4_k.gguf` next to the LM. Override with `--codec-model
+PATH/mimo-tokenizer-q4_k.gguf` if you keep the tokenizer elsewhere.
 
 ### qwen3-tts
 

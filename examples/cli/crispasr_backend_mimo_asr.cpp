@@ -81,8 +81,12 @@ public:
         if (tok_path.empty())
             tok_path = discover_audio_tokenizer(params.model);
         if (tok_path.empty()) {
-            fprintf(stderr, "crispasr[mimo-asr]: no audio tokenizer GGUF found. Pass --codec-model PATH "
-                            "or place mimo-tokenizer-q4_k.gguf next to the LM.\n");
+            fprintf(stderr, "crispasr[mimo-asr]: audio tokenizer GGUF not found next to LM. Options:\n"
+                            "  1. Rerun with --auto-download (the tokenizer is in the manifest as of 2026-05-26).\n"
+                            "  2. Pass --codec-model PATH/mimo-tokenizer-q4_k.gguf explicitly.\n"
+                            "  3. Download manually:\n"
+                            "       hf download cstr/mimo-tokenizer-GGUF mimo-tokenizer-q4_k.gguf "
+                            "--local-dir <dir-of-LM>\n");
             return false;
         }
         if (mimo_asr_set_tokenizer_path(ctx_, tok_path.c_str()) != 0) {
