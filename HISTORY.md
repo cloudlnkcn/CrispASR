@@ -6,6 +6,30 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-26 (P1-P6 fix train) PLAN #125 — six issue-#125 findings shipped in one session
+
+Built on the P0 scheduler hardening from earlier in the day. Six commits land six of montvid's twelve issue-#125 findings; the remaining items (P0 external Blackwell retest, P6b/c kyutai-stt long-audio dispatcher chunking, gemma4-e2b auto-chunk-vs-abort decision) are queued for followup.
+
+**Shipped this session (in push order):**
+
+- **`72b74486` P2 firered-asr** — drop `CAP_UNBOUNDED_INPUT` (encoder's relative-PE buffer is `pe_maxlen=5000` ≈ 50 s post-subsample; declaring unbounded bypassed VAD and produced silent OOB on long audio). Add defensive length check in `firered_asr_transcribe_impl` that aborts with a clear error when `T_sub > pe_maxlen`. JFK still transcribes cleanly.
+- **`f72d3db1` P1 funasr** — degenerate-loop guard in the AR decode (bail after the same token id repeats > 20× in a row, model-agnostic stop-loss for the `!`-loop reported on Blackwell CUDA). `frames_spliced`/`fake_token_len` surfaced at `CRISPASR_VERBOSE=1` for the next reporter. Four backends added to `tools/test-all-backends.py`: funasr, fun-asr-mlt-nano, sensevoice, paraformer (all had shipped without CI coverage since the 2026-05-20 ports landed). The default werv-threshold check at line 670 would have caught the `!`-loop loud (`wer("…", "!!!!…") ≈ 1.0`).
+- **`5f0aefc0` P3 omniasr-llm** — chunking decision rewritten as `(is_streaming || force_seg) && T_enc > 1`. Non-streaming GGUFs were silently feeding the entire long audio to a 512-token LLM head; now they chunk by training-window length. Segment marker injection stays gated on `is_streaming` (non-streaming variants chunk without the marker — each chunk decoded as a complete utterance, which is what the model was trained on).
+- **`b936b488` P5 mimo-asr** — tokenizer `cstr/mimo-tokenizer-GGUF/mimo-tokenizer-q4_k.gguf` added to the auto-download manifest. Was previously required separately, blocking everyone whose first `crispasr --backend mimo-asr -m auto --auto-download` produced exit code 1. Error message expanded to surface `--auto-download` as option 1, manual `hf download` as option 3. `docs/architecture.md` mimo-asr section documents the requirement.
+- **`ba0e388e` P6a kyutai-stt** — append 500 ms zero-frame silence-tail before calling `kyutai_stt_transcribe_ex`. The streaming-trained LM is causal and needs the tail to flush its final-token state; the batch wrapper was passing raw samples and stopping mid-word. Locally verified: JFK now produces "...for your country." (full final word + sentence-end punctuation, was truncated to "...for your c" before).
+- **`8bfaff23` P4 gemma4-e2b** — defensive 30 s training-window guard. On long audio the model emits `<Eos>` immediately after the prompt and continues into unrelated LLM commentary; refusing the slice with a clear "use `--vad`" message stops the silently-wrong output. Followup: auto-chunk vs abort decision for the dispatcher.
+
+**Each fix verified locally on M1 Metal** by running the affected backend on `samples/jfk.wav` (the universal control test from the reporter's methodology). Output recorded inline in each PLAN P-section.
+
+**Workflow notes.** All six commits originated in `/Volumes/backups/code/CrispASR-issue125-p1p2` per `feedback_parallel_workers.md` and `feedback_storage_paths.md`; rebased + fast-forwarded into `main` per `feedback_integrate_to_main.md`. `clang-format-18` applied only to the four `src/`+`examples/cli/` files I touched per `feedback_clang_format_v18.md`'s tight scope (registry .py and docs/architecture.md are out of scope and stayed untouched by the formatter).
+
+**Lessons.** Two patterns recurred across the six fixes:
+
+- **Capability-flag honesty.** firered-asr's `CAP_UNBOUNDED_INPUT` was the same class of failure as the previous voxtral/cohere/gemma4-e2b/glm-asr/kyutai-stt cases that drove the opt-out fix train (`dc2295b2` etc.). A defensive sweep of every `CAP_UNBOUNDED_INPUT` declaration against the actual encoder cap remains worth doing.
+- **Defensive backend-side guards beat dispatcher tweaks.** P2 (firered-asr length check), P4 (gemma4-e2b 30 s guard), and P5 (mimo-asr improved error message) all live in the backend wrapper, with a clear abort + remediation instruction. Beats the alternative — push the contract into the dispatcher and pray every entry point honours it.
+
+---
+
 ## 2026-05-26 (later) PLAN #125 P0 — mimo-asr regression reattributed; sched src-mutation log hardened
 
 Closer reading of the v0.6.9 → v0.6.10 delta moved the bisect away from `6b492b2b` (FA per-head mask). The FA patch is fully `#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK`-guarded; the CMake option defaults OFF (`ggml/CMakeLists.txt:211`); no CI or release script sets the flag ON (verified by `grep -rn FA_PERHEAD`). With the macro undefined, the compiled binary is byte-identical to upstream for that path. A self-built `eaee2319` (which is the reporter's binary, `/opt/crispasr-main/build/bin/crispasr`) gets OFF by default. The patch cannot be the cause of a default-build segfault.
