@@ -89,7 +89,18 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     }
     const bool is_firered = (arch.find("firered") != std::string::npos);
     const bool is_ecapa = (arch.find("ecapa") != std::string::npos);
-    const bool is_chatterbox = (arch.find("chatterbox") != std::string::npos || arch.find("kartoffelbox") != std::string::npos);
+    const bool is_chatterbox =
+        (arch.find("chatterbox") != std::string::npos || arch.find("kartoffelbox") != std::string::npos);
+    // CosyVoice3: the three sub-models live in separate GGUFs but share the
+    // `cosyvoice3-` arch prefix (llm / flow / hift). For the LLM sub-model
+    // we skip the speech-token embedding + LM-head tensors — they're small
+    // (6761 × 896) and quantising them adds noise to the AR sampling
+    // logits (same reasoning as llama.cpp's Q4_K_M keeping `output.weight`
+    // off the Q4_K path). For the flow sub-model the `input_embd.w` and
+    // the `spk_affine` projection stay at full precision too. HiFT is too
+    // small to bother quantising (42 MB F16) — the tool will still run on
+    // it but the gains are negligible.
+    const bool is_cosyvoice3 = (arch.find("cosyvoice3") != std::string::npos);
     // The granite-speech 4.1 family ("granite_speech" base + plus, "granite_nle"
     // for the non-autoregressive variant) all share the same 16-layer Conformer
     // encoder + Q-Former projector + Granite-1B LLM, so the same quantization
@@ -102,16 +113,14 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // GGUF in the wild uses for encoder weights. Off by default to keep the
     // canonical Q4K bit-identical to F16 reference; opt in with the env var.
     const char* env_enc_f16 = std::getenv("CRISPASR_GRANITE_ENC_F16");
-    const bool granite_enc_to_f16 =
-        is_granite_family && env_enc_f16 && *env_enc_f16 && *env_enc_f16 != '0';
+    const bool granite_enc_to_f16 = is_granite_family && env_enc_f16 && *env_enc_f16 && *env_enc_f16 != '0';
     // Optional: quantize EVERYTHING for the granite family — including the
     // 16-layer Conformer encoder and the Q-Former projector that we
     // normally pin at F32/F16. Produces the published `-mini` variant
     // (~1.7 GB on 4.1-2b) at the cost of ~0.93 cosine parity instead
     // of ~0.999. Off by default; opt in with the env var.
     const char* env_quant_all = std::getenv("CRISPASR_GRANITE_QUANT_ALL");
-    const bool granite_quant_all =
-        is_granite_family && env_quant_all && *env_quant_all && *env_quant_all != '0';
+    const bool granite_quant_all = is_granite_family && env_quant_all && *env_quant_all && *env_quant_all != '0';
 
     // OmniASR-CTC: 48-layer wav2vec2-style encoder + CTC head. Per-layer
     // activation cosine analysis on JFK (Q4_K vs Q8_0 dumps via
@@ -129,7 +138,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // skip whole encoder). Opt out entirely with
     // CRISPASR_OMNIASR_QUANT_ALL=1 to ship a smaller variant at the
     // documented ~22% WER cost.
-    const bool is_omniasr_ctc = (arch.find("omniasr-ctc") != std::string::npos) || (arch.find("omniasr_ctc") != std::string::npos);
+    const bool is_omniasr_ctc =
+        (arch.find("omniasr-ctc") != std::string::npos) || (arch.find("omniasr_ctc") != std::string::npos);
     int omniasr_n_enc = 0;
     // Default: keep first 4 encoder layers at F16. Empirically determined
     // by sweeping CRISPASR_OMNIASR_KEEP_F16_HEAD ∈ {0, 4, 8, 12, 16} on
@@ -153,21 +163,19 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             omniasr_keep_tail = std::max(0, atoi(env_t));
     }
     const char* env_omniasr_all = std::getenv("CRISPASR_OMNIASR_QUANT_ALL");
-    const bool omniasr_quant_all =
-        is_omniasr_ctc && env_omniasr_all && *env_omniasr_all && *env_omniasr_all != '0';
+    const bool omniasr_quant_all = is_omniasr_ctc && env_omniasr_all && *env_omniasr_all && *env_omniasr_all != '0';
     // Layers in [0, head_cutoff) stay F16; layers in [tail_cutoff, n_enc) stay F16.
     const int omniasr_head_cutoff = is_omniasr_ctc && !omniasr_quant_all ? omniasr_keep_head : 0;
-    const int omniasr_tail_cutoff = is_omniasr_ctc && !omniasr_quant_all
-                                        ? std::max(0, omniasr_n_enc - omniasr_keep_tail)
-                                        : omniasr_n_enc;
+    const int omniasr_tail_cutoff =
+        is_omniasr_ctc && !omniasr_quant_all ? std::max(0, omniasr_n_enc - omniasr_keep_tail) : omniasr_n_enc;
     if (is_omniasr_ctc && !omniasr_quant_all && (omniasr_keep_head + omniasr_keep_tail) > 0) {
         if (omniasr_keep_head > 0 && omniasr_keep_tail == 0) {
             printf("%s: omniasr-ctc — keeping enc.0-%d (head) at F16 to "
                    "prevent CTC drift (CRISPASR_OMNIASR_QUANT_ALL=1 to override)\n",
                    __func__, omniasr_head_cutoff - 1);
         } else {
-            printf("%s: omniasr-ctc — keeping enc.0-%d (head) + enc.%d-%d (tail) at F16\n",
-                   __func__, omniasr_head_cutoff - 1, omniasr_tail_cutoff, omniasr_n_enc - 1);
+            printf("%s: omniasr-ctc — keeping enc.0-%d (head) + enc.%d-%d (tail) at F16\n", __func__,
+                   omniasr_head_cutoff - 1, omniasr_tail_cutoff, omniasr_n_enc - 1);
         }
     }
 
@@ -228,54 +236,58 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         // FireRedASR/LID and ECAPA-TDNN: 3D conv weights (kernel=1 or small kernel)
         // are effectively 2D matmuls — safe to quantize.
         const bool ok_dims = (ggml_n_dims(t) == 2) || ((is_firered || is_ecapa) && ggml_n_dims(t) >= 2);
-        bool quantize = ggml_is_quantized(qtype) && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) && ok_dims &&
-                        is_weight && (sname.find("norm") == std::string::npos) &&
-                        // Skip projector tensors (Granite family: precision-sensitive).
-                        // CRISPASR_GRANITE_QUANT_ALL=1 overrides for the `-mini` build.
-                        (granite_quant_all || sname.find("proj.") != 0) &&
-                        // Skip encoder tensors for the Granite family: 16-layer Conformer
-                        // encoder is precision-sensitive (cos drops to ~0.93 at Q4_K
-                        // when encoder is quantized; ~0.999 when kept F32).
-                        !(is_granite_family && !granite_quant_all && sname.find("enc.") == 0) &&
-                        // Skip small classifier heads (ECAPA cosine: 45x192, precision-critical)
-                        !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) &&
-                        // Skip OmniASR-LLM bridging tensors (enc_proj, lm_head, tok_emb, lang_emb)
-                        (sname.find("enc_proj.") != 0) && (sname.find("lm_head.") != 0) &&
-                        (sname.find("tok_emb.") != 0) && (sname.find("lang_emb.") != 0) &&
-                        // Skip chatterbox tensors that are read manually via
-                        // ggml_backend_tensor_get — vocoder, embeddings, conditioning, VE.
-                        // Only T3 block weights (t3.blk.*) and S3Gen encoder/denoiser
-                        // weights use the ggml graph and are safe to quantize.
-                        !(is_chatterbox && (sname.find("s3.v.") == 0 ||
-                                            sname.find("conds.") == 0 ||
-                                            sname.find("ve.") == 0 ||
-                                            sname.find("t3.text_emb") == 0 ||
-                                            sname.find("t3.speech_emb") == 0 ||
-                                            sname.find("t3.wpe") == 0 ||
-                                            sname.find("t3.text_pos_emb") == 0 ||
-                                            sname.find("t3.speech_pos_emb") == 0 ||
-                                            sname.find("t3.cond.") == 0)) &&
-                        // Skip OmniASR-CTC encoder layers in head/tail bands.
-                        // Names look like "enc.<idx>.attn.*" / "enc.<idx>.ffn.*";
-                        // skip if idx in [0, head_cutoff) ∪ [tail_cutoff, n_enc).
-                        ([&]() {
-                            if (!is_omniasr_ctc || omniasr_quant_all
-                                || (omniasr_head_cutoff == 0 && omniasr_tail_cutoff >= omniasr_n_enc))
-                                return true;
-                            if (sname.size() < 5 || sname.compare(0, 4, "enc.") != 0)
-                                return true;
-                            int idx = 0;
-                            size_t p = 4;
-                            while (p < sname.size() && sname[p] >= '0' && sname[p] <= '9') {
-                                idx = idx * 10 + (sname[p] - '0');
-                                p++;
-                            }
-                            if (p == 4)
-                                return true;
-                            const bool in_head = idx < omniasr_head_cutoff;
-                            const bool in_tail = idx >= omniasr_tail_cutoff;
-                            return !(in_head || in_tail);
-                        }());
+        bool quantize =
+            ggml_is_quantized(qtype) && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) && ok_dims && is_weight &&
+            (sname.find("norm") == std::string::npos) &&
+            // Skip projector tensors (Granite family: precision-sensitive).
+            // CRISPASR_GRANITE_QUANT_ALL=1 overrides for the `-mini` build.
+            (granite_quant_all || sname.find("proj.") != 0) &&
+            // Skip encoder tensors for the Granite family: 16-layer Conformer
+            // encoder is precision-sensitive (cos drops to ~0.93 at Q4_K
+            // when encoder is quantized; ~0.999 when kept F32).
+            !(is_granite_family && !granite_quant_all && sname.find("enc.") == 0) &&
+            // Skip small classifier heads (ECAPA cosine: 45x192, precision-critical)
+            !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) &&
+            // Skip OmniASR-LLM bridging tensors (enc_proj, lm_head, tok_emb, lang_emb)
+            (sname.find("enc_proj.") != 0) && (sname.find("lm_head.") != 0) && (sname.find("tok_emb.") != 0) &&
+            (sname.find("lang_emb.") != 0) &&
+            // Skip chatterbox tensors that are read manually via
+            // ggml_backend_tensor_get — vocoder, embeddings, conditioning, VE.
+            // Only T3 block weights (t3.blk.*) and S3Gen encoder/denoiser
+            // weights use the ggml graph and are safe to quantize.
+            !(is_chatterbox && (sname.find("s3.v.") == 0 || sname.find("conds.") == 0 || sname.find("ve.") == 0 ||
+                                sname.find("t3.text_emb") == 0 || sname.find("t3.speech_emb") == 0 ||
+                                sname.find("t3.wpe") == 0 || sname.find("t3.text_pos_emb") == 0 ||
+                                sname.find("t3.speech_pos_emb") == 0 || sname.find("t3.cond.") == 0)) &&
+            // CosyVoice3 precision-sensitive tensors. AR head +
+            // speech-token embedding lookups feed straight into
+            // the speech-token sampler; flow input_embd / spk
+            // projection are tiny (a few MB) and quant noise
+            // there cascades through the 10-step CFM ODE.
+            !(is_cosyvoice3 &&
+              (sname == "cosyvoice3.speech_embd.weight" || sname == "cosyvoice3.speech_lm_head.weight" ||
+               sname == "cosyvoice3.flow.input_embd.w" || sname == "cosyvoice3.flow.spk_affine.w")) &&
+            // Skip OmniASR-CTC encoder layers in head/tail bands.
+            // Names look like "enc.<idx>.attn.*" / "enc.<idx>.ffn.*";
+            // skip if idx in [0, head_cutoff) ∪ [tail_cutoff, n_enc).
+            ([&]() {
+                if (!is_omniasr_ctc || omniasr_quant_all ||
+                    (omniasr_head_cutoff == 0 && omniasr_tail_cutoff >= omniasr_n_enc))
+                    return true;
+                if (sname.size() < 5 || sname.compare(0, 4, "enc.") != 0)
+                    return true;
+                int idx = 0;
+                size_t p = 4;
+                while (p < sname.size() && sname[p] >= '0' && sname[p] <= '9') {
+                    idx = idx * 10 + (sname[p] - '0');
+                    p++;
+                }
+                if (p == 4)
+                    return true;
+                const bool in_head = idx < omniasr_head_cutoff;
+                const bool in_tail = idx >= omniasr_tail_cutoff;
+                return !(in_head || in_tail);
+            }());
 
         const int64_t ncols = t->ne[0];
         ggml_type qtype_used = qtype;
@@ -359,12 +371,9 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
 
             printf("done\n");
         } else if (granite_enc_to_f16 && type == GGML_TYPE_F32 && sname.find("enc.") == 0 &&
-                   sname.find("norm") == std::string::npos &&
-                   sname.find("running_mean") == std::string::npos &&
-                   sname.find("running_var") == std::string::npos &&
-                   sname.find("rel_pos") == std::string::npos &&
-                   sname.find("conv_bn") == std::string::npos &&
-                   ggml_n_dims(t) == 2) {
+                   sname.find("norm") == std::string::npos && sname.find("running_mean") == std::string::npos &&
+                   sname.find("running_var") == std::string::npos && sname.find("rel_pos") == std::string::npos &&
+                   sname.find("conv_bn") == std::string::npos && ggml_n_dims(t) == 2) {
             // Only downcast 2D weight matrices. 1D biases stay F32 because
             // Metal's `ggml_add(matmul_result_f32, bias)` asserts bias is
             // F32. conv_bn (BatchNorm gamma/beta) also stays F32 because

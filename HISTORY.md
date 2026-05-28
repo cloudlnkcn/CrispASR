@@ -6,6 +6,73 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-28 cosyvoice3: Phase 5a + 5b — end-to-end synth + HF release
+
+Closes out the CosyVoice3-0.5B-2512 port: ships a working
+text→speech pipeline through the unified CLI, three-quant matrix
+on HF, registry entry, and full validation.
+
+Phase 5a (commit `b9cd5fa7` + fix `7b04a690`):
+
+* `models/convert-cosyvoice3-voices-to-gguf.py` bakes per-voice
+  prompt_speech_tokens (speech_tokenizer_v3.onnx) + spk_emb
+  (campplus.onnx 192-D) + ref_mel (matcha 24 kHz log-mel) +
+  prompt_text into a single `cosyvoice3-voices.gguf`. Inlined
+  librosa.filters.mel + whisper log-mel front-end to dodge the
+  numba/numpy-2.4 import storm.
+* Runtime: `cosyvoice3_tts_init_voices_from_file` +
+  `cosyvoice3_tts_synth` (text → BPE → AR speech tokens → pre_la
+  + repeat_interleave → flow Euler → HiFT). The synth wrapper
+  composes upstream's CV3LM input layout exactly:
+  `[sos@speech_embd[6561], text_embeds, task_id@speech_embd[6563],
+  prompt_speech_embeds]` — sos / task come from the speech
+  embedding table (not a separate `llm_embedding` as the
+  handover spec claimed; CV3LM drops that). Stop-floor variant of
+  `generate_tokens` breaks on any id ≥ speech_codebook so the AR
+  loop terminates on EOS instead of running max_tokens.
+* CLI: `cosyvoice3-tts` backend with sibling auto-discovery of
+  flow/HiFT/voices GGUFs (env overrides `COSYVOICE3_HIFT_PATH`,
+  `COSYVOICE3_VOICES_PATH`). Defaults temperature to 0.8 —
+  greedy decode hits CV3's documented `silent_tokens` loop within
+  ~5 steps and produces silence.
+* Tokenisation bug found via ASR roundtrip: joining `prompt_text`
+  and user text into one string before BPE-ing shifts the
+  boundary token (" Hello" → 1 token vs "Hello" → 2 tokens),
+  which subtly mispronounces ("a test" → "our test" on the smoke
+  prompt; three independent ASR backends agreed). Upstream
+  tokenises the two id streams separately then concats; fix
+  `7b04a690` mirrors that exactly. Post-fix WER 0% on the smoke
+  prompt.
+
+Phase 5b:
+
+* `crispasr-quantize` gained a CV3-specific skip rule
+  (`speech_embd.weight` + `speech_lm_head.weight` for the LLM,
+  `flow.input_embd.w` + `flow.spk_affine.w` for the flow) so the
+  precision-critical tables stay F16 across all quant variants.
+  Pattern mirrors the chatterbox skip block.
+* Quant matrix: LLM F16 (1.29 GB) → Q4_K (384 MB); Flow F16
+  (665 MB) → Q8_0 (361 MB); HiFT stays F16 (42 MB). 896-wide
+  rows fall back to Q4_0 (block 32) automatically. Smallest
+  viable combo: 745 MB total (Q4_K + Q8_0 + F16 + voices) vs
+  1.96 GB F16 reference.
+* All four combos validated via ASR roundtrip on "Hello, this is
+  a test." Q4_K LLM introduces minor punctuation drift
+  ("Hello, this is a test." → "Hello? This is a test.") but
+  content is fully preserved. German smoke (same Q4_K combo)
+  agrees: "Hallo, das ist ein Test." → "Hallo? Das ist ein Test."
+* HF: `cstr/cosyvoice3-0.5b-2512-GGUF` carries all 6 files (LLM
+  F16 + Q4_K, flow F16 + Q8_0, HiFT F16, voices) with a full
+  model card documenting the quant matrix, ASR-validation
+  results, and the auto-discovery rules.
+* Registry: `cosyvoice3-tts` entry resolves Q4_K LLM as the
+  default plus extras pulling HiFT + voices in one go; `-m auto
+  --backend cosyvoice3-tts` works out of the box.
+* Docs: README "TTS models" row + feature-matrix row added.
+
+Phase 6 (S3Tokenizer V3 + CAMPPlus + matcha mel C++ port for
+runtime arbitrary-WAV cloning) tracked separately in PLAN.md.
+
 ## 2026-05-28 cosyvoice3: Phase 4-A — HiFT loader + F0 predictor (cos=1.0)
 
 First slice of the HiFT vocoder port: binds all 246 hift GGUF tensors

@@ -556,6 +556,17 @@ constexpr Entry k_registry[] = {
     {"voxcpm2-tts", "voxcpm2-q4_k.gguf",
      "https://huggingface.co/cstr/voxcpm2-GGUF/resolve/main/voxcpm2-q4_k.gguf",
      "~1.6 GB", nullptr, nullptr},
+    // CosyVoice3 0.5B-2512: FunAudioLLM streaming multilingual TTS,
+    // Apache 2.0, 9 languages + 18 Chinese dialects, 24 kHz, zero-shot
+    // voice cloning via baked voices.gguf. Three-stage pipeline (LLM
+    // AR → flow Euler → HiFT vocoder). Default companion bundle:
+    // Q4_K LLM (384 MB) + Q8_0 flow (361 MB) + F16 HiFT (42 MB) +
+    // voices (57 KB) = ~745 MB. F16 reference also on the same repo.
+    {"cosyvoice3-tts", "cosyvoice3-llm-q4_k.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-llm-q4_k.gguf",
+     "~384 MB",
+     "cosyvoice3-flow-q8_0.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-flow-q8_0.gguf"},
 };
 
 // Multi-companion extras. When a backend needs >1 auxiliary file the
@@ -586,9 +597,22 @@ constexpr ExtraCompanion k_vibevoice_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// CosyVoice3 needs HiFT + voices in addition to flow (which rides as the
+// inline companion). The CLI auto-discovers them as siblings of the LLM
+// at load time; staging both here makes `-m auto --backend cosyvoice3-tts`
+// pull everything in one go.
+constexpr ExtraCompanion k_cosyvoice3_tts_extras[] = {
+    {"cosyvoice3-hift-f16.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-hift-f16.gguf"},
+    {"cosyvoice3-voices.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-voices.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
+    {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {nullptr, nullptr},
 };
 // clang-format on

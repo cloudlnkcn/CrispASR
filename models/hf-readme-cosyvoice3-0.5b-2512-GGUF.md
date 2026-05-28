@@ -1,0 +1,155 @@
+---
+license: apache-2.0
+language:
+- zh
+- en
+- ja
+- ko
+- yue
+- fr
+- de
+- es
+- pt
+- it
+- ru
+base_model:
+- FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+tags:
+- tts
+- text-to-speech
+- gguf
+- crispasr
+- cosyvoice3
+- multilingual
+- voice-cloning
+- zero-shot
+- 24khz
+---
+
+# Fun-CosyVoice3-0.5B-2512 — GGUF
+
+GGUF conversion of [FunAudioLLM/Fun-CosyVoice3-0.5B-2512](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512)
+for use with [CrispASR](https://github.com/CrispStrobe/CrispASR)
+(`--backend cosyvoice3-tts`).
+
+CosyVoice3 is a streaming, multilingual, zero-shot voice-cloning TTS
+system from Alibaba's FunAudioLLM team. The 0.5B-2512 release is
+Apache-2.0 licensed and supports **9 languages plus 18 Chinese
+dialects**. Output is 24 kHz mono.
+
+The model is a three-stage pipeline:
+
+```
+text (Qwen2 BPE) → CosyVoice3LM (Qwen2-0.5B + speech-token AR head)
+                 → speech tokens ∈ [0, 6561)
+                 → Flow (DiT + CausalConditionalCFM, 10-step Euler ODE)
+                 → mel @ 24 kHz / 480-hop
+                 → CausalHiFTGenerator (HiFi-GAN + NSF + iSTFT)
+                 → 24 kHz PCM
+```
+
+## Files
+
+| File | Quantisation | Size |
+|---|---|---|
+| `cosyvoice3-llm-f16.gguf` | F16 | 1.29 GB |
+| `cosyvoice3-llm-q4_k.gguf` | Q4_K (Q4_0 fallback on 896-wide rows; head + embeddings stay F16) | 384 MB |
+| `cosyvoice3-flow-f16.gguf` | F16 | 665 MB |
+| `cosyvoice3-flow-q8_0.gguf` | Q8_0 (input_embd + spk_affine stay F16) | 361 MB |
+| `cosyvoice3-hift-f16.gguf` | F16 — too small to benefit from quant | 42 MB |
+| `cosyvoice3-voices.gguf` | F32 voice-clone bundle (1 baked voice today) | 57 KB |
+
+Pick **one LLM + one flow + HiFT + voices**. The smallest viable
+combo is `llm-q4_k + flow-q8_0 + hift-f16 + voices` at **745 MB
+total**; the F16 reference is 1.96 GB.
+
+## Quant validation (ASR roundtrip on smoke prompt)
+
+Synthesis used the default zero-shot voice (upstream
+`asset/zero_shot_prompt.wav`) at `--temperature 0.8 --seed 42`. The
+generated WAV was transcribed with `parakeet-tdt-0.6b-v3-q4_k` and
+compared against the prompt text.
+
+| Combo | Synthesis size | ASR transcript of TTS output | WER |
+|---|---|---|---|
+| `llm-f16  + flow-f16 ` | 1.96 GB | "Hello, this is a test." | 0% |
+| `llm-f16  + flow-q8_0` | 1.66 GB | "Hello, this is a test." | 0% |
+| `llm-q4_k + flow-f16 ` | 1.05 GB | "Hello? This is a test." | 0% (punct only) |
+| `llm-q4_k + flow-q8_0` | 745 MB  | "Hello? This is a test." | 0% (punct only) |
+| `llm-q4_k + flow-q8_0` (German) | — | "Hallo? Das ist ein Test." | 0% (punct only) |
+
+Q4_K LLM introduces a small punctuation drift (commas occasionally
+read as question-intonation) but content is fully preserved across
+languages. Q8_0 flow is perceptually indistinguishable from F16.
+
+## Usage
+
+### CrispASR (recommended)
+
+```bash
+# Auto-discovers flow + hift + voices as siblings of the LLM.
+crispasr -m cosyvoice3-llm-q4_k.gguf \
+         --backend cosyvoice3-tts \
+         --tts "Hello, this is a test." \
+         --voice zero_shot \
+         --tts-output out.wav
+```
+
+The CLI auto-discovers companion GGUFs in this order:
+
+* **Flow** — `cosyvoice3-flow-*.gguf` next to the LLM, or `--codec-model PATH`.
+* **HiFT** — `cosyvoice3-hift-*.gguf` next to the LLM, or `COSYVOICE3_HIFT_PATH` env var.
+* **Voices** — `cosyvoice3-voices.gguf` next to the LLM, or `COSYVOICE3_VOICES_PATH` env var.
+
+Greedy decode is disabled by default (CV3 falls into a documented
+"silent_tokens" loop within ~5 steps). The backend overrides
+`--temperature 0` to 0.8 so the RAS sampler engages — pass a different
+positive value to override.
+
+### Voices
+
+Today the repo ships one baked voice: `zero_shot` (the upstream
+`asset/zero_shot_prompt.wav` clip, ~3.5 s of Mandarin). More voices
+can be baked with the converter in the CrispASR tree:
+
+```bash
+python models/convert-cosyvoice3-voices-to-gguf.py \
+    --manifest my-voices.json \
+    --upstream-base /path/to/CosyVoice-clone \
+    --output my-voices.gguf
+```
+
+Each manifest entry is `{name, wav, prompt_text}`. The script needs
+`campplus.onnx` (CV2/CV3 speaker encoder) and
+`speech_tokenizer_v3.onnx` (CV3 token extractor); both auto-download
+from HF on first run.
+
+Arbitrary-WAV runtime cloning (no Python pre-bake step) is the next
+milestone — tracked as `Phase 6: S3Tokenizer V3 port` in the CrispASR
+roadmap.
+
+## Tensor naming
+
+Conventional naming for all three GGUFs:
+
+* **LLM** — llama.cpp-standard `token_embd`, `blk.K.{attn,ffn}_*`,
+  `output_norm`, `output`, plus CV3-specific
+  `cosyvoice3.speech_embd.weight` (input embedding, vocab 6761) and
+  `cosyvoice3.speech_lm_head.weight` (output head).
+* **Flow** — `cosyvoice3.flow.{input_embd,pre_la,spk_affine,dit.*}`
+  matching the upstream `CausalMaskedDiffWithDiT` module tree.
+* **HiFT** — `cosyvoice3.hift.{conv_pre,ups.K,resblocks.K.*,source_*,
+  m_source,f0.*,conv_post}` with weight-norm pre-resolved on the
+  Python converter side (g · v / ‖v‖).
+
+## License
+
+Apache-2.0 (inherited from the upstream model). Free for commercial
+use.
+
+## Related links
+
+* Upstream: [FunAudioLLM/Fun-CosyVoice3-0.5B-2512](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512)
+* Project page: [funaudiollm.github.io/cosyvoice3](https://funaudiollm.github.io/cosyvoice3/)
+* Code: [github.com/FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice)
+* CrispASR: [github.com/CrispStrobe/CrispASR](https://github.com/CrispStrobe/CrispASR)

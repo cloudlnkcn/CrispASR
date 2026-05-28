@@ -431,256 +431,60 @@ None of these affect correctness — they're pure throughput pickings.
 
 ---
 
-## CosyVoice3-0.5B-2512 TTS port — Phase 1 landed, runtime is open
+## CosyVoice3-0.5B-2512 TTS — Phase 6 (open): C++ S3Tokenizer V3 + arbitrary-WAV cloning
 
-Tier 2 of the FunAudioLLM family work (after funasr + sensevoice).
-**Apache-2.0** multilingual TTS (9 langs + 18+ Chinese dialects),
-zero-shot voice cloning, 24 kHz output, 278K downloads/month upstream.
+Phase 1 (converter) → HISTORY §"2026-05-20 cosyvoice3 phase-1".
+Phases 2 (LM), 3 (flow Euler), 4 (HiFT), 5a (CLI + voice bundle),
+5b (Q4_K + Q8_0 quants + HF upload + registry) → HISTORY
+§"2026-05-28 cosyvoice3 phase 5a + 5b". The CV3 backend ships
+end-to-end through `crispasr --backend cosyvoice3-tts` with
+ASR-roundtrip-validated quants on
+`cstr/cosyvoice3-0.5b-2512-GGUF`.
 
-### Architecture — three sub-models
+**Phase 6 — open**: arbitrary-WAV runtime cloning. Today voice
+cloning uses baked bundles produced by
+`models/convert-cosyvoice3-voices-to-gguf.py` (Python). To accept a
+`--voice ref.wav --ref-text "..."` runtime path the three front-end
+extractors need C++ ports:
 
-```
-text (Qwen2 BPE, vocab=151936)
-  → CosyVoice3LM: Qwen2-0.5B body (24L, GQA 14/2, q/k/v biases,
-                  NEOX RoPE θ=1e6, RMSNorm 1e-6) + speech_embedding
-                  (6761, 896) + llm_decoder (6761, 896)
-  → AR-decode speech tokens with RAS (top_p=0.8, top_k=25, win_size=10,
-                                       tau_r=0.1 — uniform-random fallback
-                                       when last 10 tokens are too
-                                       repetitive)              → (T_tok,) ∈ [0, 6561)
+1. **CAMPPlus 192-D speaker encoder.** Probably reusable from
+   `src/chatterbox_campplus.{h,cpp}` (same upstream model). Output:
+   `cosyvoice3_tts_extract_spk_emb(ctx, wav_16k_pcm, n_samples) →
+   float[192]`.
+2. **matcha mel @ 24 kHz** (n_fft=1920, hop=480, win=1920, 80-mel,
+   log-compressed). Standalone helper next to the wav reader; output:
+   `cosyvoice3_tts_extract_ref_mel(ctx, wav_24k_pcm, n_samples) →
+   float[T*80]`.
+3. **speech_tokenizer_v3** (port-strategy investigation done — option
+   A confirmed tractable). The ONNX is 969 MB; the architecture is:
+   - **Input** `(1, 128, T_mel)` log-mel-128 @ 16 kHz + `feats_length (1,)`.
+   - **Output** `(B, T_tok)` int speech-token indices in `[0, 6561)`.
+   - **Subsampler**: 14 `Conv` ops, T_mel→T_tok ≈ 4× downsample.
+   - **Encoder**: 12 transformer-style blocks at `d=1280`, `ff=5120`.
+     Each block carries one named tensor `blocks.K.attn.fsmn_block.weight`
+     shape `(1280, 1, 31)` — depthwise FSMN memory conv (kernel 31).
+     Per-block ops (anonymous in the ONNX as `onnx::MatMul_*`):
+     Q/K/V/O × 1280² + FFN 1280→5120→1280 + 2× LayerNorm + Mish/GELU.
+   - **FSQ head**: `Linear(1280, 8)` → per-axis 3-level quantisation
+     → index = `Σ 3^i · level_i ∈ [0, 6561)`. (3^8 = 6561 matches the
+     CV3 speech codebook exactly.)
+   - **Reuse opportunity**: `src/paraformer.cpp` + `src/funasr.cpp`
+     already implement FSMN blocks (`attn.fsmn.w` + the matching
+     forward); the primitive drops in directly. The 14-Conv subsampler
+     is the only genuinely new code (Conv1d stacks with stride patterns
+     and channel expansions to be read off `g.node` ordering).
 
-  → input_embedding (6561, 80)
-  → pre_lookahead causal conv (k=4 then k=3, 3-frame future lookahead)
-  → concat [pre_la, spk_affine, ...]                            → (T_tok, 320)
-  → CausalConditionalCFM (Euler ODE, 10 steps, cosine t-schedule,
-                          sigma_min=1e-6, inference_cfg_rate=0.7):
-      22-block DiT estimator @ dim=1024, heads=16, head_dim=64,
-      ff_mult=2 with AdaLN-Zero per-block modulation projected
-      from sinusoidal time-embed via 2-layer MLP. RoPE inside MHA.
-      conv_pos_embed (2× conv1d-31) on the input.                → mel (T_mel=2*T_tok, 80)
+   Chosen path: **option (A) full ggml port** — matches the rest of the
+   codebase, no onnxruntime dependency, lets `crispasr-quantize`
+   shrink the encoder too. Estimated effort with paraformer FSMN
+   reuse: 1-2 days of focused porting (ONNX→GGUF converter + diff
+   harness + runtime forward + FSQ head). Out of scope for the
+   phase-5b session.
 
-  → CausalHiFTGenerator (HiFi-GAN-iSTFT hybrid):
-      conv_pre 80→512 (k=5) → 3 upsample stages (rates [8, 5, 3],
-      kernels [16, 11, 7]) with Snake activations (learnable α)
-      + NSF source modulator (CausalConvRNNF0Predictor → SineGen
-      9-harmonics → source_downs/resblocks chain) → conv_post 64→18
-      → iSTFT (n_fft=16, hop=4)                                  → 24 kHz PCM
-```
-
-### Reuse map (proven by repo sweep)
-
-Almost every primitive is already in tree:
-
-- **Qwen2 LLM forward**: `core_attn::kv_self_attn` already accepts q/k/v
-  biases. `src/mimo_asr.cpp` is the closest existing consumer.
-- **CFM Euler solver w/ cosine schedule + CFG**: `src/chatterbox_s3gen.cpp:1690`
-  `cfm_euler_solve` — byte-equivalent reuse, just plug our DiT denoiser
-  in as the forward function.
-- **Sinusoidal time embedding**: `src/chatterbox_s3gen.cpp:1367`
-  `sinusoidal_embedding` (scale=1000).
-- **Causal 1D conv with left-pad**: `src/chatterbox_s3gen.cpp:1395`
-  `causal_conv1d`.
-- **F0 predictor** (5× Conv1d → classifier): `src/chatterbox_s3gen.cpp:1925`
-  `run_f0_predictor` — exact match to CosyVoice3's `CausalConvRNNF0Predictor`
-  (misleading name, no RNN).
-- **NSF SineGen** (9 harmonics → modulated source → STFT):
-  `src/chatterbox_s3gen.cpp:2413-2500`.
-- **iSTFT n_fft=16 hop=4**: `src/chatterbox_s3gen.cpp:77-162` —
-  exact-match parameters.
-- **weight_norm parametrisation resolver** (`g·v/‖v‖`):
-  `src/voxcpm2_tts.cpp:1395` `wn_reconstruct`. **Lifted into the
-  converter so the runtime never sees parametrised tensors.**
-- **CAMPPlus speaker encoder**: `src/chatterbox_campplus.{h,cpp}` —
-  100% reusable (192-dim output, CPU-only forward).
-- **S3Tokenizer V2 → V3** (for arbitrary-WAV cloning):
-  `src/chatterbox_s3tok.{h,cpp}`. V3 may have format changes around
-  the FSQ codebook; defer to Phase 5.
-- **GPT-2 BPE tokenizer**: `src/core/bpe.h` (Qwen2/Qwen3 share family).
-- **DiT block scaffolding**: `src/voxcpm2_tts.cpp` LocDiT — note
-  voxcpm2 uses pre-norm RMSNorm, CosyVoice3 uses AdaLN-Zero (~150 LOC delta).
-
-### Genuinely new code (small, well-bounded)
-
-1. AdaLN-Zero modulation (~150 LOC) — γ/β/gate × 2 from time-embed.
-2. Pre-lookahead conv (~30 LOC) — causal conv with asymmetric future padding.
-3. Snake activation w/ per-channel α (~30 LOC).
-4. RAS (Repetition-Aware Sampling) (~50 LOC).
-
-Total new infrastructure: **~260 LOC**. Plus ~1500 LOC glue +
-~500 LOC converter/dumper. Realistic timeline: **~1 week of focused
-work in 4 phases**.
-
-### Phase status (2026-05-20)
-
-- **Phase 1 — recon + converter — LANDED (this commit).**
-  `models/convert-cosyvoice3-to-gguf.py` walks the three .pt files
-  (`llm.pt` 2.0 GB → `cosyvoice3-llm-f16.gguf` 1.29 GB; `flow.pt`
-  1.3 GB → `cosyvoice3-flow-f16.gguf` 0.67 GB; `hift.pt` 83 MB
-  → `cosyvoice3-hift-f16.gguf` 42 MB) and materialises the
-  `weight_norm` parametrisations so the runtime side stays simple.
-  All three GGUFs are at
-  `/Volumes/backups/ai/crispasr-models/cosyvoice3-0.5b-2512/`.
-- **Phase 2 — LLM runtime — scaffolded 2026-05-27.**
-  `src/cosyvoice3_tts.{h,cpp}` carries the loader, the Qwen2 step
-  graph (lifted from mimo_asr's pattern unchanged via
-  `core_attn::kv_self_attn`), the speech_embd + speech_lm_head
-  (6761-vocab) wiring, KV cache + cached T=1 step graph, embed-lookup
-  helpers, and a `prefill_with_embeds` + `step_speech` entry pair.
-  First-run diff via `tools/reference_backends/cosyvoice3_tts.py`
-  (HF Qwen2Model F32) + `tools/diff-cosyvoice3-lm.py` on "Hello, this
-  is a test." (7 tokens, no voice prompt, greedy):
-    `cosine = 1.000000`, `max |Δ| = 0.0149` (0.08% of max),
-    top-5 indices byte-exact `[4512, 2322, 2325, 0, 4916]` on both
-    sides — the delta is consistent with F16 weight storage vs F32
-    ref. **RAS sampler landed 2026-05-27 (follow-up commit)**: ported
-    `nucleus_sampling` + `ras_sampling` from upstream
-    `CosyVoice/cosyvoice/utils/common.py`, top_p=0.8 / top_k=25 /
-    win_size=10 / tau_r=0.1, plus `generate_tokens_from_embeds`
-    end-to-end AR loop. Greedy 8-step AR sequence is byte-identical
-    to PyTorch (`[4512]*8` on both sides — the model's expected
-    no-prompt collapse, broken by RAS into varied tokens spanning
-    the codebook). **Phase 2 greedy LLM diff gate is formally
-    PASSING.** Seeded-RAS bit-identity vs PyTorch's
-    `torch.multinomial` is not yet in scope (would require porting
-    ATen's PRNG); deferred.
-- **Phase 3 — DiT-based flow-matching estimator + CausalConditionalCFM**.
-  - **3a (2026-05-27): loader + DiT block scaffold — landed.**
-    `cosyvoice3_tts_init_flow_from_file` binds all 330 flow GGUF
-    tensors; hparams + `cv3_flow_hp` + `cv3_dit_block` + `cv3_flow`
-    structs live alongside the LM in the same context. Smoke test
-    validates 22-block DiT layout. Note: `chatterbox_s3gen::cfm_euler_solve`
-    is NOT directly reusable (chatterbox-specific tensor lookups
-    baked into time-MLP path); the Euler loop will be re-implemented
-    locally for cosyvoice3 in 3d.
-  - **3b (2026-05-27): AdaLN-Zero modulation + per-block DiT forward — landed.**
-    Per-block `(shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
-    gate_mlp) = chunk(linear(silu(t_emb)), 6)`, then
-    `x = x + gate_msa · MHA(LN(x)·(1+scale_msa) + shift_msa)` (and FFN
-    analogously). LayerNorm is affine-free; FFN is Linear → GELU(tanh)
-    → Linear; **RoPE is x_transformers-style partial — rotates only
-    `head_dim` channels of the pre-reshape 1024-dim Q/K**, which
-    corresponds to head 0 (heads 1..15 carry no positional info).
-    Mode is `GGML_ROPE_TYPE_NORMAL` (adjacent pairs), θ=10000. Wired
-    into `cosyvoice3_tts_extract_stage` as
-    `flow_dit_blk_<N>_{lnx_a,h_a,attn,xattn,ff,out}` and exercised
-    through the unified `crispasr-diff cosyvoice3-tts` pipeline.
-    Block-0 and block-21 diff against piecewise PyTorch reconstruction
-    of `DiTBlock.forward` both PASS at cos_min ≥ 0.999994, max|Δ| ≤
-    0.156 (well under the established F16 weight floor of ~0.08%).
-  - **3c (2026-05-27): pre-lookahead conv + input pipeline — landed.**
-    `PreLookaheadLayer` (Conv1d 80→1024 k=4 right-pad-3 + LeakyReLU →
-    Conv1d 1024→80 k=3 left-pad-2 + residual) and `InputEmbedding`
-    (`F.normalize(spk) → spk_affine`, concat `[x, cond, mu, spk_bc]` →
-    (T_mel, 320), `Linear(320, 1024)`, then `+ CausalConvPositionEmbedding`
-    = 2× grouped causal conv1d-31 with groups=16 + Mish). Wired into
-    `cosyvoice3_tts_extract_stage` as
-    `flow_pre_la_{tok_emb,c1,c2,…}` and
-    `flow_in_pipe_{spk,cat,proj,pos,…}`. All 21 stages (12 phase-3b
-    DiT + 4 pre_la + 5 in_pipe) PASS at cos_min ≥ 0.999 through
-    `crispasr-diff cosyvoice3-tts`. Grouped causal conv1d implemented
-    as a per-group loop (no native ggml op) reusing the
-    `chatterbox_s3gen::causal_conv1d` symmetric-pad + trim-right trick.
-  - **3d — local Euler ODE + mel output — landed 2026-05-28.**
-    - **3d-A (2026-05-27)**: full 22-block DiT estimator forward +
-      `norm_out` (`AdaLayerNormZero_Final`, 2-chunk `(scale, shift)`)
-      + `proj_out` (`Linear(1024, 80)`). Per-block helper extracted
-      from phase 3b, looped 22× with shared `silu(t_emb)`. Stages
-      `flow_dit_full_norm`, `flow_dit_full` PASS at cos=1.0 /
-      max|Δ|≤3.6e-3.
-    - **3d-B (2026-05-28)**: cosine-schedule Euler driver, 10 steps,
-      `cfg_rate=0.7`, classifier-free guidance via two B=1 estimator
-      passes per step (cond + uncond) then CFG combine. Composed
-      `cv3_build_estimator_full_graph` that does time_mlp +
-      InputEmbedding + 22-block + norm_out + proj_out in one ggml
-      context. Stages `flow_euler_dphi_step0` (single post-CFG step)
-      PASS at cos=1.0 max|Δ|=4.5e-3, and `flow_euler` (final mel
-      after 10 steps) PASS at cos=0.999997 max|Δ|=1.4e-2 — well
-      under the 0.99 gate. The Python ref harness's `x_init` comes
-      from upstream's `set_all_random_seed(0); rand_noise = torch.randn
-      ([1, 80, 50*300])` so the seeded noise is bit-equivalent on
-      both sides (porting torch's MT+Box-Muller in C++ was out of
-      scope; the C++ Euler driver accepts `x_init` as a caller input).
-      Public API: `cosyvoice3_tts_solve_flow_euler(ctx, mu, T_mel,
-      spks_proj, cond, x_init, n_steps, cfg_rate)` returns the final
-      mel as malloc'd float[T_mel * mel_dim].
-  - **3e — end-to-end mel diff — landed via 3d-B's
-    `flow_euler` stage.** Diff-gate cos ≥ 0.99 PASSES.
-- **Phase 4 — CausalHiFTGenerator + F0 predictor + Snake +
-  iSTFT — DONE 2026-05-28.** End-to-end `hift_inference`
-  (mel → F0 → SineGen → STFT → decode → audio) PASS at cos=0.999989.
-  - **4-A (2026-05-28)**: HiFT loader + F0 predictor
-    (`CausalConvRNNF0Predictor`) — binds all 246 hift GGUF tensors
-    (conv_pre/conv_post, ups.0-2, resblocks.0-8, source_downs.0-2,
-    src_resblk.0-2, m_source, f0.condnet.0-4, f0.classifier) and
-    implements the F0 predictor forward (5× CausalConv1d + ELU +
-    Linear(512,1) + abs). Reuses phase 3c's `cv3_lookahead_conv1d`
-    + `cv3_causal_conv1d` helpers. Public API:
-    `cosyvoice3_tts_init_hift_from_file`. Stage `hift_f0` PASS at
-    cos=1.0 max|Δ|=3.7e-1 (Hz units; cos=1.0 = perfect angular
-    alignment).
-  - **4-B (2026-05-28)**: HiFT decode forward (Option B —
-    caller-supplied s_stft). conv_pre (CausalConv1d k=5 right-pad-4)
-    + 3-stage upsample tower (`nn.Upsample(nearest, u) +
-    CausalConv1d(left-pad K-1)` per stage, rates [8, 5, 3]) with
-    source fusion (CausalConv1dDownSample stride∈[15,3,1]) and main
-    resblock averaging (3 ResBlocks per stage, dilations [1, 3, 5],
-    Snake-Beta activations) + conv_post (k=7 left-pad-6) + half-spectrum
-    iSTFT (n_fft=16, hop=4, periodic Hann, COLA-normalized overlap-add,
-    centered output trimmed by n_fft/2). Public API:
-    `cosyvoice3_tts_run_hift_decode(ctx, mel, T_mel, s_stft) →
-    float[T_mel * 480]`. All 8 stages PASS at cos ≥ 0.997 (final
-    `hift_decode` cos=0.999815, well above the 0.95 vocoder gate).
-    The s_stft path (SineGen + l_linear + STFT) remains caller-side;
-    runtime callers compose with F0 predictor (4-A) + their own
-    source-side prelude. A 4-B-1 follow-up will inline the SineGen
-    path inside the runtime, but the decode forward is bit-equivalent
-    to PyTorch right now.
-  - **4-B-1 (2026-05-28)**: HiFT source path —
-    `cosyvoice3_tts_run_hift_source(ctx, f0_mel, T_mel, noise_buf)`
-    chains f0_mel → nearest-upsample(×480) → SineGen2 → m_source
-    (Linear(9,1) + Tanh) → STFT(n_fft=16, hop=4, periodic Hann,
-    center=True). Caller supplies seeded `noise_buf[T_audio, 9]` for
-    bit-equivalent diff. All four hift_source stages PASS at cos=1.0
-    max|Δ|≤4.7e-6. **Key correctness fix uncovered by the diff**:
-    upstream multiplies the post-cumsum phase by `upsample_scale=480`
-    BEFORE the nearest upsample (converting per-T_mel-frame integrated
-    phase to per-audio-sample units); missing this collapsed sine_waves
-    to cos=-0.08. Folded into the cumsum * 2π scalar.
-  - **4-C (2026-05-28)**: end-to-end inference —
-    `cosyvoice3_tts_run_hift_inference(ctx, mel, T_mel, noise_buf)`
-    composes F0 predictor + source path + decode forward. Stage
-    `hift_inference` PASS at cos=0.999989 max|Δ|=1.53e-2 (gate ≥ 0.95
-    for vocoder; we're well above). Together with the LM (phase 2) +
-    flow Euler (phase 3) this completes the full TTS pipeline modulo
-    audio-rate orchestration in the CLI adapter (phase 5).
-- **Phase 5a — CLI adapter + voice-clone bundle**. DONE.
-  `models/convert-cosyvoice3-voices-to-gguf.py` bakes per-voice
-  `prompt_speech_tokens` (speech_tokenizer_v3.onnx) + `spk_emb`
-  (campplus.onnx CAMPPlus 192-D) + `ref_mel` (matcha mel @ 24 kHz)
-  + `prompt_text` into a `voices.gguf` blob. Runtime API
-  `cosyvoice3_tts_init_voices_from_file` + `cosyvoice3_tts_synth`
-  composes the full text→audio pipeline (BPE → AR speech tokens →
-  pre_la + repeat_interleave → flow Euler → HiFT). CLI backend
-  `cosyvoice3-tts` wires it into the unified dispatcher with sibling
-  auto-discovery of flow / hift / voices GGUFs (env-var overrides:
-  `COSYVOICE3_HIFT_PATH`, `COSYVOICE3_VOICES_PATH`).
-- **Phase 5b — HF upload + docs + quant**. Open. Upload the three
-  GGUFs + voices.gguf to `cstr/cosyvoice3-0.5b-2512-GGUF`; add Q4_K
-  LLM + Q8_0 flow variants; README + feature-matrix entry.
-- **Phase 6 (deferred)** — S3Tokenizer V3 for arbitrary-WAV cloning.
-  MVP uses baked-in voice references via the Python converter; this
-  phase moves the tokenizer + CAMPPlus + matcha-mel front-end into
-  C++ so runtime callers can clone from any 24 kHz WAV.
-
-### Voice cloning strategy
-
-MVP: precompute speech tokens for a small set of baked-in voices
-(`zero_shot_prompt.wav` from upstream's `asset/` + a handful of others),
-ship them as a GGUF blob keyed by voice name. Runtime selects via
-`--voice <name>`. Arbitrary-WAV cloning requires the S3Tokenizer V3
-port (Phase 6).
-
----
+Wire-up: `cosyvoice3_tts_synth_from_wav(ctx, text, wav_path,
+ref_text, *out_n)` + CLI `--voice <path>.wav --ref-text "..."`.
+Validate via ASR roundtrip on a fresh non-zero-shot WAV from
+`/Volumes/backups/code/audio_samples/`.
 
 ## 51c. MiMo-V2.5-ASR F16 step decode — open
 
