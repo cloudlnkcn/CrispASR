@@ -312,7 +312,7 @@ static std::vector<float> paraformer_compute_features(paraformer_context* ctx, c
 // ===========================================================================
 
 static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, int D,
-                        std::vector<float>& acoustic_embeds, int& N_tokens) {
+                        std::vector<float>& acoustic_embeds, int& N_tokens, std::vector<int>* fire_frames = nullptr) {
     // Conv1d(D, D, 3, padding=1) → ReLU → Linear(D, 1) → sigmoid
     // Then CIF accumulation loop.
 
@@ -388,6 +388,8 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
                 partial[d] += remainder * enc_out[(size_t)t * D + d];
             }
             fired.insert(fired.end(), partial.begin(), partial.end());
+            if (fire_frames)
+                fire_frames->push_back(t);
             // Start new token with leftover
             float leftover = accum - 1.0f;
             for (int d = 0; d < D; d++) {
@@ -403,6 +405,8 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
     // Tail handling: if remaining accum > threshold, fire one more
     if (accum > tail_threshold) {
         fired.insert(fired.end(), partial.begin(), partial.end());
+        if (fire_frames)
+            fire_frames->push_back(T - 1);
     }
 
     N_tokens = (int)(fired.size() / (size_t)D);
@@ -508,7 +512,8 @@ static ggml_tensor* build_decoder_post(ggml_context* ctx0, ggml_tensor* cur, con
 // ===========================================================================
 
 static std::string paraformer_transcribe_impl(paraformer_context* ctx, const float* pcm, int n_samples,
-                                              std::vector<float>* staged_out = nullptr, const char* stage = nullptr) {
+                                              std::vector<float>* staged_out = nullptr, const char* stage = nullptr,
+                                              std::vector<int>* out_fire_frames = nullptr) {
     const auto& hp = ctx->model.hp;
     const int D = (int)hp.d_model;
 
@@ -662,7 +667,10 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     // flat index t*D + d.  This IS row-major (T, D), so no transpose needed.
     std::vector<float> acoustic_embeds;
     int N_tokens = 0;
-    cif_predict(ctx, enc_out.data(), T_lfr, D, acoustic_embeds, N_tokens);
+    std::vector<int> fire_frames_vec;
+    cif_predict(ctx, enc_out.data(), T_lfr, D, acoustic_embeds, N_tokens, out_fire_frames ? &fire_frames_vec : nullptr);
+    if (out_fire_frames)
+        *out_fire_frames = std::move(fire_frames_vec);
 
     fprintf(stderr, "paraformer: CIF predicted %d tokens from T_lfr=%d\n", N_tokens, T_lfr);
     if (N_tokens <= 0)
@@ -871,6 +879,44 @@ char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n
         buf[s.size()] = '\0';
     }
     return buf;
+}
+
+paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx, const float* samples, int n_samples) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::vector<int> fire_frames;
+    std::string s = paraformer_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, &fire_frames);
+
+    auto* r = (paraformer_result*)std::malloc(sizeof(paraformer_result));
+    if (!r)
+        return nullptr;
+    r->text = (char*)std::malloc(s.size() + 1);
+    if (r->text) {
+        std::memcpy(r->text, s.data(), s.size());
+        r->text[s.size()] = '\0';
+    }
+
+    // Convert fire frame indices to centiseconds.
+    // LFR (low frame rate) subsampling: each LFR frame covers `lfr_m` raw
+    // mel frames. Raw mel frames are 10ms apart (hop=160 at 16kHz).
+    // So frame t in the encoder corresponds to t * lfr_m * 10ms.
+    const int lfr_m = (int)ctx->model.hp.lfr_m;
+    const int ms_per_frame = lfr_m * 10;
+    r->n_chars = (int)fire_frames.size();
+    r->char_times_cs = (int32_t*)std::malloc(fire_frames.size() * sizeof(int32_t));
+    if (r->char_times_cs) {
+        for (int i = 0; i < r->n_chars; i++)
+            r->char_times_cs[i] = fire_frames[i] * ms_per_frame / 10; // ms → cs
+    }
+    return r;
+}
+
+void paraformer_result_free(paraformer_result* r) {
+    if (!r)
+        return;
+    std::free(r->text);
+    std::free(r->char_times_cs);
+    std::free(r);
 }
 
 float* paraformer_extract_stage(paraformer_context* ctx, const float* samples, int n_samples, const char* stage_name,

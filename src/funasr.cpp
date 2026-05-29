@@ -28,8 +28,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <random>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <vector>
 
 #ifndef M_PI
@@ -1287,7 +1289,9 @@ static const char* PROMPT_PREFIX = "<|im_start|>system\nYou are a helpful assist
 static const char* PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n";
 
 static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm, int n_samples,
-                                          std::vector<float>* stage_out, const char* stage_name) {
+                                          std::vector<float>* stage_out, const char* stage_name,
+                                          std::vector<int32_t>* out_ids = nullptr,
+                                          std::vector<float>* out_probs = nullptr) {
     const auto& hp = ctx->model.hparams;
 
     int T_lfr = 0, D_lfr = 0;
@@ -1388,8 +1392,36 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
         }
         return best;
     };
+    auto softmax_of = [](const std::vector<float>& v, int idx) -> float {
+        float mx = *std::max_element(v.begin(), v.end());
+        float sum = 0;
+        for (float x : v)
+            sum += std::exp(x - mx);
+        return std::exp(v[idx] - mx) / sum;
+    };
+    const float temperature = ctx->params.temperature;
+    auto pick_next = [&](std::vector<float>& v) -> int {
+        if (temperature > 0.0f) {
+            // Temperature sampling
+            float mx = *std::max_element(v.begin(), v.end());
+            std::vector<float> probs(v.size());
+            float sum = 0;
+            for (size_t i = 0; i < v.size(); i++) {
+                probs[i] = std::exp((v[i] - mx) / temperature);
+                sum += probs[i];
+            }
+            for (auto& p : probs)
+                p /= sum;
+            static thread_local std::mt19937 rng(std::random_device{}());
+            std::discrete_distribution<int> dist(probs.begin(), probs.end());
+            return dist(rng);
+        }
+        return argmax(v);
+    };
     std::vector<int32_t> generated;
-    int next_id = argmax(logits);
+    std::vector<float> generated_probs;
+    int next_id = pick_next(logits);
+    float next_prob = softmax_of(logits, next_id);
     int n_past = total_prompt;
     int prev_id = -1;
     int repeat_run = 0;
@@ -1410,6 +1442,7 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
             prev_id = next_id;
         }
         generated.push_back(next_id);
+        generated_probs.push_back(next_prob);
         std::vector<float> step_embed = funasr_embed_tokens(ctx, {next_id});
         if (step_embed.empty())
             break;
@@ -1417,7 +1450,8 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
         if (logits.empty())
             break;
         n_past += 1;
-        next_id = argmax(logits);
+        next_id = pick_next(logits);
+        next_prob = softmax_of(logits, next_id);
     }
     if (funasr_bench_enabled()) {
         auto decode_t1 = std::chrono::steady_clock::now();
@@ -1427,6 +1461,12 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
                      n_steps, n_steps > 0 ? ms / n_steps : 0.0);
     }
     (void)d;
+
+    // Pass back raw token IDs and probabilities if requested.
+    if (out_ids)
+        *out_ids = generated;
+    if (out_probs)
+        *out_probs = generated_probs;
 
     // Detokenize, skipping any special tokens that survived.
     std::string out;
@@ -1450,6 +1490,7 @@ extern "C" funasr_context_params funasr_context_default_params(void) {
     p.n_threads = 4;
     p.verbosity = 1;
     p.use_gpu = true;
+    p.temperature = 0.0f;
     return p;
 }
 
@@ -1583,4 +1624,46 @@ extern "C" float* funasr_extract_stage(funasr_context* ctx, const float* samples
     if (n_out)
         *n_out = (int)staged.size();
     return out;
+}
+
+extern "C" funasr_result* funasr_transcribe_with_probs(funasr_context* ctx, const float* samples, int n_samples) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::vector<int32_t> ids;
+    std::vector<float> probs;
+    std::string s = funasr_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, &ids, &probs);
+
+    auto* r = (funasr_result*)std::malloc(sizeof(funasr_result));
+    if (!r)
+        return nullptr;
+    r->text = (char*)std::malloc(s.size() + 1);
+    if (r->text) {
+        std::memcpy(r->text, s.data(), s.size());
+        r->text[s.size()] = '\0';
+    }
+    r->n_tokens = (int)ids.size();
+    r->token_ids = (int32_t*)std::malloc(ids.size() * sizeof(int32_t));
+    r->token_probs = (float*)std::malloc(probs.size() * sizeof(float));
+    if (r->token_ids)
+        std::memcpy(r->token_ids, ids.data(), ids.size() * sizeof(int32_t));
+    if (r->token_probs)
+        std::memcpy(r->token_probs, probs.data(), probs.size() * sizeof(float));
+    return r;
+}
+
+extern "C" void funasr_result_free(funasr_result* r) {
+    if (!r)
+        return;
+    std::free(r->text);
+    std::free(r->token_ids);
+    std::free(r->token_probs);
+    std::free(r);
+}
+
+extern "C" const char* funasr_token_text(funasr_context* ctx, int id) {
+    if (!ctx || id < 0 || id >= (int)ctx->vocab.id_to_token.size())
+        return "";
+    static thread_local std::string buf;
+    buf = funasr_decode_token(ctx->vocab, id);
+    return buf.c_str();
 }

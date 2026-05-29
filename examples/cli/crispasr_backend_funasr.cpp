@@ -22,11 +22,8 @@ public:
     const char* name() const override { return "funasr"; }
 
     uint32_t capabilities() const override {
-        // CAP_TIMESTAMPS_CTC: `-am qwen3-forced-aligner.gguf` works because
-        // the FA model shares the Qwen3-0.6B body funasr already uses; the
-        // CLI's shared aligner path doesn't need anything backend-specific.
-        // No beam / temperature wiring yet (greedy AR decode only).
-        return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_PUNCTUATION_TOGGLE | CAP_DIARIZE | CAP_TIMESTAMPS_CTC;
+        return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_PUNCTUATION_TOGGLE | CAP_DIARIZE | CAP_TIMESTAMPS_CTC |
+               CAP_TEMPERATURE | CAP_TOKEN_CONFIDENCE;
     }
 
     bool init(const whisper_params& p) override {
@@ -34,6 +31,7 @@ public:
         cp.n_threads = p.n_threads;
         cp.verbosity = p.no_prints ? 0 : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
+        cp.temperature = p.temperature;
         ctx_ = funasr_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {
             fprintf(stderr, "crispasr[funasr]: failed to load model '%s'\n", p.model.c_str());
@@ -48,8 +46,9 @@ public:
         if (!ctx_)
             return out;
 
-        char* text = funasr_transcribe(ctx_, samples, n_samples);
-        if (!text) {
+        funasr_result* r = funasr_transcribe_with_probs(ctx_, samples, n_samples);
+        if (!r || !r->text) {
+            funasr_result_free(r);
             fprintf(stderr, "crispasr[funasr]: transcribe failed\n");
             return out;
         }
@@ -57,8 +56,18 @@ public:
         crispasr_segment seg;
         seg.t0 = t_offset_cs;
         seg.t1 = t_offset_cs + (int64_t)((double)n_samples / 16000.0 * 100.0);
-        seg.text = text;
-        std::free(text);
+        seg.text = r->text;
+
+        for (int i = 0; i < r->n_tokens; i++) {
+            crispasr_token tok;
+            tok.id = r->token_ids[i];
+            tok.confidence = r->token_probs[i];
+            const char* piece = funasr_token_text(ctx_, r->token_ids[i]);
+            if (piece)
+                tok.text = piece;
+            seg.tokens.push_back(std::move(tok));
+        }
+        funasr_result_free(r);
 
         while (!seg.text.empty() && (seg.text.front() == ' ' || seg.text.front() == '\n'))
             seg.text.erase(seg.text.begin());

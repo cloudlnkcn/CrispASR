@@ -38,6 +38,17 @@ void paraformer_free(paraformer_context* ctx);
 // Transcribe audio (16 kHz mono PCM). Returns a malloc'd string; caller frees.
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples);
 
+// Variant that returns per-character CIF timestamps (centiseconds from audio start).
+// Each emitted character maps to the encoder frame where CIF fired.
+struct paraformer_result {
+    char* text;
+    int32_t* char_times_cs; // per-character end time in centiseconds
+    int n_chars;            // number of entries in char_times_cs
+};
+struct paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx, const float* samples,
+                                                                int n_samples);
+void paraformer_result_free(struct paraformer_result* r);
+
 // Stage-capture API for the diff harness.
 float* paraformer_extract_stage(paraformer_context* ctx, const float* samples, int n_samples, const char* stage_name,
                                 int* n_out);

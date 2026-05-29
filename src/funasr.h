@@ -47,8 +47,9 @@ struct funasr_context;
 
 struct funasr_context_params {
     int n_threads;
-    int verbosity; // 0=silent 1=normal 2=verbose
-    bool use_gpu;  // false => force CPU backend
+    int verbosity;     // 0=silent 1=normal 2=verbose
+    bool use_gpu;      // false => force CPU backend
+    float temperature; // 0 = greedy argmax (default)
 };
 
 struct funasr_context_params funasr_context_default_params(void);
@@ -59,6 +60,19 @@ void funasr_free(struct funasr_context* ctx);
 
 // Transcribe 16 kHz mono PCM. Returns malloc'd UTF-8 string; caller frees with free().
 char* funasr_transcribe(struct funasr_context* ctx, const float* samples, int n_samples);
+
+// Variant that additionally returns per-emitted-token ids + softmax probs.
+struct funasr_result {
+    char* text;
+    int32_t* token_ids;
+    float* token_probs;
+    int n_tokens;
+};
+struct funasr_result* funasr_transcribe_with_probs(struct funasr_context* ctx, const float* samples, int n_samples);
+void funasr_result_free(struct funasr_result* r);
+
+// Single-id detokenize.
+const char* funasr_token_text(struct funasr_context* ctx, int id);
 
 // Pull one intermediate activation out of the pipeline for diff testing.
 // Returns malloc'd F32 buffer; caller frees with free(). *n_out is set

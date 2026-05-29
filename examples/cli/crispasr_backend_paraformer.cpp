@@ -16,7 +16,7 @@ public:
     const char* name() const override { return "paraformer"; }
 
     uint32_t capabilities() const override {
-        return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_PUNCTUATION_TOGGLE | CAP_DIARIZE;
+        return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_PUNCTUATION_TOGGLE | CAP_DIARIZE | CAP_TIMESTAMPS_CTC;
     }
 
     bool init(const whisper_params& p) override {
@@ -38,8 +38,9 @@ public:
         if (!ctx_)
             return out;
 
-        char* text = paraformer_transcribe(ctx_, samples, n_samples);
-        if (!text) {
+        paraformer_result* r = paraformer_transcribe_with_timestamps(ctx_, samples, n_samples);
+        if (!r || !r->text) {
+            paraformer_result_free(r);
             fprintf(stderr, "crispasr[paraformer]: transcribe failed\n");
             return out;
         }
@@ -47,8 +48,48 @@ public:
         crispasr_segment seg;
         seg.t0 = t_offset_cs;
         seg.t1 = t_offset_cs + (int64_t)((double)n_samples / 16000.0 * 100.0);
-        seg.text = text;
-        std::free(text);
+        seg.text = r->text;
+
+        // Build per-character word timing from CIF fire positions.
+        // Each fire corresponds to one emitted character/token.
+        if (r->char_times_cs && r->n_chars > 0) {
+            // Group consecutive characters into words (split on spaces).
+            std::string full_text = r->text;
+            int ci = 0; // index into char_times_cs
+            size_t pos = 0;
+            while (pos < full_text.size() && ci < r->n_chars) {
+                // Skip whitespace
+                while (pos < full_text.size() && full_text[pos] == ' ')
+                    pos++;
+                if (pos >= full_text.size())
+                    break;
+
+                // Collect one word
+                size_t word_start = pos;
+                int ci_start = ci;
+                while (pos < full_text.size() && full_text[pos] != ' ' && ci < r->n_chars) {
+                    // Count UTF-8 characters consumed
+                    unsigned char c = (unsigned char)full_text[pos];
+                    if (c < 0x80)
+                        pos++;
+                    else if (c < 0xE0)
+                        pos += 2;
+                    else if (c < 0xF0)
+                        pos += 3;
+                    else
+                        pos += 4;
+                    ci++;
+                }
+                if (ci > ci_start) {
+                    crispasr_word w;
+                    w.text = full_text.substr(word_start, pos - word_start);
+                    w.t0 = t_offset_cs + (ci_start > 0 ? r->char_times_cs[ci_start - 1] : 0);
+                    w.t1 = t_offset_cs + r->char_times_cs[ci - 1];
+                    seg.words.push_back(std::move(w));
+                }
+            }
+        }
+        paraformer_result_free(r);
 
         while (!seg.text.empty() && (seg.text.front() == ' ' || seg.text.front() == '\n'))
             seg.text.erase(seg.text.begin());
