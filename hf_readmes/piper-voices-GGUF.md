@@ -46,26 +46,36 @@ research license; the CC BY-NC-SA voices) are **deliberately excluded**.
 | `piper-de_DE-mls-medium-f16.gguf` | mls | German | medium | **CC-BY 4.0** † |
 | `piper-en_GB-cori-medium-f16.gguf` | cori | English (GB, F) | medium | **public domain** |
 | `piper-en_US-libritts_r-medium-f16.gguf` | libritts_r | English (US) | medium | **CC-BY 4.0** † |
+| `piper-de_DE-eva_k-x_low-f16.gguf` | eva_k | German (F) | x-low | **BSD-style** ‡ |
+| `piper-de_DE-karlsson-low-f16.gguf` | karlsson | German (M) | low | **BSD-style** ‡ |
+| `piper-de_DE-ramona-low-f16.gguf` | ramona | German (F) | low | **BSD-style** ‡ |
 
 The Thorsten + kerstin German voices are released **CC0** (public-domain
 dedication — [Thorsten-Voice](https://www.thorsten-voice.de/) /
-Thorsten Müller, and the kerstin set). `en_GB-cori` is **public domain**
-per its upstream MODEL_CARD.
+Thorsten Müller; kerstin from [rhasspy/dataset-voice-kerstin](https://github.com/rhasspy/dataset-voice-kerstin)).
+`en_GB-cori` is **public domain** (trained on [LibriVox](https://librivox.org)
+recordings, which are public domain).
 
 † **CC-BY 4.0 — attribution required.** `mls` is from
 [Multilingual LibriSpeech](https://www.openslr.org/94/) (MLS);
 `en_US-libritts_r` is from [LibriTTS-R](https://www.openslr.org/141/)
-(Koizumi et al., Google). When you ship audio from these voices, credit
-the dataset per CC-BY 4.0.
+(Koizumi et al., Google). Credit the dataset per CC-BY 4.0 when shipping
+their audio.
+
+‡ **M-AILABS — BSD-style license.** `eva_k` / `karlsson` / `ramona` are
+from the [M-AILABS Speech Dataset](https://github.com/i-celeste-aurora/m-ailabs-dataset)
+(German voices derived from LibriVox + Project Gutenberg public-domain
+sources). Its BSD-style license permits commercial use and redistribution
+**provided the copyright notice is retained**, and forbids using the
+contributors' names to endorse derived products. Retain the M-AILABS
+notice when redistributing.
 
 ### Excluded (license not redistributable)
 
 Deliberately **not** converted/hosted here:
 - `en_US-lessac` — Blizzard 2013 (CSTR Edinburgh), research/non-commercial.
-- `en_US-ryan`, `en_US-hfc_female/male`, `de_DE-pavoque` — CC BY-**NC**-SA.
-- `de_DE-eva_k`, `de_DE-karlsson`, `de_DE-ramona` — M-AILABS dataset whose
-  license URL (caito.de) is defunct/unverifiable. Re-add only after
-  confirming the terms.
+- `en_US-ryan`, `en_US-hfc_female/male`, `de_DE-pavoque` — CC BY-**NC**-SA
+  (non-commercial).
 
 ## Licensing
 
@@ -75,10 +85,13 @@ Two layers, both permissive here:
   phonemizer integration, and `convert-piper-to-gguf.py` are MIT
   (rhasspy/piper is MIT-licensed; CrispASR's runtime is its own).
 - **Voice weights** — each GGUF is a derivative of an upstream Piper voice
-  and carries **that voice's dataset license** (the table above). Every
-  voice hosted here is CC0 or public domain, so the GGUFs are free to
-  use, redistribute, and ship commercially. No attribution is legally
-  required, but crediting [Thorsten-Voice](https://www.thorsten-voice.de/)
+  and carries **that voice's dataset license** (the table above). All
+  voices here are redistributable and commercial-use-OK, but obligations
+  differ: CC0 / public-domain (thorsten, kerstin, cori) need nothing;
+  CC-BY 4.0 (mls, libritts_r) need dataset attribution; M-AILABS
+  (eva_k, karlsson, ramona) need the copyright notice retained. Honour
+  the per-voice terms for any audio you ship. Crediting
+  [Thorsten-Voice](https://www.thorsten-voice.de/)
   and the [Piper](https://github.com/rhasspy/piper) project is appreciated.
 
 To add a voice with a different license (e.g. the CC BY 4.0
