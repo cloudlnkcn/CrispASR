@@ -4218,3 +4218,349 @@ The original 5 min sweep and the 90 s rerun both came back `BOTH_EMPTY` for `omn
 Issue #123 added the JA variant to the registry + README, but no row in any of `PERFORMANCE.md`'s cohere tables (the long-form coverage at line 1374, the cross-backend matrix at line 1535, the per-length wall-time table at line 1555). The English `cohere-transcribe` is benchmarked across multiple Japanese / English / multilingual clips; the JA fine-tune isn't.
 
 **Fix shape.** Run the JA variant on the same fixture set the English one used (TedX / JSUT clips per the model card; `samples/jfk.wav` is English so won't exercise the JA tuning). Drop one extra row into each cohere table with the JA numbers. ~30 min of inference + table updates once the fixtures are downloaded.
+
+---
+
+## 128. Piper TTS — lightweight VITS runtime (MIT)
+
+Native C++ runtime for [rhasspy/piper](https://github.com/rhasspy/piper)
+VITS models. MIT-licensed. Fills a gap in the TTS lineup: tiny models
+(~15-50 MB Q4_K per language) with zero-shot latency, useful on mobile
+(CrisperWeaver) and for fast previews.
+
+### Why
+
+Current smallest TTS is Kokoro at ~75 MB. Piper voices are **~15 MB**
+Q4_K per language and run in single-digit ms per sentence on CPU.
+250+ community voices across 30+ languages. Especially strong for
+German (thorsten-medium 6.1% MOS, karlsson, kerstin, pavoque, ramona,
+eva_k). The "just works" option when download budget is tight.
+
+### Architecture
+
+VITS (Variational Inference with adversarial learning for end-to-end
+Text-to-Speech):
+- Text encoder: small transformer (6 layers, 192-d)
+- Duration predictor: 2-layer conv (already in `core/conv.h`)
+- Flow: 4 affine coupling layers (inverse autoregressive flow)
+- HiFi-GAN decoder: 4 upsample blocks + multi-receptive-field fusion
+
+Phoneme frontend: **espeak-ng** — already vendored in the tree for
+Kokoro (#56). The `kokoro.cpp` espeak-ng integration
+(`espeak_TextToPhonemes`) is directly reusable; Piper's phoneme
+alphabet is espeak-ng IPA, same as Kokoro's.
+
+### Reuse from existing code
+
+| Component | Reuse source | New code needed |
+|---|---|---|
+| espeak-ng phonemizer | `kokoro.cpp` `espeak_TextToPhonemes` | None — same API |
+| Text encoder (transformer) | `core/attention.h` `core_attn::kv_self_attn` + `core/ffn.h` | Minimal glue |
+| 1D convolutions | `core/conv.h` (`core_conv_1d`, `core_conv_1d_dw`) | None |
+| Duration predictor | `core/conv.h` | ~50 LOC adapter |
+| Affine coupling flow | **NEW** | ~200 LOC — `core/affine_coupling.h` |
+| HiFi-GAN decoder | `chatterbox_s3gen.cpp` HiFT vocoder (4 upsample + MRF) | Adapt from chatterbox; ~300 LOC delta |
+| iSTFT / audio output | `core/fft.h` + `chatterbox_s3gen.cpp` istft | None |
+| GGUF loader | `core/gguf_loader.h` | None |
+| Audio resampler | `core/audio_resample.h` | None |
+
+The affine coupling layer is the only truly new primitive. It's a
+simple invertible transform: `y = x * exp(s(x)) + t(x)` where `s`
+and `t` are small conv nets. ~200 LOC including forward + inverse.
+**This should go into `core/affine_coupling.h`** per DRY — it will
+also be needed by MeloTTS (#100 Phase A, same VITS family) and any
+future normalizing-flow TTS.
+
+### Concrete steps
+
+1. **Converter** — `models/convert-piper-to-gguf.py`. Read the `.onnx`
+   + `.onnx.json` config. Export text encoder, duration predictor, flow
+   coupling layers, HiFi-GAN decoder as GGUF tensors. Embed the
+   phoneme-to-id map as GGUF KV metadata.
+2. **`core/affine_coupling.h`** — forward-pass affine coupling layer.
+   Input: (B, C, T) → split channels → compute s,t via conv stack →
+   apply transform → concat. ~200 LOC. Reusable by #100 MeloTTS.
+3. **`src/piper_tts.cpp` + `src/piper_tts.h`** — backend runtime.
+   - `piper_tts_init_from_file(path)` → load GGUF, build encoder +
+     flow + decoder graphs
+   - `piper_tts_synthesize(ctx, text)` → espeak-ng phonemize → encoder
+     → duration → flow → HiFi-GAN → float32 PCM
+   - Wire into Session API (`crispasr_c_api.cpp`)
+4. **Registry** — add `piper` backend to `crispasr_model_registry.cpp`.
+   Host converted GGUFs at `cstr/piper-*-GGUF` on HF.
+5. **Test** — ASR roundtrip: piper synth → parakeet transcribe → verify.
+   Add to `tools/test-all-backends.py`.
+
+### Effort
+
+**Small-Medium.** espeak-ng and HiFi-GAN are already in the tree.
+The affine coupling is small. Main work is the converter + wiring.
+~1-2 days for a working EN/DE prototype, +1 day per additional
+language voice.
+
+### Trigger
+
+Immediate — Piper's size/speed makes it the best candidate for
+CrisperWeaver mobile and HF Space demos. Also the simplest new
+TTS architecture to add (no LLM, no codec, no diffusion).
+
+---
+
+## 129. F5-TTS — DiT flow-matching TTS (MIT)
+
+Native C++ runtime for [SWivid/F5-TTS](https://github.com/SWivid/F5-TTS).
+MIT-licensed. High-quality zero-shot voice cloning from 5-15s of
+reference audio.
+
+### Why
+
+F5-TTS's architecture (Diffusion Transformer + flow matching) is
+distinct from everything currently in the tree. It produces noticeably
+higher quality than the current AR-based engines (orpheus, qwen3-tts)
+for voice cloning tasks, and the MIT license is cleaner than the
+llama3.2-derived Orpheus weights. ~330M params, ~660 MB F16.
+
+### Architecture
+
+- **Text encoder**: char-level ConvNeXt blocks (not a transformer) —
+  novel in the tree
+- **DiT backbone**: 22-layer Diffusion Transformer with AdaLN-Zero
+  conditioning. Each layer: LayerNorm → self-attention → cross-attention
+  → FFN with adaptive scale/shift from the diffusion timestep embedding
+- **Flow matching**: conditional OT path (rectified flow). The ODE
+  solver is Euler (simplest) or midpoint
+- **Vocoder**: Vocos (iSTFT-based, ConvNeXt stack → STFT magnitudes +
+  phases → iSTFT). ~14M params, separate checkpoint
+
+### Reuse from existing code
+
+| Component | Reuse source | New code needed |
+|---|---|---|
+| Self-attention | `core/attention.h` `core_attn::kv_self_attn` | None |
+| Cross-attention | `core/attention.h` | None |
+| FFN (SwiGLU) | `core/ffn.h` `core_ffn::swiglu` | None |
+| AdaLN-Zero | **NEW** — `core/adaln.h` | ~100 LOC |
+| ODE solver (Euler/midpoint) | `chatterbox_s3gen.cpp` `cfm_euler_solve` | Adapt — ~50 LOC delta |
+| iSTFT | `core/fft.h` + `chatterbox_s3gen.cpp` | None |
+| Mel spectrogram | `core/mel.h` | None |
+| ConvNeXt block | **NEW** — `core/convnext.h` | ~150 LOC |
+| GGUF loader | `core/gguf_loader.h` | None |
+| Reference audio embedding | `core/mel.h` + concat | ~50 LOC |
+
+**New `core/` primitives** (both reusable by other future models):
+- `core/adaln.h` — Adaptive Layer Norm with zero-init scale/shift.
+  Used by all DiT-family models. ~100 LOC. Would also serve any
+  future DiT image/video model if one is ever ported.
+- `core/convnext.h` — ConvNeXt V2 block (depthwise conv → LayerNorm →
+  pointwise up → GELU → pointwise down + residual). ~150 LOC. Vocos
+  vocoder and F5's text encoder both use this. MeloTTS (#100) could
+  also benefit if its text encoder is ConvNeXt-flavored.
+
+### Concrete steps
+
+1. **Converter** — `models/convert-f5-tts-to-gguf.py`. Export DiT
+   (22 layers), text encoder (ConvNeXt), Vocos vocoder as separate or
+   combined GGUF. Embed char-level vocabulary as KV metadata.
+2. **`core/adaln.h`** — AdaLN-Zero: `scale, shift = linear(timestep_emb)`;
+   `out = (1 + scale) * layernorm(x) + shift`. Zero-init at construction.
+3. **`core/convnext.h`** — ConvNeXt V2 block.
+4. **`src/f5_tts.cpp` + `src/f5_tts.h`** — backend runtime.
+   - Reference audio: load WAV → mel → concat with text embeddings as
+     conditioning (masked infilling: text tokens mark where to generate,
+     ref mel provides voice identity)
+   - DiT forward: 22 layers × N ODE steps (default 32)
+   - Vocos: mel → magnitude + phase → iSTFT → 24 kHz PCM
+5. **Registry + C API + Session wiring.**
+6. **Voice cloning API**: `session.set_voice("ref.wav", ref_text="...")` —
+   same API as qwen3-tts base. Mel from ref audio is the conditioning.
+
+### Effort
+
+**Medium-Large.** The DiT is 22 layers but each layer is standard
+attention+FFN with the AdaLN wrapper. The ODE solver reuses chatterbox's
+CFM code. Main novelty is ConvNeXt blocks + AdaLN + the masked-infilling
+conditioning scheme. ~2-3 weeks including converter, runtime, validation.
+
+### Trigger
+
+Medium priority — the MIT license and voice-cloning quality make this
+attractive. Start after chatterbox C API wiring is complete (#57 Phase 3
+remaining items) so the CFM solver is battle-tested.
+
+---
+
+## 130. Zonos TTS — transformer + DAC codec (Apache 2.0)
+
+Native C++ runtime for [Zyphra/Zonos](https://github.com/Zyphra/Zonos).
+Apache 2.0 licensed. Unique in the lineup for its fine-grained acoustic
+conditioning (pitch, speaking rate, emotion via speaker embeddings).
+
+### Why
+
+Zonos's speaker conditioning is richer than any current backend:
+controllable pitch, speaking rate, and emotion arrays from reference
+audio. This makes it the best candidate for expressive TTS where the
+user wants to *tune* the output voice character, not just clone it.
+~500M params. 44.1 kHz output (highest SR in the lineup, tied with
+MeloTTS).
+
+### Architecture
+
+- **Text encoder**: character-level transformer + language embedding
+- **AR backbone**: ~24-layer transformer generating DAC audio codes
+  (8 codebooks × 50 Hz). Similar shape to orpheus (Llama AR → codec)
+  but with conditioning injection at every layer
+- **DAC codec decoder**: Descript Audio Codec — residual VQ → upsampling
+  conv stack → 44.1 kHz waveform. Structurally similar to SNAC
+  (orpheus) but different codebook structure
+- **Speaker conditioning**: reference audio → mel → small encoder →
+  embedding vector. Injected via cross-attention or AdaLN at each
+  AR layer. The conditioning also accepts explicit float arrays for
+  pitch/rate/emotion override
+
+### Reuse from existing code
+
+| Component | Reuse source | New code needed |
+|---|---|---|
+| AR transformer (Llama-style) | `orpheus.cpp` talker forward / `core/attention.h` + `core/ffn.h` | Minimal — conditioning injection is the delta |
+| KV cache | `orpheus.cpp` / `qwen3_tts.cpp` | None |
+| RVQ codebook dequant | `core/rvq.h` (`rvq_dequantize`) | None — DAC uses same RVQ pattern |
+| Upsampling conv decoder | `orpheus_snac.cpp` SNAC decoder / `indextts_voc.cpp` BigVGAN | Adapt — DAC has different layer count/strides |
+| Speaker embedding | `chatterbox_campplus.cpp` CAMPPlus / `titanet.cpp` | Adapt — Zonos uses its own encoder but the TDNN pattern overlaps |
+| Mel spectrogram (for ref) | `core/mel.h` | None |
+| GGUF loader | `core/gguf_loader.h` | None |
+| Greedy decode loop | `core/greedy_decode.h` | None |
+
+**New `core/` primitive:**
+- `core/dac_decoder.h` — Descript Audio Codec upsampling decoder.
+  Similar to SNAC but with different stride pattern (256× total
+  upsampling from 50 Hz codes to 44.1 kHz). ~300 LOC. Reusable by
+  any future DAC-based model.
+
+The conditioning-injection mechanism (pitch/rate/emotion floats →
+layer-wise adaptive bias) is backend-specific and belongs in
+`zonos_tts.cpp`, not `core/`.
+
+### Concrete steps
+
+1. **Converter** — `models/convert-zonos-to-gguf.py`. Export text encoder,
+   AR transformer, DAC decoder, speaker encoder as single GGUF. Embed
+   character vocab + conditioning config as KV metadata.
+2. **`core/dac_decoder.h`** — DAC RVQ → conv upsample → 44.1 kHz.
+3. **`src/zonos_tts.cpp` + `src/zonos_tts.h`** — backend runtime.
+   - `zonos_tts_init_from_file(path)` → load, build graphs
+   - `zonos_tts_set_conditioning(pitch, rate, emotion[])` → session state
+   - `zonos_tts_synthesize(ctx, text)` → AR decode → DAC decode → PCM
+   - Voice cloning: `set_voice("ref.wav")` → speaker embedding extraction
+4. **Registry + C API + Session wiring.**
+5. **New session setters** in `crispasr_c_api.cpp`:
+   `crispasr_session_set_pitch(float)`,
+   `crispasr_session_set_speaking_rate(float)`,
+   `crispasr_session_set_emotion(float *array, int len)`.
+
+### Effort
+
+**Medium.** The AR transformer reuses orpheus/qwen3-tts patterns heavily.
+DAC decoder is a new codec but structurally similar to SNAC. The unique
+part is the conditioning system. ~2 weeks.
+
+### Trigger
+
+Medium priority — start after F5-TTS (#129) so the `core/adaln.h`
+primitive exists (Zonos may use AdaLN for conditioning injection,
+depending on the exact layer design).
+
+---
+
+## 131. OuteTTS — LLM + WavTokenizer codec (CC BY 4.0)
+
+Native C++ runtime for [OuteAI/OuteTTS](https://github.com/OuteAI/OuteTTS).
+CC BY 4.0 (commercial OK with attribution). Zero-shot voice cloning
+from a brief reference clip.
+
+### Why
+
+OuteTTS is architecturally closest to what CrispASR already runs well:
+a GPT-style LLM generating discrete audio tokens decoded by a learned
+codec. The pattern is nearly identical to orpheus (Llama → SNAC) and
+indextts (GPT-2 → BigVGAN). This makes it the **lowest-effort new TTS
+backend** among the four — mostly converter + registry work, minimal
+new runtime code.
+
+### Architecture
+
+- **LLM backbone**: Llama-style 1B transformer (OuteTTS-0.3-1B uses
+  a custom 1B arch; OuteTTS-0.2-500M uses a 500M variant)
+- **Audio tokenizer**: WavTokenizer — single-codebook VQ at 40 or 75 Hz.
+  Encoder: conv stack → quantize. Decoder: conv stack → 24 kHz waveform.
+  Structurally simpler than SNAC (1 codebook vs 3) but similar decode
+  pattern
+- **Voice cloning**: reference audio → WavTokenizer encode → prepend
+  tokens to LLM context. Same in-context-learning pattern as
+  qwen3-tts-base
+
+### Reuse from existing code
+
+| Component | Reuse source | New code needed |
+|---|---|---|
+| Llama-style AR forward | `orpheus.cpp` / `qwen3_tts.cpp` | Minimal — same core_attn + core_ffn |
+| KV cache + greedy/beam | `core/greedy_decode.h` / `core/beam_decode.h` | None |
+| Conv-stack codec decoder | `orpheus_snac.cpp` / `indextts_voc.cpp` | Adapt for WavTokenizer strides — ~200 LOC |
+| Reference audio encoding | `core/mel.h` → WavTokenizer encoder | ~300 LOC for the encoder conv stack |
+| BPE tokenizer | `core/bpe.h` | None |
+| GGUF loader | `core/gguf_loader.h` | None |
+| Audio resampler | `core/audio_resample.h` | None |
+
+No new `core/` primitives needed. WavTokenizer's decoder is a
+standard conv-upsample stack — put it in `src/outetts_wavtok.cpp`
+(backend-specific, not generic enough for `core/` since it's a
+single-codebook design unlike the multi-codebook RVQ in `core/rvq.h`).
+
+### Concrete steps
+
+1. **Converter** — `models/convert-outetts-to-gguf.py`. Export LLM
+   weights + WavTokenizer encoder/decoder. Embed vocab + audio config
+   as KV metadata.
+2. **`src/outetts_wavtok.cpp`** — WavTokenizer encode (for ref audio)
+   + decode (for generated tokens). ~400 LOC total.
+3. **`src/outetts.cpp` + `src/outetts.h`** — backend runtime.
+   - Load GGUF, build LLM + WavTokenizer graphs
+   - Voice cloning: ref WAV → WavTokenizer encode → token sequence
+   - AR decode: text tokens + ref tokens → generate audio tokens
+   - WavTokenizer decode → 24 kHz PCM
+4. **Registry + C API + Session wiring.**
+5. **Test** — ASR roundtrip + voice similarity check.
+
+### Effort
+
+**Small-Medium.** The LLM forward is an orpheus-shape reuse. The
+WavTokenizer is simpler than SNAC. Main work is the converter and
+the WavTokenizer encode path (since our other codecs only decode,
+not encode — encoding reference audio is the new piece). ~1-1.5 weeks.
+
+### Trigger
+
+Low-medium priority. OuteTTS's single codebook makes it fast but
+quality is below F5-TTS and Zonos. Start when there's a user request
+for a lightweight voice-cloning TTS that's smaller than the 3B orpheus
+models. The CC BY 4.0 attribution requirement is a minor friction for
+redistribution compared to MIT/Apache models.
+
+---
+
+## Priority update — new TTS backends
+
+Add to the priority table at top of file:
+
+| Priority | Item | Effort | Status |
+|---|---|---|---|
+| **HIGH** | [#128 Piper TTS](#128-piper-tts--lightweight-vits-runtime-mit) | S-M | queued — smallest model size, espeak-ng already vendored |
+| **MEDIUM** | [#129 F5-TTS](#129-f5-tts--dit-flow-matching-tts-mit) | M-L | queued — needs AdaLN + ConvNeXt core primitives |
+| **MEDIUM** | [#130 Zonos TTS](#130-zonos-tts--transformer--dac-codec-apache-20) | M | queued — needs DAC decoder, reuses orpheus AR pattern |
+| **LOW** | [#131 OuteTTS](#131-outetts--llm--wavtokenizer-codec-cc-by-40) | S-M | queued — closest to existing orpheus/indextts pattern |
+
+Sequencing: **#128 → #129 → #130 → #131**. Piper first (smallest,
+most reuse, biggest size-class gap to fill). F5 second (introduces
+`core/adaln.h` + `core/convnext.h` that #130 may need). Zonos third
+(introduces `core/dac_decoder.h`). OuteTTS last (least new value
+given orpheus/indextts coverage).
