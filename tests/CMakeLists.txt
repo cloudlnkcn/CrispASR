@@ -731,6 +731,32 @@ catch_discover_tests(test-session-setters
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-session-beam — functional beam-search regression test (§90).
+#
+# [unit][beam]  — setter API (null guard, width clamping). No model.
+# [beam][.live] — end-to-end: beam_size=1 no-regression + beam 2-4
+#                 produce non-empty output. Gated on CRISPASR_MODEL_WHISPER
+#                 (+ optionally CRISPASR_MODEL_GLM_ASR).
+add_executable(test-session-beam
+    test-session-beam.cpp
+)
+target_include_directories(test-session-beam PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-session-beam PRIVATE
+    Catch2::Catch2WithMain
+    crispasr
+)
+catch_discover_tests(test-session-beam
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;beam"
+)
+catch_discover_tests(test-session-beam
+    TEST_SPEC "[.live]"
+    PROPERTIES LABELS "live;beam"
+)
+
 # ─── test - registry — Catch2 unit tests for crispasr_model_registry
 #
 #Verifies registry lookup by backend name, reverse lookup by filename,

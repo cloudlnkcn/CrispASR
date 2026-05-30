@@ -2343,17 +2343,23 @@ class CrispasrSession {
     if (rc != 0) throw Exception('setBestOf failed (rc=$rc)');
   }
 
-  /// Beam-search width. `n > 1` enables beam search on backends whose
-  /// session-API transcribe path consults `s->beam_size` — whisper
-  /// today, with the other beam-capable backends per the feature
-  /// matrix (granite, voxtral, qwen3, glm-asr, kyutai-stt, firered,
-  /// moonshine, omniasr) tracked as a follow-up that needs per-
-  /// backend high-level-transcribe API surface for beam_size before
-  /// the session wrapper can plumb it through. `n <= 1` (the default)
-  /// keeps greedy sampling, and `setBestOf(N)` still controls the
-  /// alternate "N greedy decodes, pick highest-confidence" path on
-  /// every other backend. Setter is unconditional — backends that
-  /// don't consume `beam_size` just see no behaviour change.
+  /// §90 Set beam-search width for the next transcription.
+  ///
+  /// `n` >= 2 activates beam search for backends that support it:
+  ///   whisper        — native BEAM_SEARCH strategy
+  ///   qwen3-asr      — via core_beam_decode::run_with_probs (replay)
+  ///   granite*        — via core_beam_decode::run_with_probs
+  ///   voxtral         — via core_beam_decode::run_with_probs
+  ///   glm-asr         — glm_asr_set_beam_size (per-backend setter)
+  ///   kyutai-stt      — kyutai_stt_set_beam_size
+  ///   firered         — firered_asr_set_beam_size
+  ///   moonshine       — moonshine_set_beam_size
+  ///   omniasr-llm     — omniasr_set_beam_size
+  /// Silent no-op for canary, cohere, voxtral4b, CTC/NAR backends.
+  /// `n` <= 0 or 1 reverts to greedy (default).
+  ///
+  /// Only available when built with beam-search support (symbol presence
+  /// is checked at runtime; throws on older native builds).
   void setBeamSize(int n) {
     if (_closed) throw StateError('CrispasrSession is closed');
     if (!_lib.providesSymbol('crispasr_session_set_beam_size')) {

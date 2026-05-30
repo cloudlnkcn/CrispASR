@@ -1132,18 +1132,20 @@ struct crispasr_session {
     int max_new_tokens = 0;
     float frequency_penalty = 0.0f;
 
-    // Beam search width. Default 1 (= greedy, no beam search). When > 1
-    // the dispatch path switches whisper into beam-search sampling
-    // (`wparams.strategy = BEAM_SEARCH; wparams.beam_search.beam_size =
-    // s->beam_size`). Other beam-capable backends per the feature
-    // matrix (granite, voxtral, qwen3, glm-asr, kyutai-stt, firered,
-    // moonshine, omniasr/omniasr-llm) currently expose beam search
-    // only through their CLI wrappers + `core_beam_decode::run_*` —
-    // their high-level transcribe APIs don't take a beam_size yet, so
-    // setting `s->beam_size` is a silent no-op for them (the setter
-    // still returns 0 so wrappers don't need to special-case backends).
-    // Wiring each into the session dispatch is tracked as PLAN
-    // follow-up: "expose per-call beam_size on session-API backends."
+    // ── §90 session-level beam-search width ──────────────────────────────
+    // beam_size > 1 activates beam search for backends that support it:
+    //   whisper        — native BEAM_SEARCH strategy
+    //   qwen3-asr      — via core_beam_decode::run_with_probs (replay)
+    //   granite*        — via core_beam_decode::run_with_probs
+    //   voxtral         — via core_beam_decode::run_with_probs
+    //   glm-asr         — glm_asr_set_beam_size (per-backend setter)
+    //   kyutai-stt      — kyutai_stt_set_beam_size
+    //   firered         — firered_asr_set_beam_size
+    //   moonshine       — moonshine_set_beam_size
+    //   omniasr-llm     — omniasr_set_beam_size
+    // Silent no-op for: canary, cohere (AED enc-dec — §61h deferred),
+    //   voxtral4b (streaming, no beam hook), CTC/NAR backends.
+    // Default 1 preserves greedy bit-identical output (no-regression contract).
     int beam_size = 1;
 
     // Whisper text-suppression + prompt-carry extras (whisper-only).
@@ -5656,19 +5658,14 @@ CA_EXPORT int crispasr_session_set_frequency_penalty(crispasr_session* s, float 
     return 0;
 }
 
-// Sticky beam_size for beam-search sampling. > 1 enables beam search on
-// backends whose session-API transcribe path consults `s->beam_size`
-// (whisper today; granite / voxtral / qwen3 / glm-asr / kyutai-stt /
-// firered / moonshine / omniasr have CLI-level beam search via their
-// internal `core_beam_decode` integrations but no high-level
-// session-API surface for it yet — wiring those is tracked separately).
-//
-// Returns 0 unconditionally on a non-null session — backends that don't
-// consume the field just see no behaviour change. The "this setter
-// would no-op on the active backend" answer is communicated through
-// the live feature matrix (`crispasr --list-backends-json`), not
-// through the setter's rc, so wrapper code doesn't have to special-
-// case per-backend support gates.
+// §90 Sticky beam_size for beam-search sampling. > 1 activates beam search
+// on 9 backends wired in transcribe_single:
+//   whisper (native BEAM_SEARCH), qwen3-asr / granite / voxtral (replay via
+//   core_beam_decode::run_with_probs), glm-asr / kyutai-stt / firered /
+//   moonshine / omniasr (per-backend _set_beam_size setter).
+// Silent no-op for canary, cohere (AED — §61h deferred), voxtral4b
+// (streaming), CTC/NAR backends.
+// Returns 0 on a non-null session; width <= 0 clamped to 1 (greedy).
 CA_EXPORT int crispasr_session_set_beam_size(crispasr_session* s, int n) {
     if (!s)
         return -1;

@@ -1962,7 +1962,7 @@ validation showing the model honours an instruction prompt before
 plumbing the toggle. Out of scope until a backend lands that's
 actually instruction-tuned.
 
-### 61h. Beam search for LLM family + enc-dec — IN PROGRESS
+### 61h. Beam search for LLM family + enc-dec — MOSTLY DONE
 
 **Tier:** 3. **Effort:** ~300 LOC for shared decoder + 30 LOC per
 backend. **Cells:** 8 (LLM quartet + qwen3/granite/voxtral4b +
@@ -1976,8 +1976,11 @@ canary/cohere/moonshine via per-model loop).
 | moonshine LLM-side beam | DONE — 1 ✔ (branched-KV; per-layer `kv_self.{k,v}` snapshot) |
 | omniasr-llm beam | DONE — 1 ✔ (branched-KV; whole-tensor `kv_k` / `kv_v` snapshot) |
 | kyutai-stt per-frame text-token beam | DONE — 1 ✔ (branched-KV; one pick per Mimi frame, audio codes shared across beams) |
-| qwen3/granite/voxtral4b/voxtral session-API beam | DEFERRED — pure plumbing once the session API exposes `beam_size` |
-| canary/cohere/moonshine encoder-decoder beam (per-decoder loop) | DEFERRED — separate scope from the LLM beam path |
+| qwen3-asr session-API beam | DONE — `run_with_probs` replay in `transcribe_single` (commit 0c24178e) |
+| granite* session-API beam | DONE — `run_with_probs` replay in `transcribe_single` (commit 0c24178e) |
+| voxtral session-API beam | DONE — `run_with_probs` via `run_voxtral_family` (commit 0c24178e) |
+| voxtral4b | ❌ N/A — streaming path, no beam hook |
+| canary/cohere encoder-decoder beam | DEFERRED — AED needs branched-KV or per-decoder beam loop |
 
 **What landed (May 2026 follow-up).** The original entry deferred
 omniasr-llm / kyutai-stt / moonshine because `replay_fn` does
@@ -2007,12 +2010,13 @@ actually improved quality on JFK ("fellow Americans" vs greedy's
 "fellow-american"). omniasr-llm at `-bs 4` lands above the 60s
 "rough" gate but well within order-of-magnitude.
 
-**Still deferred and why.** The session-API quartet (qwen3, granite,
-voxtral4b, voxtral) and the classic encoder-decoder backends (canary,
-cohere) need either session-API plumbing (just `set_beam_size`
-exposure) or a per-decoder beam path that reuses the cross-attention
-KV across all beams. Both are pure plumbing — reopen when the wave
-of enc-dec backends has a clear quality win to point at.
+**Still deferred and why.** The classic encoder-decoder backends
+(canary, cohere) need a beam path that reuses the cross-attention
+KV across all beams — either `run_with_probs_branched` with
+per-decoder save/restore callbacks, or a per-backend beam loop.
+voxtral4b stays out of scope (streaming API, no beam hook).
+qwen3-asr, granite*, and voxtral are now fully wired via §90
+(commit 0c24178e).
 
 ### 61i. Flash attention for fc-ctc — DEFERRED
 
@@ -2845,6 +2849,14 @@ May 2026:
 `voxtral4b` uses a streaming path, not `run_voxtral_family` — not in scope for this item.
 
 `s->beam_size == 1` (default) keeps the existing greedy path bit-identical; no regression.
+
+**Functional regression test added (2026-05-30).**
+`tests/test-session-beam.cpp` — Catch2 test with two tiers:
+  - `[unit][beam]` — setter API (null guard, width clamping). No model.
+  - `[beam][.live]` — end-to-end via session API. Gated on
+    `CRISPASR_MODEL_WHISPER` / `CRISPASR_MODEL_GLM_ASR` env vars.
+    Verifies: beam_size=1 byte-identical to default (no-regression),
+    beam 2–4 produce non-empty well-formed output on jfk.wav.
 
 ---
 
