@@ -1293,5 +1293,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         fprintf(stderr, "crispasr-server: API key authentication enabled\n");
 
     svr.listen(host, port);
+
+    // Clean up cached VAD context on shutdown (#132).
+    crispasr_vad_free_cache();
+
     return 0;
 }

@@ -163,3 +163,8 @@ crispasr_stitched_audio crispasr_stitch_vad_slices(const float* samples, int n_s
 // Remap a centisecond timestamp from stitched-buffer space back to
 // original-audio space using linear interpolation between mapping points.
 int64_t crispasr_vad_remap_timestamp(const std::vector<crispasr_vad_mapping>& mapping, int64_t stitched_cs);
+
+// Free the internally cached Silero VAD context (if any). Call on
+// shutdown or when the VAD model is no longer needed. The cache is
+// automatically invalidated when the model path changes.
+void crispasr_vad_free_cache();
