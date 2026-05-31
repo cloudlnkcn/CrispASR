@@ -1069,6 +1069,17 @@ if(_espeak_found)
     message(STATUS "piper-tts: libespeak-ng enabled")
 endif()
 
+# speecht5-tts — Microsoft SpeechT5 TTS (encoder-decoder mel + HiFi-GAN)
+# ---------------------------------------------------------------------------
+add_library(speecht5-tts STATIC speecht5_tts.h speecht5_tts.cpp)
+set_target_properties(speecht5-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(speecht5-tts PUBLIC .)
+target_compile_features   (speecht5-tts PUBLIC cxx_std_17)
+target_link_libraries     (speecht5-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(speecht5-tts PRIVATE -O3)
+endif()
+
 # ---------------------------------------------------------------------------
 # firered-vad — FireRedVAD (DFSMN voice activity detection)
 # ---------------------------------------------------------------------------

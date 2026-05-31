@@ -47,6 +47,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_outetts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_f5_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_bark_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_pocket_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_speecht5_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -154,6 +155,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_sensevoice_backend();
     if (name == "bark" || name == "bark-tts" || name == "bark-small" || name == "bark-large")
         return crispasr_make_bark_backend();
+    if (name == "speecht5" || name == "speecht5-tts" || name == "speecht5_tts")
+        return crispasr_make_speecht5_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -220,6 +223,7 @@ std::vector<std::string> crispasr_list_backends() {
         "sensevoice",
         "bark",
         "bark-tts",
+        "speecht5",
     };
 }
 
@@ -484,6 +488,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "funasr";
     if (contains_ci("sensevoice") || contains_ci("sense-voice") || contains_ci("sense_voice"))
         return "sensevoice";
+    if (contains_ci("speecht5"))
+        return "speecht5";
     if (contains_ci("ggml-") && contains_ci(".bin"))
         return "whisper";
 
@@ -582,6 +588,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "outetts";
             else if (a == "pocket-tts" || a == "pocket_tts" || a == "pockettts")
                 result = "pocket-tts";
+            else if (a == "speecht5-tts" || a == "speecht5_tts" || a == "speecht5")
+                result = "speecht5";
         }
     }
     gguf_free(gctx);

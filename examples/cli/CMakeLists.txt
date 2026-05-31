@@ -49,6 +49,7 @@ add_executable(${TARGET}
     crispasr_backend_funasr.cpp
     crispasr_backend_paraformer.cpp
     crispasr_backend_sensevoice.cpp
+    crispasr_backend_speecht5.cpp
     crispasr_aligner_cli.cpp
     crispasr_vad_cli.cpp
     crispasr_lid_cli.cpp
@@ -254,6 +255,7 @@ target_link_libraries(${TARGET} PRIVATE
     indextts
     kokoro
     piper-tts
+    speecht5-tts
     voxcpm2_tts
     m2m100
     t5_translate
