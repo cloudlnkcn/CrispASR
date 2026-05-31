@@ -1209,7 +1209,12 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
     };
 
     // --- Build depth decoder graph ---
-    auto build_depth_graph = [&](int T) -> ggml_cgraph* {
+    // codebook_idx: which codebook we're predicting (1..31). Selects the
+    // correct slice of the 3D codebooks_head weight. Python's CsmCodebooksHead
+    // uses weight[cache_position - 1] per position — each position has its OWN
+    // linear head. We replicate that by extracting weight[codebook_idx - 1].
+    // dd_n_past_for_graph: how many positions already in the depth KV cache.
+    auto build_depth_graph = [&](int T, int codebook_idx = -1, int dd_n_past_for_graph = 0) -> ggml_cgraph* {
         ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
         ggml_context* ctx0 = ggml_init(ip);
         ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
@@ -1221,9 +1226,10 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
         ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
         ggml_set_name(positions, "dd_positions");
         ggml_set_input(positions);
+        const int dd_Lk = dd_n_past_for_graph + T;
         ggml_tensor* causal_mask = nullptr;
         if (T > 1) {
-            causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
+            causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, dd_Lk, T);
             ggml_set_name(causal_mask, "dd_mask");
             ggml_set_input(causal_mask);
         }
@@ -1253,7 +1259,7 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
 
             ggml_tensor* attn = core_attn::kv_self_attn(
                 ctx0, gf, x, blk.attn_q_w, blk.attn_k_w, blk.attn_v_w, blk.attn_output_w, nullptr, nullptr, positions,
-                (T == 1) ? nullptr : causal_mask, ctx->dd_kv_k, ctx->dd_kv_v, (int)il, 0, kvp);
+                (T == 1) ? nullptr : causal_mask, ctx->dd_kv_k, ctx->dd_kv_v, (int)il, dd_n_past_for_graph, kvp);
             cur = ggml_add(ctx0, residual, attn);
 
             // FFN
@@ -1271,9 +1277,38 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
         if (T > 1) {
             cur = ggml_view_2d(ctx0, cur, dd_d, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
         }
-        // Project through codebooks head: [dd_d_model, (n_cb-1) * audio_vocab_size]
-        // The head produces logits for all 31 codebooks stacked.
-        ggml_tensor* logits = ggml_mul_mat(ctx0, m.dd_codebooks_head_w, cur);
+        // Project through the POSITION-SPECIFIC codebooks head.
+        // Python CsmCodebooksHead: weight is [n_cb-1, hidden_size, vocab_size].
+        // At each decode position k, it uses weight[k-1]:
+        //   F.linear(hidden_states, weight[k].T) = hidden @ weight[k]
+        //   where weight[k] is [hidden_size, vocab_size]
+        //
+        // In GGUF, dd_codebooks_head_w stored as 3D: ne[0]=vocab, ne[1]=hidden, ne[2]=n_cb-1
+        // (Python shape [n_cb-1, hidden, vocab] maps to gguf ne=[vocab, hidden, n_cb-1])
+        // A 2D slice at index k: ne[0]=vocab, ne[1]=hidden → that's already the
+        // correct shape for ggml_mul_mat(slice, cur) since mul_mat needs
+        // a->ne[0] == b->ne[0]: slice.ne[0]=vocab... NO wait.
+        //
+        // Actually: GGUF stores Python [31, 1024, 2051] as ne[0]=2051, ne[1]=1024, ne[2]=31.
+        // A 2D slice: ne[0]=2051, ne[1]=1024.
+        // For ggml_mul_mat(a, b): requires a->ne[0] == b->ne[0].
+        // cur has ne[0]=dd_d=1024. Slice has ne[0]=2051. They don't match.
+        // Need to transpose the slice: ne[0]=1024, ne[1]=2051.
+        ggml_tensor* head_w = m.dd_codebooks_head_w;
+        ggml_tensor* logits;
+        if (codebook_idx > 0 && ggml_n_dims(head_w) == 3) {
+            // Extract 2D slice for codebook (codebook_idx-1): shape [ne[0]=2051, ne[1]=1024]
+            int64_t slice_offset = (int64_t)(codebook_idx - 1) * head_w->nb[2];
+            ggml_tensor* head_slice = ggml_view_2d(ctx0, head_w,
+                head_w->ne[0], head_w->ne[1], head_w->nb[1], slice_offset);
+            // Transpose to [ne[0]=1024, ne[1]=2051] so mul_mat matches cur's ne[0]=1024
+            head_slice = ggml_transpose(ctx0, head_slice);
+            // Now: mul_mat([1024, 2051], [1024, 1]) -> [2051, 1] = logits
+            logits = ggml_mul_mat(ctx0, head_slice, cur);
+        } else {
+            // Fallback for old behavior
+            logits = ggml_mul_mat(ctx0, head_w, cur);
+        }
         ggml_set_name(logits, "dd_logits");
         ggml_build_forward_expand(gf, logits);
 
@@ -1438,7 +1473,8 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
             // Position 0 can't see position 1
             dd_mask[0 * 2 + 1] = neg_inf;
 
-            ggml_cgraph* dd_gf = build_depth_graph(2);
+            // Prefill with codebook_idx=1 (predicting codebook 1 from position 1), n_past=0
+            ggml_cgraph* dd_gf = build_depth_graph(2, 1, 0);
             ggml_backend_sched_reset(ctx->sched);
             if (!ggml_backend_sched_alloc_graph(ctx->sched, dd_gf)) {
                 fprintf(stderr, "csm_tts: failed to alloc depth prefill graph\n");
@@ -1455,13 +1491,13 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
                 break;
             }
 
-            // Read logits: [(n_cb-1) * avocab] — take first codebook's logits
+            // Read logits: [avocab] — just codebook 1's logits from head[0]
             ggml_tensor* dd_logits_t = ggml_graph_get_tensor(dd_gf, "dd_logits");
-            std::vector<float> dd_logits((n_cb - 1) * avocab);
+            std::vector<float> dd_logits(avocab);
             ggml_backend_tensor_get(dd_logits_t, dd_logits.data(), 0, dd_logits.size() * sizeof(float));
 
-            // Sample codebook-1 token (index 0 in the logits head)
-            int32_t cb1_token = sample_topk(&dd_logits[0], avocab, topk, temperature, ctx->rng_state);
+            // Sample codebook-1 token
+            int32_t cb1_token = sample_topk(dd_logits.data(), avocab, topk, temperature, ctx->rng_state);
             frame_codes[1] = cb1_token;
         }
 
@@ -1473,7 +1509,8 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
             embed_dd_token(frame_codes[cb_idx - 1], dd_step_embed.data());
             int32_t dd_pos = (int32_t)dd_n_past;
 
-            ggml_cgraph* dd_gf = build_depth_graph(1);
+            // Pass codebook_idx so the graph uses the correct per-codebook head
+            ggml_cgraph* dd_gf = build_depth_graph(1, cb_idx, dd_n_past);
             ggml_backend_sched_reset(ctx->sched);
             if (!ggml_backend_sched_alloc_graph(ctx->sched, dd_gf)) {
                 fprintf(stderr, "csm_tts: failed to alloc depth step graph (cb=%d)\n", cb_idx);
@@ -1487,14 +1524,12 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
                 break;
             }
 
-            // Read logits — the head gives [(n_cb-1)*avocab] stacked
-            // Codebook cb_idx corresponds to index (cb_idx-1) in the head
+            // Read logits — just [avocab] for this specific codebook
             ggml_tensor* dd_logits_t = ggml_graph_get_tensor(dd_gf, "dd_logits");
-            std::vector<float> dd_logits((n_cb - 1) * avocab);
+            std::vector<float> dd_logits(avocab);
             ggml_backend_tensor_get(dd_logits_t, dd_logits.data(), 0, dd_logits.size() * sizeof(float));
 
-            int32_t cb_token =
-                sample_topk(&dd_logits[(size_t)(cb_idx - 1) * avocab], avocab, topk, temperature, ctx->rng_state);
+            int32_t cb_token = sample_topk(dd_logits.data(), avocab, topk, temperature, ctx->rng_state);
             frame_codes[cb_idx] = cb_token;
             dd_n_past++;
         }
