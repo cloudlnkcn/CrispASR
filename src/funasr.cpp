@@ -236,11 +236,6 @@ struct funasr_context {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
-    // Separate single-backend sched for the LLM decoder. On CUDA the
-    // dual-backend [CUDA,CPU] sched produces all-NaN prefill logits
-    // (issue #125); a GPU-only sched avoids the cross-backend split.
-    // On CPU-only builds, llm_sched == sched (no separate instance).
-    ggml_backend_sched_t llm_sched = nullptr;
 
     std::vector<uint8_t> compute_meta;
 
@@ -1065,14 +1060,21 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
         ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
         cur = ggml_add(ctx0, residual, mlp);
 
-        // LLM layer snap for FUNASR_DUMP_STAGES — every layer so the
-        // post-compute dump can binary-search for the first NaN.
+        // LLM layer snap — gated on FUNASR_DUMP_STAGES to avoid bloating
+        // the graph in production (28 extra dup nodes).
         {
-            char nm[32];
-            std::snprintf(nm, sizeof(nm), "llm_layer_%u", il);
-            ggml_tensor* s = ggml_dup(ctx0, cur);
-            ggml_set_name(s, nm);
-            ggml_build_forward_expand(gf, s);
+            static int dump_flag = -1;
+            if (dump_flag < 0) {
+                const char* e = std::getenv("FUNASR_DUMP_STAGES");
+                dump_flag = (e && *e && *e != '0') ? 1 : 0;
+            }
+            if (dump_flag) {
+                char nm[32];
+                std::snprintf(nm, sizeof(nm), "llm_layer_%u", il);
+                ggml_tensor* s = ggml_dup(ctx0, cur);
+                ggml_set_name(s, nm);
+                ggml_build_forward_expand(gf, s);
+            }
         }
     }
 
@@ -1081,9 +1083,16 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
 
     // Snap the pre-lm_head hidden state for the dump.
     {
-        ggml_tensor* s = ggml_dup(ctx0, cur);
-        ggml_set_name(s, "llm_pre_lmhead");
-        ggml_build_forward_expand(gf, s);
+        static int dump_flag = -1;
+        if (dump_flag < 0) {
+            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            dump_flag = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (dump_flag) {
+            ggml_tensor* s = ggml_dup(ctx0, cur);
+            ggml_set_name(s, "llm_pre_lmhead");
+            ggml_build_forward_expand(gf, s);
+        }
     }
 
     // Last-token-only lm_head — decode loop only needs next-token logits.
@@ -1326,8 +1335,8 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
     }
 
     ggml_cgraph* gf = funasr_build_graph_llm_kv(ctx, n_past, n_tokens);
-    ggml_backend_sched_reset(ctx->llm_sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->llm_sched, gf)) {
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         std::fprintf(stderr, "funasr: failed to alloc llm graph\n");
         return {};
     }
@@ -1339,7 +1348,7 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
         ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
-    if (ggml_backend_sched_graph_compute(ctx->llm_sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "funasr: llm graph compute failed\n");
         return {};
     }
@@ -1436,14 +1445,14 @@ static std::vector<float> funasr_embed_tokens(funasr_context* ctx, const std::ve
     const int n = (int)ids.size();
     const int d = (int)ctx->model.hparams.llm_d_model;
     ggml_cgraph* gf = funasr_build_graph_embed(ctx, n);
-    ggml_backend_sched_reset(ctx->llm_sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->llm_sched, gf)) {
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         std::fprintf(stderr, "funasr: failed to alloc embed graph\n");
         return {};
     }
     ggml_tensor* ids_in = ggml_graph_get_tensor(gf, "input_ids");
     ggml_backend_tensor_set(ids_in, ids.data(), 0, (size_t)n * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(ctx->llm_sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "funasr: embed graph compute failed\n");
         return {};
     }
@@ -1771,20 +1780,11 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
         backends[n_be++] = ctx->backend;
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
-        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
-
-        // Separate GPU-only sched for the LLM decoder. On CUDA the
-        // dual-backend sched produces all-NaN prefill logits (issue #125,
-        // confirmed on P100 sm_60 + Blackwell sm_120). A single-backend
-        // sched forces every LLM op onto the GPU, matching the
-        // cached-step path which uses ggml_backend_graph_compute(backend)
-        // directly. On CPU-only builds llm_sched == sched.
-        if (!ggml_backend_is_cpu(ctx->backend)) {
-            ggml_backend_t llm_be[1] = {ctx->backend};
-            ctx->llm_sched = ggml_backend_sched_new(llm_be, nullptr, 1, 16384, false, false);
-        } else {
-            ctx->llm_sched = ctx->sched;
-        }
+        // parallel=true tells the sched to pipeline ops across backends
+        // rather than serialising them. On CUDA this avoids the
+        // cross-backend op splitting that produces all-NaN prefill logits
+        // in the Qwen2-0.6B LLM decoder (issue #125).
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, /*parallel*/ true, false);
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -1822,8 +1822,6 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
 extern "C" void funasr_free(funasr_context* ctx) {
     if (!ctx)
         return;
-    if (ctx->llm_sched && ctx->llm_sched != ctx->sched)
-        ggml_backend_sched_free(ctx->llm_sched);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->step_galloc)
