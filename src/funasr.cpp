@@ -1251,7 +1251,13 @@ static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
     ggml_set_name(ctx->kv_v, "kv_v");
     const size_t kbytes = ggml_nbytes(ctx->kv_k);
     const size_t vbytes = ggml_nbytes(ctx->kv_v);
-    ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
+    // When LLM weights were split to CPU (buf_cpu != nullptr, issue #125
+    // workaround), the KV cache must also live on CPU so the sched routes
+    // the entire LLM decoder to CPU. Otherwise KV-on-GPU + weights-on-CPU
+    // confuses the sched → Inf at layer 2 → all-NaN by layer 3.
+    ggml_backend_t kv_backend = (ctx->model.buf_cpu)
+                                    ? ctx->backend_cpu
+                                    : core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
     ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
     if (!ctx->kv_buf) {
         std::fprintf(stderr, "funasr: failed to allocate kv buffer\n");
