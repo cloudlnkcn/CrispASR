@@ -1036,6 +1036,20 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# csm-tts — sesame/csm-1b (1B Llama backbone + depth decoder + Mimi codec)
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csm_tts.cpp")
+    add_library(csm-tts STATIC csm_tts.h csm_tts.cpp)
+    set_target_properties(csm-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(csm-tts PUBLIC .)
+    target_compile_features   (csm-tts PUBLIC cxx_std_17)
+    target_link_libraries     (csm-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+    if(NOT MSVC)
+        target_compile_options(csm-tts PRIVATE -O3)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # pocket-tts — kyutai/pocket-tts (100M continuous-latent AR TTS, 24 kHz)
 # ---------------------------------------------------------------------------
 add_library(pocket-tts STATIC pocket_tts.h pocket_tts.cpp)

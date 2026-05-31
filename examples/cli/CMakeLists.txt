@@ -32,6 +32,7 @@ add_executable(${TARGET}
     crispasr_backend_indextts.cpp
     crispasr_backend_f5_tts.cpp
     crispasr_backend_pocket_tts.cpp
+    crispasr_backend_csm.cpp
     crispasr_backend_parler.cpp
     crispasr_backend_fastpitch.cpp
     crispasr_backend_bark.cpp
@@ -265,6 +266,7 @@ target_link_libraries(${TARGET} PRIVATE
     bark-tts
     dia-tts
     pocket-tts
+    csm-tts
     voxcpm2_tts
     m2m100
     t5_translate

@@ -684,7 +684,7 @@ static bool init_dd_kv_cache(csm_tts_context* ctx) {
 
 static std::vector<int32_t> tokenize_text(const csm_model& m, const std::string& text) {
     // Use the core BPE tokenizer with the model's vocab and merges.
-    return core_bpe::encode(text, m.token_to_id, m.merge_rank);
+    return core_bpe::tokenize_simple(m.token_to_id, m.merge_rank, text);
 }
 
 // ===================================================================
@@ -1339,27 +1339,14 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
             ggml_tensor* head_slice = ggml_view_2d(ctx0, head_w,
                 head_w->ne[0], head_w->ne[1], head_w->nb[1], slice_offset);
             // Transpose to [ne[0]=1024, ne[1]=2051] so mul_mat matches cur's ne[0]=1024
-            head_slice = ggml_transpose(ctx0, head_slice);
+            // ggml_mul_mat requires non-transposed a, so cont after transpose
+            head_slice = ggml_cont(ctx0, ggml_transpose(ctx0, head_slice));
             // Now: mul_mat([1024, 2051], [1024, 1]) -> [2051, 1] = logits
             logits = ggml_mul_mat(ctx0, head_slice, cur);
         } else {
             // Fallback for old behavior
             logits = ggml_mul_mat(ctx0, head_w, cur);
         }
-        // Project through codebooks head.
-        // Weight is stored as 3D [audio_vocab_size, dd_d_model, n_cb-1] in GGUF.
-        // Need to permute to [dd_d_model, audio_vocab_size*(n_cb-1)] for mul_mat.
-        ggml_tensor* head_w = m.dd_codebooks_head_w;
-        if (ggml_n_dims(head_w) == 3) {
-            // Permute dims 0,1 -> [dd_d_model, audio_vocab_size, n_cb-1]
-            head_w = ggml_permute(ctx0, head_w, 1, 0, 2, 3);
-            head_w = ggml_cont(ctx0, head_w);
-            // Reshape to 2D: [dd_d_model, audio_vocab_size * (n_cb-1)]
-            head_w = ggml_reshape_2d(ctx0, head_w, (int64_t)hp.dd_d_model,
-                                     (int64_t)hp.audio_vocab_size * ((int64_t)hp.audio_num_codebooks - 1));
-        }
-        ggml_tensor* logits = ggml_mul_mat(ctx0, head_w, cur);
->>>>>>> b6773bb7 (fix(csm): three crashes in CSM-TTS runtime — F16 tensor reads, 3D head shape, SEANet cont)
         ggml_set_name(logits, "dd_logits");
         ggml_build_forward_expand(gf, logits);
 
@@ -1488,13 +1475,9 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
         // Sample codebook-0 token
         int32_t cb0_token = sample_topk(bb_logits.data(), avocab, topk, temperature, ctx->rng_state);
 
-        // Check EOS: if codebook-0 is the EOS token, stop generation
-        if (cb0_token == (int32_t)hp.codebook_eos_token_id) {
-            if (ctx->params.verbosity >= 2) {
-                fprintf(stderr, "csm_tts: backbone EOS at frame %d\n", frame_idx);
-            }
-            break;
-        }
+        // NOTE: EOS is checked AFTER generating all codebooks for the frame.
+        // Python CSM stops when ALL codebooks are codebook_eos_token_id, not just cb0.
+        // We check after the depth decoder fills all 32 codebooks.
 
         // --- Depth decoder: fill codebooks 1..31 ---
         std::vector<int32_t> frame_codes(n_cb);
@@ -1583,6 +1566,22 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
             int32_t cb_token = sample_topk(dd_logits.data(), avocab, topk, temperature, ctx->rng_state);
             frame_codes[cb_idx] = cb_token;
             dd_n_past++;
+        }
+
+        // Check EOS: stop if ALL codebooks (except last) are codebook_eos_token_id.
+        // Python: input_ids[:, -1, :-1] == config.codebook_eos_token_id → all(-1)
+        bool all_eos = true;
+        for (int q = 0; q < n_cb - 1; q++) {
+            if (frame_codes[q] != (int32_t)hp.codebook_eos_token_id) {
+                all_eos = false;
+                break;
+            }
+        }
+        if (all_eos) {
+            if (ctx->params.verbosity >= 1) {
+                fprintf(stderr, "csm_tts: all-codebook EOS at frame %d\n", frame_idx);
+            }
+            break;
         }
 
         all_codes.push_back(frame_codes);
