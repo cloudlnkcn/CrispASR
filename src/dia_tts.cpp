@@ -552,7 +552,7 @@ static ggml_tensor* build_dia_encoder(ggml_context* ctx, dia_model& m,
                                       ggml_tensor* positions,  // (max_enc_ctx,) I32
                                       ggml_tensor* attn_mask   // (max_enc_ctx, max_enc_ctx) F32
 ) {
-    const int B = 2; // conditional + unconditional
+    const int B = 2;                            // conditional + unconditional
     const int T = (int)(inp_tokens->ne[0] / B); // actual sequence length
 
     // Embedding lookup: (enc_hidden, T, B)
@@ -1223,10 +1223,9 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     }
 
     uint32_t max_gen = (p.max_tokens > (int)m.max_delay) ? (uint32_t)p.max_tokens : m.max_generation_size;
-    // TEMP: limit for CPU testing until DAC codec is available
-    // Full 3072 steps = ~17 hours on this CPU; use 50 for a quick test
-    if (max_gen > 50)
-        max_gen = 50;
+    // TEMP: limit for CPU testing (full 3072 steps impractical on this CPU)
+    if (max_gen > 100)
+        max_gen = 100;
 
     // ===================================================================
     // 1. Run encoder (batch=2: conditional + unconditional)
@@ -1330,12 +1329,12 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         // Print first few values of conditional encoder output for diff-testing
         // Conditional = batch index 1, offset = enc_hidden * T_enc * 1
         size_t cond_offset = (size_t)enc_hidden * T_enc;
-        fprintf(stderr, "dia_tts: enc cond pos0 first 4: %.6f %.6f %.6f %.6f\n",
-                encoder_output[cond_offset+0], encoder_output[cond_offset+1],
-                encoder_output[cond_offset+2], encoder_output[cond_offset+3]);
+        fprintf(stderr, "dia_tts: enc cond pos0 first 4: %.6f %.6f %.6f %.6f\n", encoder_output[cond_offset + 0],
+                encoder_output[cond_offset + 1], encoder_output[cond_offset + 2], encoder_output[cond_offset + 3]);
         // Compute norm of first position
         float norm0 = 0;
-        for (int d = 0; d < enc_hidden; d++) norm0 += encoder_output[cond_offset+d]*encoder_output[cond_offset+d];
+        for (int d = 0; d < enc_hidden; d++)
+            norm0 += encoder_output[cond_offset + d] * encoder_output[cond_offset + d];
         fprintf(stderr, "dia_tts: enc cond pos0 norm: %.4f (ref: 2.2434)\n", sqrtf(norm0));
     }
 
