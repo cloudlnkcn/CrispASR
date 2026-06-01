@@ -653,6 +653,12 @@ static std::vector<int32_t> text_to_phoneme_ids(const char* text) {
     return ids;
 }
 
+// MSVC uses _popen/_pclose instead of popen/pclose.
+#ifdef _WIN32
+#define popen _popen
+#define pclose _pclose
+#endif
+
 // Run espeak-ng via popen to get IPA phonemes for the given text.
 // Returns the IPA string, or empty string on failure.
 static std::string phonemize_espeak(const std::string& lang, const std::string& text) {
@@ -665,7 +671,11 @@ static std::string phonemize_espeak(const std::string& lang, const std::string& 
         else
             escaped += c;
     }
+#ifdef _WIN32
+    std::string cmd = "espeak-ng -q --ipa=3 -v " + lang + " \"" + escaped + "\" 2>NUL";
+#else
     std::string cmd = "espeak-ng -q --ipa=3 -v " + lang + " '" + escaped + "' 2>/dev/null";
+#endif
     FILE* fp = popen(cmd.c_str(), "r");
     if (!fp)
         return "";
