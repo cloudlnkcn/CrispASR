@@ -1895,6 +1895,20 @@ LSTM (~10 KB state per beam). Canary and cohere have 8-layer
 transformer decoders with full KV snapshot/restore, so the cost
 scales with decoder depth × sequence length × beam width.
 
+### Translation beam search (m2m100 + madlad/t5, 2026-06-02)
+
+**m2m100-418m Q8_0 — en→de (CPU-only VPS)**
+
+| sentence | beam=1 user | beam=4 user | output |
+|---|---|---|---|
+| "Hello world, how are you today?" | 6 s | 21 s (3.4×) | "Hallo Welt, wie bist du heute?" |
+| "The president said he would not attend…" | 7 s | 45 s (6.4×) | "Der Präsident sagte, er würde wegen der Wetterbedingungen nicht an der Sitzung teilnehmen." |
+
+Translation beam is expensive: the decoder-only replay cost is
+O(beam × T²) where T is the output length, and for translation the
+decoder does more work per token than for ASR. Identical output on
+these clean inputs; benefit is on ambiguous source text.
+
 ## Multi-backend long-form comparison — 2026-05-26 (PLAN #114 P3 closeout)
 
 Live runs on M1 Metal with the post-PLAN-#114-P3 binaries. Inputs from
