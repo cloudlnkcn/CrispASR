@@ -119,6 +119,10 @@
 #include "dia_tts.h"
 #define CA_HAVE_DIA 1
 #endif
+#if __has_include("fastpitch_tts.h")
+#include "fastpitch_tts.h"
+#define CA_HAVE_FASTPITCH 1
+#endif
 #if __has_include("voxcpm2_tts.h")
 #include "voxcpm2_tts.h"
 #define CA_HAVE_VOXCPM2 1
@@ -1305,6 +1309,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_DIA
     dia_tts_context* dia_tts_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_FASTPITCH
+    fastpitch_tts_context* fastpitch_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_VOXCPM2
     voxcpm2_context* voxcpm2_ctx = nullptr;
     std::vector<float> voxcpm2_ref_pcm; // 16 kHz mono cloning reference
@@ -1962,6 +1969,20 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_FASTPITCH
+    if (s->backend == "fastpitch" || s->backend == "fastpitch-tts" || s->backend == "fastpitch_tts") {
+        s->backend = "fastpitch";
+        fastpitch_tts_params p = fastpitch_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        s->fastpitch_ctx = fastpitch_tts_init_from_file(model_path, p);
+        if (!s->fastpitch_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->backend == "voxcpm2-tts" || s->backend == "voxcpm2" || s->backend == "voxcpm2_tts") {
         s->backend = "voxcpm2-tts";
@@ -2366,6 +2387,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_DIA
     list += ",dia";
+#endif
+#ifdef CA_HAVE_FASTPITCH
+    list += ",fastpitch";
 #endif
 #ifdef CA_HAVE_VOXCPM2
     list += ",voxcpm2-tts";
@@ -4928,6 +4952,19 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         return dia_tts_synthesize(s->dia_tts_ctx, text, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_FASTPITCH
+    if (s->fastpitch_ctx) {
+        // FastPitch emits 22050 Hz mono float; deterministic (no sampling).
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = fastpitch_tts_synthesize(s->fastpitch_ctx, text, &pcm, &sr);
+        if (n <= 0 || !pcm)
+            return nullptr;
+        if (out_n_samples)
+            *out_n_samples = n;
+        return pcm;
+    }
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx) {
         // VoxCPM2 synthesises at 48 kHz mono; every other CrispASR TTS
@@ -5269,6 +5306,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_DIA
     if (s->dia_tts_ctx)
         dia_tts_free(s->dia_tts_ctx);
+#endif
+#ifdef CA_HAVE_FASTPITCH
+    if (s->fastpitch_ctx)
+        fastpitch_tts_free(s->fastpitch_ctx);
 #endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx)
