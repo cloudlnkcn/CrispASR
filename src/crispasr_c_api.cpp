@@ -115,6 +115,10 @@
 #include "csm_tts.h"
 #define CA_HAVE_CSM 1
 #endif
+#if __has_include("dia_tts.h")
+#include "dia_tts.h"
+#define CA_HAVE_DIA 1
+#endif
 #if __has_include("voxcpm2_tts.h")
 #include "voxcpm2_tts.h"
 #define CA_HAVE_VOXCPM2 1
@@ -1298,6 +1302,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_CSM
     csm_tts_context* csm_tts_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_DIA
+    dia_tts_context* dia_tts_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_VOXCPM2
     voxcpm2_context* voxcpm2_ctx = nullptr;
     std::vector<float> voxcpm2_ref_pcm; // 16 kHz mono cloning reference
@@ -1923,6 +1930,38 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_DIA
+    if (s->backend == "dia" || s->backend == "dia-tts" || s->backend == "dia-1.6b" || s->backend == "dia_tts") {
+        s->backend = "dia";
+        dia_tts_context_params p = dia_tts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->dia_tts_ctx = dia_tts_init_from_file(model_path, p);
+        if (!s->dia_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Resolve the DAC codec — the common case is the codec GGUF sitting next
+        // to the model. (The CLI additionally resolves the registry companion;
+        // callers wanting a custom codec can extend with a set_codec_path ABI.)
+        {
+            std::string mp = model_path ? model_path : "";
+            auto sep = mp.find_last_of("/\\");
+            std::string dir = (sep == std::string::npos) ? std::string(".") : mp.substr(0, sep);
+            for (const char* name : {"dac-44khz.gguf", "dac_44khz.gguf", "dia-dac-44khz.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    dia_tts_set_codec_path(s->dia_tts_ctx, cp.c_str());
+                    break;
+                }
+            }
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->backend == "voxcpm2-tts" || s->backend == "voxcpm2" || s->backend == "voxcpm2_tts") {
         s->backend = "voxcpm2-tts";
@@ -2324,6 +2363,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_CSM
     list += ",csm";
+#endif
+#ifdef CA_HAVE_DIA
+    list += ",dia";
 #endif
 #ifdef CA_HAVE_VOXCPM2
     list += ",voxcpm2-tts";
@@ -4872,6 +4914,13 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         return csm_tts_synthesize(s->csm_tts_ctx, text, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_DIA
+    if (s->dia_tts_ctx) {
+        // Dia emits 44.1 kHz mono float (DAC codec); PCM is malloc'd and freed
+        // via crispasr_pcm_free, same as the other TTS backends.
+        return dia_tts_synthesize(s->dia_tts_ctx, text, out_n_samples);
+    }
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx) {
         // VoxCPM2 synthesises at 48 kHz mono; every other CrispASR TTS
@@ -5205,6 +5254,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->csm_tts_ctx)
         csm_tts_free(s->csm_tts_ctx);
 #endif
+#ifdef CA_HAVE_DIA
+    if (s->dia_tts_ctx)
+        dia_tts_free(s->dia_tts_ctx);
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx)
         voxcpm2_free(s->voxcpm2_ctx);
@@ -5462,6 +5515,13 @@ CA_EXPORT int crispasr_session_set_temperature(crispasr_session* s, float temper
         touched++;
     }
 #endif
+#ifdef CA_HAVE_DIA
+    if (s->dia_tts_ctx) {
+        dia_tts_set_temperature(s->dia_tts_ctx, temperature);
+        dia_tts_set_seed(s->dia_tts_ctx, seed);
+        touched++;
+    }
+#endif
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx) {
         // qwen3-tts's code-predictor sampler reads cparams.temperature
@@ -5491,6 +5551,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
 #ifdef CA_HAVE_CSM
     if (s->csm_tts_ctx) {
         csm_tts_set_seed(s->csm_tts_ctx, seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_DIA
+    if (s->dia_tts_ctx) {
+        dia_tts_set_seed(s->dia_tts_ctx, seed);
         touched++;
     }
 #endif
