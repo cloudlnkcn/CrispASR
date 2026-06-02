@@ -203,6 +203,15 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // Keep embeddings, norms, and DAC codec at original precision.
     const bool is_dia = (arch.find("dia") != std::string::npos);
 
+    // Bark TTS: 3 GPT-2 sub-models + EnCodec decoder.
+    // Embeddings (token_embd, pos_embd), output heads, and the entire
+    // EnCodec decoder are read via CPU tensor_get_row_f32 / tensor_get_all_f32
+    // and are precision-sensitive. Only attn/ffn projection weights
+    // (attn_qkv, attn_output, ffn_up, ffn_down) should be quantized.
+    // Verified: Q4_K of all tensors produces near-zero audio (peak 0.001);
+    // Q8_0 works fine; selective Q4_K (projections only) is safe.
+    const bool is_bark = (arch.find("bark") != std::string::npos);
+
     const int n_tensors = gguf_get_n_tensors(ctx_in);
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(ctx_in, i);
@@ -255,10 +264,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                          (sname.size() >= 2 && sname.substr(sname.size() - 2) == ".w") ||
                          // Dia TTS: tensor names use _proj / gate / up / wo / heads suffixes
                          // without "weight" (e.g. dia.encoder.layers.0.q_proj, dia.decoder.heads.0)
-                         (sname.find("_proj") != std::string::npos) ||
-                         (sname.find(".gate") != std::string::npos) ||
-                         (sname.find(".up") != std::string::npos) ||
-                         (sname.find(".wo") != std::string::npos) ||
+                         (sname.find("_proj") != std::string::npos) || (sname.find(".gate") != std::string::npos) ||
+                         (sname.find(".up") != std::string::npos) || (sname.find(".wo") != std::string::npos) ||
                          (sname.find(".heads.") != std::string::npos);
         // FireRedASR/LID: pw1/pw2 convs are stored as 3D [1,in,out] but are
         // effectively 2D matmuls — safe to quantize. Other architectures'
@@ -314,8 +321,16 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(is_parler && sname.find("dac.") == 0) &&
             // Dia TTS: skip embeddings (codebook lookups, precision-sensitive)
             // and DAC codec tensors (audio_encoder.* / dac.* if embedded)
-            !(is_dia && (sname.find("embedding") != std::string::npos ||
-                         sname.find("audio_encoder") == 0)) &&
+            !(is_dia && (sname.find("embedding") != std::string::npos || sname.find("audio_encoder") == 0)) &&
+            // Bark TTS: skip embeddings, lm_head outputs, and EnCodec decoder.
+            // Only quantize attn/ffn projections (attn_qkv, attn_output,
+            // ffn_up, ffn_down weights inside blk.* layers).
+            // "output" matches lm_heads (text.output.weight, fine.output.0.weight)
+            // and output_norm but NOT attn_output (which is safe to quantize).
+            !(is_bark &&
+              (sname.find("token_embd") != std::string::npos || sname.find("pos_embd") != std::string::npos ||
+               (sname.find("output") != std::string::npos && sname.find("attn_output") == std::string::npos) ||
+               sname.find("encodec.") == 0)) &&
             // Skip OmniASR-CTC encoder layers in head/tail bands.
             // Names look like "enc.<idx>.attn.*" / "enc.<idx>.ffn.*";
             // skip if idx in [0, head_cutoff) ∪ [tail_cutoff, n_enc).
@@ -468,8 +483,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // may have changed tensor type fields, altering the serialized metadata size.
     const size_t meta_size_final = gguf_get_meta_size(ctx_out);
     if (meta_size_final != meta_size) {
-        fprintf(stderr, "warning: metadata size changed %zu -> %zu during quantization, "
-                        "output may be corrupt\n", meta_size, meta_size_final);
+        fprintf(stderr,
+                "warning: metadata size changed %zu -> %zu during quantization, "
+                "output may be corrupt\n",
+                meta_size, meta_size_final);
     }
     meta_data.resize(meta_size_final, 0);
     rewind(fout);
