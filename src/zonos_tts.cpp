@@ -1391,21 +1391,50 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         return nullptr;
     }
 
-    // Step 3: Full dual-KV CFG prefill.
-    // Run uncond prefix → uncond KV cache. Run cond prefix → cond KV cache.
-    // During AR decode, each step runs the backbone TWICE (once per KV cache)
-    // and blends: logits = uncond + cfg_scale * (cond - uncond).
+    // Step 3: Append initial mask frame to each prefix.
+    // Python: _prefill(conditioning, delayed_prefix_audio_codes) where
+    // delayed_prefix_audio_codes[..., 0] = [mask_id]*9 for all codebooks.
+    // embed_codes sums all 9 codebook embeddings at mask_id → 1 frame of (d_model,).
+    // The backbone sees [conditioning (14 tokens), mask_frame (1 token)] = 15 tokens.
+    // Without this, the model predicts EOS immediately.
+    {
+        std::vector<float> mask_frame_embed(d, 0.0f);
+        std::vector<float> row(d);
+        for (uint32_t k = 0; k < hp.n_codebooks; k++) {
+            tensor_get_row_f32(ctx->emb_w[k], (int)hp.masked_token_id, row.data(), d);
+            for (int i = 0; i < d; i++)
+                mask_frame_embed[i] += row[i];
+        }
+
+        // Extend cond_prefix: append mask frame
+        float* cond_ext = (float*)malloc((size_t)(cond_len + 1) * d * sizeof(float));
+        std::memcpy(cond_ext, cond_prefix, (size_t)cond_len * d * sizeof(float));
+        std::memcpy(&cond_ext[(size_t)cond_len * d], mask_frame_embed.data(), (size_t)d * sizeof(float));
+        free(cond_prefix);
+        cond_prefix = cond_ext;
+        cond_len++;
+
+        // Extend uncond_prefix: append same mask frame
+        if (uncond_prefix) {
+            float* uncond_ext = (float*)malloc((size_t)(uncond_len + 1) * d * sizeof(float));
+            std::memcpy(uncond_ext, uncond_prefix, (size_t)uncond_len * d * sizeof(float));
+            std::memcpy(&uncond_ext[(size_t)uncond_len * d], mask_frame_embed.data(), (size_t)d * sizeof(float));
+            free(uncond_prefix);
+            uncond_prefix = uncond_ext;
+            uncond_len++;
+        }
+    }
+
+    // Step 4: Full dual-KV CFG prefill.
     float* logits_cond = nullptr;
     float* logits_uncond = nullptr;
     int n_past = cond_len;
     int n_past_uncond = uncond_len;
     bool use_cfg = (cfg_scale != 1.0f);
 
-    // Clear both KV caches
     ggml_backend_buffer_clear(ctx->kv_buf, 0);
 
     if (use_cfg && uncond_prefix) {
-        // Prefill uncond path into uncond KV cache
         logits_uncond = run_backbone(ctx, uncond_prefix, uncond_len, 0, ctx->kv_k_uncond, ctx->kv_v_uncond);
         if (!logits_uncond) {
             fprintf(stderr, "zonos_tts: prefill (uncond) failed, disabling CFG\n");
@@ -1413,7 +1442,6 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         }
     }
 
-    // Prefill cond path into cond KV cache (primary)
     logits_cond = run_backbone(ctx, cond_prefix, cond_len, 0, ctx->kv_k, ctx->kv_v);
     free(cond_prefix);
     free(uncond_prefix);
@@ -1431,8 +1459,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         for (int i = 1; i < vocab; i++)
             if (logits_cond[i] > logits_cond[best])
                 best = i;
-        fprintf(stderr,
-                "zonos_tts: DIFF cond prefill cb0 argmax=%d (%.2f) first5=[%.2f,%.2f,%.2f,%.2f,%.2f]\n", best,
+        fprintf(stderr, "zonos_tts: DIFF cond prefill cb0 argmax=%d (%.2f) first5=[%.2f,%.2f,%.2f,%.2f,%.2f]\n", best,
                 logits_cond[best], logits_cond[0], logits_cond[1], logits_cond[2], logits_cond[3], logits_cond[4]);
         if (logits_uncond) {
             int best_u = 0;
