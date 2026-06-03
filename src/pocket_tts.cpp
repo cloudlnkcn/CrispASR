@@ -1238,7 +1238,511 @@ static bool check_eos(pocket_tts_context* pctx, const float* backbone_out) {
     return logit > pctx->params.eos_threshold;
 }
 
-// ── Mimi VAE decoder ──────────────────────────────────────────────
+// ── Mimi VAE decoder (ggml graph version) ─────────────────────────
+
+// Helper: causal conv1d with left-only padding.
+// Input x: (T, Cin), weight w: ggml (K, Cin, Cout), bias b: (Cout,) or nullptr.
+// Returns (T_out, Cout) — same T for stride=1 due to causal padding.
+static ggml_tensor* pocket_conv1d_causal(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride,
+                                         int dilation = 1) {
+    int K = (int)w->ne[0];
+    int eff_K = (K - 1) * dilation + 1;
+    int pad_left = eff_K - stride;
+    if (pad_left > 0) {
+        x = ggml_pad_ext(ctx, x, pad_left, 0, 0, 0, 0, 0, 0, 0);
+        x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
+    }
+    ggml_tensor* out = ggml_conv_1d(ctx, w, x, stride, 0, dilation);
+    out = ggml_reshape_2d(ctx, out, out->ne[0], out->ne[1]);
+    if (b) {
+        ggml_tensor* bb = ggml_reshape_2d(ctx, b, 1, ggml_nelements(b));
+        out = ggml_add(ctx, out, bb);
+    }
+    return out;
+}
+
+// Helper: causal ConvTranspose1d — full conv then trim right to T_in * stride.
+// Input x: (T, Cin), weight w: ggml (K, Cout, Cin), bias b: (Cout,) or nullptr.
+// Returns (T_in * stride, Cout).
+static ggml_tensor* pocket_convtr1d_causal(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b,
+                                           int stride) {
+    int T_in = (int)x->ne[0];
+    int Cout = (int)w->ne[1];
+    ggml_tensor* out = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
+    int T_full = (int)out->ne[0];
+    int T_want = T_in * stride;
+    if (T_full > T_want) {
+        // Trim from the right — keep first T_want samples
+        out = ggml_view_2d(ctx, out, T_want, Cout, out->nb[1], 0);
+        out = ggml_cont(ctx, out);
+    }
+    out = ggml_reshape_2d(ctx, out, out->ne[0], out->ne[1]);
+    if (b) {
+        ggml_tensor* bb = ggml_reshape_2d(ctx, b, 1, ggml_nelements(b));
+        out = ggml_add(ctx, out, bb);
+    }
+    return out;
+}
+
+// Build Mimi decoder transformer graph: 2 layers, pre-norm LN, causal attention
+// with limited context window, LayerScale, GELU FFN, RoPE.
+// Input x: (T, D) = (T, 512). Returns (T, D).
+static ggml_tensor* build_pocket_mimi_xfmr(ggml_context* ctx, const pocket_tts_model& m, ggml_tensor* x,
+                                            ggml_tensor* positions, ggml_tensor* causal_mask) {
+    const auto& mi = m.mimi_hp;
+    int D = (int)mi.xfmr_d_model;
+    int NH = (int)mi.xfmr_num_heads;
+    int HD = D / NH;
+    int FF = (int)mi.xfmr_dim_feedforward;
+    int T = (int)x->ne[0]; // time axis is ne[0] in (T, D) layout
+    // Note: ggml_norm/ggml_mul_mat operate on ne[0], which is the feature dim.
+    // We need x in (D, T) layout for matmul, but (T, D) for conv.
+    // Actually, ggml_mul_mat(W, x) where W is (out, in) and x is (in, T) gives (out, T).
+    // So x should be (D, T) for matmul. Let's transpose.
+
+    // Work in (D, T) layout for matmul operations
+    x = ggml_cont(ctx, ggml_transpose(ctx, x)); // (D, T)
+
+    // Apply input projection if present
+    if (m.dec_xfmr_input_proj) {
+        x = ggml_mul_mat(ctx, m.dec_xfmr_input_proj, x); // (D, T)
+    }
+
+    for (int l = 0; l < (int)mi.xfmr_num_layers; l++) {
+        const auto& L = m.dec_transformer_layers[l];
+        ggml_tensor* residual = x;
+
+        // Pre-norm LayerNorm
+        ggml_tensor* h = ggml_norm(ctx, x, 1e-5f);
+        if (L.attn_norm_w)
+            h = ggml_mul(ctx, h, L.attn_norm_w);
+        if (L.attn_norm_b)
+            h = ggml_add(ctx, h, L.attn_norm_b);
+
+        // Fused QKV projection: (3*D, D) @ (D, T) -> (3*D, T)
+        ggml_tensor* qkv = ggml_mul_mat(ctx, L.attn_in_proj, h);
+
+        // Split Q, K, V: each (D, T)
+        ggml_tensor* Q = ggml_view_2d(ctx, qkv, D, T, qkv->nb[1], 0);
+        ggml_tensor* K_t = ggml_view_2d(ctx, qkv, D, T, qkv->nb[1], (size_t)D * ggml_type_size(qkv->type));
+        ggml_tensor* V = ggml_view_2d(ctx, qkv, D, T, qkv->nb[1], (size_t)2 * D * ggml_type_size(qkv->type));
+
+        // Reshape to (HD, NH, T) for RoPE
+        Q = ggml_reshape_3d(ctx, ggml_cont(ctx, Q), HD, NH, T);
+        K_t = ggml_reshape_3d(ctx, ggml_cont(ctx, K_t), HD, NH, T);
+        V = ggml_reshape_3d(ctx, ggml_cont(ctx, V), HD, NH, T);
+
+        // RoPE (Mimi decoder uses theta=10000)
+        Q = ggml_rope_ext(ctx, Q, positions, nullptr, HD, GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f,
+                          0.0f);
+        K_t = ggml_rope_ext(ctx, K_t, positions, nullptr, HD, GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f, 0.0f, 1.0f,
+                            0.0f, 0.0f);
+
+        // Permute for flash_attn_ext: (HD, NH, T) -> (HD, T, NH)
+        Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
+        K_t = ggml_cont(ctx, ggml_permute(ctx, K_t, 0, 2, 1, 3));
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+
+        // Causal attention with context window mask
+        float scale = 1.0f / sqrtf((float)HD);
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K_t, V, causal_mask, scale, 0.0f, 0.0f);
+
+        // Output: (HD, NH, T) -> (D, T)
+        attn = ggml_reshape_2d(ctx, attn, D, T);
+
+        // Output projection
+        attn = ggml_mul_mat(ctx, L.attn_out_proj, attn);
+
+        // LayerScale
+        if (L.layer_scale_1) {
+            ggml_tensor* ls = ggml_reshape_2d(ctx, L.layer_scale_1, D, 1);
+            attn = ggml_mul(ctx, attn, ls);
+        }
+
+        x = ggml_add(ctx, residual, attn);
+
+        // FFN
+        residual = x;
+        h = ggml_norm(ctx, x, 1e-5f);
+        if (L.ffn_norm_w)
+            h = ggml_mul(ctx, h, L.ffn_norm_w);
+        if (L.ffn_norm_b)
+            h = ggml_add(ctx, h, L.ffn_norm_b);
+
+        h = ggml_mul_mat(ctx, L.ffn_linear1, h); // (FF, T)
+        h = ggml_gelu(ctx, h);
+        h = ggml_mul_mat(ctx, L.ffn_linear2, h); // (D, T)
+
+        if (L.layer_scale_2) {
+            ggml_tensor* ls = ggml_reshape_2d(ctx, L.layer_scale_2, D, 1);
+            h = ggml_mul(ctx, h, ls);
+        }
+
+        x = ggml_add(ctx, residual, h);
+    }
+
+    // Apply output projection if present
+    if (m.dec_xfmr_output_proj) {
+        x = ggml_mul_mat(ctx, m.dec_xfmr_output_proj, x); // (D, T)
+    }
+
+    // Transpose back to (T, D) for conv operations
+    x = ggml_cont(ctx, ggml_transpose(ctx, x));
+
+    return x;
+}
+
+// Build SEANet decoder graph.
+// Input x: (T, Cin) where Cin = outer_dim (512). Returns (T_pcm, 1) flattened.
+static ggml_tensor* build_pocket_seanet_dec(ggml_context* ctx, const pocket_tts_model& m, ggml_tensor* x) {
+    const auto& mi = m.mimi_hp;
+    const auto& sd = m.seanet_dec;
+    const auto& ratios = mi.seanet_ratios;
+
+    // Initial conv: causal, stride=1
+    if (sd.initial_conv_w) {
+        x = pocket_conv1d_causal(ctx, x, sd.initial_conv_w, sd.initial_conv_b, 1);
+    }
+
+    // Stages: ELU -> ConvTranspose (upsample) -> ResBlocks
+    for (size_t s = 0; s < ratios.size(); s++) {
+        int ratio = ratios[s];
+        const auto& stage = sd.stages[s];
+
+        // ELU
+        x = ggml_elu(ctx, x);
+
+        // ConvTranspose1d (upsample by ratio) — causal trim
+        if (stage.convtr_w) {
+            x = pocket_convtr1d_causal(ctx, x, stage.convtr_w, stage.convtr_b, ratio);
+        }
+
+        // Residual blocks
+        int res_K = (int)mi.seanet_residual_kernel_size;
+        for (size_t r = 0; r < stage.resblocks.size(); r++) {
+            const auto& rb = stage.resblocks[r];
+            if (!rb.conv0_w || !rb.conv1_w)
+                continue;
+
+            int dilation = 1;
+            for (size_t d = 0; d < r; d++)
+                dilation *= (int)mi.seanet_dilation_base;
+
+            ggml_tensor* h = ggml_elu(ctx, x);
+
+            // Dilated causal conv (Cin -> Cin/compress)
+            h = pocket_conv1d_causal(ctx, h, rb.conv0_w, rb.conv0_b, 1, dilation);
+
+            // ELU
+            h = ggml_elu(ctx, h);
+
+            // Second conv (Cin/compress -> Cin, kernel from weight)
+            int K1 = (int)rb.conv1_w->ne[0];
+            (void)K1;
+            h = pocket_conv1d_causal(ctx, h, rb.conv1_w, rb.conv1_b, 1);
+
+            // Residual add
+            x = ggml_add(ctx, x, h);
+        }
+    }
+
+    // Final: ELU -> conv (C_cur -> 1)
+    x = ggml_elu(ctx, x);
+    if (sd.final_conv_w) {
+        x = pocket_conv1d_causal(ctx, x, sd.final_conv_w, sd.final_conv_b, 1);
+    }
+
+    // Flatten to 1D: (T_pcm, 1) -> (T_pcm,)
+    x = ggml_reshape_1d(ctx, x, ggml_nelements(x));
+
+    return x;
+}
+
+// Mimi decode using ggml compute graph (replaces manual mimi_decode).
+// CPU-side: denormalize, quantizer projection, depthwise upsample.
+// ggml graph: transformer + SEANet.
+static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, int n_frames, float** pcm_out,
+                             int* n_samples_out) {
+    const auto& m = pctx->model;
+    const auto& mi = m.mimi_hp;
+    const int LD = (int)mi.inner_dim;           // 32
+    const int OD = (int)mi.outer_dim;           // 512
+    const int DS = (int)mi.downsample_stride(); // 16
+
+    if (n_frames <= 0) {
+        *pcm_out = nullptr;
+        *n_samples_out = 0;
+        return;
+    }
+
+    if (!m.quant_proj_w || !m.upsample_conv_w) {
+        if (pctx->verbosity >= 1)
+            fprintf(stderr, "pocket_tts: mimi_decode_ggml: missing tensors\n");
+        *pcm_out = nullptr;
+        *n_samples_out = 0;
+        return;
+    }
+
+    // ── CPU-side: denormalize + quantizer projection + depthwise upsample ──
+
+    // 1. Denormalize latents: x * emb_std + emb_mean
+    std::vector<float> denorm(n_frames * LD);
+    const float* std_data = tensor_f32_data(m.emb_std);
+    const float* mean_data = tensor_f32_data(m.emb_mean);
+    for (int f = 0; f < n_frames; f++) {
+        for (int d = 0; d < LD; d++) {
+            denorm[f * LD + d] = latent_seq[f * LD + d] * std_data[d] + mean_data[d];
+        }
+    }
+
+    // 2. Quantizer projection: Conv1d(inner_dim -> outer_dim, kernel=1) = matmul
+    std::vector<float> projected(n_frames * OD);
+    const float* qp_w = tensor_f32_data(m.quant_proj_w);
+    for (int f = 0; f < n_frames; f++) {
+        for (int o = 0; o < OD; o++) {
+            float val = 0.0f;
+            for (int d = 0; d < LD; d++) {
+                val += qp_w[o * LD + d] * denorm[f * LD + d];
+            }
+            projected[f * OD + o] = val;
+        }
+    }
+
+    // 3. Depthwise upsample: ConvTranspose1d(OD, OD, K, stride=DS, groups=OD)
+    int K_up = (int)m.upsample_conv_w->ne[0];
+    int Cout_pg = (int)m.upsample_conv_w->ne[1];
+    int T_up_full = (n_frames - 1) * DS + K_up;
+    int T_up_causal = n_frames * DS;
+
+    // Layout: (T, OD) — time-major for ggml graph input
+    std::vector<float> upsampled(T_up_full * OD, 0.0f);
+
+    if (Cout_pg == 1) {
+        // Depthwise: each channel ci uses w[ci, 0, :] = data[ci * K + k]
+        const float* w = tensor_f32_data(m.upsample_conv_w);
+        for (int ci = 0; ci < OD; ci++) {
+            for (int t = 0; t < n_frames; t++) {
+                float x_val = projected[t * OD + ci]; // time-major input
+                for (int k = 0; k < K_up; k++) {
+                    int t_out = t * DS + k;
+                    // Output in (T, OD) layout: [t_out * OD + ci]
+                    upsampled[t_out * OD + ci] += w[ci * K_up + k] * x_val;
+                }
+            }
+        }
+    } else {
+        // Full conv transpose — fallback (shouldn't happen for pocket-tts)
+        // TODO: implement if needed
+        fprintf(stderr, "pocket_tts: mimi_decode_ggml: non-depthwise upsample not implemented\n");
+        *pcm_out = nullptr;
+        *n_samples_out = 0;
+        return;
+    }
+
+    // Add bias for upsample
+    if (m.upsample_conv_b) {
+        const float* bias = tensor_f32_data(m.upsample_conv_b);
+        for (int t = 0; t < T_up_full; t++) {
+            for (int c = 0; c < OD; c++) {
+                upsampled[t * OD + c] += bias[c];
+            }
+        }
+    }
+
+    // Trim to causal length: keep first T_up_causal time steps
+    int T_xfmr = T_up_causal;
+    if (T_up_causal < T_up_full) {
+        std::vector<float> trimmed(T_up_causal * OD);
+        for (int t = 0; t < T_up_causal; t++) {
+            memcpy(&trimmed[t * OD], &upsampled[t * OD], OD * sizeof(float));
+        }
+        upsampled = std::move(trimmed);
+    }
+
+    // Dump post-upsample (same as manual path for comparison)
+    if (pctx->verbosity >= 2 || getenv("POCKET_DUMP_DIR")) {
+        const char* dd = getenv("POCKET_DUMP_DIR");
+        if (dd) {
+            // Convert to channels-first for dump compatibility with manual path
+            std::vector<float> dump_cf(OD * T_xfmr);
+            for (int t = 0; t < T_xfmr; t++)
+                for (int c = 0; c < OD; c++)
+                    dump_cf[c * T_xfmr + t] = upsampled[t * OD + c];
+            std::string p = std::string(dd) + "/cpp_mimi_upsample.f32";
+            FILE* f = fopen(p.c_str(), "wb");
+            if (f) {
+                fwrite(dump_cf.data(), sizeof(float), dump_cf.size(), f);
+                fclose(f);
+            }
+            fprintf(stderr, "POCKET_DUMP_DIR: wrote cpp_mimi_upsample.f32 (%d x %d)\n", OD, T_xfmr);
+        }
+    }
+
+    // ── Build ggml graph for transformer + SEANet ──
+
+    // Compute metadata arena size
+    const size_t graph_nodes = 16384;
+    const size_t buf_size = ggml_tensor_overhead() * graph_nodes + ggml_graph_overhead_custom(graph_nodes, false);
+    std::vector<uint8_t> compute_meta(buf_size);
+
+    struct ggml_init_params gp = {
+        /*.mem_size   =*/compute_meta.size(),
+        /*.mem_buffer =*/compute_meta.data(),
+        /*.no_alloc   =*/true,
+    };
+    ggml_context* ctx0 = ggml_init(gp);
+    if (!ctx0) {
+        fprintf(stderr, "pocket_tts: mimi_decode_ggml: failed to init compute context\n");
+        *pcm_out = nullptr;
+        *n_samples_out = 0;
+        return;
+    }
+
+    // Input tensor: upsampled data in (T, OD) layout
+    // ggml ne[0] = first dim = OD (features), ne[1] = T (time)
+    // Wait — ggml tensors are column-major. For (T, OD) time-major data:
+    // ne[0] = OD (contiguous in memory), ne[1] = T.
+    // But ggml_conv_1d expects data b = [T, IC] where ne[0]=T.
+    // So we need ne[0]=T, ne[1]=OD => ggml_new_tensor_2d(ctx, type, T, OD).
+    // But then data layout is T values contiguous per row, OD rows = channels-last = (OD, T).
+    // Hmm, ggml is column-major: ne[0] is the innermost contiguous dim.
+    // ggml_new_tensor_2d(ctx, type, A, B) creates ne[0]=A, ne[1]=B, with A contiguous.
+    // For conv1d, the input layout should be ne[0]=T (time), ne[1]=Cin (channels).
+    // So data in memory is: for each channel, T values contiguous = channels-first (Cin, T).
+    // But our upsampled data is time-major: (T, OD) = for each time step, OD values contiguous.
+    // So ne[0]=OD, ne[1]=T. We need to transpose for conv1d.
+
+    // Create input as (OD, T) — matching our memory layout (T steps of OD features)
+    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, OD, T_xfmr);
+    ggml_set_name(inp, "mimi_input");
+    ggml_set_input(inp);
+
+    // For conv1d: need (T, Cin) where ne[0]=T. Transpose.
+    ggml_tensor* x = ggml_cont(ctx0, ggml_transpose(ctx0, inp)); // (T, OD) for conv
+
+    // Build causal mask for transformer (context-limited causal)
+    int context_size = (int)mi.xfmr_context;
+    ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T_xfmr, T_xfmr);
+    ggml_set_name(causal_mask, "causal_mask");
+    ggml_set_input(causal_mask);
+
+    // Positions tensor for RoPE
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_xfmr);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    // Transpose x to (OD, T) for matmul-based transformer
+    // Actually, build_pocket_mimi_xfmr expects (T, OD) input — it transposes internally
+    x = build_pocket_mimi_xfmr(ctx0, m, x, positions, causal_mask);
+
+    // Dump hook: mark post-transformer output
+    ggml_tensor* post_xfmr = x;
+    if (getenv("POCKET_DUMP_DIR")) {
+        ggml_set_name(post_xfmr, "post_xfmr");
+        ggml_set_output(post_xfmr);
+    }
+
+    // x is (T, OD) — feed directly into SEANet
+    x = build_pocket_seanet_dec(ctx0, m, x);
+
+    ggml_set_name(x, "pcm_output");
+    ggml_set_output(x);
+
+    // Build and allocate graph
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, graph_nodes, false);
+    ggml_build_forward_expand(gf, x);
+
+    ggml_backend_t backend = pctx->backend_cpu;
+    if (!backend) {
+        backend = ggml_backend_cpu_init();
+    }
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        fprintf(stderr, "pocket_tts: mimi_decode_ggml: failed to alloc graph\n");
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        *pcm_out = nullptr;
+        *n_samples_out = 0;
+        return;
+    }
+
+    // Set input data
+    ggml_tensor* inp_t = ggml_graph_get_tensor(gf, "mimi_input");
+    ggml_backend_tensor_set(inp_t, upsampled.data(), 0, upsampled.size() * sizeof(float));
+
+    // Set positions
+    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "positions");
+    std::vector<int32_t> pos_data(T_xfmr);
+    for (int i = 0; i < T_xfmr; i++)
+        pos_data[i] = i;
+    ggml_backend_tensor_set(pos_t, pos_data.data(), 0, pos_data.size() * sizeof(int32_t));
+
+    // Set causal mask (context-limited causal: 0 = attend, -inf = block)
+    ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "causal_mask");
+    {
+        std::vector<ggml_fp16_t> mask_data((size_t)T_xfmr * T_xfmr);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < T_xfmr; q++) {
+            int start = std::max(0, q - context_size + 1);
+            for (int k = 0; k < T_xfmr; k++) {
+                // Causal: block future (k > q) and outside context window (k < start)
+                bool attend = (k <= q) && (k >= start);
+                mask_data[(size_t)q * T_xfmr + k] = attend ? zero : neg_inf;
+            }
+        }
+        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
+
+    // Set number of threads
+    int n_threads = pctx->params.n_threads > 0 ? pctx->params.n_threads : 4;
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+
+    // Compute
+    ggml_status st = ggml_backend_graph_compute(backend, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "pocket_tts: mimi_decode_ggml: graph compute failed (status=%d)\n", (int)st);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        *pcm_out = nullptr;
+        *n_samples_out = 0;
+        return;
+    }
+
+    // Dump post-transformer if requested
+    if (getenv("POCKET_DUMP_DIR")) {
+        ggml_tensor* pxfmr = ggml_graph_get_tensor(gf, "post_xfmr");
+        if (pxfmr) {
+            int n_elem = (int)ggml_nelements(pxfmr);
+            std::vector<float> xfmr_data(n_elem);
+            ggml_backend_tensor_get(pxfmr, xfmr_data.data(), 0, n_elem * sizeof(float));
+            const char* dd = getenv("POCKET_DUMP_DIR");
+            std::string p = std::string(dd) + "/cpp_mimi_post_xfmr.f32";
+            FILE* f = fopen(p.c_str(), "wb");
+            if (f) {
+                fwrite(xfmr_data.data(), sizeof(float), xfmr_data.size(), f);
+                fclose(f);
+            }
+            fprintf(stderr, "POCKET_DUMP_DIR: wrote cpp_mimi_post_xfmr.f32 (%d x %d)\n", T_xfmr, OD);
+        }
+    }
+
+    // Read PCM output
+    ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm_output");
+    int n_pcm = (int)ggml_nelements(pcm_t);
+    *pcm_out = (float*)malloc((size_t)n_pcm * sizeof(float));
+    ggml_backend_tensor_get(pcm_t, *pcm_out, 0, (size_t)n_pcm * sizeof(float));
+    *n_samples_out = n_pcm;
+
+    // Cleanup
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+
+    if (pctx->verbosity >= 2)
+        fprintf(stderr, "pocket_tts: mimi_decode_ggml: %d PCM samples\n", n_pcm);
+}
+
+// ── Mimi VAE decoder (legacy manual compute) ─────────────────────────
 
 // Mimi decoder transformer: 2 layers with LayerScale, causal attention.
 // Operates on the full sequence (non-AR batch). We reuse the same eager
@@ -2009,13 +2513,18 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
     gguf_free(meta);
     // Note: ggml_ctx and tensor data are still alive via the buffer
 
+    // Initialize CPU backend for ggml graph compute
+    ctx->backend_cpu = ggml_backend_cpu_init();
+
     return ctx;
 }
 
 void pocket_tts_free(struct pocket_tts_context* ctx) {
     if (!ctx)
         return;
-    // TODO: free ggml buffers
+    if (ctx->backend_cpu)
+        ggml_backend_free(ctx->backend_cpu);
+    // TODO: free ggml weight buffers
     delete ctx;
 }
 
@@ -2278,7 +2787,11 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     // 5. Mimi decode: latent sequence -> PCM
     float* pcm = nullptr;
     int pcm_samples = 0;
-    mimi_decode(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
+    if (getenv("POCKET_MANUAL_MIMI")) {
+        mimi_decode(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
+    } else {
+        mimi_decode_ggml(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
+    }
 
     if (!pcm || pcm_samples <= 0) {
         if (ctx->verbosity >= 1)
