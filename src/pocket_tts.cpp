@@ -1302,9 +1302,10 @@ static void backbone_forward_step(pocket_tts_context* pctx, const float* x_in, f
     layer_norm(out, cur.data(), D, tensor_f32_data(m.out_norm_w), tensor_f32_data(m.out_norm_b));
 }
 
-// Dispatch: ggml or manual backbone forward step
+// Dispatch: ggml or manual backbone forward step.
+// --no-gpu (use_gpu=false) forces legacy manual path; env var POCKET_MANUAL_BACKBONE=1 also works.
 static void backbone_step(pocket_tts_context* pctx, const float* x_in, float* out) {
-    if (getenv("POCKET_MANUAL_BACKBONE")) {
+    if (!pctx->params.use_gpu || getenv("POCKET_MANUAL_BACKBONE")) {
         backbone_forward_step(pctx, x_in, out);
     } else {
         backbone_forward_step_ggml(pctx, x_in, out);
@@ -2682,7 +2683,7 @@ struct pocket_tts_context_params pocket_tts_context_default_params(void) {
     return {
         /* n_threads       */ 4,
         /* verbosity       */ 1,
-        /* use_gpu         */ false,
+        /* use_gpu         */ true,
         /* temperature     */ 0.7f,
         /* seed            */ 0,
         /* lsd_decode_steps */ 1,
@@ -3052,7 +3053,8 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     // 5. Mimi decode: latent sequence -> PCM
     float* pcm = nullptr;
     int pcm_samples = 0;
-    if (getenv("POCKET_MANUAL_MIMI")) {
+    // --no-gpu (use_gpu=false) forces legacy manual Mimi path; env var POCKET_MANUAL_MIMI=1 also works.
+    if (!ctx->params.use_gpu || getenv("POCKET_MANUAL_MIMI")) {
         mimi_decode(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
     } else {
         mimi_decode_ggml(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
