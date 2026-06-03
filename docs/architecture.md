@@ -200,9 +200,10 @@ regression test against `samples/jfk.wav`:
   injected into LLM embedding space, KV-cached autoregressive
   decoding.
 - **Transducer** (parakeet): LSTM predictor + joint network,
-  frame-synchronous TDT decoding. Supports greedy (default) and
-  label-looping beam search (`-bs N`) with per-beam LSTM state
-  snapshots and per-beam hotword trie tracking.
+  frame-synchronous TDT decoding. Supports greedy (default),
+  label-looping beam search (`-bs N`), and MAES (Modified Adaptive
+  Expansion Search — `CRISPASR_PARAKEET_MAES=1 -bs N`), with per-beam
+  LSTM state snapshots and per-beam hotword trie tracking.
 - **Codec + LM** (kyutai-stt): neural audio codec (RVQ) →
   token-based LM.
 - **TTS — codec / vocoder pipeline**:

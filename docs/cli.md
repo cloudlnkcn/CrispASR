@@ -130,8 +130,8 @@ per-token `tokens[]` arrays when the backend populates them.
 | `--chunk-overlap F` | Overlap context (seconds) at chunk boundaries (default 3.0) |
 | `--lcs-dedup auto\|on\|off` | NeMo-style sub-word LCS dedup across chunk boundaries (default `auto` — fires when chunking with overlap) |
 | `--lcs-min-length N` | Minimum LCS length to act on (default 1; raise to 3-4 on long-silence audio where blank tokens dominate boundaries) |
-| `--parakeet-decoder ctc\|tdt` | Select CTC or TDT decode head for hybrid parakeet models |
-| `-bs N`, `--beam-size N` | Parakeet TDT/RNNT beam search width (default 1 = greedy). `2`–`4` recommended with hotwords. CTC decode is frame-synchronous and always greedy |
+| `--parakeet-decoder ctc\|tdt\|maes` | Select decode strategy: `ctc` (CTC head), `tdt` (TDT greedy/beam, default), `maes` (MAES beam search — requires `-bs N` with N>1) |
+| `-bs N`, `--beam-size N` | Parakeet TDT/RNNT beam search width (default 1 = greedy). `2`–`4` recommended with hotwords or MAES. CTC decode is frame-synchronous and always greedy |
 
 ### Parakeet streamed encoding (issue #89)
 
