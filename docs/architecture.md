@@ -525,6 +525,29 @@ mono PCM. Voice cloning: ref audio → Mimi VAE encoder → linear project
 `kyutai/pocket-tts-without-voice-cloning` (no encoder weights) or
 `kyutai/pocket-tts` (full, with encoder for voice cloning).
 
+### parler-tts
+
+Prompt-conditioned TTS from
+[parler-tts/parler-tts-mini-v1.1](https://huggingface.co/parler-tts/parler-tts-mini-v1.1)
+(Apache 2.0, ~900M params), single GGUF (~1.8 GB F16), 44.1 kHz mono.
+
+| Component | Architecture | Details |
+|---|---|---|
+| T5 encoder | flan-t5-large encoder | d=1024, 16 heads, 24 layers, gated-GELU FFN, RMSNorm, relative position bias |
+| MusicGen decoder | Causal transformer | d=1024, 16 heads, 24 layers, 9 codebooks, sinusoidal PE, LayerNorm, delay pattern |
+| DAC codec | Descript Audio Codec 44 kHz | 9 codebooks × 1024, Snake activations, 4 upsample blocks (8×8×4×2 = 512×) |
+
+Voice characteristics are controlled via `--instruct` (natural language
+description). Temperature=1.0 required (greedy produces degenerate output;
+the model is trained with stochastic sampling). `--seed` wired for
+reproducibility (note: C++ `std::mt19937` differs from PyTorch RNG).
+
+Tokenizer: LLaMA-2 sentencepiece BPE (90714 tokens). The GGUF stores the
+original sentencepiece scores and a `parler.tokenizer.is_bpe=true` flag so
+the runtime auto-selects `core_spm::tokenize_bpe` (iterative best-merge)
+instead of the Viterbi unigram path. Quantized GGUFs preserve DAC codec
+weights at F16 (audio codecs are precision-sensitive).
+
 ### m2m100 / wmt21
 
 12L encoder + 12L decoder transformer (d=1024, 16 heads, FFN=4096, ReLU,

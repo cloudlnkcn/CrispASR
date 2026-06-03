@@ -135,6 +135,10 @@
 #include "bark_tts.h"
 #define CA_HAVE_BARK 1
 #endif
+#if __has_include("parler_tts.h")
+#include "parler_tts.h"
+#define CA_HAVE_PARLER_TTS 1
+#endif
 #if __has_include("voxcpm2_tts.h")
 #include "voxcpm2_tts.h"
 #define CA_HAVE_VOXCPM2 1
@@ -1071,6 +1075,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "f5-tts";
     else if (strcmp(arch, "m2m100") == 0)
         backend = "m2m100";
+    else if (strcmp(arch, "parler-tts") == 0 || strcmp(arch, "parler_tts") == 0 || strcmp(arch, "parlertts") == 0)
+        backend = "parler-tts";
     else if (strcmp(arch, "t5") == 0)
         backend = "madlad";
 
@@ -1333,6 +1339,10 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_BARK
     bark_context* bark_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_PARLER_TTS
+    parler_tts_context* parler_tts_ctx = nullptr;
+    std::string parler_description; // voice description for T5 conditioning
 #endif
 #ifdef CA_HAVE_VOXCPM2
     voxcpm2_context* voxcpm2_ctx = nullptr;
@@ -2051,6 +2061,30 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_PARLER_TTS
+    if (s->backend == "parler-tts" || s->backend == "parler_tts" || s->backend == "parler" ||
+        s->backend == "parlertts") {
+        s->backend = "parler-tts";
+        parler_tts_context_params p = parler_tts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        // Parler requires stochastic sampling (temp=1.0); greedy is degenerate
+        p.temperature = (g_open_temperature_tls > 0.0f) ? g_open_temperature_tls : 1.0f;
+        p.seed = g_open_seed_tls;
+        s->parler_tts_ctx = parler_tts_init_from_file(model_path, p);
+        if (!s->parler_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Set default voice description (user overrides via set_instruct)
+        s->parler_description = "A female speaker delivers her words at a moderate pace "
+                                "with a clear and natural tone in a quiet environment.";
+        parler_tts_set_description(s->parler_tts_ctx, s->parler_description.c_str());
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->backend == "voxcpm2-tts" || s->backend == "voxcpm2" || s->backend == "voxcpm2_tts") {
         s->backend = "voxcpm2-tts";
@@ -2467,6 +2501,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_BARK
     list += ",bark";
+#endif
+#ifdef CA_HAVE_PARLER_TTS
+    list += ",parler-tts";
 #endif
 #ifdef CA_HAVE_VOXCPM2
     list += ",voxcpm2-tts";
@@ -4966,6 +5003,12 @@ CA_EXPORT int crispasr_session_set_instruct(crispasr_session* s, const char* ins
         return rc;
     }
 #endif
+#ifdef CA_HAVE_PARLER_TTS
+    if (s->parler_tts_ctx) {
+        s->parler_description = instruct;
+        return parler_tts_set_description(s->parler_tts_ctx, instruct);
+    }
+#endif
     return -3;
 }
 
@@ -5147,6 +5190,40 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
             return nullptr;
         *out_n_samples = n;
         return pcm;
+    }
+#endif
+#ifdef CA_HAVE_PARLER_TTS
+    if (s->parler_tts_ctx) {
+        // Parler outputs 44.1 kHz mono. Resample to 24 kHz for the session
+        // contract (Dart/Python playback path assumes 24 kHz).
+        parler_tts_set_temperature(s->parler_tts_ctx, s->temperature > 0.0f ? s->temperature : 1.0f);
+        parler_tts_set_seed(s->parler_tts_ctx, s->seed);
+        int n44 = 0;
+        float* pcm44 = parler_tts_synthesize(s->parler_tts_ctx, text, &n44);
+        if (!pcm44 || n44 <= 0) {
+            if (pcm44)
+                parler_tts_pcm_free(pcm44);
+            return nullptr;
+        }
+        // 44100 → 24000 linear interpolation
+        const int64_t nOut = (int64_t)n44 * 24000 / 44100;
+        float* dst = (float*)malloc((size_t)(nOut > 0 ? nOut : 1) * sizeof(float));
+        if (!dst) {
+            parler_tts_pcm_free(pcm44);
+            return nullptr;
+        }
+        const double ratio = 44100.0 / 24000.0;
+        for (int64_t j = 0; j < nOut; ++j) {
+            const double pos = (double)j * ratio;
+            const int64_t i0 = (int64_t)pos;
+            const int64_t i1 = (i0 + 1 < n44) ? i0 + 1 : n44 - 1;
+            const double frac = pos - (double)i0;
+            dst[j] = (float)((double)pcm44[i0] * (1.0 - frac) + (double)pcm44[i1] * frac);
+        }
+        parler_tts_pcm_free(pcm44);
+        if (out_n_samples)
+            *out_n_samples = (int)nOut;
+        return dst;
     }
 #endif
 #ifdef CA_HAVE_PIPER
@@ -5451,6 +5528,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->bark_ctx)
         bark_free(s->bark_ctx);
 #endif
+#ifdef CA_HAVE_PARLER_TTS
+    if (s->parler_tts_ctx)
+        parler_tts_free(s->parler_tts_ctx);
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx)
         voxcpm2_free(s->voxcpm2_ctx);
@@ -5731,6 +5812,12 @@ CA_EXPORT int crispasr_session_set_temperature(crispasr_session* s, float temper
         touched++;
     }
 #endif
+#ifdef CA_HAVE_PARLER_TTS
+    if (s->parler_tts_ctx) {
+        parler_tts_set_temperature(s->parler_tts_ctx, temperature > 0.0f ? temperature : 1.0f);
+        touched++;
+    }
+#endif
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx) {
         // qwen3-tts's code-predictor sampler reads cparams.temperature
@@ -5778,6 +5865,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
 #ifdef CA_HAVE_BARK
     if (s->bark_ctx) {
         bark_set_seed(s->bark_ctx, seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_PARLER_TTS
+    if (s->parler_tts_ctx) {
+        parler_tts_set_seed(s->parler_tts_ctx, seed);
         touched++;
     }
 #endif

@@ -8577,6 +8577,33 @@ The algorithm per encoder frame:
 
 Config defaults (matching NeMo): beam=4, num_steps=2, gamma=2.3, beta=2.
 Enable via `CRISPASR_PARAKEET_MAES=1` + `--beam-size 4`.
+### Benchmark results: MAES vs greedy on FLEURS English (CPU, June 2026)
+
+| Audio | Model | Greedy | MAES beam=4 | Improvement |
+|---|---|---|---|---|
+| 10s | v2 (1K vocab) | "...lag behind by 25%." | "...lag behind by 25 years." | Corrected factual error |
+| 10s | v3 (8K vocab) | "...lag behind by 25-30 years." | "...lag behind by 25 to 30 years." | More natural phrasing |
+| 60s | v2 | 5 sentences | 6 sentences (recovered "To the north and within easy reach, is the romantic and fascinating town of Sintra") | Full sentence recovered |
+| 11s jfk | v2 | identical | identical | Clean audio = no difference |
+
+**Speed**: ~35% slower on 60s (5:21 vs 3:59 wall time, CPU-only). The cost
+is almost entirely in the extra predictor LSTM + joint forward calls per
+non-blank expansion — O(beam × expansions) per frame instead of O(1). On
+GPU the decode is a tiny fraction of total time (encoder dominates), so the
+wall-time impact would be negligible.
+
+**Takeaway**: MAES is worth it for any audio that's not studio-clean. It
+recovers content that greedy misses entirely, not just minor spelling fixes.
+The v3 8K-vocab model benefits less (larger vocab = better greedy baseline).
+
+### CTC prefix beam search — shared core for all CTC backends
+
+Added `core_ctc::prefix_beam_search()` in `src/core/ctc.h`. Any backend
+with CTC logits can call it in one line. The algorithm is standard Graves
+& Jaitly 2014 prefix beam search with an optional gamma-threshold prune.
+Wired into parakeet-CTC and sensevoice; other CTC backends just need the
+include and a `beam_size` setter.
+
 ---
 
 ## Bark TTS — what ACTUALLY fixed it (June 2026)
