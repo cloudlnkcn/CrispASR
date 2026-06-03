@@ -200,8 +200,7 @@ struct zonos_tts_context {
 // -----------------------------------------------------------------------
 
 struct zonos_tts_params zonos_tts_default_params(void) {
-    struct zonos_tts_params p;
-    std::memset(&p, 0, sizeof(p));
+    struct zonos_tts_params p = {};
     p.n_threads = 4;
     p.verbosity = 1;
     p.use_gpu = false;

@@ -1945,6 +1945,8 @@ uint32_t bark_sample_rate(const struct bark_context* ctx) {
     return ctx ? ctx->pp.sample_rate : 24000;
 }
 
+} // extern "C" — close for C++ NPZ/NPY helpers below
+
 // ---------------------------------------------------------------------------
 // Minimal NPZ/NPY parser for speaker prompt loading
 // ---------------------------------------------------------------------------
@@ -2127,6 +2129,8 @@ static std::vector<npz_entry> parse_npz(const uint8_t* data, size_t len) {
     return entries;
 }
 
+extern "C" {
+
 int bark_set_speaker_npz(struct bark_context* ctx, const char* npz_path) {
     if (!ctx || !npz_path)
         return -1;
@@ -2169,7 +2173,7 @@ int bark_set_speaker_npz(struct bark_context* ctx, const char* npz_path) {
         // Strip .npy extension for matching
         std::string key = entry.name;
         if (key.size() > 4 && key.substr(key.size() - 4) == ".npy")
-            key = key.substr(0, key.size() - 4);
+            key.resize(key.size() - 4);
 
         std::vector<int> shape;
         std::vector<int32_t> arr = parse_npy_to_int32(entry.data.data(), entry.data.size(), shape);
