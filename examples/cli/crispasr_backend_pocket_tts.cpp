@@ -81,7 +81,8 @@ public:
                     int ref_sr = 0;
                     if (crispasr::core::read_wav_mono_pcm16(*fb, ref_pcm, ref_sr) && !ref_pcm.empty()) {
                         if (ref_sr != 24000)
-                            ref_pcm = core_audio::resample_polyphase(ref_pcm.data(), (int)ref_pcm.size(), ref_sr, 24000);
+                            ref_pcm =
+                                core_audio::resample_polyphase(ref_pcm.data(), (int)ref_pcm.size(), ref_sr, 24000);
                         if (pocket_tts_set_voice(ctx_, ref_pcm.data(), (int)ref_pcm.size()) == 0) {
                             if (!p.no_prints)
                                 fprintf(stderr, "crispasr[pocket-tts]: auto-loaded voice from '%s'\n", *fb);
