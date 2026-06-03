@@ -528,7 +528,7 @@ if BENCHMARK_TTS == "1":
         print(f"  TTS: {name} (--backend {backend})")
         print(f"{'='*60}")
         outfile = f"/tmp/tts-bench-{backend}.wav"
-        cmd = [crispasr_bin, "--backend", backend, "-m", "auto",
+        cmd = [CRISPASR, "--backend", backend, "-m", "auto",
                "--tts", "The quick brown fox jumps over the lazy dog.",
                "--tts-output", outfile, "--no-prints"]
         t0 = time.time()
