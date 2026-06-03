@@ -8746,3 +8746,45 @@ large data on CIFS; code and builds on local disk.
 **Lesson.** Never put git worktrees on CIFS mounts. The `actimeo=60` cache
 and async writeback can leave files in a "visible in `ls -la` but
 unreadable" ghost state. Local SSD for worktrees; CIFS for data only.
+
+### NPZ ZIP64: NumPy writes ZIP64 even for tiny files
+
+NumPy's `np.savez` writes ZIP64 extra fields (local header `comp_size =
+0xFFFFFFFF`, actual size in extra tag `0x0001`) even for files under 1 KB.
+The initial NPZ parser only checked the 32-bit size field and broke on
+`0xFFFFFFFF` (tried to read 4 GB). **Fix:** when `comp_size32 ==
+0xFFFFFFFF`, parse the ZIP64 extra field (tag `0x0001`, offset +12, 8-byte
+little-endian compressed size).
+
+**Lesson.** Always handle ZIP64 in NPZ parsers — NumPy defaults to it
+regardless of file size.
+
+### n_threads non-determinism in AR sampling
+
+With the same seed, switching from 4 to 2 threads produces different audio
+(cos=0.50 at Q4_K, cos=0.87 at F16). This is inherent to multi-threaded
+GEMM: floating-point reduction order differs across thread counts, producing
+slightly different intermediate values that accumulate through 768+ AR steps.
+
+This is NOT a bug — it matches upstream PyTorch behavior (different
+`torch.set_num_threads()` also produces different samples). Seed
+reproducibility is only guaranteed at the same thread count.
+
+### Integration test results (June 2026)
+
+Full test matrix on CPU (VPS, no GPU):
+
+| Test | Q4_K v2 | F16 | Q8_0 |
+|------|---------|-----|------|
+| Model load | PASS | PASS | PASS |
+| BERT tokenizer | PASS (119547 tok) | PASS | PASS |
+| NPZ speaker load | PASS | — | — |
+| Synthesis peak | 0.70 | 0.79 | 0.43 |
+| Seed repro (cos) | 1.000000 | 1.000000 | — |
+| Cross-seed diverge | cos=-0.003 | cos=0.010 | — |
+| Temperature setter | PASS | PASS | — |
+| ASR roundtrip | "Hello!" ✓ | "And" (stochastic) | — |
+| Q4_K v1 (all quant) | BLANK_AUDIO | — | — |
+
+GPU dispatch is wired (`ggml_backend_init_best()` + dual-backend scheduler)
+but untested on this CPU-only VPS. Pattern matches csm_tts, kokoro, voxtral.
