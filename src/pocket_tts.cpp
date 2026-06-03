@@ -1229,13 +1229,13 @@ static bool check_eos(pocket_tts_context* pctx, const float* backbone_out) {
     const auto& m = pctx->model;
     const int D = (int)m.flow_lm_hp.d_model;
 
-    // Linear(d_model -> 1) + bias -> sigmoid
+    // Linear(d_model -> 1) + bias. The reference compares the raw linear
+    // output against eos_threshold (no sigmoid).
     float logit = vec_dot(tensor_f32_data(m.out_eos_w), backbone_out, D);
     if (m.out_eos_b)
         logit += tensor_f32_data(m.out_eos_b)[0];
 
-    float prob = 1.0f / (1.0f + std::exp(-logit));
-    return prob > pctx->params.eos_threshold;
+    return logit > pctx->params.eos_threshold;
 }
 
 // ── Mimi VAE decoder ──────────────────────────────────────────────
