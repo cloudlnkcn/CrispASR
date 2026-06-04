@@ -113,15 +113,21 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     print(f"  loading MOSS-Audio-4B-Instruct from {model_dir}")
     print(f"  GitHub source: {github_path}")
 
-    # ---- Load model in float32 for bit-exact reference ----
+    # ---- Load model ----
+    # Use bfloat16 to fit in 16 GB GPU or 30 GB CPU RAM. The reference
+    # captures are converted to float32 numpy on extraction so the GGUF
+    # archive is always F32 regardless of the model dtype.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16
     config = MossAudioConfig.from_pretrained(str(model_dir))
     model = MossAudioModel.from_pretrained(
         str(model_dir),
         config=config,
-        torch_dtype=torch.float32,
-        device_map="cpu",
+        torch_dtype=dtype,
+        device_map=device,
         trust_remote_code=True,
     ).eval()
+    print(f"  device={device}, dtype={dtype}")
 
     processor = MossAudioProcessor.from_pretrained(
         str(model_dir),
@@ -132,7 +138,9 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # ---- Prepare inputs ----
     audio_tensor = torch.from_numpy(audio).float()
     inputs = processor(text=prompt, audios=[audio_tensor.numpy()], return_tensors="pt")
-    inputs = {k: v.to("cpu") for k, v in inputs.items()}
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    if inputs.get("audio_data") is not None:
+        inputs["audio_data"] = inputs["audio_data"].to(dtype)
 
     audio_input_mask = inputs["input_ids"] == processor.audio_token_id
     inputs["audio_input_mask"] = audio_input_mask
