@@ -33,6 +33,11 @@ DARWIN_EXTRA_LIBS = ["-lggml-metal", "-lggml-blas"]
 # from the LDFLAGS so the linker doesn't fail with -lcommon not found.
 EXCLUDE_LIBS = {"common"}
 
+# CMake target names that differ from their OUTPUT_NAME. The linker
+# sees the output filename (libcrispasr.a), not the cmake target name
+# (crispasr-lib). Map target → output name here.
+LIB_NAME_MAP = {"crispasr-lib": "crispasr"}
+
 
 def generate_dot(dot_path):
     """Run cmake --graphviz to produce the dependency dot file."""
@@ -57,7 +62,7 @@ def get_libs(dot_path):
     from cmake_graphviz_targets import get_static_libs
 
     libs = get_static_libs(dot_path, ["crispasr-lib"])
-    return [lib for lib in libs if lib not in EXCLUDE_LIBS]
+    return [LIB_NAME_MAP.get(lib, lib) for lib in libs if lib not in EXCLUDE_LIBS]
 
 
 def build_linux_line(libs):
