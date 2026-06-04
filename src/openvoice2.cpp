@@ -197,7 +197,21 @@ struct openvoice2_context {
     int verbosity;
     float tau;
     std::mt19937 rng;
+    std::string dump_dir;
 };
+
+// ── Diff dump helpers ────────────────────────────────────────────────
+
+static void dump_stage(const openvoice2_context* ctx, const char* label, const float* data, size_t n) {
+    if (ctx->dump_dir.empty())
+        return;
+    std::string path = ctx->dump_dir + "/" + label + ".bin";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (f) {
+        fwrite(data, sizeof(float), n, f);
+        fclose(f);
+    }
+}
 
 // ── GGUF loading ─────────────────────────────────────────────────────
 
@@ -1247,4 +1261,9 @@ extern "C" void openvoice2_free(struct openvoice2_context * ctx) {
     if (ctx->w_ctx) ggml_free(ctx->w_ctx);
     if (ctx->backend_cpu) ggml_backend_free(ctx->backend_cpu);
     delete ctx;
+}
+
+extern "C" void openvoice2_set_dump_dir(struct openvoice2_context * ctx, const char * dir) {
+    if (ctx)
+        ctx->dump_dir = dir ? dir : "";
 }
