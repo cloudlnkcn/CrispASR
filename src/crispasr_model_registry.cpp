@@ -592,12 +592,16 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/csm-1b-GGUF/resolve/main/csm-1b-q4_k.gguf",
      "~1.4 GB", nullptr, nullptr},
 
-    // MeloTTS: VITS2 52M param TTS (myshell-ai/MeloTTS). 44.1 kHz mono,
-    // 4 English speakers (US/BR/India/AU). MIT license. Single GGUF with
-    // embedded CMU dictionary for G2P. F16 recommended (93 MB).
+    // MeloTTS: VITS2 52M param TTS (myshell-ai/MeloTTS). 44.1 kHz mono.
+    // MIT license. Single GGUF with embedded CMU dictionary for G2P.
+    // V2: 4 English speakers (US/BR/India/AU), 112 symbols, 11 tones.
+    // V3: 1 speaker (EN-Newest), 219 symbols, 16 tones (newest checkpoint).
     {"melotts", "melotts-en-v2-f16.gguf",
      "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/melotts-en-v2-f16.gguf",
      "~97 MB", nullptr, nullptr},
+    {"melotts-v3", "melotts-en-v3-f16.gguf",
+     "https://huggingface.co/cstr/melotts-en-v3-GGUF/resolve/main/melotts-en-v3-f16.gguf",
+     "~93 MB", nullptr, nullptr},
 
     // SpeechT5 TTS: 80M param AR mel decoder + HiFi-GAN vocoder.
     // MIT license (microsoft/speecht5_tts). Needs a 512-d x-vector for
