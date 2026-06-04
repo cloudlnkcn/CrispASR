@@ -240,6 +240,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # dir. GitHub source (modeling code) expected at ref/moss_audio/github/
     # or via MOSS_AUDIO_GITHUB env. Prompt from MOSS_AUDIO_PROMPT env.
     "moss-audio":  "reference_backends.moss_audio",
+    # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
+    # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
+    # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
+    "tada-tts":   "reference_backends.tada_tts",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
