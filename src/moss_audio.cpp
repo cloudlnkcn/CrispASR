@@ -569,23 +569,33 @@ static ggml_cgraph* moss_audio_build_encoder_graph(
     // Conv1: (1, 1, n_mels, T) → (1, ds_hidden, n_mels/2, T/2)
     x = ggml_conv_2d(ctx0, enc.conv1_w, x, 2, 2, 1, 1, 1, 1);
     x = ggml_add(ctx0, x, ggml_reshape_4d(ctx0, enc.conv1_b, 1, 1, enc.conv1_b->ne[0], 1));
-    x = ggml_gelu(ctx0, x);
+    x = ggml_gelu_erf(ctx0, x);
 
     // Conv2
     x = ggml_conv_2d(ctx0, enc.conv2_w, x, 2, 2, 1, 1, 1, 1);
     x = ggml_add(ctx0, x, ggml_reshape_4d(ctx0, enc.conv2_b, 1, 1, enc.conv2_b->ne[0], 1));
-    x = ggml_gelu(ctx0, x);
+    x = ggml_gelu_erf(ctx0, x);
 
     // Conv3
     x = ggml_conv_2d(ctx0, enc.conv3_w, x, 2, 2, 1, 1, 1, 1);
     x = ggml_add(ctx0, x, ggml_reshape_4d(ctx0, enc.conv3_b, 1, 1, enc.conv3_b->ne[0], 1));
-    x = ggml_gelu(ctx0, x);
+    x = ggml_gelu_erf(ctx0, x);
 
-    // Reshape: (1, ds_hidden, F_down, T_down) → (T_down, ds_hidden * F_down)
-    // F_down = conv_out_len(conv_out_len(conv_out_len(128))) = 16
+    // After conv3: ggml ne = (T_down, F_down, C_out=480, B=1)
+    //   = PyTorch shape (B=1, C=480, F=F_down, T=T_down)
+    //
+    // Python: x.permute(0, 3, 1, 2).contiguous().flatten(2)
+    //   (B, C, F, T) → (B, T, C, F) → (B, T, C*F)
+    //
+    // ggml: ne=(T, F, C, B) → want ne=(C*F, T, B=1)
+    //   permute to ne=(F, C, T, B) then flatten F*C → stem_in
     int F_down = conv_out_len(conv_out_len(conv_out_len(n_mels)));
-    int stem_in = (int)hp.enc_ds_hidden * F_down; // 480 * 16 = 7680
-    x = ggml_permute(ctx0, x, 0, 2, 1, 3); // (T_down, F_down, ds_hidden, 1)
+    int C_out = (int)hp.enc_ds_hidden; // 480
+    int stem_in = C_out * F_down;      // 480 * 16 = 7680
+    // ggml_permute(src, ax0, ax1, ax2, ax3) rearranges so that
+    // output dim i reads from input dim ax_i. We want:
+    //   out[0]=src[1] (F), out[1]=src[2] (C), out[2]=src[0] (T), out[3]=src[3] (B)
+    x = ggml_permute(ctx0, x, 1, 2, 0, 3);
     x = ggml_cont(ctx0, x);
     x = ggml_reshape_2d(ctx0, x, stem_in, T_down);
 
