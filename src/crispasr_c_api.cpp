@@ -5418,13 +5418,18 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         int sr = 0;
         const int nIn = melotts_synthesize(s->melotts_ctx, text, &src, &sr);
         if (!src || nIn <= 0) {
-            if (src) free(src);
+            if (src)
+                free(src);
             return nullptr;
         }
-        if (sr <= 0) sr = 44100;
+        if (sr <= 0)
+            sr = 44100;
         const int64_t nOut = (int64_t)nIn * 24000 / sr;
         float* dst = (float*)malloc((size_t)(nOut > 0 ? nOut : 1) * sizeof(float));
-        if (!dst) { free(src); return nullptr; }
+        if (!dst) {
+            free(src);
+            return nullptr;
+        }
         const double ratio = (double)sr / 24000.0;
         for (int64_t j = 0; j < nOut; ++j) {
             const double pos = (double)j * ratio;
@@ -5434,7 +5439,8 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
             dst[j] = (float)((double)src[i0] * (1.0 - frac) + (double)src[i1] * frac);
         }
         melotts_pcm_free(src);
-        if (out_n_samples) *out_n_samples = (int)nOut;
+        if (out_n_samples)
+            *out_n_samples = (int)nOut;
         return dst;
     }
 #endif
