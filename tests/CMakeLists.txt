@@ -819,6 +819,21 @@ catch_discover_tests(test_server_wav_writer
     PROPERTIES LABELS "unit"
 )
 
+# ─── test_watermark — Catch2 unit tests for the spread-spectrum audio
+#watermark (embed + detect round-trip, SNR, robustness).
+#Pure CPU, no model dependencies — ~10 ms total.
+add_executable(test_watermark test_watermark.cpp)
+target_include_directories(test_watermark PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test_watermark PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test_watermark
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test_server_chunking — Catch2 unit tests for the sentence splitter
 #used by / v1 / audio / speech long - form input(PLAN §75d / issue #66).
 #Pure functions, no backend dependency.

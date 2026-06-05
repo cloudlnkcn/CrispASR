@@ -34,6 +34,7 @@
 #include "common-crispasr.h" // read_audio_data
 #include "crispasr_chat.h"   // /v1/chat/completions
 #include "crispasr_tts_chunking.h"
+#include "crispasr_watermark.h"
 #include "crispasr_wav_writer.h"
 #include "../server/httplib.h"
 #include "../json.hpp"
@@ -555,7 +556,10 @@ static std::string crispasr_encode_mp3(const float* pcm, int n_samples, int samp
     if (flushed < 0)
         return {};
 
-    return std::string((const char*)mp3_buf.data(), (size_t)(written + flushed));
+    // Prepend ID3v2 tag with AI-provenance metadata (TXXX frames)
+    std::string id3 = crispasr_make_id3v2_ai_tag();
+    id3.append((const char*)mp3_buf.data(), (size_t)(written + flushed));
+    return id3;
 }
 #endif // CRISPASR_HAVE_LAME
 
@@ -1299,6 +1303,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                         }
                         chunk = std::move(rs);
                     }
+                    // Embed watermark per-chunk (survives re-encoding)
+                    crispasr_watermark_embed_impl(chunk.data(), (int)chunk.size());
                     pcm_chunks.push_back(crispasr_make_pcm_int16_le(chunk.data(), (int)chunk.size()));
                     // Add silence gap between sentences (not after last)
                     if (i + 1 < sentences.size()) {
@@ -1369,6 +1375,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             }
             pcm = std::move(resampled);
         }
+
+        // Embed spread-spectrum watermark marking audio as AI-generated.
+        // Applied after speed resampling so the watermark is present in
+        // the final signal regardless of speed setting.
+        crispasr_watermark_embed_impl(pcm.data(), (int)pcm.size());
 
         const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
         const double audio_s = (double)pcm.size() / (double)sr_out;

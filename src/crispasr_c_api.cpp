@@ -654,6 +654,28 @@ CA_EXPORT void crispasr_vad_free(float* spans) {
 // is a 4-line C-ABI wrapper that does input validation + namespace
 // stripping.
 
+// =========================================================================
+// AI-generated audio watermark (spread-spectrum, frequency-domain)
+// =========================================================================
+//
+// The implementation lives in the header-only crispasr_watermark.h so
+// that both the server, CLI, and unit tests can use it. These are thin
+// C-ABI wrappers with input validation.
+
+#include "../examples/cli/crispasr_watermark.h"
+
+CA_EXPORT float crispasr_watermark_detect(const float* pcm, int n_samples) {
+    if (!pcm || n_samples <= 0)
+        return 0.0f;
+    return ::crispasr_watermark_detect_impl(pcm, n_samples);
+}
+
+CA_EXPORT void crispasr_watermark_embed(float* pcm, int n_samples, float alpha) {
+    if (!pcm || n_samples <= 0)
+        return;
+    ::crispasr_watermark_embed_impl(pcm, n_samples, alpha > 0.0f ? alpha : 0.005f);
+}
+
 #include "core/crispasr_lcs.h"
 
 CA_EXPORT int crispasr_lcs_dedup_prefix_count(const int32_t* prev_tail_tokens, int n_prev, const int32_t* curr_tokens,

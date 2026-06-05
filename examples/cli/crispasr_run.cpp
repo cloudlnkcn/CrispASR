@@ -37,6 +37,8 @@
 #include "titanet.h"
 #include "speaker_db.h"
 
+#include "crispasr_watermark.h"
+#include "crispasr_wav_writer.h"
 #include "common-crispasr.h" // read_audio_data
 
 #include <algorithm>
@@ -1398,44 +1400,20 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
         }
 
-        // Write output WAV (backend-native sample rate, mono)
+        // Embed spread-spectrum watermark marking audio as AI-generated
+        crispasr_watermark_embed_impl(audio.data(), (int)audio.size());
+
+        // Write output WAV (backend-native sample rate, mono).
+        // crispasr_make_wav_int16 includes a LIST/INFO chunk with
+        // AI-provenance metadata (ISFT, ICMT).
         std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
+        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_in);
         FILE* fout = fopen(out_path.c_str(), "wb");
         if (!fout) {
             fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
             return 16;
         }
-        int32_t sr = sr_in;
-        int16_t channels = 1;
-        int16_t bits = 16;
-        int32_t data_size = (int32_t)audio.size() * 2;
-        int32_t file_size = 36 + data_size;
-        fwrite("RIFF", 1, 4, fout);
-        fwrite(&file_size, 4, 1, fout);
-        fwrite("WAVEfmt ", 1, 8, fout);
-        int32_t fmt_size = 16;
-        fwrite(&fmt_size, 4, 1, fout);
-        int16_t fmt_tag = 1; // PCM
-        fwrite(&fmt_tag, 2, 1, fout);
-        fwrite(&channels, 2, 1, fout);
-        fwrite(&sr, 4, 1, fout);
-        int32_t byte_rate = sr * channels * (bits / 8);
-        fwrite(&byte_rate, 4, 1, fout);
-        int16_t block_align = channels * (bits / 8);
-        fwrite(&block_align, 2, 1, fout);
-        fwrite(&bits, 2, 1, fout);
-        fwrite("data", 1, 4, fout);
-        fwrite(&data_size, 4, 1, fout);
-        // Convert float → int16
-        for (size_t i = 0; i < audio.size(); i++) {
-            float s = audio[i];
-            if (s > 1.0f)
-                s = 1.0f;
-            if (s < -1.0f)
-                s = -1.0f;
-            int16_t v = (int16_t)(s * 32767.0f);
-            fwrite(&v, 2, 1, fout);
-        }
+        fwrite(wav.data(), 1, wav.size(), fout);
         fclose(fout);
 
         if (!params.no_prints)

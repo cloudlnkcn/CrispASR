@@ -49,8 +49,9 @@ TEST_CASE("WAV header field values", "[unit][wav]") {
     const int rate = 24000;
     std::string wav = crispasr_make_wav_int16(samples.data(), (int)samples.size(), rate);
 
-    // RIFF size = 36 + data_size.
-    REQUIRE(le_u32(wav, 4) == 36 + samples.size() * 2);
+    // RIFF size = file_size - 8 (includes data + LIST/INFO chunk).
+    const size_t info_size = crispasr_wav_make_info_chunk().size();
+    REQUIRE(le_u32(wav, 4) == 36 + samples.size() * 2 + info_size);
 
     // fmt chunk size is 16 for PCM.
     REQUIRE(le_u32(wav, 16) == 16);
@@ -78,10 +79,11 @@ TEST_CASE("WAV header field values", "[unit][wav]") {
 }
 
 TEST_CASE("WAV body size matches sample count", "[unit][wav]") {
+    const size_t info_size = crispasr_wav_make_info_chunk().size();
     for (int n : {1, 17, 256, 24000, 100000}) {
         std::vector<float> samples(n, 0.5f);
         std::string wav = crispasr_make_wav_int16(samples.data(), n, 24000);
-        REQUIRE(wav.size() == 44 + (size_t)n * 2);
+        REQUIRE(wav.size() == 44 + (size_t)n * 2 + info_size);
     }
 }
 
@@ -151,18 +153,19 @@ TEST_CASE("regression #122: WAV header reflects backend's native rate", "[unit][
 }
 
 TEST_CASE("WAV serializer handles empty input", "[unit][wav]") {
-    // n_samples = 0 should produce a header-only WAV (44 bytes), not
-    // crash and not undersize the buffer.
+    // n_samples = 0 should produce header + LIST/INFO (no sample data),
+    // not crash and not undersize the buffer.
+    const size_t info_size = crispasr_wav_make_info_chunk().size();
     std::string wav = crispasr_make_wav_int16(nullptr, 0, 24000);
-    REQUIRE(wav.size() == 44);
+    REQUIRE(wav.size() == 44 + info_size);
     REQUIRE(wav.substr(0, 4) == "RIFF");
-    REQUIRE(le_u32(wav, 4) == 36); // 36 + 0
-    REQUIRE(le_u32(wav, 40) == 0); // data size
+    REQUIRE(le_u32(wav, 4) == 36 + info_size); // 36 + 0 + info
+    REQUIRE(le_u32(wav, 40) == 0);             // data size
 
     // Negative sample count: be defensive — treat as zero, do not
     // dereference the pointer (which may be nullptr).
     std::string wav_neg = crispasr_make_wav_int16(nullptr, -5, 24000);
-    REQUIRE(wav_neg.size() == 44);
+    REQUIRE(wav_neg.size() == 44 + info_size);
     REQUIRE(le_u32(wav_neg, 40) == 0);
 }
 
@@ -230,11 +233,77 @@ TEST_CASE("PCM handles empty input", "[unit][pcm]") {
     REQUIRE(pcm_neg.empty());
 }
 
-TEST_CASE("PCM byte-stream matches WAV body byte-for-byte", "[unit][pcm]") {
+// ──────────────────────────────────────────────────────────────────────────
+// WAV LIST/INFO AI-provenance metadata
+// ──────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("WAV contains LIST/INFO chunk with AI provenance", "[unit][wav][metadata]") {
+    std::vector<float> samples(100, 0.0f);
+    std::string wav = crispasr_make_wav_int16(samples.data(), (int)samples.size(), 24000);
+
+    // The LIST chunk should appear after the data chunk
+    const size_t data_end = 44 + samples.size() * 2;
+    REQUIRE(wav.size() > data_end + 12);
+    REQUIRE(wav.substr(data_end, 4) == "LIST");
+    REQUIRE(wav.substr(data_end + 8, 4) == "INFO");
+
+    // ISFT sub-chunk should be present
+    auto found_isft = wav.find("ISFT", data_end);
+    REQUIRE(found_isft != std::string::npos);
+    // The ISFT value should contain "CrispASR"
+    REQUIRE(wav.find("CrispASR", found_isft) != std::string::npos);
+
+    // ICMT sub-chunk should be present with AI notice
+    auto found_icmt = wav.find("ICMT", data_end);
+    REQUIRE(found_icmt != std::string::npos);
+    REQUIRE(wav.find("AI text-to-speech", found_icmt) != std::string::npos);
+}
+
+TEST_CASE("WAV RIFF size accounts for LIST/INFO chunk", "[unit][wav][metadata]") {
+    std::vector<float> samples(100, 0.0f);
+    std::string wav = crispasr_make_wav_int16(samples.data(), (int)samples.size(), 24000);
+    // RIFF size field = file_size - 8
+    REQUIRE(le_u32(wav, 4) + 8 == wav.size());
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// MP3 ID3v2 AI-provenance metadata
+// ──────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("ID3v2 tag structure is valid", "[unit][mp3][metadata]") {
+    std::string tag = crispasr_make_id3v2_ai_tag();
+
+    // Header: "ID3" magic
+    REQUIRE(tag.size() >= 10);
+    REQUIRE(tag.substr(0, 3) == "ID3");
+    // Version 2.3
+    REQUIRE((uint8_t)tag[3] == 3);
+    REQUIRE((uint8_t)tag[4] == 0);
+    // Flags = 0
+    REQUIRE((uint8_t)tag[5] == 0);
+
+    // Synchsafe size should match remaining bytes
+    uint32_t syncsafe = ((uint32_t)(uint8_t)tag[6] << 21) | ((uint32_t)(uint8_t)tag[7] << 14) |
+                        ((uint32_t)(uint8_t)tag[8] << 7) | ((uint32_t)(uint8_t)tag[9]);
+    REQUIRE(syncsafe == tag.size() - 10);
+
+    // Should contain TXXX frames
+    REQUIRE(tag.find("TXXX") != std::string::npos);
+    REQUIRE(tag.find("AI_GENERATED") != std::string::npos);
+    REQUIRE(tag.find("GENERATOR") != std::string::npos);
+    REQUIRE(tag.find("CrispASR") != std::string::npos);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// crispasr_make_pcm_int16_le (OpenAI's response_format=pcm)
+// ──────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("PCM byte-stream matches WAV data chunk byte-for-byte", "[unit][pcm]") {
     // Both serializers should write the same int16 LE samples — only the
-    // 44-byte header differs. Verify by stripping the header.
+    // 44-byte header and trailing LIST/INFO chunk differ. Verify by
+    // extracting just the data region from the WAV.
     std::vector<float> samples = {0.0f, 0.25f, -0.25f, 0.5f, -0.5f, 0.99f, -0.99f, 1.0f, -1.0f};
     std::string wav = crispasr_make_wav_int16(samples.data(), (int)samples.size(), 24000);
     std::string pcm = crispasr_make_pcm_int16_le(samples.data(), (int)samples.size());
-    REQUIRE(wav.substr(44) == pcm);
+    REQUIRE(wav.substr(44, pcm.size()) == pcm);
 }
