@@ -1274,8 +1274,11 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
                     if (k > n_past + q) mask[(size_t)q * Lk + k] = neg_inf;
         }
 
+        fprintf(stderr, "kugelaudio: sched_reset...\n");
         ggml_backend_sched_reset(ctx->sched);
+        fprintf(stderr, "kugelaudio: alloc_graph n_nodes=%d...\n", ggml_graph_n_nodes(gf));
         if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return false;
+        fprintf(stderr, "kugelaudio: alloc_graph OK, setting inputs...\n");
 
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "lm_input"), embeds_data, 0,
                                 (size_t)hp.d_lm * n_toks * sizeof(float));
