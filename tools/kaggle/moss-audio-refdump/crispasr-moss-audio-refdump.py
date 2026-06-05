@@ -43,7 +43,7 @@ kh.step("moss_github_cloned")
 print("[3] installing deps", flush=True)
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--quiet",
-    "torch", "transformers>=4.57", "safetensors", "gguf",
+    "torch", "transformers==4.57.1", "safetensors", "gguf",
     "huggingface_hub", "hf_transfer",
 ])
 kh.step("deps_installed")
