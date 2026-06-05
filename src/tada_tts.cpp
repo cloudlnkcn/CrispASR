@@ -135,12 +135,18 @@ struct tada_context {
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> compute_meta;
 
-    // KV cache
+    // KV cache (positive path)
     ggml_context*          kv_ctx = nullptr;
     ggml_backend_buffer_t  kv_buf = nullptr;
     ggml_tensor*           kv_k   = nullptr;
     ggml_tensor*           kv_v   = nullptr;
     int kv_max_ctx = 0;
+
+    // KV cache (negative path for CFG)
+    ggml_context*          kv_neg_ctx = nullptr;
+    ggml_backend_buffer_t  kv_neg_buf = nullptr;
+    ggml_tensor*           kv_neg_k   = nullptr;
+    ggml_tensor*           kv_neg_v   = nullptr;
 
     // Codec (lazy-loaded)
     std::string codec_path;
@@ -295,7 +301,17 @@ static bool kv_init(tada_context* c, int max_ctx) {
         return false;
     }
     c->kv_max_ctx = max_ctx;
-    // Zero-init KV cache
+
+    // Negative KV cache (for CFG doubled-batch)
+    ggml_init_params ip_neg = {ggml_tensor_overhead() * 2, nullptr, true};
+    c->kv_neg_ctx = ggml_init(ip_neg);
+    c->kv_neg_k = ggml_new_tensor_4d(c->kv_neg_ctx, kv_pair.k, hd, max_ctx, nkv, nl);
+    c->kv_neg_v = ggml_new_tensor_4d(c->kv_neg_ctx, kv_pair.v, hd, max_ctx, nkv, nl);
+    ggml_set_name(c->kv_neg_k, "kv_neg_k");
+    ggml_set_name(c->kv_neg_v, "kv_neg_v");
+    c->kv_neg_buf = ggml_backend_alloc_ctx_tensors(c->kv_neg_ctx, c->backend);
+
+    // Zero-init both KV caches
     ggml_backend_buffer_clear(c->kv_buf, 0);
     return true;
 }
@@ -375,7 +391,12 @@ static ggml_cgraph* build_graph_step_embed(tada_context* c) {
 // Llama forward pass (same as orpheus) with KV cache.
 // Input: embeds (d, T), output: hidden_state (d, 1) at last position.
 static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tokens,
-                                           bool compute_logits) {
+                                           bool compute_logits,
+                                           ggml_tensor* use_kv_k = nullptr,
+                                           ggml_tensor* use_kv_v = nullptr) {
+    // Default to positive KV cache
+    if (!use_kv_k) use_kv_k = c->kv_k;
+    if (!use_kv_v) use_kv_v = c->kv_v;
     const auto& hp = c->hp;
     const int d = (int)hp.d_model;
     const int n_q = (int)hp.n_heads;
@@ -388,7 +409,7 @@ static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tok
     const int T = n_tokens;
     const int Lk = n_past + T;
 
-    GGML_ASSERT(c->kv_k && c->kv_v && Lk <= c->kv_max_ctx);
+    GGML_ASSERT(use_kv_k && use_kv_v && Lk <= c->kv_max_ctx);
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -423,7 +444,7 @@ static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tok
             ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
             nullptr, nullptr, positions,
             (T == 1) ? nullptr : causal_mask,
-            c->kv_k, c->kv_v, (int)il, n_past, kvp);
+            use_kv_k, use_kv_v, (int)il, n_past, kvp);
         cur = ggml_add(ctx0, residual, attn);
 
         residual = cur;
@@ -645,7 +666,9 @@ struct talker_result {
 };
 
 static talker_result run_talker_kv(tada_context* c, const float* embeds,
-                                    int n_tokens, int n_past, bool need_logits) {
+                                    int n_tokens, int n_past, bool need_logits,
+                                    ggml_tensor* use_kv_k = nullptr,
+                                    ggml_tensor* use_kv_v = nullptr) {
     talker_result res = {nullptr, nullptr};
     if (n_past + n_tokens > c->kv_max_ctx) {
         fprintf(stderr, "tada: kv overflow (%d+%d > %d)\n", n_past, n_tokens, c->kv_max_ctx);
@@ -670,7 +693,8 @@ static talker_result run_talker_kv(tada_context* c, const float* embeds,
         }
     }
 
-    ggml_cgraph* gf = build_graph_talker_kv(c, n_past, n_tokens, need_logits);
+    ggml_cgraph* gf = build_graph_talker_kv(c, n_past, n_tokens, need_logits,
+                                               use_kv_k, use_kv_v);
     ggml_backend_sched_reset(c->sched);
     if (!ggml_backend_sched_alloc_graph(c->sched, gf)) return res;
 
@@ -763,7 +787,8 @@ static void build_logsnr_schedule(std::vector<float>& t_span, int num_steps) {
 
 // Euler ODE solver for flow matching with CFG.
 static void fm_euler_solve(tada_context* c, float* speech, const float* cond,
-                            int num_steps, float cfg_scale) {
+                            int num_steps, float cfg_scale,
+                            const float* neg_cond = nullptr) {
     const int lat = (int)c->hp.fm_latent;
     const int ad = (int)c->hp.acoustic_dim;
 
@@ -772,7 +797,8 @@ static void fm_euler_solve(tada_context* c, float* speech, const float* cond,
     build_logsnr_schedule(t_span, num_steps);
 
     std::vector<float> vel_pos(lat), vel_neg(lat);
-    std::vector<float> zero_cond(c->hp.fm_hidden, 0.0f); // negative condition = zeros
+    std::vector<float> zero_cond(c->hp.fm_hidden, 0.0f);
+    const float* neg = neg_cond ? neg_cond : zero_cond.data();
 
     for (int i = 0; i < num_steps; i++) {
         float dt = t_span[i + 1] - t_span[i];
@@ -785,7 +811,7 @@ static void fm_euler_solve(tada_context* c, float* speech, const float* cond,
             // CFG: velocity = v_neg + cfg * (v_pos - v_neg)
             // Separate acoustic and duration CFG (duration_cfg = 1.0)
             run_fm_step(c, speech, t_val, cond, vel_pos.data());
-            run_fm_step(c, speech, t_val, zero_cond.data(), vel_neg.data());
+            run_fm_step(c, speech, t_val, neg, vel_neg.data());
 
             for (int j = 0; j < ad; j++) {
                 // Acoustic dims: apply acoustic CFG
@@ -1043,8 +1069,9 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
                 num_prompt, max_tokens);
     }
 
-    // ── Zero KV cache ──
+    // ── Zero KV caches ──
     ggml_backend_buffer_clear(ctx->kv_buf, 0);
+    if (ctx->kv_neg_buf) ggml_backend_buffer_clear(ctx->kv_neg_buf, 0);
 
     // ── AR + FM generation loop ──
     std::vector<std::vector<float>> acoustic_features;
@@ -1066,15 +1093,37 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         int32_t cur_token = all_ids[step];
         bool need_logits = (step >= num_prompt - 1);
 
-        // Build step embedding
+        // Build step embedding (positive path)
         float* emb = build_step_embedding(ctx, cur_token, cur_acoustic.data(),
                                            cur_mask, cur_t_before, cur_t_after);
         if (!emb) { fprintf(stderr, "tada: embed failed at step %d\n", step); return nullptr; }
 
-        // LLM forward
+        // LLM forward (positive — uses real tokens)
         talker_result tr = run_talker_kv(ctx, emb, 1, n_past, need_logits);
         free(emb);
         if (!tr.hidden) { fprintf(stderr, "tada: talker failed at step %d\n", step); return nullptr; }
+
+        // LLM forward (negative — pad token substituted for CFG)
+        // Build neg embedding: same acoustic/time, but token replaced with pad
+        float* neg_hidden = nullptr;
+        if (cfg_scale != 1.0f && ctx->kv_neg_k) {
+            int32_t pad_id = 128004; // Llama <|finetune_right_pad_id|>
+            auto pad_it = ctx->vocab.token_to_id.find("<|finetune_right_pad_id|>");
+            if (pad_it != ctx->vocab.token_to_id.end()) pad_id = pad_it->second;
+
+            // Keep structural tokens, replace content with pad
+            bool is_structural = (cur_token == eot);
+            int32_t neg_token = is_structural ? cur_token : pad_id;
+
+            float* neg_emb = build_step_embedding(ctx, neg_token, cur_acoustic.data(),
+                                                    cur_mask, cur_t_before, cur_t_after);
+            if (neg_emb) {
+                talker_result neg_tr = run_talker_kv(ctx, neg_emb, 1, n_past, false,
+                                                      ctx->kv_neg_k, ctx->kv_neg_v);
+                free(neg_emb);
+                neg_hidden = neg_tr.hidden; // caller frees
+            }
+        }
         n_past++;
 
         // ── Flow matching solver ──
@@ -1084,8 +1133,11 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
             speech[j] = rng_normal(&ctx->rng_state) * noise_temp;
         }
 
-        // Solve ODE
-        fm_euler_solve(ctx, speech.data(), tr.hidden, num_fm_steps, cfg_scale);
+        // Solve ODE with proper negative conditioning
+        fm_euler_solve(ctx, speech.data(), tr.hidden, num_fm_steps, cfg_scale, neg_hidden);
+
+        // Free negative hidden state
+        if (neg_hidden) { free(neg_hidden); neg_hidden = nullptr; }
 
         // Extract time from gray code
         int num_time_bits = (int)hp.num_time_bits;
@@ -1260,6 +1312,8 @@ void tada_free(struct tada_context* ctx) {
     if (!ctx) return;
     if (ctx->codec_ctx) tada_codec_free(ctx->codec_ctx);
     if (ctx->sched) ggml_backend_sched_free(ctx->sched);
+    if (ctx->kv_neg_buf) ggml_backend_buffer_free(ctx->kv_neg_buf);
+    if (ctx->kv_neg_ctx) ggml_free(ctx->kv_neg_ctx);
     if (ctx->kv_buf) ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx) ggml_free(ctx->kv_ctx);
     if (ctx->buf_w) ggml_backend_buffer_free(ctx->buf_w);
