@@ -479,4 +479,218 @@ EMSCRIPTEN_BINDINGS(whisper) {
                              r.set("backboneSwapped", swapped);
                              return r;
                          }));
+
+    // -------------------------------------------------------------------
+    // Full C-ABI parity wrappers (PLAN #59)
+    // -------------------------------------------------------------------
+
+    // --- Session setters ---
+    emscripten::function("sessionSetSourceLanguage", emscripten::optional_override([](const std::string& lang) {
+        return g_tts_session ? crispasr_session_set_source_language(g_tts_session, lang.c_str()) : -1;
+    }));
+    emscripten::function("sessionSetTargetLanguage", emscripten::optional_override([](const std::string& lang) {
+        return g_tts_session ? crispasr_session_set_target_language(g_tts_session, lang.c_str()) : -1;
+    }));
+    emscripten::function("sessionSetPunctuation", emscripten::optional_override([](bool enable) {
+        return g_tts_session ? crispasr_session_set_punctuation(g_tts_session, enable ? 1 : 0) : -1;
+    }));
+    emscripten::function("sessionSetTranslate", emscripten::optional_override([](bool enable) {
+        return g_tts_session ? crispasr_session_set_translate(g_tts_session, enable ? 1 : 0) : -1;
+    }));
+    emscripten::function("sessionSetTemperature", emscripten::optional_override([](float temp, int seed) {
+        return g_tts_session ? crispasr_session_set_temperature(g_tts_session, temp, (unsigned long long)seed) : -1;
+    }));
+    emscripten::function("sessionSetTtsSeed", emscripten::optional_override([](int seed) {
+        return g_tts_session ? crispasr_session_set_tts_seed(g_tts_session, (unsigned long long)seed) : -1;
+    }));
+    emscripten::function("sessionSetTtsSteps", emscripten::optional_override([](int steps) {
+        return g_tts_session ? crispasr_session_set_tts_steps(g_tts_session, steps) : -1;
+    }));
+    emscripten::function("sessionSetMaxNewTokens", emscripten::optional_override([](int n) {
+        return g_tts_session ? crispasr_session_set_max_new_tokens(g_tts_session, n) : -1;
+    }));
+    emscripten::function("sessionSetFrequencyPenalty", emscripten::optional_override([](float p) {
+        return g_tts_session ? crispasr_session_set_frequency_penalty(g_tts_session, p) : -1;
+    }));
+    emscripten::function("sessionSetTopP", emscripten::optional_override([](float p) {
+        return g_tts_session ? crispasr_session_set_top_p(g_tts_session, p) : -1;
+    }));
+    emscripten::function("sessionSetMinP", emscripten::optional_override([](float p) {
+        return g_tts_session ? crispasr_session_set_min_p(g_tts_session, p) : -1;
+    }));
+    emscripten::function("sessionSetRepetitionPenalty", emscripten::optional_override([](float r) {
+        return g_tts_session ? crispasr_session_set_repetition_penalty(g_tts_session, r) : -1;
+    }));
+    emscripten::function("sessionSetCfgWeight", emscripten::optional_override([](float w) {
+        return g_tts_session ? crispasr_session_set_cfg_weight(g_tts_session, w) : -1;
+    }));
+    emscripten::function("sessionSetExaggeration", emscripten::optional_override([](float e) {
+        return g_tts_session ? crispasr_session_set_exaggeration(g_tts_session, e) : -1;
+    }));
+    emscripten::function("sessionSetMaxSpeechTokens", emscripten::optional_override([](int n) {
+        return g_tts_session ? crispasr_session_set_max_speech_tokens(g_tts_session, n) : -1;
+    }));
+    emscripten::function("sessionSetLengthScale", emscripten::optional_override([](float s) {
+        return g_tts_session ? crispasr_session_set_length_scale(g_tts_session, s) : -1;
+    }));
+    emscripten::function("sessionSetBestOf", emscripten::optional_override([](int n) {
+        return g_tts_session ? crispasr_session_set_best_of(g_tts_session, n) : -1;
+    }));
+    emscripten::function("sessionSetBeamSize", emscripten::optional_override([](int n) {
+        return g_tts_session ? crispasr_session_set_beam_size(g_tts_session, n) : -1;
+    }));
+    emscripten::function("sessionSetGrammarText", emscripten::optional_override(
+        [](const std::string& text, const std::string& root, float penalty) {
+            return g_tts_session ? crispasr_session_set_grammar_text(
+                g_tts_session, text.c_str(), root.c_str(), penalty) : -1;
+        }));
+    emscripten::function("sessionSetFallbackThresholds", emscripten::optional_override(
+        [](float entropy, float logprob, float noSpeech, float tempInc) {
+            return g_tts_session ? crispasr_session_set_fallback_thresholds(
+                g_tts_session, entropy, logprob, noSpeech, tempInc) : -1;
+        }));
+    emscripten::function("sessionSetAltN", emscripten::optional_override([](int n) {
+        return g_tts_session ? crispasr_session_set_alt_n(g_tts_session, n) : -1;
+    }));
+    emscripten::function("sessionSetWhisperDecodeExtras", emscripten::optional_override(
+        [](bool suppressNst, const std::string& regex, bool carryPrompt) {
+            return g_tts_session ? crispasr_session_set_whisper_decode_extras(
+                g_tts_session, suppressNst ? 1 : 0, regex.c_str(), carryPrompt ? 1 : 0) : -1;
+        }));
+    emscripten::function("sessionSetAsk", emscripten::optional_override([](const std::string& prompt) {
+        return g_tts_session ? crispasr_session_set_ask(g_tts_session, prompt.c_str()) : -1;
+    }));
+
+    // --- Session ASR ---
+    emscripten::function("sessionTranscribe", emscripten::optional_override(
+        [](const emscripten::val& audio, const std::string& lang) -> emscripten::val {
+            if (!g_tts_session) return emscripten::val::array();
+            const int n = audio["length"].as<int>();
+            std::vector<float> pcm(n);
+            emscripten::val heap = emscripten::val::module_property("HEAPU8");
+            emscripten::val memory = heap["buffer"];
+            emscripten::val mv = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcm.data()), n);
+            mv.call<void>("set", audio);
+
+            crispasr_session_result* res;
+            if (!lang.empty()) {
+                res = crispasr_session_transcribe_lang(g_tts_session, pcm.data(), n, lang.c_str());
+            } else {
+                res = crispasr_session_transcribe(g_tts_session, pcm.data(), n);
+            }
+            if (!res) return emscripten::val::array();
+
+            int ns = crispasr_session_result_n_segments(res);
+            emscripten::val out = emscripten::val::array();
+            for (int i = 0; i < ns; i++) {
+                emscripten::val seg = emscripten::val::object();
+                const char* t = crispasr_session_result_segment_text(res, i);
+                seg.set("text", std::string(t ? t : ""));
+                seg.set("t0", crispasr_session_result_segment_t0(res, i) / 100.0);
+                seg.set("t1", crispasr_session_result_segment_t1(res, i) / 100.0);
+                int nw = crispasr_session_result_n_words(res, i);
+                emscripten::val words = emscripten::val::array();
+                for (int j = 0; j < nw; j++) {
+                    emscripten::val w = emscripten::val::object();
+                    const char* wt = crispasr_session_result_word_text(res, i, j);
+                    w.set("text", std::string(wt ? wt : ""));
+                    w.set("t0", crispasr_session_result_word_t0(res, i, j) / 100.0);
+                    w.set("t1", crispasr_session_result_word_t1(res, i, j) / 100.0);
+                    w.set("p", (double)crispasr_session_result_word_p(res, i, j));
+                    words.call<void>("push", w);
+                }
+                seg.set("words", words);
+                out.call<void>("push", seg);
+            }
+            crispasr_session_result_free(res);
+            return out;
+        }));
+
+    // --- Session translate ---
+    emscripten::function("sessionTranslateText", emscripten::optional_override(
+        [](const std::string& text, const std::string& src, const std::string& tgt, int maxTokens) -> std::string {
+            if (!g_tts_session) return "";
+            char* res = crispasr_session_translate_text(g_tts_session, text.c_str(),
+                                                        src.c_str(), tgt.c_str(), maxTokens);
+            if (!res) return "";
+            std::string out(res);
+            crispasr_session_translate_text_free(res);
+            return out;
+        }));
+
+    // --- Available backends ---
+    emscripten::function("availableBackends", emscripten::optional_override([]() -> std::string {
+        char buf[1024] = {0};
+        crispasr_session_available_backends(buf, sizeof(buf));
+        return std::string(buf);
+    }));
+
+    // --- Detect backend from GGUF ---
+    emscripten::function("detectBackendFromGguf", emscripten::optional_override(
+        [](const std::string& path) -> std::string {
+            char out[128] = {0};
+            int rc = crispasr_detect_backend_from_gguf(path.c_str(), out, sizeof(out));
+            return rc == 0 ? std::string(out) : "";
+        }));
+
+    // --- LCS dedup ---
+    emscripten::function("lcsDedup", emscripten::optional_override(
+        [](const emscripten::val& prev, const emscripten::val& curr, int minLen) -> int {
+            int pn = prev["length"].as<int>();
+            int cn = curr["length"].as<int>();
+            std::vector<int> pvec(pn), cvec(cn);
+            for (int i = 0; i < pn; i++) pvec[i] = prev[i].as<int>();
+            for (int i = 0; i < cn; i++) cvec[i] = curr[i].as<int>();
+            return crispasr_lcs_dedup_prefix_count(pvec.data(), pn, cvec.data(), cn, minLen);
+        }));
+
+    // --- Kokoro lang helpers ---
+    emscripten::function("kokoroLangIsGerman", emscripten::optional_override(
+        [](const std::string& lang) -> bool {
+            return crispasr_kokoro_lang_is_german_abi(lang.c_str()) != 0;
+        }));
+    emscripten::function("kokoroLangHasNativeVoice", emscripten::optional_override(
+        [](const std::string& lang) -> bool {
+            return crispasr_kokoro_lang_has_native_voice_abi(lang.c_str()) != 0;
+        }));
+
+    // --- Text-LID ---
+    emscripten::function("textDetectLanguage", emscripten::optional_override(
+        [](const std::string& text, const std::string& modelPath, int nThreads) -> emscripten::val {
+            char label[64] = {0};
+            float conf = 0.0f;
+            int rc = crispasr_text_detect_language(text.c_str(), modelPath.c_str(),
+                                                   nThreads, label, 64, &conf);
+            emscripten::val r = emscripten::val::object();
+            r.set("rc", rc);
+            r.set("lang", std::string(label));
+            r.set("confidence", (double)conf);
+            return r;
+        }));
+
+    // --- Registry ---
+    emscripten::function("registryListBackends", emscripten::optional_override([]() -> std::string {
+        char buf[8192] = {0};
+        crispasr_registry_list_backends_abi(buf, sizeof(buf));
+        return std::string(buf);
+    }));
+
+    // --- Punctuation ---
+    emscripten::function("puncInit", emscripten::optional_override(
+        [](const std::string& modelPath) -> int {
+            void* h = crispasr_punc_init(modelPath.c_str());
+            return h ? (int)(uintptr_t)h : 0;
+        }));
+    emscripten::function("puncProcess", emscripten::optional_override(
+        [](int handle, const std::string& text) -> std::string {
+            if (!handle) return text;
+            const char* r = crispasr_punc_process((void*)(uintptr_t)handle, text.c_str());
+            if (!r) return text;
+            std::string out(r);
+            crispasr_punc_free_text(r);
+            return out;
+        }));
+    emscripten::function("puncFree", emscripten::optional_override([](int handle) {
+        if (handle) crispasr_punc_free((void*)(uintptr_t)handle);
+    }));
 }

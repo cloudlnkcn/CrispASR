@@ -10,16 +10,15 @@ effort estimate. Completed items have been moved to `HISTORY.md`.
 
 **Latest release: v0.6.12** (commit `345ecfdc`). Full notes in [`RELEASE_NOTES_v0.6.12.md`](RELEASE_NOTES_v0.6.12.md).
 
-> **Audit 2026-06-03 + follow-up 2026-06-04** — code-verified all items.
-> **Closed this session:** #96 graph-default flip (DONE), #73 FA benchmark
-> (DONE — crossover confirmed, cohere defaults to cast-on-read), #61j
-> glm-asr translate (DONE), #94 Go auto-gen (was already done), #93 CMake
-> rename (was already done `11148b23`), #103 Silero v6 (was already done,
-> v6.2.0), #100 MeloTTS Phase A (done `e65b8d82`), O4 beam search (done).
+> **Audit 2026-06-03 → 2026-06-05** — code-verified all items.
+> **Closed:** #96 graph-default flip, #73 FA benchmark (cohere cast-on-read
+> default), #61j glm-asr translate, #94 Go auto-gen, #93 CMake rename,
+> #103 Silero v6, #100 Phase A (MeloTTS), O4 beam search, **#100 Phase B
+> (OpenVoice2 voice cloning — WORKING, ASR roundtrip "Hello.")**.
 > **Still open:** #52 perf pass, #51c F16 (RAM-blocked), #56 JA kanji
 > (needs MeCab/KaKaSi), #58 MOSS (in progress), #115 Option C, #75 server
 > round 2, #66 wrapper publishing, O5/O6/O7 (O6 GPU-only, O7 needs draft
-> models), #100 Phase B (OpenVoice2 cloning), #101 OmniVoice, #102 RapidTP.
+> models), #101 OmniVoice, #102 RapidTP.
 
 **Current state (May 2026, v0.6.11):** 20 ASR + 3 TTS + 1 speaker-verification backends (+ Chatterbox T3 in progress), unified CLI,
 OpenAI-compatible server + WebSocket streaming, shared `src/core/` library, FireRedPunc

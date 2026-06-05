@@ -256,6 +256,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             (sname.find("norm") == std::string::npos) &&
             (granite_quant_all || sname.find("proj.") != 0) &&
             !(is_granite_family && !granite_quant_all && sname.find("enc.") == 0) &&
+            // MOSS-Audio: keep encoder + adapter + deepstack at F16
+            !(arch == "moss_audio" && (sname.find("enc.") == 0 ||
+                                       sname.find("adapter.") == 0 ||
+                                       sname.find("deepstack.") == 0)) &&
             !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) &&
             (sname.find("enc_proj.") != 0) && (sname.find("lm_head.") != 0) && (sname.find("tok_emb.") != 0) &&
             (sname.find("lang_emb.") != 0) &&

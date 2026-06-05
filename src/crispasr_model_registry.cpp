@@ -205,8 +205,13 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/mimo-asr-GGUF/resolve/main/mimo-asr-q4_k.gguf", "~4.2 GB",
      "mimo-tokenizer-q4_k.gguf",
      "https://huggingface.co/cstr/mimo-tokenizer-GGUF/resolve/main/mimo-tokenizer-q4_k.gguf"},
+    {"moss-audio", "moss-audio-4b-instruct-q4_k.gguf",
+     "https://huggingface.co/cstr/MOSS-Audio-4B-Instruct-GGUF/resolve/main/moss-audio-4b-instruct-q4_k.gguf", "~3.8 GB",
+     nullptr, nullptr},
     {"omniasr", "omniasr-ctc-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniASR-CTC-1B-v2-GGUF/resolve/main/omniasr-ctc-1b-v2-q4_k.gguf", "~658 MB", nullptr, nullptr},
+    {"omniasr-300m", "omniasr-ctc-300m-v2-q4_k.gguf",
+     "https://huggingface.co/cstr/omniASR-CTC-300M-v2-GGUF/resolve/main/omniasr-ctc-300m-v2-q4_k.gguf", "~194 MB", nullptr, nullptr},
     {"omniasr-llm", "omniasr-llm-300m-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniasr-llm-300m-v2-GGUF/resolve/main/omniasr-llm-300m-v2-q4_k.gguf", "~1019 MB", nullptr, nullptr},
     {"omniasr-llm-1b", "omniasr-llm-1b-q4_k.gguf",
@@ -594,6 +599,23 @@ constexpr Entry k_registry[] = {
     {"csm", "csm-1b-q4_k.gguf",
      "https://huggingface.co/cstr/csm-1b-GGUF/resolve/main/csm-1b-q4_k.gguf",
      "~1.4 GB", nullptr, nullptr},
+
+    // MeloTTS: VITS2 52M param TTS (myshell-ai/MeloTTS). 44.1 kHz mono.
+    // MIT license. Single GGUF with embedded CMU dictionary + neural G2P.
+    // V2: 4 English speakers (US/BR/India/AU), 112 symbols, 11 tones.
+    // V3: 1 speaker (EN-Newest), 219 symbols, 16 tones (newest checkpoint).
+    // Companion: bert-base-uncased Q4_K (52 MB) for BERT conditioning.
+    // Also available: F16 (227 MB), Q8_0 (97 MB) on the same HF repo.
+    {"melotts", "melotts-en-v2-f16.gguf",
+     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/melotts-en-v2-f16.gguf",
+     "~102+52 MB",
+     "bert-base-uncased-q4k.gguf",
+     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/bert-base-uncased-q4k.gguf"},
+    {"melotts-v3", "melotts-en-v3-f16.gguf",
+     "https://huggingface.co/cstr/melotts-en-v3-GGUF/resolve/main/melotts-en-v3-f16.gguf",
+     "~93+52 MB",
+     "bert-base-uncased.gguf",
+     "https://huggingface.co/cstr/melotts-en-v3-GGUF/resolve/main/bert-base-uncased.gguf"},
 
     // SpeechT5 TTS: 80M param AR mel decoder + HiFi-GAN vocoder.
     // MIT license (microsoft/speecht5_tts). Needs a 512-d x-vector for

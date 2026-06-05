@@ -53,6 +53,7 @@ add_executable(${TARGET}
     crispasr_backend_gemma4_e2b.cpp
     crispasr_backend_omniasr.cpp
     crispasr_backend_mimo_asr.cpp
+    crispasr_backend_moss_audio.cpp
     crispasr_backend_funasr.cpp
     crispasr_backend_paraformer.cpp
     crispasr_backend_sensevoice.cpp
@@ -181,6 +182,7 @@ target_link_libraries(crispasr-diff PRIVATE
     gemma4_e2b
     mimo_tokenizer
     mimo_asr
+    moss_audio
     voxcpm2_tts
     funasr
     paraformer
@@ -282,6 +284,7 @@ target_link_libraries(${TARGET} PRIVATE
     funasr
     paraformer
     sensevoice
+    moss_audio
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>

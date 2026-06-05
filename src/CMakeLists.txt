@@ -792,6 +792,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# moss_audio — OpenMOSS-Team/MOSS-Audio-4B-Instruct (Whisper encoder + DeepStack + Qwen3 LLM)
+# ---------------------------------------------------------------------------
+add_library(moss_audio STATIC moss_audio.h moss_audio.cpp)
+set_target_properties(moss_audio PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(moss_audio PUBLIC .)
+target_compile_features   (moss_audio PUBLIC cxx_std_17)
+target_link_libraries     (moss_audio PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(moss_audio PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # qwen3_tts — Qwen/Qwen3-TTS (Qwen3 talker + 16-codebook RVQ output)
 # ---------------------------------------------------------------------------
 add_library(qwen3_tts STATIC qwen3_tts.h qwen3_tts.cpp)
@@ -1129,15 +1141,37 @@ if(NOT MSVC)
     target_compile_options(fastpitch-tts PRIVATE -O3)
 endif()
 
+# bert-encoder — BERT encoder for MeloTTS conditioning
+# ---------------------------------------------------------------------------
+add_library(bert-encoder STATIC bert_encoder.h bert_encoder.cpp)
+set_target_properties(bert-encoder PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(bert-encoder PUBLIC .)
+target_compile_features   (bert-encoder PUBLIC cxx_std_17)
+target_link_libraries     (bert-encoder PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(bert-encoder PRIVATE -O3)
+endif()
+
 # melotts — myshell-ai/MeloTTS VITS2 TTS (native ggml runtime)
 # ---------------------------------------------------------------------------
 add_library(melotts STATIC melotts.h melotts.cpp)
 set_target_properties(melotts PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(melotts PUBLIC .)
 target_compile_features   (melotts PUBLIC cxx_std_17)
-target_link_libraries     (melotts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries     (melotts PUBLIC crispasr-core ggml ggml-base ggml-cpu bert-encoder)
 if(NOT MSVC)
     target_compile_options(melotts PRIVATE -O3)
+endif()
+
+# openvoice2 — myshell-ai/OpenVoice V2 Tone Color Converter (voice cloning)
+# ---------------------------------------------------------------------------
+add_library(openvoice2 STATIC openvoice2.h openvoice2.cpp)
+set_target_properties(openvoice2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(openvoice2 PUBLIC .)
+target_compile_features   (openvoice2 PUBLIC cxx_std_17)
+target_link_libraries     (openvoice2 PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(openvoice2 PRIVATE -O3)
 endif()
 
 # piper-tts — rhasspy/piper VITS TTS (native ggml runtime)
@@ -1559,8 +1593,14 @@ endif()
 if (TARGET pocket-tts)
     target_link_libraries(crispasr-lib PUBLIC pocket-tts)
 endif()
+if (TARGET bert-encoder)
+    target_link_libraries(crispasr-lib PUBLIC bert-encoder)
+endif()
 if (TARGET melotts)
     target_link_libraries(crispasr-lib PUBLIC melotts)
+endif()
+if (TARGET openvoice2)
+    target_link_libraries(crispasr-lib PUBLIC openvoice2)
 endif()
 if (TARGET piper-tts)
     target_link_libraries(crispasr-lib PUBLIC piper-tts)

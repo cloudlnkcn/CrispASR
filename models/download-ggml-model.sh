@@ -120,7 +120,7 @@ fi
 if [ -x "$(command -v wget2)" ]; then
     wget2 --no-config --progress bar -O ggml-"$model".bin $src/$pfx-"$model".bin
 elif [ -x "$(command -v curl)" ]; then
-    curl -L --output ggml-"$model".bin $src/$pfx-"$model".bin
+    curl -fL --output ggml-"$model".bin $src/$pfx-"$model".bin
 elif [ -x "$(command -v wget)" ]; then
     wget --no-config --quiet --show-progress -O ggml-"$model".bin $src/$pfx-"$model".bin
 else
@@ -144,7 +144,7 @@ if [ "$file_size" -lt 1000000 ]; then
     rm -f ggml-"$model".bin
     sleep 5
     if [ -x "$(command -v curl)" ]; then
-        curl -L --retry 3 --retry-delay 5 --output ggml-"$model".bin $src/$pfx-"$model".bin
+        curl -fL --retry 3 --retry-delay 5 --output ggml-"$model".bin $src/$pfx-"$model".bin
     elif [ -x "$(command -v wget)" ]; then
         wget --no-config --quiet --show-progress -O ggml-"$model".bin $src/$pfx-"$model".bin
     fi

@@ -63,10 +63,14 @@
 #include "sensevoice.h"
 #include "cosyvoice3_tts.h"
 #include "parler_tts.h"
+#include "melotts.h"
+#include "moss_audio.h"
 #if __has_include("kugelaudio.h")
 #include "kugelaudio.h"
 #define CA_HAVE_KUGELAUDIO 1
 #endif
+
+#include "core/gguf_loader.h"
 
 #include "common-crispasr.h"
 
@@ -81,6 +85,32 @@
 #include <sys/stat.h>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <windows.h>
+static char* portable_mkdtemp(char* tpl) {
+    // Replace trailing XXXXXX with a unique suffix
+    char tmp_path[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tmp_path) == 0)
+        return nullptr;
+    char unique[MAX_PATH];
+    if (GetTempFileNameA(tmp_path, "cd", 0, unique) == 0)
+        return nullptr;
+    // GetTempFileName creates a file — remove it, make a directory instead
+    _unlink(unique);
+    if (_mkdir(unique) != 0)
+        return nullptr;
+    strncpy(tpl, unique, strlen(tpl));
+    tpl[strlen(unique)] = '\0';
+    return tpl;
+}
+#define mkdtemp portable_mkdtemp
+#define rmdir _rmdir
+#else
+#include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Per-backend stage runners
@@ -791,7 +821,8 @@ int main(int argc, char** argv) {
             "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
             "granite-4.1, "
             "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
-            "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, parler-tts\n"
+            "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
+            "parler-tts, moss-audio\n"
             "  model.gguf    crispasr-compatible model weights\n"
             "  reference.gguf  archive produced by tools/dump_reference.py\n"
             "  audio.wav     16 kHz mono WAV\n",
@@ -4862,6 +4893,226 @@ int main(int argc, char** argv) {
         fprintf(stderr, "crispasr-diff: kugelaudio backend not compiled in\n");
         return 4;
 #endif
+    } else if (backend_name == "moss-audio") {
+        auto cp = moss_audio_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 1;
+        moss_audio_context* ctx = moss_audio_init_from_file(model_path.c_str(), cp);
+        if (!ctx) { fprintf(stderr, "failed to load moss-audio model\n"); return 4; }
+
+        // ---- mel_spectrogram ----
+        int n_mels = 0, T_mel = 0;
+        float* mel = nullptr;
+        const char* mel_override = std::getenv("MOSS_AUDIO_MEL_FILE");
+        if (mel_override) {
+            FILE* mf = fopen(mel_override, "rb");
+            if (mf) {
+                fseek(mf, 0, SEEK_END);
+                size_t sz = (size_t)ftell(mf);
+                fseek(mf, 0, SEEK_SET);
+                n_mels = 128; T_mel = (int)(sz / sizeof(float) / n_mels);
+                mel = (float*)malloc(sz);
+                fread(mel, 1, sz, mf); fclose(mf);
+                printf("  (mel override from %s: %d x %d)\n", mel_override, n_mels, T_mel);
+            }
+        }
+        if (!mel) {
+            mel = moss_audio_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+        }
+        if (mel) {
+            auto rep = ref.compare("mel_spectrogram", mel, (size_t)n_mels * T_mel);
+            print_row("mel_spectrogram", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] mel_spectrogram         (compute failed)\n"); n_fail++;
+        }
+
+        // ---- encoder + deepstack taps ----
+        {
+            if (mel) {
+                int T_enc = 0, d_enc = 0;
+                float *ds0 = nullptr, *ds1 = nullptr, *ds2 = nullptr;
+                float* enc = moss_audio_run_encoder(ctx, mel, n_mels, T_mel,
+                                                     &T_enc, &d_enc, &ds0, &ds1, &ds2);
+                free(mel);
+                if (enc) {
+                    auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_enc);
+                    print_row("encoder_output", rep, COS_THRESHOLD);
+                    record(rep);
+
+                    // DeepStack taps (per-chunk, compare first chunk = first 50 tokens)
+                    // Ref taps are shape (50, 1280) = first chunk only
+                    int chunk_tokens = 50; // conv_out_len(conv_out_len(conv_out_len(400)))
+                    if (ds0) {
+                        auto r0 = ref.compare("enc_layer_8", ds0, (size_t)chunk_tokens * d_enc);
+                        print_row("enc_layer_8", r0, COS_THRESHOLD); record(r0);
+                    }
+                    if (ds1) {
+                        auto r1 = ref.compare("enc_layer_16", ds1, (size_t)chunk_tokens * d_enc);
+                        print_row("enc_layer_16", r1, COS_THRESHOLD); record(r1);
+                    }
+                    if (ds2) {
+                        auto r2 = ref.compare("enc_layer_24", ds2, (size_t)chunk_tokens * d_enc);
+                        print_row("enc_layer_24", r2, COS_THRESHOLD); record(r2);
+                    }
+
+                    // ---- adapter_output ----
+                    int adapt_T = 0, adapt_d = 0;
+                    float* adapted = moss_audio_run_adapter(ctx, enc, T_enc, d_enc, &adapt_T, &adapt_d);
+                    if (adapted) {
+                        auto ra = ref.compare("adapter_output", adapted, (size_t)adapt_T * adapt_d);
+                        print_row("adapter_output", ra, COS_THRESHOLD); record(ra);
+                        free(adapted);
+                    }
+
+                    free(enc);
+                    free(ds0); free(ds1); free(ds2);
+                } else {
+                    printf("[ERR ] encoder_output         (encoder failed)\n"); n_fail++;
+                }
+            }
+        }
+
+        moss_audio_free(ctx);
+    } else if (backend_name == "melotts") {
+        // MeloTTS (VITS2): text-driven TTS. The reference archive
+        // contains intermediate activations (enc_output, enc_mean,
+        // enc_logvar, dp_logw, z_p, z_dec, audio) produced by the
+        // Python reference dump script. We run the C++ runtime with
+        // dump_dir, then compare each stage.
+        //
+        // Usage:
+        //   python tools/reference_backends/melotts.py \
+        //       --ckpt /path/to/checkpoint.pth --config /path/to/config.json \
+        //       --text "Hello world." --seed 42 --output /tmp/melotts-ref.gguf
+        //   crispasr-diff melotts melotts-en-f16.gguf /tmp/melotts-ref.gguf dummy.wav
+
+        // Read melotts metadata directly from reference GGUF
+        gguf_context* ref_meta = core_gguf::open_metadata(ref_path.c_str());
+        if (!ref_meta) {
+            fprintf(stderr, "crispasr-diff melotts: failed to open reference '%s'\n", ref_path.c_str());
+            return 4;
+        }
+        const std::string text = core_gguf::kv_str(ref_meta, "melotts.text", "Hello world.");
+        const uint32_t seed = core_gguf::kv_u32(ref_meta, "melotts.seed", 42);
+        const uint32_t spk = core_gguf::kv_u32(ref_meta, "melotts.speaker_id", 0);
+        core_gguf::free_metadata(ref_meta);
+
+        printf("crispasr-diff melotts: text=\"%s\"  seed=%u  speaker=%u\n", text.c_str(), seed, spk);
+
+        melotts_params mp = melotts_default_params();
+        mp.n_threads = 4;
+        mp.verbosity = 0;
+        mp.seed = seed;
+        mp.speaker_id = (int)spk;
+
+        melotts_context* ctx = melotts_init_from_file(model_path.c_str(), mp);
+        if (!ctx) {
+            fprintf(stderr, "crispasr-diff melotts: failed to load '%s'\n", model_path.c_str());
+            return 4;
+        }
+
+        // Enable intermediate dumps
+        char dump_dir[] = "/tmp/crispasr-diff-melotts-XXXXXX";
+        if (!mkdtemp(dump_dir)) {
+            fprintf(stderr, "crispasr-diff melotts: mkdtemp failed\n");
+            melotts_free(ctx);
+            return 4;
+        }
+        melotts_set_dump_dir(ctx, dump_dir);
+
+        // Synthesize
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = melotts_synthesize(ctx, text.c_str(), &pcm, &sr);
+        if (n <= 0 || !pcm) {
+            fprintf(stderr, "crispasr-diff melotts: synthesis failed\n");
+            melotts_free(ctx);
+            return 4;
+        }
+        melotts_pcm_free(pcm);
+
+        // Compare stages. Note: C++ dumps are (T,C) row-major flat files,
+        // Python ref stores (C,T) row-major. For 1D stages (dp_logw etc.)
+        // layout doesn't matter; for 2D stages we compare element-wise
+        // after accounting for the transpose.
+        struct MStage {
+            const char* name;
+            bool is_2d; // needs (C,T)↔(T,C) transpose
+            int dim0;   // C dimension for 2D stages (0 = auto-detect)
+        };
+        static const MStage stages[] = {
+            {"speaker_emb", false, 0}, {"enc_output", true, 192}, {"enc_mean", true, 192}, {"enc_logvar", true, 192},
+            {"dp_logw", false, 0},     {"z_p", true, 192},        {"z_dec", true, 192},    {"audio", false, 0},
+        };
+
+        for (const auto& st : stages) {
+            // Load C++ dump
+            std::string dump_path = std::string(dump_dir) + "/" + st.name + ".bin";
+            FILE* f = fopen(dump_path.c_str(), "rb");
+            if (!f) {
+                printf("  %-24s: SKIP (no C++ dump)\n", st.name);
+                n_skip++;
+                continue;
+            }
+            fseek(f, 0, SEEK_END);
+            size_t fsize = (size_t)ftell(f);
+            fseek(f, 0, SEEK_SET);
+            size_t cpp_n = fsize / sizeof(float);
+            std::vector<float> cpp_data(cpp_n);
+            if (fread(cpp_data.data(), sizeof(float), cpp_n, f) != cpp_n) {
+                fclose(f);
+                printf("  %-24s: SKIP (read error)\n", st.name);
+                n_skip++;
+                continue;
+            }
+            fclose(f);
+
+            // For 2D stages, transpose C++ (T,C) to match ref (C,T)
+            std::vector<float> cpp_cmp;
+            if (st.is_2d && st.dim0 > 0 && cpp_n > 0) {
+                int C = st.dim0;
+                int T = (int)(cpp_n / C);
+                cpp_cmp.resize(cpp_n);
+                for (int t = 0; t < T; t++)
+                    for (int c = 0; c < C; c++)
+                        cpp_cmp[c * T + t] = cpp_data[t * C + c];
+            } else {
+                cpp_cmp = cpp_data;
+            }
+
+            auto rep = ref.compare(st.name, cpp_cmp.data(), cpp_cmp.size());
+            float thr = COS_THRESHOLD;
+            // SDP has different RNG, relax threshold
+            if (std::string(st.name) == "sdp_logw")
+                thr = 0.0f;
+            // Audio depends on flow noise
+            if (std::string(st.name) == "audio")
+                thr = 0.9f;
+            // z_p/z_dec depend on sampling noise
+            if (std::string(st.name) == "z_p" || std::string(st.name) == "z_dec")
+                thr = 0.9f;
+
+            if (rep.found && rep.is_pass(thr)) {
+                n_pass++;
+                printf("  %-24s: PASS cos=%.6f max_abs=%.4e\n", st.name, rep.cos_min, rep.max_abs);
+            } else if (rep.found) {
+                n_fail++;
+                printf("  %-24s: FAIL cos=%.6f max_abs=%.4e (threshold=%.3f)\n", st.name, rep.cos_min, rep.max_abs,
+                       thr);
+            } else {
+                n_skip++;
+                printf("  %-24s: SKIP\n", st.name);
+            }
+        }
+
+        // Cleanup dump dir
+        for (const auto& st : stages) {
+            std::string p = std::string(dump_dir) + "/" + st.name + ".bin";
+            remove(p.c_str());
+        }
+        rmdir(dump_dir);
+        melotts_free(ctx);
 
     } else {
         fprintf(stderr,
@@ -4869,7 +5120,7 @@ int main(int argc, char** argv) {
                 "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
                 "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
                 "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, paraformer, sensevoice, "
-                "cosyvoice3-tts, parler-tts, kugelaudio.\n",
+                "cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio.\n",
                 backend_name.c_str());
         return 5;
     }

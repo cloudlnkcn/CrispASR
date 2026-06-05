@@ -16,6 +16,7 @@
 // data-dependent control flow into one monolithic graph.
 
 #include "melotts.h"
+#include "bert_encoder.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -81,13 +82,120 @@ static std::vector<std::string> json_parse_string_array(const std::string& json)
 // Minimal English G2P using embedded CMU dictionary.
 // Falls back to character-level mapping for unknown words.
 
+// ── Neural G2P (g2p_en encoder-decoder) ───────────────────────────
+// Tiny GRU seq2seq: 29 graphemes → 74 ARPAbet phonemes.
+// Weights loaded from GGUF metadata (base64 JSON, ~4 KB).
+
+struct neural_g2p_model {
+    bool loaded = false;
+    // Grapheme/phoneme vocabularies
+    std::vector<std::string> graphemes; // 29: <pad> <unk> </s> a-z
+    std::vector<std::string> phonemes;  // 74: <pad> <unk> <s> </s> AA0..ZH
+    std::map<std::string, int> g2idx;
+    // Weights (all F32)
+    std::vector<float> enc_emb;                                // (29, 256)
+    std::vector<float> dec_emb;                                // (74, 256)
+    std::vector<float> enc_w_ih, enc_w_hh, enc_b_ih, enc_b_hh; // GRU (768, 256)
+    std::vector<float> dec_w_ih, dec_w_hh, dec_b_ih, dec_b_hh;
+    std::vector<float> fc_w, fc_b; // (74, 256), (74,)
+    int hidden_dim = 256;
+};
+
+static float nn_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static void gru_cell(const float* x, const float* h_prev, int input_dim, int hidden_dim, const float* w_ih,
+                     const float* w_hh, const float* b_ih, const float* b_hh, float* h_out) {
+    // GRU: 3 gates (reset, update, new) packed as [r, z, n]
+    std::vector<float> g_ih(3 * hidden_dim, 0.0f);
+    std::vector<float> g_hh(3 * hidden_dim, 0.0f);
+    for (int o = 0; o < 3 * hidden_dim; o++) {
+        float s1 = b_ih[o], s2 = b_hh[o];
+        for (int i = 0; i < input_dim; i++)
+            s1 += x[i] * w_ih[o * input_dim + i];
+        for (int i = 0; i < hidden_dim; i++)
+            s2 += h_prev[i] * w_hh[o * hidden_dim + i];
+        g_ih[o] = s1;
+        g_hh[o] = s2;
+    }
+    for (int i = 0; i < hidden_dim; i++) {
+        float r = nn_sigmoid(g_ih[i] + g_hh[i]);
+        float z = nn_sigmoid(g_ih[hidden_dim + i] + g_hh[hidden_dim + i]);
+        float n = tanhf(g_ih[2 * hidden_dim + i] + r * g_hh[2 * hidden_dim + i]);
+        h_out[i] = (1.0f - z) * n + z * h_prev[i];
+    }
+}
+
+static std::vector<std::string> neural_g2p_predict(const neural_g2p_model& m, const std::string& word) {
+    if (!m.loaded)
+        return {};
+    int D = m.hidden_dim;
+
+    // Encode: chars + </s>
+    std::string lower;
+    for (char c : word)
+        lower += (char)tolower((unsigned char)c);
+
+    std::vector<int> char_ids;
+    for (char c : lower) {
+        std::string cs(1, c);
+        auto it = m.g2idx.find(cs);
+        char_ids.push_back(it != m.g2idx.end() ? it->second : 1); // 1=<unk>
+    }
+    char_ids.push_back(2); // 2=</s>
+
+    // Run encoder GRU
+    std::vector<float> h(D, 0.0f);
+    for (int cid : char_ids) {
+        const float* emb = &m.enc_emb[cid * D];
+        std::vector<float> h_new(D);
+        gru_cell(emb, h.data(), D, D, m.enc_w_ih.data(), m.enc_w_hh.data(), m.enc_b_ih.data(), m.enc_b_hh.data(),
+                 h_new.data());
+        h = h_new;
+    }
+
+    // Decode: start with <s> (id=2), greedy until </s> (id=3) or 20 steps
+    std::vector<std::string> preds;
+    int dec_id = 2; // <s>
+    for (int step = 0; step < 20; step++) {
+        const float* dec_emb = &m.dec_emb[dec_id * D];
+        std::vector<float> h_new(D);
+        gru_cell(dec_emb, h.data(), D, D, m.dec_w_ih.data(), m.dec_w_hh.data(), m.dec_b_ih.data(), m.dec_b_hh.data(),
+                 h_new.data());
+        h = h_new;
+
+        // FC: logits = h @ fc_w^T + fc_b
+        int n_ph = (int)m.phonemes.size();
+        float best_val = -1e30f;
+        int best_id = 0;
+        for (int p = 0; p < n_ph; p++) {
+            float s = m.fc_b[p];
+            for (int d = 0; d < D; d++)
+                s += h[d] * m.fc_w[p * D + d];
+            if (s > best_val) {
+                best_val = s;
+                best_id = p;
+            }
+        }
+
+        if (best_id == 3)
+            break; // </s>
+        if (best_id >= 4 && best_id < n_ph)
+            preds.push_back(m.phonemes[best_id]);
+        dec_id = best_id;
+    }
+    return preds;
+}
+
 struct melotts_g2p {
     // CMU dict: word -> list of syllables, each syllable is a list of phonemes
-    // Stored as JSON in GGUF, parsed on load.
     std::map<std::string, std::vector<std::vector<std::string>>> cmudict;
     std::map<std::string, int> symbol_to_id;
     std::vector<std::string> symbols;
-    int tone_start_en; // tone offset for English (7 in the combined scheme)
+    int tone_start_en;
+    // Neural G2P fallback (g2p_en model)
+    neural_g2p_model neural;
 };
 
 // ARPAbet stress marker -> tone: 0=no stress, 1=primary+1, 2=secondary+1, 3=tertiary+1
@@ -521,10 +629,11 @@ static void lts_fallback(const std::string& word, const std::map<std::string, in
 }
 
 static void g2p_english(const melotts_g2p& g2p, const std::string& text, std::vector<int>& phone_ids,
-                        std::vector<int>& tone_ids, std::vector<int>& lang_ids) {
+                        std::vector<int>& tone_ids, std::vector<int>& lang_ids, std::vector<int>& word2ph) {
     phone_ids.clear();
     tone_ids.clear();
     lang_ids.clear();
+    word2ph.clear();
 
     // Language ID for English = 2 (ZH=0, JP=1, EN=2)
     int lang_id = 2;
@@ -544,35 +653,55 @@ static void g2p_english(const melotts_g2p& g2p, const std::string& text, std::ve
 
     // Leading pad
     add_phone("_", 0);
+    word2ph.push_back(1); // pad token
 
     for (const auto& word : words) {
+        int n_before = (int)phone_ids.size();
+
         // Check if it's punctuation
         if (word.size() == 1 && g2p.symbol_to_id.count(word)) {
             add_phone(word, 0);
-            continue;
+        }
+        // Lookup in CMU dict
+        else {
+            std::string upper_word = to_upper(word);
+            auto dict_it = g2p.cmudict.find(upper_word);
+            if (dict_it != g2p.cmudict.end()) {
+                for (const auto& syllable : dict_it->second) {
+                    for (const auto& ph : syllable) {
+                        int tone = arpa_to_tone(ph);
+                        std::string base = to_lower(arpa_strip_stress(ph));
+                        std::string mapped = post_replace_ph(base, g2p.symbol_to_id);
+                        add_phone(mapped, tone);
+                    }
+                }
+            } else {
+                // Try neural G2P first (g2p_en model), fall back to LTS rules
+                bool used_neural = false;
+                if (g2p.neural.loaded) {
+                    auto preds = neural_g2p_predict(g2p.neural, word);
+                    if (!preds.empty()) {
+                        for (const auto& ph : preds) {
+                            int tone = arpa_to_tone(ph);
+                            std::string base = to_lower(arpa_strip_stress(ph));
+                            std::string mapped = post_replace_ph(base, g2p.symbol_to_id);
+                            add_phone(mapped, tone);
+                        }
+                        used_neural = true;
+                    }
+                }
+                if (!used_neural)
+                    lts_fallback(word, g2p.symbol_to_id, tone_start, lang_id, phone_ids, tone_ids, lang_ids);
+            }
         }
 
-        // Lookup in CMU dict
-        std::string upper_word = to_upper(word);
-        auto dict_it = g2p.cmudict.find(upper_word);
-        if (dict_it != g2p.cmudict.end()) {
-            for (const auto& syllable : dict_it->second) {
-                for (const auto& ph : syllable) {
-                    int tone = arpa_to_tone(ph);
-                    std::string base = to_lower(arpa_strip_stress(ph));
-                    std::string mapped = post_replace_ph(base, g2p.symbol_to_id);
-                    add_phone(mapped, tone);
-                }
-            }
-        } else {
-            // Rule-based letter-to-phoneme fallback for OOV words.
-            // Produces approximate ARPAbet that's good enough for TTS.
-            lts_fallback(word, g2p.symbol_to_id, tone_start, lang_id, phone_ids, tone_ids, lang_ids);
-        }
+        int n_phones = (int)phone_ids.size() - n_before;
+        word2ph.push_back(n_phones);
     }
 
     // Trailing pad
     add_phone("_", 0);
+    word2ph.push_back(1);
 
     // Intersperse with blanks: [0, e0, 0, e1, 0, ..., eN, 0]
     // Matches Python: result = [item] * (len*2+1); result[1::2] = lst
@@ -590,6 +719,12 @@ static void g2p_english(const melotts_g2p& g2p, const std::string& text, std::ve
         phone_ids = p2;
         tone_ids = t2;
         lang_ids = l2;
+
+        // Double word2ph to account for interspersed blanks
+        for (auto& w : word2ph)
+            w *= 2;
+        if (!word2ph.empty())
+            word2ph[0] += 1; // leading pad gets +1
     }
 }
 
@@ -728,6 +863,9 @@ struct melotts_context {
     melotts_hparams hp;
     melotts_weights w;
     melotts_g2p g2p;
+
+    // Optional BERT encoder for contextual conditioning
+    struct bert_encoder_context* bert_ctx = nullptr;
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -985,10 +1123,11 @@ static void cpu_layer_norm(std::vector<float>& x, ggml_tensor* g_t, ggml_tensor*
 
 // ── Text Encoder forward ──────────────────────────────────────────
 
+// ja_bert_features: (768, T) row-major, or empty for disable-bert mode
 static void text_encoder_forward(melotts_context* ctx, const std::vector<int>& phone_ids,
                                  const std::vector<int>& tone_ids, const std::vector<int>& lang_ids,
-                                 std::vector<float>& out_enc, std::vector<float>& out_mean,
-                                 std::vector<float>& out_logvar) {
+                                 const std::vector<float>& ja_bert_features, std::vector<float>& out_enc,
+                                 std::vector<float>& out_mean, std::vector<float>& out_logvar) {
     const auto& hp = ctx->hp;
     const auto& w = ctx->w;
     const int T = (int)phone_ids.size();
@@ -1010,12 +1149,21 @@ static void text_encoder_forward(melotts_context* ctx, const std::vector<int>& p
         size_t bytes = ggml_nbytes(t);
         std::vector<uint8_t> raw(bytes);
         ggml_backend_tensor_get(t, raw.data(), 0, bytes);
-        if (t->type == GGML_TYPE_F16) {
+        if (t->type == GGML_TYPE_F32) {
+            memcpy(table.data(), raw.data(), n * sizeof(float));
+        } else if (t->type == GGML_TYPE_F16) {
             const ggml_fp16_t* src = (const ggml_fp16_t*)raw.data();
             for (int64_t i = 0; i < n; i++)
                 table[i] = ggml_fp16_to_fp32(src[i]);
         } else {
-            memcpy(table.data(), raw.data(), n * sizeof(float));
+            // Quantized (Q4_K, Q8_0, etc.) — dequantize via type traits
+            const auto to_float = ggml_get_type_traits(t->type)->to_float;
+            if (to_float) {
+                to_float(raw.data(), table.data(), n);
+            } else {
+                fprintf(stderr, "melotts: unsupported embedding type %d\n", (int)t->type);
+                std::fill(table.begin(), table.end(), 0.0f);
+            }
         }
     };
 
@@ -1045,25 +1193,43 @@ static void text_encoder_forward(melotts_context* ctx, const std::vector<int>& p
         }
     }
 
-    // Add BERT projection biases (even with zero BERT input, bias contributes)
-    // bert_proj: Conv1d(1024, hidden, 1) → bias shape (hidden,)
-    // ja_bert_proj: Conv1d(768, hidden, 1) → bias shape (hidden,)
-    // Both are applied to zero input, so output = bias, scaled by sqrt(C)
+    // BERT conditioning: project ja_bert features (768→192) + bert_proj bias
+    // For English: bert(1024) is always zeros, so only bias contributes.
+    // ja_bert(768) has actual features when BERT model is loaded.
     {
-        std::vector<float> bp_bias, jbp_bias;
+        std::vector<float> bp_bias;
         if (w.bert_proj_b)
             read_tensor_f32(w.bert_proj_b, bp_bias);
-        if (w.ja_bert_proj_b)
-            read_tensor_f32(w.ja_bert_proj_b, jbp_bias);
-        for (int t = 0; t < T; t++) {
-            for (int c = 0; c < C; c++) {
-                float b = 0;
-                if (c < (int)bp_bias.size())
-                    b += bp_bias[c];
-                if (c < (int)jbp_bias.size())
-                    b += jbp_bias[c];
-                x[t * C + c] += b * sqrt_c;
+
+        // bert_proj bias (1024-dim input is zero, only bias matters)
+        for (int t = 0; t < T; t++)
+            for (int c = 0; c < C && c < (int)bp_bias.size(); c++)
+                x[t * C + c] += bp_bias[c] * sqrt_c;
+
+        // ja_bert_proj: Conv1d(768, hidden, 1) applied to ja_bert features
+        if (!ja_bert_features.empty() && w.ja_bert_proj_w && w.ja_bert_proj_b) {
+            // ja_bert_features is (768, T) row-major = [c * T + t]
+            // ja_bert_proj is Conv1d(768, 192, 1) — 1x1 conv = linear
+            std::vector<float> jbp_w, jbp_b;
+            read_tensor_f32(w.ja_bert_proj_w, jbp_w);
+            read_tensor_f32(w.ja_bert_proj_b, jbp_b);
+            int bert_dim = 768;
+            for (int t = 0; t < T; t++) {
+                for (int oc = 0; oc < C; oc++) {
+                    float sum = jbp_b[oc];
+                    for (int ic = 0; ic < bert_dim; ic++)
+                        sum += ja_bert_features[ic * T + t] * jbp_w[ic + oc * bert_dim];
+                    x[t * C + oc] += sum * sqrt_c;
+                }
             }
+        } else {
+            // No BERT features — just add ja_bert_proj bias
+            std::vector<float> jbp_bias;
+            if (w.ja_bert_proj_b)
+                read_tensor_f32(w.ja_bert_proj_b, jbp_bias);
+            for (int t = 0; t < T; t++)
+                for (int c = 0; c < C && c < (int)jbp_bias.size(); c++)
+                    x[t * C + c] += jbp_bias[c] * sqrt_c;
         }
     }
 
@@ -2046,6 +2212,7 @@ static bool load_weights(melotts_context* ctx, const char* path) {
     // G2P data
     std::string symbols_json = core_gguf::kv_str(meta, "melotts.symbols_json", "[]");
     std::string cmudict_json = core_gguf::kv_str(meta, "melotts.cmudict_json", "{}");
+    std::string g2p_en_json = core_gguf::kv_str(meta, "melotts.g2p_en_json", "");
 
     core_gguf::free_metadata(meta);
 
@@ -2157,6 +2324,89 @@ static bool load_weights(melotts_context* ctx, const char* path) {
         }
         if (ctx->verbosity >= 1)
             fprintf(stderr, "melotts: CMU dict: %zu entries\n", ctx->g2p.cmudict.size());
+    }
+
+    // Parse neural G2P weights (g2p_en model, base64 JSON)
+    if (!g2p_en_json.empty()) {
+        // Minimal JSON parse: extract meta.graphemes, meta.phonemes, weights.*
+        // The JSON structure: {"meta":{"graphemes":[...],"phonemes":[...]},"weights":{"enc_emb":{"shape":[29,256],"data":"base64..."},...}}
+        auto& nm = ctx->g2p.neural;
+
+        // Extract graphemes and phonemes arrays
+        auto extract_array = [&](const std::string& key) -> std::vector<std::string> {
+            std::string pat = "\"" + key + "\"";
+            size_t pos = g2p_en_json.find(pat);
+            if (pos == std::string::npos)
+                return {};
+            pos = g2p_en_json.find('[', pos);
+            if (pos == std::string::npos)
+                return {};
+            return json_parse_string_array(g2p_en_json.substr(pos, g2p_en_json.find(']', pos) - pos + 1));
+        };
+        nm.graphemes = extract_array("graphemes");
+        nm.phonemes = extract_array("phonemes");
+        for (size_t i = 0; i < nm.graphemes.size(); i++)
+            nm.g2idx[nm.graphemes[i]] = (int)i;
+
+        // Extract base64-encoded weight arrays
+        auto extract_weight = [&](const std::string& key) -> std::vector<float> {
+            std::string pat = "\"" + key + "\"";
+            size_t pos = g2p_en_json.find(pat);
+            if (pos == std::string::npos)
+                return {};
+            // Find "data":"base64..."
+            size_t dpos = g2p_en_json.find("\"data\"", pos);
+            if (dpos == std::string::npos)
+                return {};
+            size_t qstart = g2p_en_json.find('"', dpos + 6);
+            if (qstart == std::string::npos)
+                return {};
+            qstart++;
+            size_t qend = g2p_en_json.find('"', qstart);
+            if (qend == std::string::npos)
+                return {};
+            std::string b64 = g2p_en_json.substr(qstart, qend - qstart);
+
+            // Base64 decode
+            static const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::vector<uint8_t> raw;
+            int val = 0, bits = 0;
+            for (char c : b64) {
+                if (c == '=' || c == '\n' || c == '\r')
+                    continue;
+                size_t idx = chars.find(c);
+                if (idx == std::string::npos)
+                    continue;
+                val = (val << 6) | (int)idx;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    raw.push_back((uint8_t)(val >> bits));
+                }
+            }
+            std::vector<float> out(raw.size() / sizeof(float));
+            if (!raw.empty())
+                memcpy(out.data(), raw.data(), out.size() * sizeof(float));
+            return out;
+        };
+
+        nm.enc_emb = extract_weight("enc_emb");
+        nm.dec_emb = extract_weight("dec_emb");
+        nm.enc_w_ih = extract_weight("enc_w_ih");
+        nm.enc_w_hh = extract_weight("enc_w_hh");
+        nm.enc_b_ih = extract_weight("enc_b_ih");
+        nm.enc_b_hh = extract_weight("enc_b_hh");
+        nm.dec_w_ih = extract_weight("dec_w_ih");
+        nm.dec_w_hh = extract_weight("dec_w_hh");
+        nm.dec_b_ih = extract_weight("dec_b_ih");
+        nm.dec_b_hh = extract_weight("dec_b_hh");
+        nm.fc_w = extract_weight("fc_w");
+        nm.fc_b = extract_weight("fc_b");
+
+        nm.loaded = !nm.enc_emb.empty() && !nm.dec_emb.empty() && !nm.fc_w.empty();
+        if (nm.loaded && ctx->verbosity >= 1)
+            fprintf(stderr, "melotts: neural G2P loaded (%zu graphemes, %zu phonemes)\n", nm.graphemes.size(),
+                    nm.phonemes.size());
     }
 
     // Pass 2: load weights
@@ -2367,9 +2617,28 @@ struct melotts_context* melotts_init_from_file(const char* path_model, struct me
     return ctx;
 }
 
+bool melotts_load_bert(struct melotts_context* ctx, const char* bert_gguf_path) {
+    if (!ctx || !bert_gguf_path)
+        return false;
+    if (ctx->bert_ctx) {
+        bert_encoder_free(ctx->bert_ctx);
+        ctx->bert_ctx = nullptr;
+    }
+    ctx->bert_ctx = bert_encoder_init(bert_gguf_path, ctx->n_threads);
+    if (!ctx->bert_ctx) {
+        fprintf(stderr, "melotts: failed to load BERT model '%s'\n", bert_gguf_path);
+        return false;
+    }
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "melotts: BERT conditioning enabled (%s)\n", bert_gguf_path);
+    return true;
+}
+
 void melotts_free(struct melotts_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->bert_ctx)
+        bert_encoder_free(ctx->bert_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->w_buf)
@@ -2389,7 +2658,8 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
 
     // 1. Text processing (G2P)
     std::vector<int> phone_ids, tone_ids, lang_ids;
-    g2p_english(ctx->g2p, text, phone_ids, tone_ids, lang_ids);
+    std::vector<int> word2ph;
+    g2p_english(ctx->g2p, text, phone_ids, tone_ids, lang_ids, word2ph);
     int T = (int)phone_ids.size();
 
     if (ctx->verbosity >= 2) {
@@ -2401,26 +2671,84 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
     std::vector<float> g_vec(gin);
     {
         std::vector<float> g_table;
-        int64_t n = ggml_nelements(ctx->w.emb_g);
-        g_table.resize(n);
-        size_t bytes = ggml_nbytes(ctx->w.emb_g);
-        std::vector<uint8_t> raw(bytes);
-        ggml_backend_tensor_get(ctx->w.emb_g, raw.data(), 0, bytes);
-        if (ctx->w.emb_g->type == GGML_TYPE_F16) {
-            const ggml_fp16_t* src = (const ggml_fp16_t*)raw.data();
-            for (int64_t i = 0; i < n; i++)
-                g_table[i] = ggml_fp16_to_fp32(src[i]);
-        } else {
-            memcpy(g_table.data(), raw.data(), n * sizeof(float));
-        }
+        read_tensor_f32(ctx->w.emb_g, g_table); // handles F16, F32, Q4_K, Q8_0
         for (int c = 0; c < gin; c++)
             g_vec[c] = g_table[ctx->speaker_id * gin + c];
     }
     dump_stage(ctx, "speaker_emb", g_vec.data(), g_vec.size());
 
-    // 3. Text encoder
+    // 3. BERT conditioning (if loaded)
+    std::vector<float> ja_bert_features;
+    if (ctx->bert_ctx) {
+        float* bert_out = nullptr;
+        int n_bert_tokens = 0;
+        if (bert_encoder_forward(ctx->bert_ctx, text, &bert_out, &n_bert_tokens)) {
+            int bert_dim = bert_encoder_hidden_size(ctx->bert_ctx);
+
+            // Build BERT-aligned word2ph: for each whitespace word,
+            // get how many BERT subwords it has, then distribute the
+            // word's phonemes across those subwords (matching Python's
+            // distribute_phone from japanese.py).
+            int* subtokens = nullptr;
+            int n_words = bert_encoder_word_subtokens(ctx->bert_ctx, text, &subtokens);
+
+            // Build per-BERT-token phone counts
+            // word2ph has: [pad] [word0_phones] [word1_phones] ... [pad]
+            // subtokens has: [n_sub_word0] [n_sub_word1] ...
+            // BERT tokens: [CLS] [sub00 sub01..] [sub10..] ... [SEP]
+            std::vector<int> bert_word2ph;
+            bert_word2ph.push_back(word2ph[0]); // leading pad → [CLS]
+
+            int w2p_idx = 1; // skip leading pad
+            for (int wi = 0; wi < n_words && w2p_idx < (int)word2ph.size() - 1; wi++) {
+                int n_phones_word = word2ph[w2p_idx];
+                int n_sub = subtokens[wi];
+                // distribute_phone: split n_phones evenly across n_sub tokens
+                if (n_sub <= 1) {
+                    bert_word2ph.push_back(n_phones_word);
+                } else {
+                    int base = n_phones_word / n_sub;
+                    int remainder = n_phones_word % n_sub;
+                    for (int s = 0; s < n_sub; s++) {
+                        bert_word2ph.push_back(base + (s < remainder ? 1 : 0));
+                    }
+                }
+                w2p_idx++;
+            }
+
+            // trailing pad → [SEP]
+            if (w2p_idx < (int)word2ph.size())
+                bert_word2ph.push_back(word2ph.back());
+            free(subtokens);
+
+            // Expand BERT features using bert_word2ph
+            ja_bert_features.resize(bert_dim * T, 0.0f);
+            int phone_pos = 0;
+            for (int bi = 0; bi < (int)bert_word2ph.size() && phone_pos < T; bi++) {
+                int n_phones = bert_word2ph[bi];
+                int bt = std::clamp(bi, 0, n_bert_tokens - 1);
+                for (int p = 0; p < n_phones && phone_pos < T; p++) {
+                    for (int c = 0; c < bert_dim; c++)
+                        ja_bert_features[c * T + phone_pos] = bert_out[bt * bert_dim + c];
+                    phone_pos++;
+                }
+            }
+            while (phone_pos < T) {
+                int bt = n_bert_tokens - 1;
+                for (int c = 0; c < bert_dim; c++)
+                    ja_bert_features[c * T + phone_pos] = bert_out[bt * bert_dim + c];
+                phone_pos++;
+            }
+            free(bert_out);
+            if (ctx->verbosity >= 2)
+                fprintf(stderr, "melotts: BERT %d tokens, %d word2ph entries → %d phones\n", n_bert_tokens,
+                        (int)bert_word2ph.size(), T);
+        }
+    }
+
+    // 4. Text encoder
     std::vector<float> enc_out, enc_mean, enc_logvar;
-    text_encoder_forward(ctx, phone_ids, tone_ids, lang_ids, enc_out, enc_mean, enc_logvar);
+    text_encoder_forward(ctx, phone_ids, tone_ids, lang_ids, ja_bert_features, enc_out, enc_mean, enc_logvar);
 
     int C = (int)ctx->hp.inter_channels;
     if (enc_mean.empty()) {
