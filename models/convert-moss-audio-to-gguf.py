@@ -215,6 +215,29 @@ def main():
     writer.add_uint32("moss_audio.audio_start_id", 151669)
     writer.add_uint32("moss_audio.audio_end_id", 151670)
 
+    # Bake mel filterbank + Hann window from WhisperFeatureExtractor
+    # so the C++ runtime uses the exact same filters as the Python reference.
+    try:
+        from transformers import WhisperFeatureExtractor
+        fe = WhisperFeatureExtractor(
+            feature_size=ac.get("num_mel_bins", 128),
+            sampling_rate=16000,
+            hop_length=ac.get("mel_hop_length", 160) if "mel_hop_length" in ac else 160,
+            n_fft=ac.get("mel_n_fft", 400) if "mel_n_fft" in ac else 400,
+        )
+        mel_filters = np.ascontiguousarray(np.asarray(fe.mel_filters, dtype=np.float32))
+        writer.add_tensor("audio.mel_filters", mel_filters)
+        print(f"  mel_filters shape: {mel_filters.shape}")
+
+        n_fft = fe.n_fft if hasattr(fe, 'n_fft') else 400
+        win = np.asarray(
+            [0.5 * (1.0 - np.cos(2.0 * np.pi * i / n_fft)) for i in range(n_fft)],
+            dtype=np.float32)
+        writer.add_tensor("audio.mel_window", win)
+        print(f"  mel_window shape: {win.shape}")
+    except ImportError:
+        print("  WARNING: transformers not available, skipping mel filter bake")
+
     # Tokenizer: BPE vocab + merges
     tok_path = model_dir / "tokenizer.json"
     if tok_path.exists():

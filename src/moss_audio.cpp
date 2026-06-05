@@ -470,32 +470,12 @@ extern "C" float* moss_audio_compute_mel(struct moss_audio_context* ctx,
     for (int i = 0; i < n_fft; i++)
         hann[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * (float)i / (float)n_fft));
 
-    // Mel filterbank (Whisper-style, slaney norm)
-    std::vector<float> mel_filters((size_t)n_freqs * n_mels_val, 0.0f);
-    {
-        auto hz_to_mel = [](float hz) { return 2595.0f * std::log10(1.0f + hz / 700.0f); };
-        auto mel_to_hz = [](float mel) { return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f); };
-        float mel_lo = hz_to_mel(0.0f);
-        float mel_hi = hz_to_mel((float)hp.sample_rate / 2.0f);
-        std::vector<float> mel_pts(n_mels_val + 2);
-        for (int i = 0; i <= n_mels_val + 1; i++)
-            mel_pts[i] = mel_to_hz(mel_lo + (float)i * (mel_hi - mel_lo) / (float)(n_mels_val + 1));
-        std::vector<float> fftfreqs(n_freqs);
-        for (int i = 0; i < n_freqs; i++)
-            fftfreqs[i] = (float)i * (float)hp.sample_rate / (float)n_fft;
-        for (int m = 0; m < n_mels_val; m++) {
-            float lo = mel_pts[m], mid = mel_pts[m + 1], hi = mel_pts[m + 2];
-            float enorm = 2.0f / (hi - lo);
-            for (int f = 0; f < n_freqs; f++) {
-                float w = 0.0f;
-                if (fftfreqs[f] >= lo && fftfreqs[f] <= mid)
-                    w = (fftfreqs[f] - lo) / (mid - lo);
-                else if (fftfreqs[f] > mid && fftfreqs[f] <= hi)
-                    w = (hi - fftfreqs[f]) / (hi - mid);
-                mel_filters[(size_t)m * n_freqs + f] = w * enorm;
-            }
-        }
-    }
+    // Mel filterbank — Whisper uses slaney mel scale with slaney area norm
+    // (librosa default: htk=False, norm='slaney'). core_mel::build_slaney_fb
+    // matches this exactly.
+    std::vector<float> mel_filters = core_mel::build_slaney_fb(
+        (int)hp.sample_rate, n_fft, n_mels_val, 0.0f, -1.0f,
+        core_mel::FbLayout::MelsFreqs);
 
     // STFT + mel + log via core_mel
     core_mel::FftR2C fft_fn = [](const float* in, int N, float* out) {
@@ -513,6 +493,7 @@ extern "C" float* moss_audio_compute_mel(struct moss_audio_context* ctx,
     mel_params.log_guard = core_mel::LogGuard::MaxClip;
     mel_params.log_eps = 1e-10f;
     mel_params.center_pad = true;
+    mel_params.center_pad_reflect = true; // WhisperFeatureExtractor uses reflect padding
 
     int T_mel_actual = 0;
     std::vector<float> mel_out = core_mel::compute(
