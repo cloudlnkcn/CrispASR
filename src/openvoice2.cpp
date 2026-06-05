@@ -247,7 +247,7 @@ static bool load_wn_block(const std::map<std::string, ggml_tensor*>& tensors, co
 }
 
 extern "C" struct openvoice2_context_params openvoice2_context_default_params(void) {
-    return {/*n_threads=*/4, /*verbosity=*/1, /*use_gpu=*/false, /*tau=*/0.3f};
+    return {/*n_threads=*/4, /*verbosity=*/1, /*use_gpu=*/false, /*tau=*/0.0f};
 }
 
 extern "C" struct openvoice2_context* openvoice2_init_from_file(const char* path,
@@ -1203,6 +1203,26 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     if (!hifigan_decode_cpu(ctx, z, g_zero, T_src, pcm)) {
         fprintf(stderr, "openvoice2: hifigan decode failed\n");
         return false;
+    }
+
+    // Peak-normalize output to fill ±0.95 range.
+    // The voice converter produces weak output (±0.3) on synthetic MeloTTS input;
+    // normalization makes it audible without amplifying noise beyond tanh clipping.
+    {
+        const char* no_norm = std::getenv("OV2_NO_NORMALIZE");
+        if (!no_norm || std::strcmp(no_norm, "1") != 0) {
+            float peak = 0.0f;
+            for (auto v : pcm) {
+                float a = v < 0 ? -v : v;
+                if (a > peak) peak = a;
+            }
+            if (peak > 0.01f) {
+                float gain = 0.95f / peak;
+                for (auto& v : pcm) v *= gain;
+                if (ctx->verbosity >= 1)
+                    fprintf(stderr, "openvoice2: peak-normalized (gain=%.2f, peak was %.4f)\n", gain, peak);
+            }
+        }
     }
 
     *n_out = (int)pcm.size();
