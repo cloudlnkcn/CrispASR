@@ -2825,3 +2825,49 @@ def vad_slices(
     if n > 0:
         lib.crispasr_vad_free(out_spans)
     return spans
+
+
+# ---------------------------------------------------------------------------
+# Watermark — AI-generated audio marking
+# ---------------------------------------------------------------------------
+
+def watermark_load_model(gguf_path: str) -> None:
+    """Load an AudioSeal GGUF for neural watermarking.
+
+    Once loaded, :func:`watermark_embed` and :func:`watermark_detect`
+    dispatch to AudioSeal automatically. Without loading, they use the
+    built-in spread-spectrum watermark.
+    """
+    lib = _get_lib()
+    fn = lib.crispasr_watermark_load_model
+    fn.argtypes = [ctypes.c_char_p]
+    fn.restype = ctypes.c_int
+    rc = fn(gguf_path.encode())
+    if rc != 0:
+        raise RuntimeError(f"crispasr_watermark_load_model failed (rc={rc})")
+
+
+def watermark_embed(pcm: "numpy.ndarray", alpha: float = 0.005) -> None:
+    """Embed an AI-generated watermark into float32 PCM in-place."""
+    import numpy as np
+    if pcm.dtype != np.float32:
+        raise TypeError("pcm must be float32")
+    lib = _get_lib()
+    fn = lib.crispasr_watermark_embed
+    fn.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float]
+    fn.restype = None
+    fn(pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+       ctypes.c_int(len(pcm)), ctypes.c_float(alpha))
+
+
+def watermark_detect(pcm: "numpy.ndarray") -> float:
+    """Detect AI-generated watermark. Returns confidence in [0, 1]."""
+    import numpy as np
+    if pcm.dtype != np.float32:
+        raise TypeError("pcm must be float32")
+    lib = _get_lib()
+    fn = lib.crispasr_watermark_detect
+    fn.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+    fn.restype = ctypes.c_float
+    return float(fn(pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.c_int(len(pcm))))

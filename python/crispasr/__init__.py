@@ -27,6 +27,9 @@ from ._binding import (
     mic_default_device_name,
     registry_lookup,
     registry_lookup_by_filename,
+    watermark_detect,
+    watermark_embed,
+    watermark_load_model,
 )
 
 __all__ = [
@@ -56,5 +59,8 @@ __all__ = [
     "mic_default_device_name",
     "registry_lookup",
     "registry_lookup_by_filename",
+    "watermark_detect",
+    "watermark_embed",
+    "watermark_load_model",
 ]
 __version__ = "0.4.9"

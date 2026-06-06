@@ -108,6 +108,11 @@ long long    crispasr_align_result_word_t0(crispasr_align_result* r, int i);
 long long    crispasr_align_result_word_t1(crispasr_align_result* r, int i);
 void         crispasr_align_result_free(crispasr_align_result* r);
 
+// --- Watermark ---
+int   crispasr_watermark_load_model(const char* gguf_path);
+void  crispasr_watermark_embed(float* pcm, int n_samples, float alpha);
+float crispasr_watermark_detect(const float* pcm, int n_samples);
+
 // --- VAD (PLAN #59) ---
 int crispasr_vad_segments(const char* vad_model_path, const float* pcm, int n_samples,
                           int sample_rate, float threshold, int min_speech_ms, int min_silence_ms,
@@ -1865,4 +1870,39 @@ func (db *SpeakerDB) Close() {
 		C.crispasr_speaker_db_free(db.handle)
 		db.handle = nil
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Watermark — AI-generated audio marking
+// ---------------------------------------------------------------------------
+
+// WatermarkLoadModel loads an AudioSeal GGUF for neural watermarking.
+// Once loaded, WatermarkEmbed/Detect dispatch to AudioSeal automatically.
+// Returns nil on success or an error if the model fails to load.
+func WatermarkLoadModel(ggufPath string) error {
+	cp := C.CString(ggufPath)
+	defer C.free(unsafe.Pointer(cp))
+	rc := C.crispasr_watermark_load_model(cp)
+	if rc != 0 {
+		return fmt.Errorf("crispasr_watermark_load_model failed (rc=%d)", int(rc))
+	}
+	return nil
+}
+
+// WatermarkEmbed embeds an AI-generated watermark into PCM audio in-place.
+// Uses AudioSeal if a model was loaded, otherwise spread-spectrum.
+func WatermarkEmbed(pcm []float32) {
+	if len(pcm) == 0 {
+		return
+	}
+	C.crispasr_watermark_embed((*C.float)(unsafe.Pointer(&pcm[0])), C.int(len(pcm)), 0.005)
+}
+
+// WatermarkDetect returns a confidence score [0, 1] indicating whether
+// the audio contains an AI-generated watermark. >0.65 = present.
+func WatermarkDetect(pcm []float32) float32 {
+	if len(pcm) == 0 {
+		return 0
+	}
+	return float32(C.crispasr_watermark_detect((*C.float)(unsafe.Pointer(&pcm[0])), C.int(len(pcm))))
 }

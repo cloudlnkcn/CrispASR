@@ -1474,6 +1474,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (!params.no_prints)
             fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
                     audio.size(), sr_in, (double)audio.size() / (double)sr_in);
+        crispasr_wm_dispatch::shutdown();
         return 0;
     }
 
