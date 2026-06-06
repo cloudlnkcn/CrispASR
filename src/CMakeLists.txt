@@ -214,7 +214,12 @@ set_target_properties(crispasr-lib PROPERTIES
 )
 
 target_include_directories(crispasr-lib PUBLIC . ../include)
-target_compile_features   (crispasr-lib PUBLIC cxx_std_11) # don't bump
+
+set(CRISPASR_LIB_CXX_STANDARD cxx_std_11)
+if (GGML_CUDA AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+    set(CRISPASR_LIB_CXX_STANDARD cxx_std_17)
+endif()
+target_compile_features   (crispasr-lib PUBLIC ${CRISPASR_LIB_CXX_STANDARD}) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
     target_compile_definitions(crispasr-lib PRIVATE CRISPASR_BIG_ENDIAN)
