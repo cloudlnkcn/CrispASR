@@ -18,6 +18,9 @@
 #include <direct.h>
 #include <io.h>
 #include <sys/stat.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")

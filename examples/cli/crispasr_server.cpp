@@ -59,6 +59,9 @@
 
 #ifdef _WIN32
 #include <io.h> // _mktemp_s
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <unistd.h> // mkstemp, close, unlink
