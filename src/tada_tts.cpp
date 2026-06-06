@@ -788,7 +788,8 @@ static void build_logsnr_schedule(std::vector<float>& t_span, int num_steps) {
 // Euler ODE solver for flow matching with CFG.
 static void fm_euler_solve(tada_context* c, float* speech, const float* cond,
                             int num_steps, float cfg_scale,
-                            const float* neg_cond = nullptr) {
+                            const float* neg_cond = nullptr,
+                            bool dump_trajectory = false) {
     const int lat = (int)c->hp.fm_latent;
     const int ad = (int)c->hp.acoustic_dim;
 
@@ -813,21 +814,6 @@ static void fm_euler_solve(tada_context* c, float* speech, const float* cond,
             run_fm_step(c, speech, t_val, cond, vel_pos.data());
             run_fm_step(c, speech, t_val, neg, vel_neg.data());
 
-            if (i == 0) {
-                float vp_rms = 0, vn_rms = 0, diff_rms = 0;
-                for (int j = 0; j < ad; j++) {
-                    vp_rms += vel_pos[j]*vel_pos[j];
-                    vn_rms += vel_neg[j]*vel_neg[j];
-                    diff_rms += (vel_pos[j]-vel_neg[j])*(vel_pos[j]-vel_neg[j]);
-                }
-                vp_rms = std::sqrt(vp_rms / ad); vn_rms = std::sqrt(vn_rms / ad);
-                diff_rms = std::sqrt(diff_rms / ad);
-                fprintf(stderr, "    fm[0] cfg=%.2f vp=%.4f vn=%.4f diff=%.6f vp[0..4]=[%.4f,%.4f,%.4f,%.4f,%.4f] vn[0..4]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                        a_cfg, vp_rms, vn_rms, diff_rms,
-                        vel_pos[0],vel_pos[1],vel_pos[2],vel_pos[3],vel_pos[4],
-                        vel_neg[0],vel_neg[1],vel_neg[2],vel_neg[3],vel_neg[4]);
-            }
-
             for (int j = 0; j < ad; j++) {
                 // Acoustic dims: apply acoustic CFG
                 speech[j] += dt * (vel_neg[j] + a_cfg * (vel_pos[j] - vel_neg[j]));
@@ -835,6 +821,14 @@ static void fm_euler_solve(tada_context* c, float* speech, const float* cond,
             for (int j = ad; j < lat; j++) {
                 // Time dims: duration CFG = 1.0 (no guidance)
                 speech[j] += dt * (vel_neg[j] + 1.0f * (vel_pos[j] - vel_neg[j]));
+            }
+
+            if (dump_trajectory) {
+                float srms = 0, vp = 0, vn = 0;
+                for (int j = 0; j < ad; j++) { srms += speech[j]*speech[j]; vp += vel_pos[j]*vel_pos[j]; vn += vel_neg[j]*vel_neg[j]; }
+                fprintf(stderr, "  euler[%d] t=%.3f dt=%.4f cfg=%.2f vp=%.3f vn=%.3f srms=%.4f s[0:3]=[%.3f,%.3f,%.3f]\n",
+                        i, t_val, dt, a_cfg, std::sqrt(vp/ad), std::sqrt(vn/ad), std::sqrt(srms/ad),
+                        speech[0], speech[1], speech[2]);
             }
         } else {
             run_fm_step(c, speech, t_val, cond, vel_pos.data());
@@ -1173,7 +1167,17 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         for (int j = 0; j < ad; j++) noise_rms += speech[j] * speech[j];
         noise_rms = std::sqrt(noise_rms / ad);
 
-        fm_euler_solve(ctx, speech.data(), tr.hidden, num_fm_steps, cfg_scale, neg_hidden);
+        // Dump Euler trajectory for first 2 GENERATED (non-prompt) features
+        int feat_idx_for_dump = step - shift;
+        bool is_generated = (feat_idx_for_dump >= ctx->n_prompt);
+        bool dump_trajectory = (is_generated && feat_idx_for_dump < ctx->n_prompt + 2 && ctx->params.verbosity >= 1);
+        if (dump_trajectory) {
+            fprintf(stderr, "  === Euler trajectory step %d ===\n", step);
+            fprintf(stderr, "  noise: rms=%.4f [%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                    noise_rms, speech[0], speech[1], speech[2], speech[3], speech[4]);
+        }
+
+        fm_euler_solve(ctx, speech.data(), tr.hidden, num_fm_steps, cfg_scale, neg_hidden, dump_trajectory);
 
         float speech_rms = 0;
         for (int j = 0; j < ad; j++) speech_rms += speech[j] * speech[j];
