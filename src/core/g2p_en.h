@@ -80,9 +80,9 @@ inline std::string arpa_to_ipa(const std::string& arpa) {
     else if (stress == 2) ipa = "ˌ";
 
     if (base == "AH" && stress == 0) { ipa += "ə"; return ipa; }
-    if (base == "IH" && stress == 0) { ipa += "ᵻ"; return ipa; }  // barred-i
+    if (base == "IH" && stress == 0) { ipa += "ɪ"; return ipa; }  // espeak uses ɪ not ᵻ
     if (base == "IY" && stress == 0) { ipa += "i"; return ipa; }
-    if (base == "UW" && stress == 0) { ipa += "ʊ"; return ipa; }  // unstressed GOOSE → ʊ
+    if (base == "UW" && stress == 0) { ipa += "ʊ"; return ipa; }
     // ER: stressed → ɜː (were, her), unstressed → ɚ (after, under)
     if (base == "ER" && stress >= 1) { ipa += "ɜː"; return ipa; }
     if (base == "ER") { ipa += "ɚ"; return ipa; }
@@ -458,11 +458,50 @@ inline std::vector<std::string> tokenize(const std::string& text) {
 
 // ── Main API: text → IPA ────────────────────────────────────────────
 
-// Convert a single word to IPA using the three-tier pipeline.
+// espeak-ng IPA overrides for words where CMUdict disagrees.
+// These are the exact IPA strings piper models expect.
+inline const std::map<std::string, std::string>& espeak_overrides() {
+    static const std::map<std::string, std::string> table = {
+        // Function words — espeak stresses these in isolation
+        {"THE", "ðə"},       // no stress in running speech
+        {"A", "ə"},
+        {"AN", "ən"},
+        // AA/AO confusion — espeak uses ɔ for these
+        {"ON", "ˈɔn"},
+        {"WAS", "wˈʌz"},
+        {"BOUGHT", "bˈɔːt"},
+        {"COUGH", "kˈɔf"},
+        {"THOUGHT", "θˈɔːt"},
+        {"OUGHT", "ˈɔːt"},
+        // Common irregular words
+        {"WOMEN", "wˈɪmɪn"},
+        {"YOUR", "jˈʊɹ"},
+        {"CAFE", "kˈæfeɪ"},
+        {"NAIVE", "naɪˈiːv"},
+        {"UNIQUE", "juːnˈiːk"},
+        {"BOUTIQUE", "buːtˈiːk"},
+        {"PNEUMONIA", "nuːmˈoʊniə"},
+        {"RESUME", "ɹᵻzˈuːm"},
+        {"CHARACTER", "kˈæɹɪktɚ"},
+        {"THOROUGH", "θˈʌɹoʊ"},
+        {"AUDIO", "ˈɔːdɪoʊ"},
+    };
+    return table;
+}
+
+// Convert a single word to IPA using the pipeline:
+// 0. espeak override table (exact match for problem words)
+// 1. CMUdict + ARPAbet→IPA
+// 2. Neural G2P
+// 3. LTS rules
 inline std::string word_to_ipa(const context& ctx, const std::string& word) {
-    // Uppercase for CMUdict lookup
     std::string upper;
     for (char c : word) upper += (char)toupper((unsigned char)c);
+
+    // Tier 0: espeak override table
+    auto& overrides = espeak_overrides();
+    auto ov_it = overrides.find(upper);
+    if (ov_it != overrides.end()) return ov_it->second;
 
     std::vector<std::string> arpa_phones;
 
@@ -484,10 +523,9 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
         arpa_phones = lts_predict(word);
     }
 
-    // Convert ARPAbet → IPA with T-flapping.
-    // In American English, /t/ between a stressed vowel and an unstressed
-    // vowel becomes a tap [ɾ] (e.g. "water" → wˈɔːɾɚ, "data" → dˈeɪɾə).
-    // espeak-ng does this and piper models expect it.
+    // Convert ARPAbet → IPA with context-dependent rules:
+    // 1. T-flapping: T/D between vowels → ɾ (water → wˈɔːɾɚ)
+    // 2. ɹ-insertion: ɚ/ɜː before vowel → ɚɹ/ɜːɹ (natural → nˈætʃɚɹəl)
     std::string ipa;
     int n_ph = (int)arpa_phones.size();
     for (int pi = 0; pi < n_ph; pi++) {
@@ -518,7 +556,23 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
         }
 
         std::string p = arpa_to_ipa(ph);
-        if (!p.empty()) ipa += p;
+        if (!p.empty()) {
+            ipa += p;
+            // ɹ-insertion: after ɚ or ɜː, before a vowel phoneme, insert ɹ
+            // (espeak-ng does this: "natural" → nˈætʃɚɹəl, "during" → dˈʊɹɹɪŋ)
+            if ((base_ph == "ER" || base_ph == "R") && pi + 1 < n_ph) {
+                std::string next_base = arpa_phones[pi+1];
+                if (!next_base.empty() && next_base.back() >= '0' && next_base.back() <= '2')
+                    next_base.pop_back();
+                for (auto& cc : next_base) cc = (char)toupper((unsigned char)cc);
+                bool next_vowel = (next_base == "AA" || next_base == "AE" || next_base == "AH" ||
+                    next_base == "AO" || next_base == "AW" || next_base == "AY" || next_base == "EH" ||
+                    next_base == "ER" || next_base == "EY" || next_base == "IH" || next_base == "IY" ||
+                    next_base == "OW" || next_base == "OY" || next_base == "UH" || next_base == "UW" ||
+                    next_base == "AX");
+                if (next_vowel) ipa += "ɹ";  // ER or R before vowel
+            }
+        }
     }
     return ipa;
 }

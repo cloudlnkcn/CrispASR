@@ -35,7 +35,7 @@ TEST_CASE("ARPAbet to IPA conversion", "[g2p][arpabet]") {
         CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");     // unstressed → schwa
         CHECK(g2p_en::arpa_to_ipa("AH1") == "ˈʌ");    // primary stress → ʌ
         CHECK(g2p_en::arpa_to_ipa("AH2") == "ˌʌ");    // secondary stress
-        CHECK(g2p_en::arpa_to_ipa("IH0") == "ᵻ");     // barred-i unstressed
+        CHECK(g2p_en::arpa_to_ipa("IH0") == "ɪ");      // espeak uses ɪ for unstressed
         CHECK(g2p_en::arpa_to_ipa("ER1") == "ˈɜː");   // stressed → ɜː
     }
     SECTION("case insensitivity") {
@@ -116,7 +116,7 @@ TEST_CASE("word_to_ipa produces IPA output", "[g2p][ipa]") {
 
     SECTION("the produces ð") {
         std::string ipa = g2p_en::word_to_ipa(ctx, "the");
-        CHECK(ipa.find("θ") != std::string::npos); // th → θ
+        CHECK(ipa.find("ð") != std::string::npos); // voiced th
     }
 
     SECTION("she produces ʃ") {
