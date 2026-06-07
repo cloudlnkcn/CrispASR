@@ -40,6 +40,7 @@ int              crispasr_session_set_cfg_weight(CrispasrSession* s, float cfg_w
 int              crispasr_session_set_exaggeration(CrispasrSession* s, float exaggeration);
 int              crispasr_session_set_max_speech_tokens(CrispasrSession* s, int n);
 int              crispasr_session_set_length_scale(CrispasrSession* s, float scale);
+int              crispasr_session_set_g2p_dict(CrispasrSession* s, const char* source);
 int              crispasr_session_set_best_of(CrispasrSession* s, int n);
 int              crispasr_session_set_beam_size(CrispasrSession* s, int n);
 int              crispasr_session_set_grammar_text(CrispasrSession* s, const char* gbnf_text,
@@ -511,6 +512,18 @@ func (s *CrispasrSession) SetLengthScale(scale float32) error {
 	rc := C.crispasr_session_set_length_scale(s.handle, C.float(scale))
 	if rc != 0 && rc != -2 {
 		return errors.New("crispasr_session_set_length_scale failed")
+	}
+	return nil
+}
+
+// SetG2PDict selects the G2P pronunciation dictionary source for TTS backends:
+// "olaph" (MIT, default), "open-dict" (CC-BY-SA), or a file path.
+func (s *CrispasrSession) SetG2PDict(source string) error {
+	cs := C.CString(source)
+	defer C.free(unsafe.Pointer(cs))
+	rc := C.crispasr_session_set_g2p_dict(s.handle, cs)
+	if rc != 0 {
+		return errors.New("crispasr_session_set_g2p_dict failed")
 	}
 	return nil
 }

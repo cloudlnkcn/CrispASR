@@ -6591,6 +6591,17 @@ CA_EXPORT int crispasr_session_set_tts_steps(crispasr_session* s, int steps) {
     return touched > 0 ? 0 : -2;
 }
 
+// G2P dictionary source: "olaph" (MIT), "open-dict" (CC-BY-SA), or file path.
+// Applies to piper + kokoro backends. Returns 0 on success, -1 if session
+// is null, -2 if no TTS backend is active.
+CA_EXPORT int crispasr_session_set_g2p_dict(crispasr_session* s, const char* source) {
+    if (!s) return -1;
+    // piper_tts_set_g2p_dict is process-global (not per-context) so call
+    // it unconditionally — it affects the next phonemize_builtin() call.
+    piper_tts_set_g2p_dict(source);
+    return 0;
+}
+
 // Set the top-p nucleus-sampling threshold. Honoured by chatterbox;
 // other backends no-op (their AR loops use top-k or hardcoded
 // sampling parameters today).

@@ -595,6 +595,8 @@ CRISPASR_API int crispasr_session_set_cfg_weight(struct crispasr_session* s, flo
 CRISPASR_API int crispasr_session_set_exaggeration(struct crispasr_session* s, float exaggeration);
 CRISPASR_API int crispasr_session_set_max_speech_tokens(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_length_scale(struct crispasr_session* s, float scale);
+// G2P dict source: "olaph" (MIT), "open-dict" (CC-BY-SA), or file path.
+CRISPASR_API int crispasr_session_set_g2p_dict(struct crispasr_session* s, const char* source);
 CRISPASR_API int crispasr_session_set_best_of(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_beam_size(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_grammar_text(struct crispasr_session* s, const char* gbnf_text,
