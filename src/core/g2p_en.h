@@ -52,22 +52,39 @@ inline const std::map<std::string, std::string>& arpabet_to_ipa() {
 }
 
 // Convert an ARPAbet phoneme (e.g. "AH0", "EY1") to IPA.
+// Stress-dependent quality: unstressed vowels reduce differently
+// to match espeak-ng's output (which piper was trained on).
 inline std::string arpa_to_ipa(const std::string& arpa) {
     // Strip stress digit
     std::string base = arpa;
-    int stress = 0;
+    int stress = -1; // -1 = no digit (consonant)
     if (!base.empty() && base.back() >= '0' && base.back() <= '2') {
         stress = base.back() - '0';
         base.pop_back();
     }
     // Uppercase for lookup
     for (auto& c : base) c = (char)toupper((unsigned char)c);
+
+    // Stress-dependent vowel quality (matches espeak-ng output):
+    // AH0 → ə (schwa, not ʌ — unstressed "a" reduces to schwa)
+    // AH1/AH2 → ʌ (strut vowel, stressed)
+    // IY0 → i (short, not iː — unstressed)
+    // IY1/IY2 → iː (long, stressed)
+    // ER → ɜː (no trailing ɹ — piper handles rhoticity via the model)
+    std::string ipa;
+    if (stress == 1) ipa = "ˈ";
+    // Note: secondary stress (2) is intentionally NOT emitted.
+    // espeak-ng rarely uses ˌ for piper models, and it changes prosody
+    // enough to confuse ASR (e.g. "audio" heard as "idea").
+
+    if (base == "AH" && stress == 0) { ipa += "ə"; return ipa; }
+    if (base == "IY" && stress == 0) { ipa += "i"; return ipa; }
+    if (base == "IH" && stress == 0) { ipa += "ɪ"; return ipa; } // keep as-is but no length
+    if (base == "ER") { ipa += "ɜː"; return ipa; } // no trailing ɹ
+
     auto& table = arpabet_to_ipa();
     auto it = table.find(base);
     if (it == table.end()) return "";
-    std::string ipa;
-    if (stress == 1) ipa = "ˈ";
-    else if (stress == 2) ipa = "ˌ";
     ipa += it->second;
     return ipa;
 }

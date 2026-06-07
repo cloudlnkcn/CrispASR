@@ -15,9 +15,9 @@ TEST_CASE("ARPAbet to IPA conversion", "[g2p][arpabet]") {
     SECTION("basic vowels") {
         CHECK(g2p_en::arpa_to_ipa("AA0") == "ɑː");
         CHECK(g2p_en::arpa_to_ipa("AE1") == "ˈæ");
-        CHECK(g2p_en::arpa_to_ipa("IY0") == "iː");
-        CHECK(g2p_en::arpa_to_ipa("UW2") == "ˌuː");
-        CHECK(g2p_en::arpa_to_ipa("AH0") == "ʌ");
+        CHECK(g2p_en::arpa_to_ipa("IY0") == "i");    // unstressed → short
+        CHECK(g2p_en::arpa_to_ipa("UW2") == "uː");   // secondary stress not emitted
+        CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");    // unstressed → schwa
         CHECK(g2p_en::arpa_to_ipa("EY1") == "ˈeɪ");
     }
     SECTION("basic consonants") {
@@ -32,12 +32,12 @@ TEST_CASE("ARPAbet to IPA conversion", "[g2p][arpabet]") {
         CHECK(g2p_en::arpa_to_ipa("JH") == "dʒ");
     }
     SECTION("stress markers") {
-        CHECK(g2p_en::arpa_to_ipa("AH0") == "ʌ");     // no stress
-        CHECK(g2p_en::arpa_to_ipa("AH1") == "ˈʌ");    // primary
-        CHECK(g2p_en::arpa_to_ipa("AH2") == "ˌʌ");    // secondary
+        CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");     // unstressed → schwa
+        CHECK(g2p_en::arpa_to_ipa("AH1") == "ˈʌ");    // primary stress → ʌ
+        CHECK(g2p_en::arpa_to_ipa("AH2") == "ʌ");     // secondary not emitted
     }
     SECTION("case insensitivity") {
-        CHECK(g2p_en::arpa_to_ipa("ah0") == "ʌ");
+        CHECK(g2p_en::arpa_to_ipa("ah0") == "ə");
         CHECK(g2p_en::arpa_to_ipa("Sh") == "ʃ");
     }
     SECTION("unknown phoneme") {
