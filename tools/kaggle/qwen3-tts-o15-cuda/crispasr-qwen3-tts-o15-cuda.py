@@ -163,10 +163,16 @@ def run_tts(label, o15_value, extra_env=None, timeout=300):
     if extra_env:
         env.update(extra_env)
 
+    # Use jfk.wav from the repo as voice reference (qwen3-tts requires a voice)
+    voice_ref = REPO / "samples" / "jfk.wav"
+    ref_text = "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+
     cmd = [
         str(CLI), "--backend", "qwen3-tts",
         "-m", str(tts_model),
         "--codec-model", str(tts_codec),
+        "--voice", str(voice_ref),
+        "--ref-text", ref_text,
         "--tts", TTS_TEXT,
         "--tts-output", str(out_wav),
         "--seed", "42",

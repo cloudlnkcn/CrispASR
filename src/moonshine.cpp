@@ -3,6 +3,7 @@
 #include "moonshine-tokenizer.h"
 
 #include "core/beam_decode.h"
+#include "core/gguf_loader.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -15,13 +16,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
 struct moonshine_context {
     moonshine_model model;
     moonshine_tokenizer tokenizer;
-    ggml_backend_t backend = nullptr;
+    ggml_backend_t backend     = nullptr; // GPU or CPU (chosen at init)
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
     std::string result_text;
     std::string scratch_token_text; // backs `moonshine_token_text` return value
 
@@ -32,6 +36,7 @@ struct moonshine_context {
     int enc_len = 0;
 
     int n_threads = 4;
+    bool use_gpu = false;
     float temperature = 0.0f; // 0 = greedy argmax; > 0 = multinomial sampling
     int beam_size = 1;        // 1 = greedy/sampled; >1 = beam search (deterministic)
     // Sticky per-call seed override for best-of-N. 0 = derive deterministically
@@ -43,14 +48,17 @@ struct moonshine_context {
     moonshine_timing timing = {};
 };
 
+using TensorMap = std::map<std::string, ggml_tensor*>;
+
 // helper: get tensor by name, track failures
-static struct ggml_tensor* checked_get_tensor(struct ggml_context* ctx, const char* name, bool& ok) {
-    struct ggml_tensor* t = ggml_get_tensor(ctx, name);
-    if (!t) {
+static struct ggml_tensor* checked_get_tensor(const TensorMap& tensors, const char* name, bool& ok) {
+    auto it = tensors.find(name);
+    if (it == tensors.end()) {
         fprintf(stderr, "%s: tensor '%s' not found\n", __func__, name);
         ok = false;
+        return nullptr;
     }
-    return t;
+    return it->second;
 }
 
 // helper: read uint32 from GGUF KV
@@ -97,20 +105,15 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
 
     ctx->n_threads = (params.n_threads > 0) ? params.n_threads : 4;
 
-    // 1. Open GGUF file (no_alloc: create tensor metadata only)
-    struct gguf_init_params gguf_params = {
-        /*.no_alloc =*/true,
-        /*.ctx      =*/&model.ctx_w,
-    };
-
-    struct gguf_context* ctx_gguf = gguf_init_from_file(model_path, gguf_params);
+    // ── Pass 1: metadata (hparams) ──
+    struct gguf_context* ctx_gguf = core_gguf::open_metadata(model_path);
     if (!ctx_gguf) {
         fprintf(stderr, "%s: failed to open GGUF file '%s'\n", __func__, model_path);
         delete ctx;
         return nullptr;
     }
 
-    // 2. Read hyperparameters from GGUF KV pairs
+    // Read hyperparameters from GGUF KV pairs
     auto& hp = model.hparams;
     hp.enc_hidden_size = gguf_get_u32(ctx_gguf, "moonshine.encoder.embedding_length");
     hp.enc_n_layers = gguf_get_u32(ctx_gguf, "moonshine.encoder.block_count");
@@ -136,7 +139,7 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     if (hp.enc_hidden_size == 0 || hp.n_heads == 0 || hp.enc_n_layers == 0 || hp.dec_n_layers == 0) {
         fprintf(stderr, "%s: invalid model hparams (hidden=%u heads=%u enc_layers=%u dec_layers=%u)\n", __func__,
                 hp.enc_hidden_size, hp.n_heads, hp.enc_n_layers, hp.dec_n_layers);
-        gguf_free(ctx_gguf);
+        core_gguf::free_metadata(ctx_gguf);
         delete ctx;
         return nullptr;
     }
@@ -145,79 +148,47 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     hp.head_dim = hp.enc_hidden_size / hp.n_heads;
     hp.rotary_dim = (uint32_t)(hp.head_dim * hp.partial_rotary_factor);
 
-    // 3. Allocate a single CPU buffer for all tensor data
-    model.buf_w = ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_w, ggml_backend_cpu_buffer_type());
-    if (!model.buf_w) {
-        fprintf(stderr, "%s: failed to allocate tensor buffer\n", __func__);
-        gguf_free(ctx_gguf);
+    core_gguf::free_metadata(ctx_gguf);
+
+    // ── Init backends ──
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    if (!ctx->backend_cpu) {
+        fprintf(stderr, "%s: failed to init CPU backend\n", __func__);
         delete ctx;
         return nullptr;
     }
+    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
-    // 4. Load tensor data from GGUF file
-    FILE* f = fopen(model_path, "rb");
-    if (!f) {
-        fprintf(stderr, "%s: failed to open '%s' for reading\n", __func__, model_path);
-        gguf_free(ctx_gguf);
+    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    if (!ctx->backend)
+        ctx->backend = ctx->backend_cpu;
+    ctx->use_gpu = (ctx->backend != ctx->backend_cpu);
+
+    // ── Pass 2: load weights via core_gguf (mmap, backend buffer) ──
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(model_path, ctx->backend, "moonshine", wl)) {
+        fprintf(stderr, "%s: failed to load weights from '%s'\n", __func__, model_path);
         delete ctx;
         return nullptr;
     }
+    model.ctx_w = wl.ctx;
+    model.buf_w = wl.buf;
 
-    const int64_t n_tensors = gguf_get_n_tensors(ctx_gguf);
-    const size_t data_offset = gguf_get_data_offset(ctx_gguf);
-    std::vector<uint8_t> read_buf;
-
-    for (int64_t i = 0; i < n_tensors; i++) {
-        const char* name = gguf_get_tensor_name(ctx_gguf, i);
-        struct ggml_tensor* tensor = ggml_get_tensor(model.ctx_w, name);
-        if (!tensor) {
-            fprintf(stderr, "%s: tensor '%s' not found in context\n", __func__, name);
-            fclose(f);
-            gguf_free(ctx_gguf);
-            delete ctx;
-            return nullptr;
-        }
-
-        const size_t nbytes = ggml_nbytes(tensor);
-        const size_t offs = data_offset + gguf_get_tensor_offset(ctx_gguf, i);
-        read_buf.resize(nbytes);
-
-        if (fseek(f, offs, SEEK_SET) != 0) {
-            fprintf(stderr, "%s: fseek failed for tensor '%s'\n", __func__, name);
-            fclose(f);
-            gguf_free(ctx_gguf);
-            delete ctx;
-            return nullptr;
-        }
-
-        if (fread(read_buf.data(), 1, nbytes, f) != nbytes) {
-            fprintf(stderr, "%s: fread failed for tensor '%s'\n", __func__, name);
-            fclose(f);
-            gguf_free(ctx_gguf);
-            delete ctx;
-            return nullptr;
-        }
-
-        ggml_backend_tensor_set(tensor, read_buf.data(), 0, nbytes);
-    }
-
-    fclose(f);
-    gguf_free(ctx_gguf);
-
-    // 5. Map tensors to model struct fields
+    // Bind tensors into model struct fields
     bool ok = true;
+    const auto& tensors = wl.tensors;
 
     // Encoder conv stem
-    model.enc_conv1_w = checked_get_tensor(model.ctx_w, "encoder.conv1.weight", ok);
-    model.enc_groupnorm_w = checked_get_tensor(model.ctx_w, "encoder.groupnorm.weight", ok);
-    model.enc_groupnorm_b = checked_get_tensor(model.ctx_w, "encoder.groupnorm.bias", ok);
-    model.enc_conv2_w = checked_get_tensor(model.ctx_w, "encoder.conv2.weight", ok);
-    model.enc_conv2_b = checked_get_tensor(model.ctx_w, "encoder.conv2.bias", ok);
-    model.enc_conv3_w = checked_get_tensor(model.ctx_w, "encoder.conv3.weight", ok);
-    model.enc_conv3_b = checked_get_tensor(model.ctx_w, "encoder.conv3.bias", ok);
+    model.enc_conv1_w = checked_get_tensor(tensors, "encoder.conv1.weight", ok);
+    model.enc_groupnorm_w = checked_get_tensor(tensors, "encoder.groupnorm.weight", ok);
+    model.enc_groupnorm_b = checked_get_tensor(tensors, "encoder.groupnorm.bias", ok);
+    model.enc_conv2_w = checked_get_tensor(tensors, "encoder.conv2.weight", ok);
+    model.enc_conv2_b = checked_get_tensor(tensors, "encoder.conv2.bias", ok);
+    model.enc_conv3_w = checked_get_tensor(tensors, "encoder.conv3.weight", ok);
+    model.enc_conv3_b = checked_get_tensor(tensors, "encoder.conv3.bias", ok);
 
     // Encoder output norm
-    model.enc_output_norm = checked_get_tensor(model.ctx_w, "encoder.output_norm.weight", ok);
+    model.enc_output_norm = checked_get_tensor(tensors, "encoder.output_norm.weight", ok);
 
     // Encoder layers
     model.enc_layers.resize(hp.enc_n_layers);
@@ -226,43 +197,43 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
         char name[128];
 
         snprintf(name, sizeof(name), "encoder.layers.%d.attn_norm.weight", i);
-        layer.attn_norm = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_norm = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.attn.q.weight", i);
-        layer.attn_q = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_q = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.attn.k.weight", i);
-        layer.attn_k = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_k = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.attn.v.weight", i);
-        layer.attn_v = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_v = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.attn.o.weight", i);
-        layer.attn_o = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_o = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.ffn_norm.weight", i);
-        layer.ffn_norm = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_norm = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.ffn.fc1.weight", i);
-        layer.ffn_fc1_w = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_fc1_w = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.ffn.fc1.bias", i);
-        layer.ffn_fc1_b = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_fc1_b = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.ffn.fc2.weight", i);
-        layer.ffn_fc2_w = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_fc2_w = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "encoder.layers.%d.ffn.fc2.bias", i);
-        layer.ffn_fc2_b = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_fc2_b = checked_get_tensor(tensors, name, ok);
     }
 
     // Decoder
-    model.dec_embed = checked_get_tensor(model.ctx_w, "decoder.embed_tokens.weight", ok);
-    model.dec_output_norm = checked_get_tensor(model.ctx_w, "decoder.output_norm.weight", ok);
+    model.dec_embed = checked_get_tensor(tensors, "decoder.embed_tokens.weight", ok);
+    model.dec_output_norm = checked_get_tensor(tensors, "decoder.output_norm.weight", ok);
     // Weight tying: use decoder.output.weight if present, else share with embed
-    model.dec_output = ggml_get_tensor(model.ctx_w, "decoder.output.weight");
-    if (!model.dec_output) {
-        model.dec_output = model.dec_embed;
+    {
+        auto it = tensors.find("decoder.output.weight");
+        model.dec_output = (it != tensors.end()) ? it->second : model.dec_embed;
     }
 
     // Decoder layers
@@ -272,49 +243,49 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
         char name[128];
 
         snprintf(name, sizeof(name), "decoder.layers.%d.attn_norm.weight", i);
-        layer.attn_norm = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_norm = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.attn.q.weight", i);
-        layer.attn_q = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_q = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.attn.k.weight", i);
-        layer.attn_k = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_k = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.attn.v.weight", i);
-        layer.attn_v = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_v = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.attn.o.weight", i);
-        layer.attn_o = checked_get_tensor(model.ctx_w, name, ok);
+        layer.attn_o = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.cross_attn_norm.weight", i);
-        layer.cross_attn_norm = checked_get_tensor(model.ctx_w, name, ok);
+        layer.cross_attn_norm = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.cross_attn.q.weight", i);
-        layer.cross_attn_q = checked_get_tensor(model.ctx_w, name, ok);
+        layer.cross_attn_q = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.cross_attn.k.weight", i);
-        layer.cross_attn_k = checked_get_tensor(model.ctx_w, name, ok);
+        layer.cross_attn_k = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.cross_attn.v.weight", i);
-        layer.cross_attn_v = checked_get_tensor(model.ctx_w, name, ok);
+        layer.cross_attn_v = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.cross_attn.o.weight", i);
-        layer.cross_attn_o = checked_get_tensor(model.ctx_w, name, ok);
+        layer.cross_attn_o = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.ffn_norm.weight", i);
-        layer.ffn_norm = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_norm = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.ffn.fc1.weight", i);
-        layer.ffn_fc1_w = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_fc1_w = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.ffn.fc1.bias", i);
-        layer.ffn_fc1_b = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_fc1_b = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.ffn.fc2.weight", i);
-        layer.ffn_fc2_w = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_fc2_w = checked_get_tensor(tensors, name, ok);
 
         snprintf(name, sizeof(name), "decoder.layers.%d.ffn.fc2.bias", i);
-        layer.ffn_fc2_b = checked_get_tensor(model.ctx_w, name, ok);
+        layer.ffn_fc2_b = checked_get_tensor(tensors, name, ok);
     }
 
     if (!ok) {
@@ -336,18 +307,25 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
         return nullptr;
     }
 
-    // 7. Initialize backend.
-    // Force CPU: weights are allocated on CPU buffer (line 138) and the graph
-    // uses ggml_backend_graph_compute (no scheduler). GPU would crash because
-    // it can't access CPU-resident weight tensors without a scheduler.
-    // The model is tiny (27M params) so GPU overhead exceeds compute benefit.
-    ctx->backend = ggml_backend_cpu_init();
-    if (!ctx->backend) {
-        fprintf(stderr, "%s: failed to init CPU backend\n", __func__);
-        delete ctx;
-        return nullptr;
+    // ── Create backend scheduler ──
+    {
+        ggml_backend_t backends[2];
+        int n_be = 0;
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend_cpu != ctx->backend)
+            backends[n_be++] = ctx->backend_cpu;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be,
+                                            /*graph_size=*/16384,
+                                            /*parallel=*/false, /*op_offload=*/false);
+        if (!ctx->sched) {
+            fprintf(stderr, "%s: failed to create backend scheduler\n", __func__);
+            delete ctx;
+            return nullptr;
+        }
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+
+    fprintf(stderr, "moonshine: loaded %zu tensors%s\n", wl.tensors.size(),
+            ctx->use_gpu ? " (GPU)" : "");
     return ctx;
 }
 
@@ -564,10 +542,9 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
     struct ggml_cgraph* graph = ggml_new_graph(ctx0);
     ggml_build_forward_expand(graph, output);
 
-    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(gallocr, graph)) {
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
-        ggml_gallocr_free(gallocr);
         ggml_free(ctx0);
         return -1;
     }
@@ -580,9 +557,8 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
     }
     ggml_backend_tensor_set(pos, pos_data.data(), 0, seq_len * sizeof(int32_t));
 
-    if (ggml_backend_graph_compute(ctx->backend, graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
-        ggml_gallocr_free(gallocr);
         ggml_free(ctx0);
         return -1;
     }
@@ -595,7 +571,6 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
     ctx->enc_len = out_seq;
     ggml_backend_tensor_get(output, ctx->encoder_out.data(), 0, out_bytes);
 
-    ggml_gallocr_free(gallocr);
     ggml_free(ctx0);
     return 0;
 }
@@ -691,19 +666,17 @@ static int moonshine_precompute_cross_kv(struct moonshine_context* ctx) {
         ggml_build_forward_expand(graph, V);
     }
 
-    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(gallocr, graph)) {
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
-        ggml_gallocr_free(gallocr);
         ggml_free(ctx0);
         return -1;
     }
 
     ggml_backend_tensor_set(enc_out, ctx->encoder_out.data(), 0, (size_t)hidden * enc_len * sizeof(float));
 
-    if (ggml_backend_graph_compute(ctx->backend, graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
-        ggml_gallocr_free(gallocr);
         ggml_free(ctx0);
         return -1;
     }
@@ -716,7 +689,6 @@ static int moonshine_precompute_cross_kv(struct moonshine_context* ctx) {
     }
     ctx->kv_cross.n = enc_len;
 
-    ggml_gallocr_free(gallocr);
     ggml_free(ctx0);
     return 0;
 }
@@ -854,9 +826,8 @@ static struct ggml_tensor* moonshine_build_decoder_step(struct ggml_context* ctx
     return logits;
 }
 
-// Build a decoder step graph and return it via out params for the caller to manage
-static int moonshine_decode_step(struct moonshine_context* ctx, int32_t token_id, std::vector<float>& logits_out,
-                                 ggml_gallocr_t gallocr) {
+// Build a decoder step graph and compute via scheduler
+static int moonshine_decode_step(struct moonshine_context* ctx, int32_t token_id, std::vector<float>& logits_out) {
     const auto& hp = ctx->model.hparams;
     const int cur_pos = ctx->kv_self.n;
 
@@ -890,7 +861,8 @@ static int moonshine_decode_step(struct moonshine_context* ctx, int32_t token_id
     ggml_set_output(logits);
     ggml_build_forward_expand(graph, logits);
 
-    if (!ggml_gallocr_alloc_graph(gallocr, graph)) {
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
         ggml_free(ctx0);
         return -1;
@@ -900,7 +872,7 @@ static int moonshine_decode_step(struct moonshine_context* ctx, int32_t token_id
     int32_t pos_val = cur_pos;
     ggml_backend_tensor_set(inp_pos, &pos_val, 0, sizeof(int32_t));
 
-    if (ggml_backend_graph_compute(ctx->backend, graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
         ggml_free(ctx0);
         return -1;
@@ -973,38 +945,16 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     // Encoder output no longer needed after cross-KV precompute
     { std::vector<float>().swap(ctx->encoder_out); }
 
-    // 4. Pre-allocate decoder compute buffer with max-size graph
-    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    {
-        const size_t n_tensors = hp.dec_n_layers * 60 + 50;
-        const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
-        struct ggml_init_params gp = {mem_size, nullptr, true};
-        struct ggml_context* plan_ctx = ggml_init(gp);
-        struct ggml_tensor* t = ggml_new_tensor_1d(plan_ctx, GGML_TYPE_I32, 1);
-        ggml_set_name(t, "token_id");
-        ggml_set_input(t);
-        struct ggml_tensor* p = ggml_new_tensor_1d(plan_ctx, GGML_TYPE_I32, 1);
-        ggml_set_name(p, "dec_pos");
-        ggml_set_input(p);
-        struct ggml_cgraph* plan_graph = ggml_new_graph(plan_ctx);
-        struct ggml_tensor* plan_logits = moonshine_build_decoder_step(
-            plan_ctx, ctx->model, ctx->kv_self, ctx->kv_cross, t, p, ctx->enc_len, max_len - 1, plan_graph);
-        ggml_set_output(plan_logits);
-        ggml_build_forward_expand(plan_graph, plan_logits);
-        ggml_gallocr_reserve(gallocr, plan_graph);
-        ggml_free(plan_ctx);
-    }
-
-    // 5. Decode loop. Picks via argmax when temperature == 0, otherwise
+    // 4. Decode loop (sched handles per-step allocation). Picks via argmax when temperature == 0, otherwise
     // softmax(logits/T) + multinomial sample. Beam search (beam_size > 1)
     // takes a separate path below — it ignores temperature and always
     // returns the highest cumulative-log-prob hypothesis.
     if (ctx->beam_size > 1) {
         // 5a. Prefill BOS to populate slot 0 + capture initial logits.
         std::vector<float> bos_logits;
-        ret = moonshine_decode_step(ctx, (int32_t)hp.bos_token_id, bos_logits, gallocr);
+        ret = moonshine_decode_step(ctx, (int32_t)hp.bos_token_id, bos_logits);
         if (ret != 0) {
-            ggml_gallocr_free(gallocr);
+
             ctx->kv_self.reset();
             ctx->kv_cross.reset();
             return ret;
@@ -1049,10 +999,10 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
         };
         auto snap_free = [](moonshine_kv_snap* s) { delete s; };
         std::vector<float> step_logits_buf;
-        auto step = [&step_logits_buf, gallocr](moonshine_context* c, int32_t tok, int /*n_past*/) -> float* {
+        auto step = [&step_logits_buf](moonshine_context* c, int32_t tok, int /*n_past*/) -> float* {
             // n_past is implicit in c->kv_self.n (set by restore_fn just
             // before this call). decode_step uses it directly.
-            if (moonshine_decode_step(c, tok, step_logits_buf, gallocr) != 0)
+            if (moonshine_decode_step(c, tok, step_logits_buf) != 0)
                 return nullptr;
             const int V = (int)c->model.hparams.vocab_size;
             float* out = (float*)std::malloc((size_t)V * sizeof(float));
@@ -1081,7 +1031,7 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
         ctx->timing.decode_ms = std::chrono::duration<double, std::milli>(t_decode_done - t_encode_done).count();
         ctx->timing.n_tokens = (int)out_tokens.size();
 
-        ggml_gallocr_free(gallocr);
+
         ctx->kv_self.reset();
         ctx->kv_cross.reset();
         return 0;
@@ -1109,7 +1059,7 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     };
 
     for (int step = 0; step < max_len; step++) {
-        ret = moonshine_decode_step(ctx, token, logits, gallocr);
+        ret = moonshine_decode_step(ctx, token, logits);
         if (ret != 0) {
             break;
         }
@@ -1182,7 +1132,7 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     ctx->timing.n_tokens = (int)out_tokens.size();
 
     // Cleanup
-    ggml_gallocr_free(gallocr);
+    // sched is persistent — no per-call free needed
     ctx->kv_self.reset();
     ctx->kv_cross.reset();
 
@@ -1262,14 +1212,18 @@ void moonshine_free(struct moonshine_context* ctx) {
     if (!ctx) {
         return;
     }
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
     // moonshine_model's destructor frees buf_w + ctx_w. It must run BEFORE
     // we free the backend, otherwise ggml_metal sees a buffer outliving its
     // device and ggml_metal_rsets_free's assert fires at process exit.
     auto* backend = ctx->backend;
+    auto* backend_cpu = ctx->backend_cpu;
     delete ctx;
-    if (backend) {
+    if (backend && backend != backend_cpu)
         ggml_backend_free(backend);
-    }
+    if (backend_cpu)
+        ggml_backend_free(backend_cpu);
 }
 
 void moonshine_print_model_info(struct moonshine_context* ctx) {
@@ -1353,8 +1307,8 @@ void moonshine_set_n_threads(struct moonshine_context* ctx, int n_threads) {
         return;
     }
     ctx->n_threads = n_threads;
-    if (ctx->backend) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, n_threads);
+    if (ctx->backend_cpu) {
+        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
     }
 }
 

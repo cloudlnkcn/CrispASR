@@ -19,6 +19,7 @@ struct moonshine_init_params {
     const char* model_path;
     const char* tokenizer_path; // NULL = auto-detect from model directory
     int n_threads;              // 0 = default (4)
+    bool use_gpu;               // false = CPU-only (default); true = best available
 };
 
 struct moonshine_context* moonshine_init(const char* model_path);

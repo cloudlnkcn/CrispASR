@@ -2063,12 +2063,16 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
 #endif
 #ifdef CA_HAVE_MOONSHINE
     if (s->backend == "moonshine") {
-        s->moonshine_ctx = moonshine_init(model_path);
+        moonshine_init_params mp = {};
+        mp.model_path = model_path;
+        mp.tokenizer_path = nullptr;
+        mp.n_threads = s->n_threads;
+        mp.use_gpu = g_open_use_gpu_tls;
+        s->moonshine_ctx = moonshine_init_with_params(mp);
         if (!s->moonshine_ctx) {
             delete s;
             return nullptr;
         }
-        moonshine_set_n_threads((moonshine_context*)s->moonshine_ctx, s->n_threads);
         return s;
     }
 #endif
