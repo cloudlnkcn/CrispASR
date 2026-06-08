@@ -136,11 +136,125 @@ static inline ggml_tensor* snake(ggml_context* ctx, ggml_tensor* x, ggml_tensor*
     return ggml_add(ctx, x, div);
 }
 
-// Conv1d wrapper: x(C_in, T) * w(k, C_in, C_out) + b(C_out,) -> (C_out, T)
-// Standard causal=false conv with padding = (kernel_size-1)/2 * dilation
-// For the DAC decoder, all convs use symmetric padding.
-// NOTE: This is a placeholder. The actual implementation needs to handle
-// the ggml tensor layout conventions properly.
-// See orpheus_snac.cpp for the working Conv1d pattern.
+// Conv1d: x(C_in, T) * w(K, C_in, C_out) + b(C_out,) -> (C_out, T)
+// Same-padding with optional dilation. Weight layout matches GGUF convention.
+static inline ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x,
+                                   ggml_tensor* w, ggml_tensor* b,
+                                   int K, int dil = 1) {
+    const int T = (int)x->ne[1];
+    const int Cout = (int)w->ne[2];
+    const int p = dil * (K - 1) / 2;
+    ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, Cin)
+    y = ggml_conv_1d(ctx, w, y, /*stride=*/1, p, dil);       // (T, Cout, 1)
+    y = ggml_reshape_2d(ctx, y, T, Cout);                    // (T, Cout)
+    y = ggml_cont(ctx, ggml_transpose(ctx, y));              // (Cout, T)
+    if (b) y = ggml_add(ctx, y, b);
+    return y;
+}
+
+// ConvTranspose1d with symmetric cropping: T_out = T_in * stride
+// DAC uses kernel=2*stride, pad=stride/2.
+static inline ggml_tensor* convt1d(ggml_context* ctx, ggml_tensor* x,
+                                    ggml_tensor* w, ggml_tensor* b,
+                                    int stride) {
+    const int pad = stride / 2;
+    const int Cin = (int)x->ne[0];
+    const int Cout = (int)w->ne[2];
+    // core_convt::convt1d_crop if available, else manual:
+    // x: (Cin, T) -> transpose -> (T, Cin)
+    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, Cin)
+    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xt, stride, 0, 1);
+    // Output is (T_out_full, Cout). Crop pad from each side.
+    int T_out_full = (int)y->ne[0];
+    int T_out = T_out_full - 2 * pad;
+    if (T_out > 0 && pad > 0) {
+        y = ggml_view_2d(ctx, y, T_out, Cout,
+                         y->nb[1], pad * sizeof(float));
+        y = ggml_cont(ctx, y);
+    }
+    // (T_out, Cout) -> (Cout, T_out)
+    y = ggml_cont(ctx, ggml_transpose(ctx, y));
+    if (b) y = ggml_add(ctx, y, b);
+    (void)Cin;
+    return y;
+}
+
+// ResidualUnit: Snake -> Conv1d(k=7,dil=d) -> Snake -> Conv1d(k=1) -> add
+static inline ggml_tensor* res_unit(ggml_context* ctx, ggml_tensor* x,
+                                     const DacResUnit& u, int dil) {
+    ggml_tensor* y = snake(ctx, x, u.alpha0);
+    y = conv1d(ctx, y, u.conv0_w, u.conv0_b, 7, dil);
+    y = snake(ctx, y, u.alpha1);
+    y = conv1d(ctx, y, u.conv1_w, u.conv1_b, 1); // k=1 pointwise
+    return ggml_add(ctx, x, y);
+}
+
+// DecoderBlock: Snake -> ConvTranspose1d(stride=s) -> 3 x ResidualUnit(d=1,3,9)
+static inline ggml_tensor* dec_block(ggml_context* ctx, ggml_tensor* x,
+                                      const DacDecoderBlock& blk, int stride) {
+    x = snake(ctx, x, blk.snake_alpha);
+    x = convt1d(ctx, x, blk.up_w, blk.up_b, stride);
+    x = res_unit(ctx, x, blk.res[0], 1);
+    x = res_unit(ctx, x, blk.res[1], 3);
+    x = res_unit(ctx, x, blk.res[2], 9);
+    return x;
+}
+
+// Build full DAC decode graph: codes (n_codebooks x T) -> PCM (T*512,)
+// Returns the PCM output tensor. Caller must create/alloc the graph.
+//
+// `codes_in` is an array of n_codebooks I32 tensors, each of length T.
+// These must already be created (ggml_new_tensor_1d) and set as inputs.
+static inline ggml_tensor* build_decode_graph(
+    ggml_context* ctx, const DacWeights& w, ggml_tensor** codes_in,
+    int /*T*/, ggml_cgraph* gf)
+{
+    const auto& cfg = w.config;
+    const int n_cb = cfg.n_codebooks;
+
+    // RVQ dequantize: for each codebook, lookup + project + sum
+    ggml_tensor* z_q = nullptr;
+    for (int k = 0; k < n_cb; k++) {
+        const auto& q = w.quantizers[k];
+        // codebook lookup: (codebook_dim, T)
+        ggml_tensor* z = ggml_get_rows(ctx, q.codebook, codes_in[k]);
+        z = ggml_cont(ctx, ggml_cast(ctx, z, GGML_TYPE_F32));
+        // out_proj: (codebook_dim, T) -> (hidden, T)
+        // pw conv: weight is (1, codebook_dim, hidden)
+        ggml_tensor* W2d = ggml_reshape_2d(ctx, q.out_proj_w,
+                                           q.out_proj_w->ne[0] * q.out_proj_w->ne[1],
+                                           q.out_proj_w->ne[2]);
+        z = ggml_mul_mat(ctx, W2d, z); // (hidden, T)
+        if (q.out_proj_b)
+            z = ggml_add(ctx, z, q.out_proj_b);
+        z_q = k == 0 ? z : ggml_add(ctx, z_q, z);
+    }
+    z_q = ggml_cont(ctx, z_q);
+
+    // Input conv: Conv1d(hidden, 1536, k=7, p=3)
+    ggml_tensor* h = conv1d(ctx, z_q, w.in_conv_w, w.in_conv_b, 7);
+
+    // 4 decoder blocks: strides [8, 8, 4, 2]
+    for (int b = 0; b < cfg.n_decoder_blocks; b++) {
+        h = dec_block(ctx, h, w.blocks[b], cfg.upsampling_ratios[b]);
+        h = ggml_cont(ctx, h);
+    }
+
+    // Final: Snake -> Conv1d(96, 1, k=7, p=3) -> Tanh
+    h = snake(ctx, h, w.out_snake_alpha);
+    h = conv1d(ctx, h, w.out_conv_w, w.out_conv_b, 7);
+    h = ggml_tanh(ctx, h);
+
+    // Output: (1, T_pcm) -> flatten to (T_pcm,)
+    int T_pcm = (int)h->ne[1];
+    h = ggml_reshape_1d(ctx, h, T_pcm);
+    h = ggml_cont(ctx, h);
+    ggml_set_name(h, "dac_pcm");
+    ggml_set_output(h);
+    if (gf)
+        ggml_build_forward_expand(gf, h);
+
+    return h;
+}
 
 } // namespace core_dac
