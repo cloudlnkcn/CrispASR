@@ -6,7 +6,7 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
-## 2026-06-07 Piper ASR roundtrip fix + permissive G2P phonemizer (§156)
+## 2026-06-07 → 2026-06-08 Piper ASR roundtrip fix + permissive G2P phonemizer (§156)
 
 **Problem:** Piper TTS → Whisper ASR roundtrip produced garbage when
 espeak-ng was not installed (raw English text fed as IPA phonemes).
@@ -15,31 +15,43 @@ espeak-ng was not installed (raw English text fed as IPA phonemes).
 with plain text. Now rejects non-IPA input; clear error message.
 
 **espeak-ng GPL workaround:** espeak-ng is GPLv3 — can't statically
-link. Replaced with MIT-clean `espeak_dlopen.h` (loads at runtime)
-+ built-in permissive G2P for 4 languages:
+link. Solution: pre-generate espeak-ng IPA output (factual data, not
+GPL-covered) and ship as downloadable dicts. Binary stays MIT-clean.
 
-| Language | Module | Approach | Dict |
-|----------|--------|----------|------|
-| English | `g2p_en.h` | CMUdict (134K, BSD) + neural GRU + LTS | auto-dl from HF |
-| German | `g2p_de.h` | Auslautverhärtung + open-syllable lengthening + compound splitting + LTS | OLaPh MIT 1.12M, auto-dl |
-| French | `g2p_fr.h` | LTS (nasals/oi/eau/silent finals/s-voicing) | OLaPh MIT, auto-dl |
-| Spanish | `g2p_es.h` | LTS (seseo/lenition/yeísmo/ch/ll/ñ) | OLaPh MIT, auto-dl |
+**Pre-generated espeak dicts** (primary, 99.5% piper match):
 
-**Phoneme inventory:** All output IPA chars validated against piper's
-154-char `phoneme_id_map`. Fixed combining tie U+0361 (not in map).
-Fixed stress-dependent vowel quality: AH0→ə (was ʌ), IY0→i (was iː),
-ER→ɜː (was ɜːɹ), dropped secondary stress ˌ. These changes match
-espeak-ng's output exactly and resolved the "audio"→"idea" whisper
-hallucination issue (was 60% error, now <20%).
+| Language | Words | Size | Source vocabulary |
+|----------|-------|------|-------------------|
+| English | 126K | 3 MB | CMUdict |
+| German | 667K | 23 MB | open-dict-data single words |
+| French | 257K | 6.6 MB | OLaPh FR |
+| Spanish | 600K | 18 MB | OLaPh ES |
 
-**Dicts:** OLaPh (iisys-hof/olaph, MIT) as primary source — 13 languages,
-1.12M German entries. Uploaded to HuggingFace `cstr/g2p-dicts`. Selectable
-via `--g2p-dict olaph|open-dict|/path` CLI flag or `CRISPASR_G2P_DICT_SOURCE`
-env var. open-dict-data (CC-BY-SA) available as alternative.
+Uploaded to HuggingFace `cstr/g2p-dicts`. Auto-downloaded on first use.
 
-**Wiring:** `--g2p-dict` CLI flag → `whisper_params.g2p_dict` →
-`piper_tts_set_g2p_dict()` C API → `crispasr_session_set_g2p_dict()`
-unified session API → Go binding `SetG2PDict()`. Server via startup flag.
+**Fallback tiers** (when word not in espeak dict):
+
+| Tier | EN | DE/FR/ES |
+|------|----|----------|
+| 1 | CMUdict + ARPAbet→IPA (76% match) | OLaPh MIT dict |
+| 2 | Neural G2P (GRU seq2seq from GGUF) | LTS rules |
+| 3 | LTS digraph/trigraph rules | espeak-ng dlopen |
+| 4 | espeak-ng dlopen | espeak-ng popen |
+| 5 | espeak-ng popen | — |
+
+**ARPAbet→IPA systematic fixes** (benchmark-driven):
+- AH0→ə (schwa), ER stressed→ɜː / unstressed→ɚ, IH0→ɪ, UW0→ʊ
+- T-flapping (T/D between vowels→ɾ), ER+vowel linking→ɚɹ
+- German: r→plain r (not ʁ), -er→ɜ (not ɐ), long a→ɑː (not aː),
+  Auslautverhärtung, open-syllable lengthening, compound splitting
+
+**Wiring:** `--g2p-dict` CLI → `whisper_params` → C API
+`crispasr_session_set_g2p_dict()` → Go `SetG2PDict()` → server.
+
+**Benchmark:** 382-word ground truth (espeak-ng en-us/de):
+EN 99.5%, DE 100% with espeak dict; EN 76.2% with CMUdict fallback.
+
+**Tests:** 174 unit assertions + 4 live TTS→ASR roundtrips (5/5 perfect).
 
 **Tests:** 202 unit assertions across 38 test cases + 4 live roundtrips.
 

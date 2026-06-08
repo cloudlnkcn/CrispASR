@@ -81,42 +81,51 @@ boundaries.
 
 TTS backends that use IPA phonemes (piper, kokoro) need a
 grapheme-to-phoneme (G2P) engine to convert text to IPA. CrispASR
-ships built-in G2P for 4 languages — **no espeak-ng required**:
+ships pre-generated IPA pronunciation dictionaries for 4 languages —
+**no espeak-ng required**:
 
-| Language | Built-in rules | Dictionary (auto-download) |
-|----------|---------------|----------------------------|
-| English | CMUdict (134K words, BSD) + LTS rules | 3.5 MB from cstr/g2p-dicts |
-| German | Auslautverhärtung, open-syllable lengthening, compound splitting | 40 MB OLaPh (MIT) |
-| French | Nasal vowels, silent finals, s-voicing | 6 MB OLaPh (MIT) |
-| Spanish | Seseo, b/d/g lenition, yeísmo | 16 MB OLaPh (MIT) |
+| Language | IPA dict (primary) | Fallback | Match rate |
+|----------|--------------------|----------|------------|
+| English | 126K words, 3 MB | CMUdict + ARPAbet→IPA + LTS rules | 99.5% |
+| German | 667K words, 23 MB | OLaPh + LTS rules (Auslautverhärtung, compound splitting) | 100% |
+| French | 257K words, 6.6 MB | OLaPh + LTS rules (nasals, silent finals, s-voicing) | — |
+| Spanish | 600K words, 18 MB | OLaPh + LTS rules (seseo, lenition, yeísmo) | — |
+
+Dictionaries are auto-downloaded from
+[cstr/g2p-dicts](https://huggingface.co/datasets/cstr/g2p-dicts)
+on first use and cached at `~/.cache/crispasr/`.
 
 The `--g2p-dict` flag selects the dictionary source:
 
 ```bash
-# Default: OLaPh MIT dicts (auto-downloaded from HuggingFace)
+# Default: pre-generated IPA dicts (piper-compatible, auto-download)
 crispasr --backend piper -m auto --tts "Hello world"
 
-# Use open-dict-data (CC-BY-SA, Wiktionary-sourced) instead
-crispasr --backend piper -m auto --g2p-dict open-dict --tts "Hello world"
+# Use CMUdict + ARPAbet→IPA conversion instead (76% piper match)
+crispasr --backend piper -m auto --g2p-dict cmudict --tts "Hello world"
+
+# Use OLaPh MIT dicts (British IPA conventions)
+crispasr --backend piper -m auto --g2p-dict olaph --tts "Hello world"
 
 # Use your own dictionary file
 crispasr --backend piper -m auto --g2p-dict /path/to/my/dict.txt --tts "Hello world"
 ```
 
 The phonemization cascade tries in order:
-1. Built-in G2P (LTS rules + dictionary) — always available
-2. espeak-ng via dlopen (loaded at runtime if installed)
-3. espeak-ng via popen (subprocess fallback)
+1. Pre-generated IPA dict (99.5% piper-compatible) — auto-download
+2. CMUdict + ARPAbet→IPA conversion (EN) / OLaPh dict (DE/FR/ES)
+3. LTS letter-to-sound rules — always available, zero dependencies
+4. espeak-ng via dlopen (loaded at runtime if installed)
+5. espeak-ng via popen (subprocess fallback)
 
-Dictionaries are auto-downloaded to `~/.cache/crispasr/` on first use.
-Override with env vars: `CRISPASR_CMUDICT_PATH`, `CRISPASR_DE_DICT_PATH`,
-`CRISPASR_FR_DICT_PATH`, `CRISPASR_ES_DICT_PATH`, or
-`CRISPASR_G2P_DICT_SOURCE` (`olaph` or `open-dict`).
+Override per-language dict paths with env vars:
+`CRISPASR_CMUDICT_PATH`, `CRISPASR_DE_DICT_PATH`,
+`CRISPASR_FR_DICT_PATH`, `CRISPASR_ES_DICT_PATH`.
 
-Dictionary sources:
-- **OLaPh** (MIT, default): [iisys-hof/olaph](https://github.com/iisys-hof/olaph), hosted at [cstr/g2p-dicts](https://huggingface.co/datasets/cstr/g2p-dicts)
-- **open-dict-data** (CC-BY-SA): [open-dict-data/ipa-dict](https://github.com/open-dict-data/ipa-dict), Wiktionary-sourced
+Dictionary sources at [cstr/g2p-dicts](https://huggingface.co/datasets/cstr/g2p-dicts):
+- **Pre-generated IPA** (primary): piper-compatible phonetic transcriptions for EN/DE/FR/ES
 - **CMUdict** (BSD): [cmusphinx/cmudict](https://github.com/cmusphinx/cmudict), English ARPAbet
+- **OLaPh** (MIT): [iisys-hof/olaph](https://github.com/iisys-hof/olaph), 13 languages
 
 ## Kokoro — multilingual, smallest
 
