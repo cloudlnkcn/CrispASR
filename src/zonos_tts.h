@@ -105,6 +105,17 @@ void zonos_tts_free(struct zonos_tts_context* ctx);
 // out_prefix_len receives the per-path length; out_d_model receives d_model.
 float* zonos_tts_build_conditioning_prefix(struct zonos_tts_context* ctx, const char* text, int* out_prefix_len,
                                            int* out_d_model);
+
+// Run up to n_steps_req AR decode steps and capture CFG-blended logits at each.
+// Return layout: float[n_steps_out][n_codebooks][head_vocab_size] where:
+//   slot 0      = prefill logits (CFG-blended, no EOS masking)
+//   slot k≥1   = AR step k-1 logits (CFG-blended + EOS mask for cb1-8)
+// Uses greedy sampling (temperature=0) so inputs are deterministic.
+// out_n_steps = 1 + AR steps executed (stopped at n_steps_req or EOS).
+// Caller frees with free(). Returns nullptr on failure.
+float* zonos_tts_run_ar_steps_dump(struct zonos_tts_context* ctx, const char* text, int n_steps_req, int* out_n_steps,
+                                   int* out_n_cb, int* out_vocab);
+
 void zonos_tts_set_n_threads(struct zonos_tts_context* ctx, int n_threads);
 void zonos_tts_set_temperature(struct zonos_tts_context* ctx, float temperature);
 void zonos_tts_set_seed(struct zonos_tts_context* ctx, uint64_t seed);

@@ -51,10 +51,16 @@ import numpy as np
 # dump_reference.py plugin API
 # ---------------------------------------------------------------------------
 
+_N_AR_STEPS = int(os.environ.get("ZONOS_DIFF_N_STEPS", "10"))
+
 DEFAULT_STAGES = [
     "conditioning_prefix",   # (2, prefix_len, d_model): cond+uncond stacked
     "phoneme_ids",           # (prefix_len_ph,): int32 token IDs
-    "prefill_logits",        # (n_codebooks, head_vocab_size): cond logits after prefill
+    "prefill_logits",        # (n_codebooks, head_vocab_size): CFG-blended logits from prefill
+    # Per-AR-step CFG-blended logits (post-logit_bias masking), same as what the
+    # sampler sees. Shape (n_codebooks, head_vocab_size) each.
+    # Count controlled by ZONOS_DIFF_N_STEPS env var (default 10).
+    *[f"ar_step_{k}_logits" for k in range(_N_AR_STEPS)],
     "output_codes",          # (n_codebooks, seq_len): final generated codes
 ]
 
@@ -124,39 +130,6 @@ def dump(model_dir: Path, audio: np.ndarray, stages: set, **kwargs) -> dict[str,
     if "conditioning_prefix" in stages:
         captures["conditioning_prefix"] = conditioning.detach().cpu().float().numpy()
 
-    # prefill_logits + output_codes — need to run generate()
-    if "prefill_logits" in stages or "output_codes" in stages:
-        torch.manual_seed(seed)
-
-        # Hook _prefill to capture logits before CFG blend
-        _prefill_logits: list[np.ndarray] = []
-
-        original_prefill = model._prefill.__func__
-
-        def hooked_prefill(self, prefix_hidden_states, input_ids, inference_params, cfg_scale):
-            result = original_prefill(self, prefix_hidden_states, input_ids, inference_params, cfg_scale)
-            if "prefill_logits" in stages and not _prefill_logits:
-                # result shape: (1, n_cb, vocab) after CFG blend
-                _prefill_logits.append(result.detach().cpu().float().numpy())
-            return result
-
-        import types
-        model._prefill = types.MethodType(hooked_prefill, model)
-
-        codes = model.generate(
-            conditioning,
-            max_new_tokens=max_tokens,
-            cfg_scale=2.0,
-            progress_bar=False,
-        )
-
-        if "prefill_logits" in stages and _prefill_logits:
-            # shape (1, n_cb, vocab) → squeeze batch → (n_cb, vocab)
-            captures["prefill_logits"] = _prefill_logits[0].squeeze(0)
-
-        if "output_codes" in stages:
-            captures["output_codes"] = codes.detach().cpu().numpy().astype(np.int32)
-
     # phoneme_ids: extract from the conditioner for the same text
     if "phoneme_ids" in stages:
         try:
@@ -166,6 +139,56 @@ def dump(model_dir: Path, audio: np.ndarray, stages: set, **kwargs) -> dict[str,
             captures["phoneme_ids"] = np.array(ids, dtype=np.int32)
         except Exception as e:
             print(f"phoneme_ids capture failed: {e}", file=sys.stderr)
+
+    # prefill_logits + ar_step_K_logits + output_codes — run generate() with hook
+    n_steps = _N_AR_STEPS
+    need_generate = (
+        "prefill_logits" in stages
+        or "output_codes" in stages
+        or any(f"ar_step_{k}_logits" in stages for k in range(n_steps))
+    )
+    if need_generate:
+        torch.manual_seed(seed)
+
+        # Hook sample_from_logits (imported in zonos.model) to capture the exact
+        # distribution used for sampling at each call:
+        #   call index 0 → prefill_logits   (CFG-blended, no logit_bias yet)
+        #   call index k (k ≥ 1) → ar_step_{k-1}_logits  (CFG-blended + logit_bias)
+        # The logits tensor has shape (1, n_codebooks, vocab_size) at each call.
+        import zonos.model as _zonos_model
+        _call_idx: list[int] = [0]
+        _ar_captures: dict[str, np.ndarray] = {}
+        _orig_sample = _zonos_model.sample_from_logits
+
+        def _hooked_sample(logits, **kwargs):
+            idx = _call_idx[0]
+            _call_idx[0] += 1
+            arr = logits.detach().squeeze(0).cpu().float().numpy()  # (n_cb, vocab)
+            if idx == 0:
+                if "prefill_logits" in stages:
+                    _ar_captures["prefill_logits"] = arr
+            else:
+                k = idx - 1
+                stage = f"ar_step_{k}_logits"
+                if stage in stages:
+                    _ar_captures[stage] = arr
+            return _orig_sample(logits, **kwargs)
+
+        _zonos_model.sample_from_logits = _hooked_sample
+        try:
+            codes = model.generate(
+                conditioning,
+                max_new_tokens=max_tokens,
+                cfg_scale=2.0,
+                progress_bar=False,
+                disable_torch_compile=True,
+            )
+        finally:
+            _zonos_model.sample_from_logits = _orig_sample
+
+        captures.update(_ar_captures)
+        if "output_codes" in stages:
+            captures["output_codes"] = codes.detach().cpu().numpy().astype(np.int32)
 
     return captures
 

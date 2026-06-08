@@ -761,6 +761,69 @@ static void print_row(const char* name, const crispasr_diff::Report& r, float co
            shape_str.c_str(), r.cos_min, r.cos_mean, r.max_abs, r.rms, *extra ? "  " : "", extra);
 }
 
+// Like compare_with_row_width but handles mismatched row strides between the
+// C++ data (stride_cpp) and the reference data (stride_ref).  Only the first
+// min(stride_cpp, stride_ref) columns of each row are compared — the extra
+// reference columns (e.g. Python pad_vocab_to_multiple_of padding) are skipped.
+// Non-finite C++ values (e.g. logit_bias -inf masks) are counted but excluded
+// from all metrics so cos/rms remain valid.
+static crispasr_diff::Report compare_logits_strided(const crispasr_diff::Ref& ref, const std::string& name,
+                                                    const float* data, size_t n_cpp_elem, int stride_cpp,
+                                                    int stride_ref) {
+    crispasr_diff::Report r;
+    auto pair = ref.get_f32(name);
+    if (!pair.first || pair.second == 0 || stride_cpp <= 0 || stride_ref <= 0)
+        return r;
+    r.found = true;
+    r.shape = ref.shape(name);
+    const int row_w = std::min(stride_cpp, stride_ref);
+    const size_t n_rows = std::min(n_cpp_elem / (size_t)stride_cpp, pair.second / (size_t)stride_ref);
+    r.n_elem = n_rows * (size_t)row_w;
+    if (r.n_elem == 0)
+        return r;
+    double sum_abs = 0.0, sum_sq = 0.0;
+    size_t n_finite = 0;
+    r.cos_min = 1.0f;
+    double cos_sum = 0.0;
+    size_t cos_rows = 0;
+    for (size_t i = 0; i < n_rows; ++i) {
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (int k = 0; k < row_w; ++k) {
+            const float a = data[i * (size_t)stride_cpp + (size_t)k];
+            const float b = pair.first[i * (size_t)stride_ref + (size_t)k];
+            if (!std::isfinite(a)) {
+                ++r.n_nonfinite;
+                continue;
+            }
+            ++n_finite;
+            const float d = a - b;
+            const float ad = std::fabs(d);
+            if (ad > r.max_abs)
+                r.max_abs = ad;
+            sum_abs += ad;
+            sum_sq += (double)d * d;
+            dot += (double)a * b;
+            na += (double)a * a;
+            nb += (double)b * b;
+        }
+        const double denom = std::sqrt(na) * std::sqrt(nb);
+        if (denom > 1e-12) {
+            const float cs = (float)(dot / denom);
+            if (cs < r.cos_min)
+                r.cos_min = cs;
+            cos_sum += cs;
+            ++cos_rows;
+        }
+    }
+    if (n_finite > 0) {
+        r.mean_abs = (float)(sum_abs / n_finite);
+        r.rms = (float)std::sqrt(sum_sq / n_finite);
+    }
+    if (cos_rows > 0)
+        r.cos_mean = (float)(cos_sum / cos_rows);
+    return r;
+}
+
 static crispasr_diff::Report compare_with_row_width(const crispasr_diff::Ref& ref, const std::string& name,
                                                     const float* data, size_t n_elem, int row_w) {
     crispasr_diff::Report r;
@@ -5128,10 +5191,12 @@ int main(int argc, char** argv) {
 
     } else if (backend_name == "zonos-tts") {
         // Zonos TTS diff: text-driven, audio arg is unused.
-        // Text comes from ZONOS_TTS_TEXT env var (or the ref archive's metadata).
+        // Text from ZONOS_TTS_TEXT env var. Speaker embedding from ZONOS_SPEAKER_EMB_PATH.
         // Stages:
-        //   conditioning_prefix  (2*T, d_model) — cond rows then uncond rows
-        //   phoneme_ids          (T_ph,)         — int32 IDs from espeak
+        //   conditioning_prefix  (2*T, d_model)    — cond+uncond prefix rows
+        //   prefill_logits       (n_cb, vocab)      — CFG logits after prefill (no logit_bias)
+        //   ar_step_K_logits     (n_cb, vocab)      — per-AR-step CFG logits (+logit_bias)
+        //   Count controlled by ZONOS_DIFF_N_STEPS env var (default 10).
 
         auto zp = zonos_tts_default_params();
         zp.n_threads = 4;
@@ -5143,7 +5208,7 @@ int main(int argc, char** argv) {
             return 4;
         }
 
-        // Resolve synthesis text: prefer ref archive metadata, then env var.
+        // Resolve synthesis text
         std::string syn_text;
         const char* env_text = std::getenv("ZONOS_TTS_TEXT");
         if (env_text && *env_text) {
@@ -5155,7 +5220,12 @@ int main(int argc, char** argv) {
         }
         printf("crispasr-diff[zonos-tts]: text = %s\n", syn_text.c_str());
 
-        // Stage 1: conditioning_prefix
+        // How many AR steps to compare (must match Python ZONOS_DIFF_N_STEPS)
+        int n_diff_steps = 10;
+        if (const char* ns = std::getenv("ZONOS_DIFF_N_STEPS"))
+            n_diff_steps = std::atoi(ns);
+
+        // Stage: conditioning_prefix
         {
             int prefix_len = 0, d_model = 0;
             float* prefix = zonos_tts_build_conditioning_prefix(ctx, syn_text.c_str(), &prefix_len, &d_model);
@@ -5163,12 +5233,97 @@ int main(int argc, char** argv) {
                 printf("[ERR ] conditioning_prefix    zonos_tts_build_conditioning_prefix returned null\n");
                 n_fail++;
             } else {
-                // Shape: (2 * prefix_len, d_model) — compare row-by-row
                 auto rep = compare_with_row_width(ref, "conditioning_prefix", prefix, (size_t)2 * prefix_len * d_model,
                                                   d_model);
                 print_row("conditioning_prefix", rep, COS_THRESHOLD);
                 record(rep);
                 free(prefix);
+            }
+        }
+
+        // Stages: prefill_logits + ar_step_K_logits (K = 0..n_diff_steps-1)
+        // Run the AR dump and compare slot by slot.
+        {
+            int n_slots = 0, n_cb = 0, vocab = 0;
+            float* ar_dump = zonos_tts_run_ar_steps_dump(ctx, syn_text.c_str(), n_diff_steps, &n_slots, &n_cb, &vocab);
+            if (!ar_dump) {
+                printf("[ERR ] prefill_logits         zonos_tts_run_ar_steps_dump returned null\n");
+                n_fail++;
+            } else {
+                // Python pads vocab to the next multiple of 2 (pad_vocab_to_multiple_of=2),
+                // so the reference rows may be one element wider than the C++ output.
+                // Read vocab_ref from the reference shape (ggml ne[0] = innermost = vocab).
+                int vocab_ref = vocab;
+                {
+                    auto shp = ref.shape("prefill_logits");
+                    if (!shp.empty())
+                        vocab_ref = (int)shp[0];
+                }
+
+                // Print helper that shows cos stats even when a small number of C++
+                // values are non-finite (-inf from logit_bias masking is expected).
+                auto print_row_logits = [&](const char* nm, const crispasr_diff::Report& rpt) {
+                    // Pass if cos_min is good; expected non-finite (-inf logit_bias
+                    // entries) do not by themselves cause a fail.
+                    const bool cos_ok = std::isfinite(rpt.cos_min) && rpt.cos_min >= COS_THRESHOLD;
+                    const bool is_pass = rpt.found && cos_ok;
+                    const char* tag = rpt.found ? (is_pass ? "[PASS]" : "[FAIL]") : "[SKIP]";
+                    std::string shp_s = "[";
+                    for (size_t si = 0; si < rpt.shape.size(); si++) {
+                        shp_s += std::to_string(rpt.shape[si]);
+                        if (si + 1 < rpt.shape.size())
+                            shp_s += ",";
+                    }
+                    shp_s += "]";
+                    if (!rpt.found) {
+                        printf("%s %-22s %s  (reference not in archive)\n", tag, nm, shp_s.c_str());
+                        return;
+                    }
+                    if (!std::isfinite(rpt.cos_mean)) {
+                        printf("%s %-22s shape=%-16s non_finite=%zu/%zu  (cos unreliable — check for unexpected "
+                               "Inf/NaN)\n",
+                               tag, nm, shp_s.c_str(), rpt.n_nonfinite, rpt.n_elem);
+                        return;
+                    }
+                    if (rpt.n_nonfinite > 0) {
+                        printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  max_abs=%.2e  rms=%.2e"
+                               "  (non_finite=%zu logit_bias)\n",
+                               tag, nm, shp_s.c_str(), rpt.cos_min, rpt.cos_mean, rpt.max_abs, rpt.rms,
+                               rpt.n_nonfinite);
+                    } else {
+                        printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  max_abs=%.2e  rms=%.2e\n", tag, nm,
+                               shp_s.c_str(), rpt.cos_min, rpt.cos_mean, rpt.max_abs, rpt.rms);
+                    }
+                };
+                auto record_logits = [&](const crispasr_diff::Report& rpt) {
+                    if (!rpt.found) {
+                        n_skip++;
+                        return;
+                    }
+                    if (std::isfinite(rpt.cos_min) && rpt.cos_min >= COS_THRESHOLD) {
+                        n_pass++;
+                        return;
+                    }
+                    n_fail++;
+                };
+
+                const size_t slot_sz = (size_t)n_cb * vocab;
+                // Slot 0 → prefill_logits
+                {
+                    auto rep = compare_logits_strided(ref, "prefill_logits", ar_dump, slot_sz, vocab, vocab_ref);
+                    print_row_logits("prefill_logits", rep);
+                    record_logits(rep);
+                }
+                // Slots 1..n_slots-1 → ar_step_K_logits
+                for (int k = 0; k < n_slots - 1; k++) {
+                    char stage[64];
+                    snprintf(stage, sizeof(stage), "ar_step_%d_logits", k);
+                    const float* slot_ptr = ar_dump + (size_t)(k + 1) * slot_sz;
+                    auto rep = compare_logits_strided(ref, stage, slot_ptr, slot_sz, vocab, vocab_ref);
+                    print_row_logits(stage, rep);
+                    record_logits(rep);
+                }
+                free(ar_dump);
             }
         }
 

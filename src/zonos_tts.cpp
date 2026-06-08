@@ -1452,6 +1452,168 @@ float* zonos_tts_build_conditioning_prefix(struct zonos_tts_context* ctx, const 
     return out;
 }
 
+float* zonos_tts_run_ar_steps_dump(struct zonos_tts_context* ctx, const char* text, int n_steps_req, int* out_n_steps,
+                                   int* out_n_cb, int* out_vocab) {
+    if (!ctx || !text || n_steps_req <= 0 || !out_n_steps || !out_n_cb || !out_vocab)
+        return nullptr;
+
+    const auto& hp = ctx->hp;
+    const int d = (int)hp.d_model;
+    const int n_cb = (int)hp.n_codebooks;
+    const int vocab = (int)hp.head_vocab_size;
+    const int eos_id = (int)hp.eos_token_id;
+    const int mask_id = (int)hp.masked_token_id;
+    const float cfg_scale = ctx->params.cfg_scale;
+    const bool use_cfg = (cfg_scale != 1.0f);
+
+    // Slot 0 = prefill logits, slots 1..n = AR step 0..n-1 logits
+    const int total_slots = 1 + n_steps_req;
+    float* result = (float*)malloc((size_t)total_slots * n_cb * vocab * sizeof(float));
+    if (!result)
+        return nullptr;
+
+    // ── Phonemize and build conditioning prefix ──
+    const char* lang = "en-us";
+    if (ctx->cond_state.language_id >= 0 && ctx->cond_state.language_id < (int)ctx->cond_state.language_codes.size())
+        lang = ctx->cond_state.language_codes[ctx->cond_state.language_id].c_str();
+    auto phoneme_ids = tokenize_text_full(text, lang);
+
+    int cond_len = 0, uncond_len = 0;
+    float* cond_prefix = build_prefix_cpu(ctx, phoneme_ids, false, &cond_len);
+    float* uncond_prefix = build_prefix_cpu(ctx, phoneme_ids, true, &uncond_len);
+    if (!cond_prefix || !uncond_prefix) {
+        free(cond_prefix);
+        free(uncond_prefix);
+        free(result);
+        return nullptr;
+    }
+
+    // Append mask frame to each prefix
+    {
+        std::vector<float> mask_emb(d, 0.0f);
+        std::vector<float> row(d);
+        for (uint32_t k = 0; k < hp.n_codebooks; k++) {
+            tensor_get_row_f32(ctx->emb_w[k], mask_id, row.data(), d);
+            for (int i = 0; i < d; i++)
+                mask_emb[i] += row[i];
+        }
+        auto extend = [&](float*& p, int& len) {
+            float* e = (float*)malloc((size_t)(len + 1) * d * sizeof(float));
+            std::memcpy(e, p, (size_t)len * d * sizeof(float));
+            std::memcpy(e + (size_t)len * d, mask_emb.data(), (size_t)d * sizeof(float));
+            free(p);
+            p = e;
+            len++;
+        };
+        extend(cond_prefix, cond_len);
+        if (uncond_prefix)
+            extend(uncond_prefix, uncond_len);
+    }
+
+    // Allocate KV cache
+    int kv_need = cond_len + n_steps_req + 16;
+    if (!kv_alloc(ctx, kv_need)) {
+        free(cond_prefix);
+        free(uncond_prefix);
+        free(result);
+        return nullptr;
+    }
+
+    ggml_backend_buffer_clear(ctx->kv_buf, 0);
+
+    float* logits_cond = nullptr;
+    float* logits_uncond = nullptr;
+    int n_past = cond_len, n_past_u = uncond_len;
+
+    if (use_cfg && uncond_prefix) {
+        logits_uncond = run_backbone(ctx, uncond_prefix, uncond_len, 0, ctx->kv_k_uncond, ctx->kv_v_uncond);
+    }
+    logits_cond = run_backbone(ctx, cond_prefix, cond_len, 0, ctx->kv_k, ctx->kv_v);
+    free(cond_prefix);
+    free(uncond_prefix);
+
+    if (!logits_cond) {
+        free(logits_uncond);
+        free(result);
+        return nullptr;
+    }
+
+    // Slot 0: prefill CFG logits (no EOS masking — matches Python call 0 before logit_bias)
+    {
+        float* slot = &result[0];
+        if (use_cfg && logits_uncond) {
+            for (int i = 0; i < n_cb * vocab; i++)
+                slot[i] = logits_uncond[i] + cfg_scale * (logits_cond[i] - logits_uncond[i]);
+        } else {
+            std::memcpy(slot, logits_cond, (size_t)n_cb * vocab * sizeof(float));
+        }
+    }
+
+    // AR steps
+    std::vector<float> cfg_buf((size_t)n_cb * vocab);
+    int steps_done = 0;
+
+    for (int step = 0; step < n_steps_req; step++) {
+        // CFG blend + EOS masking (matches Python logits + logit_bias)
+        if (use_cfg && logits_uncond) {
+            for (int i = 0; i < n_cb * vocab; i++)
+                cfg_buf[i] = logits_uncond[i] + cfg_scale * (logits_cond[i] - logits_uncond[i]);
+            for (int k = 1; k < n_cb; k++)
+                cfg_buf[(size_t)k * vocab + eos_id] = -INFINITY;
+        } else {
+            std::memcpy(cfg_buf.data(), logits_cond, (size_t)n_cb * vocab * sizeof(float));
+        }
+
+        // Store in slot step+1
+        float* slot = &result[(size_t)(step + 1) * n_cb * vocab];
+        std::memcpy(slot, cfg_buf.data(), (size_t)n_cb * vocab * sizeof(float));
+
+        // Greedy sample (temperature=0) — deterministic, matches Python with same logits
+        std::vector<int32_t> new_tokens(n_cb);
+        for (int k = 0; k < n_cb; k++) {
+            const float* cb_logits = &cfg_buf[(size_t)k * vocab];
+            int best = 0;
+            for (int i = 1; i < vocab; i++)
+                if (cb_logits[i] > cb_logits[best])
+                    best = i;
+            new_tokens[k] = best;
+        }
+
+        free(logits_cond);
+        logits_cond = nullptr;
+        steps_done++;
+
+        if (new_tokens[0] == eos_id)
+            break;
+
+        // Build delayed embedding (delay pattern: cb_k visible at step >= k)
+        std::vector<int32_t> delayed(n_cb, mask_id);
+        for (int k = 0; k < n_cb; k++)
+            if (step >= k)
+                delayed[k] = new_tokens[k];
+        std::vector<float> embed(d);
+        embed_codebook_tokens(ctx, delayed.data(), embed.data());
+
+        logits_cond = run_backbone(ctx, embed.data(), 1, n_past, ctx->kv_k, ctx->kv_v);
+        n_past++;
+        if (use_cfg) {
+            free(logits_uncond);
+            logits_uncond = run_backbone(ctx, embed.data(), 1, n_past_u, ctx->kv_k_uncond, ctx->kv_v_uncond);
+            n_past_u++;
+        }
+        if (!logits_cond)
+            break;
+    }
+
+    free(logits_cond);
+    free(logits_uncond);
+
+    *out_n_steps = 1 + steps_done; // slot 0 = prefill + AR steps
+    *out_n_cb = n_cb;
+    *out_vocab = vocab;
+    return result;
+}
+
 // -----------------------------------------------------------------------
 // Synthesis: AR decode with CFG + multi-codebook delay pattern
 // -----------------------------------------------------------------------
