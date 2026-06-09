@@ -518,12 +518,15 @@ jobs:
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@v3
 
-      - name: Install OpenBLAS and pkgconfiglite
+      - name: Install OpenBLAS and pkg-config
         if: matrix.blas == 'ON'
         run: |
           Invoke-WebRequest "https://github.com/OpenMathLib/OpenBLAS/releases/download/v${{matrix.blasver}}/OpenBLAS-${{matrix.blasver}}_${{matrix.blasfile}}.zip" -OutFile "OpenBLAS-${{matrix.blasver}}.zip"
           Expand-Archive "OpenBLAS-${{matrix.blasver}}.zip" -DestinationPath "OpenBLAS-${{matrix.blasver}}"
-          choco install pkgconfiglite --allow-empty-checksums
+          # pkgconfiglite downloads from SourceForge which fails on windows-2025 (TLS mismatch)
+          # Use MSYS2 pkgconf which is pre-installed on all GitHub Windows runners
+          C:\msys64\usr\bin\pacman.exe --noconfirm -Sy msys/pkgconf
+          echo "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Fetch SDL2 and set SDL2_DIR
         if: matrix.sdl2 == 'ON'
