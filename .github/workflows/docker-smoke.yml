@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Validate compose YAML
         run: |
@@ -99,7 +99,7 @@ jobs:
 
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Build Hugging Face Space image
         run: docker build -f hf-space/Dockerfile -t crispasr-hf-space .

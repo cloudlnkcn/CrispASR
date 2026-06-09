@@ -50,7 +50,7 @@ jobs:
     name: clang-format (style)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install clang-format
         # Pin the version so the same formatting verdict is produced here and
@@ -99,7 +99,7 @@ jobs:
     name: clang-tidy (lint / types / security)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -136,7 +136,7 @@ jobs:
     name: cppcheck (static analysis)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install cppcheck
         run: |
@@ -189,10 +189,10 @@ jobs:
     # block PRs. The job is best-effort: missing upstream metadata or
     # network errors degrade to "skip" without failing the lint.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 

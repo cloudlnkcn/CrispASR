@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run driver smoke test
         run: python tests/regression/test_driver_smoke.py
 
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run no-model Python unit tests
         run: |
           python -m pytest tests/test_backend_config.py -v || \
@@ -89,7 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: pip install huggingface_hub
       - run: python tests/regression/run_one.py --dry-run
 
@@ -164,7 +164,7 @@ jobs:
           # stay manual or Kaggle-only. They need 2+ GB per slot once
           # you add parakeet on top.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build + runtime deps
         run: |

@@ -180,7 +180,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.16
+        uses: hendrikmuhs/ccache-action@v1.2.20
         with:
           key: macOS-latest-swift
           evict-old-files: 1d
@@ -319,7 +319,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Build ${{ matrix.arch }}
         run: |
@@ -410,7 +410,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       - name: Fetch SDL2 and set SDL2_DIR
         if: matrix.sdl2 == 'ON'
@@ -516,7 +516,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       - name: Install OpenBLAS and pkgconfiglite
         if: matrix.blas == 'ON'
@@ -596,7 +596,7 @@ jobs:
           choco install ninja
 
       - name: Install ccache
-        uses: hendrikmuhs/ccache-action@v1.2.16
+        uses: hendrikmuhs/ccache-action@v1.2.20
         with:
           key: ${{ github.job }}-${{ matrix.cuda-toolkit }}-${{ matrix.build }}
           variant: sccache
@@ -716,7 +716,7 @@ jobs:
           echo "CUDA_PATH_V12_2=$CUDA_TOOLKIT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       - name: Install 7-Zip
         run: choco install 7zip -y
@@ -878,7 +878,7 @@ jobs:
           java-version: 21
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Build
         run: |
@@ -906,7 +906,7 @@ jobs:
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           cmdline-tools-version: 9.0
 
@@ -1053,7 +1053,7 @@ jobs:
           fetch-depth: 0
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.16
+        uses: hendrikmuhs/ccache-action@v1.2.20
         with:
           key: release
           evict-old-files: 1d
@@ -1179,7 +1179,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-x64-cpu-low-perf
           evict-old-files: 1d
@@ -1209,7 +1209,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-arm64-cpu-low-perf
           evict-old-files: 1d
@@ -1246,7 +1246,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-x64-cpu-high-perf
           evict-old-files: 1d
@@ -1276,7 +1276,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-arm64-cpu-high-perf
           evict-old-files: 1d
@@ -1306,7 +1306,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-arm64-cpu-high-perf-sve
           evict-old-files: 1d

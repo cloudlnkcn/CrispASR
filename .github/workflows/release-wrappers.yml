@@ -63,7 +63,7 @@ jobs:
     permissions:
       id-token: write  # for PyPI trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -86,7 +86,7 @@ jobs:
           fi
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -106,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -154,7 +154,7 @@ jobs:
     permissions:
       id-token: write  # for pub.dev OIDC publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
