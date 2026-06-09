@@ -943,14 +943,20 @@ void download_extras(const Entry& e, bool quiet, const std::string& cache_dir_ov
     }
 }
 
+static bool license_is_nc(const std::string& lic) {
+    return lic.find("NC") != std::string::npos || lic.find("NonCommercial") != std::string::npos;
+}
+
 void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
     if (!quiet && !e.license.empty()) {
-        // The license string is authoritative — it carries its own
-        // commercial/non-commercial language (e.g. "CC-BY-NC-SA-4.0"
-        // already says NC; FunASR Model License v1.1 says "commercial
-        // OK with attribution"). Don't append a misleading "(non-
-        // commercial)" suffix.
-        fprintf(stderr, "crispasr: note: %s is licensed %s\n", e.filename.c_str(), e.license.c_str());
+        if (license_is_nc(e.license)) {
+            fprintf(stderr,
+                    "crispasr: WARNING: %s is licensed %s — NON-COMMERCIAL USE ONLY.\n"
+                    "  By loading this model you confirm you will not use it for commercial purposes.\n",
+                    e.filename.c_str(), e.license.c_str());
+        } else {
+            fprintf(stderr, "crispasr: note: %s is licensed %s\n", e.filename.c_str(), e.license.c_str());
+        }
     }
 }
 

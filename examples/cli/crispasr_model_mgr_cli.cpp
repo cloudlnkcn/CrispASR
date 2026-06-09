@@ -152,11 +152,30 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     }
 
     const std::string cached_path = crispasr_cache::dir(cache_dir_override) + "/" + match.filename;
-    if (crispasr_cache::file_present(cached_path))
+    if (crispasr_cache::file_present(cached_path)) {
+        if (!match.license.empty()) {
+            const bool is_nc = match.license.find("NC") != std::string::npos ||
+                               match.license.find("NonCommercial") != std::string::npos;
+            if (is_nc)
+                fprintf(stderr,
+                        "crispasr: WARNING: %s is licensed %s — NON-COMMERCIAL USE ONLY.\n"
+                        "  By loading this model you confirm you will not use it for commercial purposes.\n",
+                        match.filename.c_str(), match.license.c_str());
+        }
         return cached_path;
+    }
 
     fprintf(stderr, "crispasr: model '%s' not found locally.\n", effective_model_arg.c_str());
     fprintf(stderr, "  Available for download: %s (%s)\n", match.filename.c_str(), match.approx_size.c_str());
+    if (!match.license.empty()) {
+        const bool is_nc =
+            match.license.find("NC") != std::string::npos || match.license.find("NonCommercial") != std::string::npos;
+        if (is_nc)
+            fprintf(stderr, "  LICENSE: %s — NON-COMMERCIAL USE ONLY. Do not use for commercial purposes.\n",
+                    match.license.c_str());
+        else
+            fprintf(stderr, "  License: %s\n", match.license.c_str());
+    }
 
     bool do_download = false;
     if (auto_download) {
