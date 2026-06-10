@@ -33,11 +33,14 @@ RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https:
 
 COPY --from=build /src/CrispASR/build /opt/crispasr/build
 COPY --from=build /src/CrispASR/samples /space/samples
-COPY hf-space/requirements.txt /space/requirements.txt
+# In the HF Space repo, files are at root level (not hf-space/).
+# When building from the CrispASR repo root, they're under hf-space/.
+# Support both contexts by trying root first.
+COPY requirements.txt /space/requirements.txt
 RUN pip3 install --no-cache-dir -r /space/requirements.txt
 RUN find /opt/crispasr/build -type f -name 'lib*.so*' -exec cp -a {} /usr/local/lib/ \; && ldconfig
 
-COPY hf-space/app.py hf-space/start.sh /space/
+COPY app.py start.sh /space/
 RUN chmod +x /space/start.sh && \
   useradd -m -u 1000 app && \
   mkdir -p /models /cache && \

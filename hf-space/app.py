@@ -95,7 +95,7 @@ NMT_MODELS = [
      "Google T5-based. Widest language coverage. Output inherits CC-BY-SA."),
 ]
 
-CRISPASR_CLI_BIN = shutil.which("crispasr") or "crispasr"
+CRISPASR_CLI_BIN = shutil.which("crispasr-cli") or shutil.which("crispasr") or "crispasr-cli"
 
 
 def log(msg: str) -> None:
