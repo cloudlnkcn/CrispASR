@@ -511,7 +511,7 @@ Each tab loads its own backend through the server's `/load` endpoint; the server
                 label="Top-K predictions",
                 interactive=False,
             )
-            lid_raw = gr.Code(label="Raw output", language="text")
+            lid_raw = gr.Code(label="Raw output")
 
         # --- Backends info --------------------------------------------
         with gr.Tab("About & backends"):
