@@ -1002,7 +1002,7 @@ endif()
 # ---------------------------------------------------------------------------
 # kokoro — hexgrad/Kokoro-82M + yl4579/StyleTTS2-LJSpeech (iSTFTNet TTS)
 # ---------------------------------------------------------------------------
-add_library(kokoro STATIC kokoro.h kokoro.cpp)
+add_library(kokoro STATIC kokoro.h kokoro.cpp phonemizer.h phonemizer.cpp)
 set_target_properties(kokoro PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kokoro PUBLIC .)
 target_compile_features   (kokoro PUBLIC cxx_std_17)
