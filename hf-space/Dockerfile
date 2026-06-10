@@ -34,6 +34,7 @@ RUN chmod +x /space/start.sh && \
   chown -R 1000:1000 /space /opt/crispasr /models /cache
 
 ENV PATH=/opt/crispasr/build/bin:$PATH
+ENV HOME=/cache
 ENV CRISPASR_SERVER_URL=http://127.0.0.1:8080
 ENV CRISPASR_CACHE_DIR=/cache
 ENV CRISPASR_SAMPLES_DIR=/space/samples
