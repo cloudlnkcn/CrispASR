@@ -5444,3 +5444,80 @@ for legacy paths + GPU mirror copies for graph-build functions. No
 Graph paths run entirely on GPU; legacy paths stay on CPU.
 Memory overhead: ~2× model size on discrete GPUs.
 
+## §163 LFM2-Audio — TTS, speech-to-speech, and performance
+
+**Status**: ASR landed (`470d56f2`–`b0daa882`). KV + conv state cache
+gives ~10x decode speedup. English + Japanese, F16/Q5_K/Q4_K verified.
+
+### Phase 1 — ASR (DONE)
+
+- `src/lfm2_audio.{h,cpp}`: FastConformer encoder → adapter → LFM2
+  hybrid backbone → greedy text decode. Diff-validated (cos ≥ 0.998).
+- KV cache (6 attn layers) + conv state cache (10 conv layers).
+- CLI `--backend lfm2-audio`, C API, model registry, HF repos.
+- Quantization rules in crispasr-quantize (encoder/adapter/mimi at F16).
+
+### Phase 2 — TTS (text → audio)
+
+The model natively supports TTS via the depthformer + Mimi decoder.
+The depthformer (6L, 1024-dim) takes the backbone's hidden state and
+generates 8-codebook Mimi audio tokens autoregressively (one codebook
+at a time). The Mimi decoder then converts codes → 24 kHz PCM.
+
+**Files to implement:**
+
+1. **Depthformer decode** — `lfm2_audio.cpp`: `depth_linear` projects
+   backbone hidden to `(codebooks, depth_dim)`, then 6 transformer
+   layers with shared QKV + per-codebook `SharedEmbedding` produce
+   codes sequentially. Each codebook conditions on the previous
+   codebook's token. Weights already in GGUF (`depth.*`).
+
+2. **Mimi codec decoder** — reuse existing `core/seanet_decoder.h`
+   (already handles the Kyutai Mimi architecture for CSM/kyutai-stt).
+   The 8-codebook variant needs: RVQ dequant → upsample → encoder
+   transformer → SEANet → 24 kHz PCM. Mimi weights already in GGUF
+   (`mimi.*`).
+
+3. **Audio detokenizer** — alternative TTS output path using the
+   separate LFM2 detokenizer GGUF (8L LFM2 512-dim + ISTFT). Simpler
+   than Mimi: codes → FusedEmbedding → upsample 6× → LFM2 →
+   linear → ISTFT → 24 kHz. Detokenizer GGUF already converted.
+
+4. **TTS prompt** — system prompt `"Perform TTS in {language}."`,
+   text input as user turn, sequential generation produces audio tokens.
+
+**Effort**: ~2–3 days. Depthformer is 6 layers of standard transformer
+with tied weights. Mimi decoder is already in the codebase.
+
+### Phase 3 — Speech-to-speech (interleaved mode)
+
+LFM2-Audio supports interleaved generation where text and audio tokens
+alternate in fixed-size chunks (`interleaved_n_text=6, n_audio=9`).
+This enables real-time conversational audio-in → audio-out.
+
+**Key pieces:**
+
+1. **Interleaved decode loop** — alternate between generating 6 text
+   tokens and 9 audio tokens. Modality switching controlled by the
+   model's internal tokens (`<|audio_start|>=128`, `<|text_end|>=130`).
+
+2. **Streaming Mimi decode** — decode audio chunks as they're generated
+   (every 9 audio frames = 0.72s of audio at 12.5 Hz Mimi rate).
+
+3. **Audio input + output in same session** — full-duplex pipe.
+
+**Effort**: ~1–2 days on top of Phase 2.
+
+### Phase 4 — Performance optimization
+
+Current: ~47s for 11s audio (F16), ~31s (Q4_K). Target: <5s.
+
+| Optimization | Expected speedup | Effort |
+|---|---|---|
+| `ggml_gallocr` (replace 2 GB scratch buffer) | ~1.3× (less malloc overhead) | 1 day |
+| `ggml_backend_sched` (GPU offload) | ~5–10× on CUDA/Metal | 2 days |
+| Encoder graph fusion (single graph for mel+enc+adapter) | ~1.2× (fewer graph builds) | 0.5 day |
+| Batch prefill (overlap encoder with backbone) | ~1.1× | 0.5 day |
+| Flash attention for prefill | ~1.5× on long sequences | already enabled |
+| `causal_conv1d` kernel (CUDA) | ~1.2× (conv layers faster) | 1 day |
+
