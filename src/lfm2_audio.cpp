@@ -205,6 +205,46 @@ struct lfm2_audio_context {
         for (auto& s : conv_states)
             std::fill(s.begin(), s.end(), 0.0f);
     }
+
+    // ---- Detokenizer (codes → PCM, lazy-loaded from companion GGUF) ----
+    struct DetokModel {
+        bool loaded = false;
+        bool tried = false; // avoid repeated load attempts
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        std::map<std::string, ggml_tensor*> tensors;
+
+        // FusedEmbedding: (hidden=512, 8*2048=16384)
+        ggml_tensor* emb_w = nullptr;
+        // 8 LFM2 layers
+        struct Layer {
+            bool is_attention = false;
+            ggml_tensor* operator_norm_w = nullptr;
+            ggml_tensor* ffn_norm_w = nullptr;
+            ggml_tensor *ff_w1 = nullptr, *ff_w2 = nullptr, *ff_w3 = nullptr;
+            // conv
+            ggml_tensor *conv_conv_w = nullptr, *conv_in_proj_w = nullptr, *conv_out_proj_w = nullptr;
+            // attn
+            ggml_tensor *attn_q_proj_w = nullptr, *attn_k_proj_w = nullptr, *attn_v_proj_w = nullptr;
+            ggml_tensor *attn_out_proj_w = nullptr, *attn_q_ln_w = nullptr, *attn_k_ln_w = nullptr;
+        };
+        std::vector<Layer> layers;
+        ggml_tensor* embedding_norm_w = nullptr;
+        ggml_tensor* output_w = nullptr; // (512→1282)
+        ggml_tensor* output_b = nullptr;
+        // hparams
+        int hidden = 512;
+        int n_layers = 8;
+        int n_heads = 16;
+        int n_kv_heads = 8;
+        int head_dim = 32;
+        int sliding_window = 30;
+        int output_size = 1282;
+        int conv_kernel = 3;
+        float rope_theta = 1000000.0f;
+        std::string layer_types; // "ccacacacc" etc
+    } detok;
+    std::string model_path; // to derive detokenizer path
 };
 
 // ===========================================================================
@@ -499,6 +539,7 @@ lfm2_audio_context* lfm2_audio_init_from_file(const char* path_model, lfm2_audio
     ctx->backend = ggml_backend_cpu_init();
     ctx->compute_meta.resize(2ULL * 1024 * 1024 * 1024); // 2 GB scratch
 
+    ctx->model_path = path_model;
     if (!lfm2_audio_load(ctx->model, path_model, ctx->backend, params.verbosity)) {
         ggml_backend_free(ctx->backend);
         delete ctx;
@@ -543,6 +584,10 @@ lfm2_audio_context* lfm2_audio_init_from_file(const char* path_model, lfm2_audio
 void lfm2_audio_free(lfm2_audio_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->detok.buf)
+        ggml_backend_buffer_free(ctx->detok.buf);
+    if (ctx->detok.ctx)
+        ggml_free(ctx->detok.ctx);
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
@@ -1875,20 +1920,225 @@ static std::vector<float> lfm2_embed_audio_codes(lfm2_audio_context* ctx, const 
     return result;
 }
 
-// Helper: decode Mimi codes to PCM using the detokenizer.
-// Detokenizer: FusedEmbedding → upsample 6× → 8L LFM2 → Linear → ISTFT → 24 kHz.
-// For now, since the detokenizer GGUF loading isn't wired yet, this is a stub
-// that returns nullptr. The caller should check and handle gracefully.
+// Lazy-load the detokenizer companion GGUF.
+static bool lfm2_load_detokenizer(lfm2_audio_context* ctx) {
+    auto& d = ctx->detok;
+    if (d.loaded)
+        return true;
+    if (d.tried)
+        return false;
+    d.tried = true;
+    std::string path = ctx->model_path;
+    auto pos = path.rfind(".gguf");
+    if (pos == std::string::npos)
+        return false;
+    std::string dp = path.substr(0, pos) + "-detokenizer.gguf";
+    FILE* f = fopen(dp.c_str(), "rb");
+    if (!f) {
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "lfm2-audio: detokenizer not found at %s\n", dp.c_str());
+        return false;
+    }
+    fclose(f);
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "lfm2-audio: loading detokenizer from %s\n", dp.c_str());
+    gguf_context* gc = core_gguf::open_metadata(dp.c_str());
+    if (!gc)
+        return false;
+    d.hidden = (int)core_gguf::kv_u32(gc, "lfm2audio.detok_hidden_size", 512);
+    d.n_layers = (int)core_gguf::kv_u32(gc, "lfm2audio.detok_n_layers", 8);
+    d.n_heads = (int)core_gguf::kv_u32(gc, "lfm2audio.detok_n_heads", 16);
+    d.n_kv_heads = (int)core_gguf::kv_u32(gc, "lfm2audio.detok_n_kv_heads", 8);
+    d.head_dim = d.hidden / d.n_heads;
+    d.sliding_window = (int)core_gguf::kv_u32(gc, "lfm2audio.detok_sliding_window", 30);
+    d.output_size = (int)core_gguf::kv_u32(gc, "lfm2audio.detok_output_size", 1282);
+    d.layer_types = core_gguf::kv_str(gc, "lfm2audio.detok_layer_types", "ccacacacc");
+    core_gguf::free_metadata(gc);
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(dp.c_str(), ctx->backend, "lfm2-detok", wl))
+        return false;
+    d.ctx = wl.ctx;
+    d.buf = wl.buf;
+    d.tensors = std::move(wl.tensors);
+    auto G = [&](const char* n) { return core_gguf::try_get(d.tensors, n); };
+    d.emb_w = G("detok.emb.weight");
+    d.embedding_norm_w = G("detok.lfm.embedding_norm.weight");
+    d.output_w = G("detok.output.weight");
+    d.output_b = G("detok.output.bias");
+    d.layers.resize(d.n_layers);
+    for (int i = 0; i < d.n_layers; i++) {
+        auto& l = d.layers[i];
+        char b[128];
+        auto T = [&](const char* s) {
+            snprintf(b, sizeof(b), "detok.lfm.layers.%d.%s", i, s);
+            return G(b);
+        };
+        l.operator_norm_w = T("operator_norm.weight");
+        l.ffn_norm_w = T("ffn_norm.weight");
+        l.ff_w1 = T("feed_forward.w1.weight");
+        l.ff_w2 = T("feed_forward.w2.weight");
+        l.ff_w3 = T("feed_forward.w3.weight");
+        l.is_attention = (i < (int)d.layer_types.size() && d.layer_types[i] == 'a');
+        if (l.is_attention) {
+            l.attn_q_proj_w = T("self_attn.q_proj.weight");
+            l.attn_k_proj_w = T("self_attn.k_proj.weight");
+            l.attn_v_proj_w = T("self_attn.v_proj.weight");
+            l.attn_out_proj_w = T("self_attn.out_proj.weight");
+            l.attn_q_ln_w = T("self_attn.q_layernorm.weight");
+            l.attn_k_ln_w = T("self_attn.k_layernorm.weight");
+        } else {
+            l.conv_conv_w = T("conv.conv.weight");
+            l.conv_in_proj_w = T("conv.in_proj.weight");
+            l.conv_out_proj_w = T("conv.out_proj.weight");
+        }
+    }
+    d.loaded = (d.emb_w && d.output_w);
+    if (d.loaded && ctx->verbosity >= 1)
+        fprintf(stderr, "lfm2-audio: detokenizer loaded (%dL, %dd)\n", d.n_layers, d.hidden);
+    return d.loaded;
+}
+
 static float* lfm2_detokenize(lfm2_audio_context* ctx, const std::vector<std::vector<int32_t>>& codes,
                               int* out_n_samples) {
-    // TODO: implement once detokenizer GGUF loading is wired.
-    // For now return nullptr — the synthesize function will report the codes
-    // and the caller can use the Python detokenizer.
-    (void)ctx;
-    (void)codes;
+    if (!lfm2_load_detokenizer(ctx)) {
+        if (out_n_samples)
+            *out_n_samples = 0;
+        return nullptr;
+    }
+    auto& d = ctx->detok;
+    const int nf = (int)codes.size(), cb = (int)codes[0].size(), h = d.hidden, Tu = nf * 6, nq = d.output_size / 2;
+
+    // 1. FusedEmbedding: codes → mean embedding on CPU
+    std::vector<float> emb(nf * h, 0.0f);
+    for (int t = 0; t < nf; t++) {
+        const size_t em = 16 * 1024 * 1024;
+        std::vector<uint8_t> eb(em);
+        ggml_context* ec = ggml_init({em, eb.data(), false});
+        if (!ec)
+            break;
+        ggml_tensor* ids = ggml_new_tensor_1d(ec, GGML_TYPE_I32, cb);
+        for (int c = 0; c < cb; c++)
+            ((int32_t*)ids->data)[c] = codes[t][c] + c * 2048;
+        ggml_tensor* rows = ggml_get_rows(ec, d.emb_w, ids);
+        ggml_tensor* o = ggml_dup(ec, rows);
+        ggml_cgraph* g = ggml_new_graph(ec);
+        ggml_build_forward_expand(g, o);
+        ggml_graph_compute_with_ctx(ec, g, 1);
+        const float* od = (const float*)o->data;
+        for (int j = 0; j < h; j++) {
+            float s = 0;
+            for (int c = 0; c < cb; c++)
+                s += od[c * h + j];
+            emb[t * h + j] = s / cb;
+        }
+        ggml_free(ec);
+    }
+
+    // 2. Upsample 6× nearest-exact
+    std::vector<float> up(Tu * h);
+    for (int t = 0; t < nf; t++)
+        for (int r = 0; r < 6; r++)
+            memcpy(up.data() + (t * 6 + r) * h, emb.data() + t * h, sizeof(float) * h);
+
+    // 3. Run 8L LFM2 backbone with sliding window mask
+    const size_t mem = 512ULL * 1024 * 1024;
+    std::vector<uint8_t> buf(mem);
+    ggml_context* c0 = ggml_init({mem, buf.data(), false});
+    if (!c0) {
+        if (out_n_samples)
+            *out_n_samples = 0;
+        return nullptr;
+    }
+    ggml_tensor* x = ggml_new_tensor_2d(c0, GGML_TYPE_F32, h, Tu);
+    memcpy(x->data, up.data(), sizeof(float) * Tu * h);
+    ggml_tensor* mask = ggml_new_tensor_2d(c0, GGML_TYPE_F16, Tu, Tu);
+    {
+        ggml_fp16_t *m = (ggml_fp16_t*)mask->data, z = ggml_fp32_to_fp16(0.0f), ni = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < Tu; q++)
+            for (int k = 0; k < Tu; k++)
+                m[q * Tu + k] = ((k <= q) && (q - k) < d.sliding_window) ? z : ni;
+    }
+    ggml_tensor* pos = ggml_new_tensor_1d(c0, GGML_TYPE_I32, Tu);
+    for (int i = 0; i < Tu; i++)
+        ((int32_t*)pos->data)[i] = i;
+    ggml_cgraph* gf = ggml_new_graph_custom(c0, 16384, false);
+    for (int il = 0; il < d.n_layers; il++) {
+        auto& l = d.layers[il];
+        ggml_tensor* res = x;
+        ggml_tensor* hh = lfm2_rms_norm(c0, x, l.operator_norm_w, 1e-5f);
+        if (l.is_attention) {
+            ggml_tensor *Q = ggml_mul_mat(c0, l.attn_q_proj_w, hh), *K = ggml_mul_mat(c0, l.attn_k_proj_w, hh),
+                        *V = ggml_mul_mat(c0, l.attn_v_proj_w, hh);
+            Q = ggml_reshape_3d(c0, Q, d.head_dim, d.n_heads, Tu);
+            K = ggml_reshape_3d(c0, K, d.head_dim, d.n_kv_heads, Tu);
+            V = ggml_reshape_3d(c0, V, d.head_dim, d.n_kv_heads, Tu);
+            if (l.attn_q_ln_w) {
+                Q = ggml_mul(c0, ggml_rms_norm(c0, Q, 1e-5f), l.attn_q_ln_w);
+                K = ggml_mul(c0, ggml_rms_norm(c0, K, 1e-5f), l.attn_k_ln_w);
+            }
+            Q = ggml_rope_ext(c0, Q, pos, nullptr, d.head_dim, GGML_ROPE_TYPE_NEOX, 0, d.rope_theta, 1, 0, 1, 0, 0);
+            K = ggml_rope_ext(c0, K, pos, nullptr, d.head_dim, GGML_ROPE_TYPE_NEOX, 0, d.rope_theta, 1, 0, 1, 0, 0);
+            Q = ggml_cont(c0, ggml_permute(c0, Q, 0, 2, 1, 3));
+            K = ggml_cont(c0, ggml_permute(c0, K, 0, 2, 1, 3));
+            V = ggml_cont(c0, ggml_permute(c0, V, 0, 2, 1, 3));
+            ggml_tensor* a = ggml_flash_attn_ext(c0, Q, K, V, mask, 1.0f / sqrtf((float)d.head_dim), 0, 0);
+            hh = ggml_mul_mat(c0, l.attn_out_proj_w, ggml_reshape_2d(c0, a, h, Tu));
+        } else {
+            ggml_tensor* bc = ggml_mul_mat(c0, l.conv_in_proj_w, hh);
+            ggml_tensor *B = ggml_view_2d(c0, bc, h, Tu, bc->nb[1], 0),
+                        *C = ggml_view_2d(c0, bc, h, Tu, bc->nb[1], h * sizeof(float));
+            ggml_tensor* xi = ggml_view_2d(c0, bc, h, Tu, bc->nb[1], 2 * h * sizeof(float));
+            ggml_tensor* Bx = ggml_mul(c0, ggml_cont(c0, B), ggml_cont(c0, xi));
+            int K = d.conv_kernel;
+            ggml_tensor* cw = ggml_cast(c0, l.conv_conv_w, GGML_TYPE_F32);
+            ggml_tensor* cw4 = ggml_reshape_4d(c0, cw, K, 1, 1, h);
+            ggml_tensor* Bt = ggml_cont(c0, ggml_transpose(c0, Bx));
+            ggml_tensor* B4 = ggml_reshape_4d(c0, Bt, Tu, 1, h, 1);
+            ggml_tensor* cr = ggml_conv_2d_dw_direct(c0, cw4, B4, 1, 1, K - 1, 0, 1, 1);
+            cr = ggml_cont(c0, ggml_permute(c0, cr, 1, 2, 0, 3));
+            int Tc = (int)cr->ne[1];
+            if (Tc > Tu)
+                cr = ggml_view_2d(c0, ggml_reshape_2d(c0, cr, h, Tc), h, Tu, h * sizeof(float), 0);
+            else
+                cr = ggml_reshape_2d(c0, cr, h, Tu);
+            ggml_tensor* y = ggml_mul(c0, ggml_cont(c0, C), ggml_cont(c0, cr));
+            hh = ggml_mul_mat(c0, l.conv_out_proj_w, y);
+        }
+        x = ggml_add(c0, res, hh);
+        res = x;
+        hh = lfm2_rms_norm(c0, x, l.ffn_norm_w, 1e-5f);
+        hh = lfm2_swiglu_ffn(c0, hh, l.ff_w1, l.ff_w2, l.ff_w3);
+        x = ggml_add(c0, res, hh);
+    }
+    x = lfm2_rms_norm(c0, x, d.embedding_norm_w, 1e-5f);
+    ggml_tensor* lin = ggml_mul_mat(c0, d.output_w, x);
+    if (d.output_b)
+        lin = ggml_add(c0, lin, d.output_b);
+    ggml_tensor* out = ggml_dup(c0, lin);
+    ggml_set_name(out, "do");
+    ggml_build_forward_expand(gf, out);
+    ggml_graph_compute_with_ctx(c0, gf, ctx->n_threads);
+
+    // 4. Split log_mag + angle → ISTFT → PCM
+    const float* od = (const float*)out->data;
+    std::vector<float> mag(Tu * nq), phase(Tu * nq);
+    for (int t = 0; t < Tu; t++)
+        for (int f = 0; f < nq; f++) {
+            mag[t * nq + f] = expf(od[t * d.output_size + f]);
+            phase[t * nq + f] = od[t * d.output_size + nq + f];
+        }
+    ggml_free(c0);
+    auto pcm_v = core_istft::istft(mag.data(), phase.data(), 1280, 320, Tu, nullptr, core_istft::TRIM_SAME);
+    for (float& s : pcm_v)
+        s = std::max(-1.0f, std::min(1.0f, s));
+    float* pcm = (float*)malloc(pcm_v.size() * sizeof(float));
+    memcpy(pcm, pcm_v.data(), pcm_v.size() * sizeof(float));
     if (out_n_samples)
-        *out_n_samples = 0;
-    return nullptr;
+        *out_n_samples = (int)pcm_v.size();
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "lfm2-audio: detokenizer produced %zu samples (%.1fs at 24kHz)\n", pcm_v.size(),
+                pcm_v.size() / 24000.0f);
+    return pcm;
 }
 
 float* lfm2_audio_synthesize(lfm2_audio_context* ctx, const char* text, const char* language, int* out_n_samples) {
