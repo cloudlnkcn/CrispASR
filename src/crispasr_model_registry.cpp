@@ -46,6 +46,20 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
+    // LiquidAI LFM2.5-Audio-1.5B: FastConformer + LFM2 hybrid
+    // conv+attention backbone. ASR (+ TTS/speech-to-speech planned).
+    // English base model — Q5_K recommended (Q4_K too aggressive for EN).
+    {"lfm2-audio", "lfm2-audio-1.5b-q5_k.gguf",
+     "https://huggingface.co/cstr/lfm2-audio-1.5b-GGUF/resolve/main/lfm2-audio-1.5b-q5_k.gguf",
+     "~1.6 GB", nullptr, nullptr, nullptr,
+     "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
+     "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B)"},
+    // Japanese variant — Q4_K is safe for Japanese.
+    {"lfm2-audio", "lfm2-audio-1.5b-jp-q4_k.gguf",
+     "https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF/resolve/main/lfm2-audio-1.5b-jp-q4_k.gguf",
+     "~1.5 GB", nullptr, nullptr, nullptr,
+     "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
+     "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP)"},
     {"voxtral", "voxtral-mini-3b-2507-q4_k.gguf",
      "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-q4_k.gguf", "~2.5 GB", nullptr, nullptr},
     {"voxtral4b", "voxtral-mini-4b-realtime-q4_k.gguf",

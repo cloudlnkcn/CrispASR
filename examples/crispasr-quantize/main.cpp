@@ -244,6 +244,23 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // Only the 210 backbone projection tensors are quantized.
     const bool is_zonos = (arch.find("zonos") != std::string::npos);
 
+    // LFM2-Audio: hybrid conv+attention backbone. The text/audio embedding
+    // (lfm.embed_tokens — also serves as LM head via tied weights), the
+    // audio adapter MLP, and the Mimi codec are all precision-sensitive.
+    // The FastConformer encoder's FFN and attention projection weights can
+    // be quantized; the depthwise conv weights are too small. Only the
+    // LFM backbone layers (lfm.layers.*) and depthformer layers
+    // (depth.layers.*) have bulk weights safe for Q4_K. Keep:
+    //   - lfm.embed_tokens (sampling-critical, like llama output.weight)
+    //   - audio_embd.* (codebook embedding lookups)
+    //   - adapter.* (small, precision-sensitive)
+    //   - mimi.* (audio codec — small convs, codebook lookups)
+    //   - encoder.* (FastConformer — conformer drift issue, same as
+    //     canary/omniasr CTC)
+    //   - depth.codebook.* (codebook embedding lookups for TTS)
+    //   - preprocessor.* (mel filterbank)
+    const bool is_lfm2_audio = (arch.find("lfm2-audio") != std::string::npos);
+
     // Bark TTS: 3 GPT-2 sub-models + EnCodec decoder.
     // Embeddings (token_embd, pos_embd), output heads, and the entire
     // EnCodec decoder are read via CPU tensor_get_row_f32 / tensor_get_all_f32
@@ -279,17 +296,14 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         const int64_t ncols = t->ne[0];
 
         bool should_quantize =
-            ggml_is_quantized(qtype) && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && ok_dims && is_weight &&
-            (sname.find("norm") == std::string::npos) &&
-            (granite_quant_all || sname.find("proj.") != 0) &&
+            ggml_is_quantized(qtype) && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && ok_dims &&
+            is_weight && (sname.find("norm") == std::string::npos) && (granite_quant_all || sname.find("proj.") != 0) &&
             !(is_granite_family && !granite_quant_all && sname.find("enc.") == 0) &&
             // MOSS-Audio: keep encoder + adapter + deepstack at F16
-            !(arch == "moss_audio" && (sname.find("enc.") == 0 ||
-                                       sname.find("adapter.") == 0 ||
-                                       sname.find("deepstack.") == 0)) &&
-            !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) &&
-            (sname.find("enc_proj.") != 0) && (sname.find("lm_head.") != 0) && (sname.find("tok_emb.") != 0) &&
-            (sname.find("lang_emb.") != 0) &&
+            !(arch == "moss_audio" &&
+              (sname.find("enc.") == 0 || sname.find("adapter.") == 0 || sname.find("deepstack.") == 0)) &&
+            !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) && (sname.find("enc_proj.") != 0) &&
+            (sname.find("lm_head.") != 0) && (sname.find("tok_emb.") != 0) && (sname.find("lang_emb.") != 0) &&
             !(is_chatterbox && (sname.find("s3.v.") == 0 || sname.find("conds.") == 0 || sname.find("ve.") == 0 ||
                                 sname.find("t3.text_emb") == 0 || sname.find("t3.speech_emb") == 0 ||
                                 sname.find("t3.wpe") == 0 || sname.find("t3.text_pos_emb") == 0 ||
@@ -299,11 +313,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                sname == "cosyvoice3.flow.input_embd.w" || sname == "cosyvoice3.flow.spk_affine.w" ||
                sname == "cosyvoice3.s3tok.fsq.proj.w")) &&
             !is_f5tts &&
-            !(is_qwen3_tts &&
-              (sname.find("speaker.") == 0 || sname.find("code_pred.token_embd") == 0 ||
-               sname.find("code_pred.output") == 0 || sname.find("code_pred.small_to_mtp") == 0 ||
-               sname.find("talker.token_embd") == 0 || sname.find("talker.text_proj") == 0 ||
-               sname.find("talker.codec_bridge") == 0)) &&
+            !(is_qwen3_tts && (sname.find("speaker.") == 0 || sname.find("code_pred.token_embd") == 0 ||
+                               sname.find("code_pred.output") == 0 || sname.find("code_pred.small_to_mtp") == 0 ||
+                               sname.find("talker.token_embd") == 0 || sname.find("talker.text_proj") == 0 ||
+                               sname.find("talker.codec_bridge") == 0)) &&
             !(is_parler && sname.find("dac.") == 0) &&
             !(is_dia && (sname.find("embedding") != std::string::npos || sname.find("audio_encoder") == 0)) &&
             !(is_zonos && (sname.find("heads.") == 0 || sname.find("embeddings.") == 0 ||
@@ -312,6 +325,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
               (sname.find("token_embd") != std::string::npos || sname.find("pos_embd") != std::string::npos ||
                (sname.find("output") != std::string::npos && sname.find("attn_output") == std::string::npos) ||
                sname.find("encodec.") == 0)) &&
+            !(is_lfm2_audio && (sname.find("lfm.embed_tokens") == 0 || sname.find("lfm.embedding_norm") == 0 ||
+                                sname.find("audio_embd.") == 0 || sname.find("adapter.") == 0 ||
+                                sname.find("mimi.") == 0 || sname.find("encoder.") == 0 ||
+                                sname.find("depth.codebook.") == 0 || sname.find("preprocessor.") == 0)) &&
             ([&]() {
                 if (!is_omniasr_ctc || omniasr_quant_all ||
                     (omniasr_head_cutoff == 0 && omniasr_tail_cutoff >= omniasr_n_enc))
@@ -336,10 +353,19 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         if (should_quantize && ncols % ggml_blck_size(qt) != 0) {
             ggml_type fallback = GGML_TYPE_COUNT;
             switch (qtype) {
-            case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: fallback = GGML_TYPE_Q4_0; break;
-            case GGML_TYPE_Q5_K: fallback = GGML_TYPE_Q5_0; break;
-            case GGML_TYPE_Q6_K: fallback = GGML_TYPE_Q8_0; break;
-            default: break;
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+                fallback = GGML_TYPE_Q4_0;
+                break;
+            case GGML_TYPE_Q5_K:
+                fallback = GGML_TYPE_Q5_0;
+                break;
+            case GGML_TYPE_Q6_K:
+                fallback = GGML_TYPE_Q8_0;
+                break;
+            default:
+                break;
             }
             if (fallback != GGML_TYPE_COUNT && ncols % ggml_blck_size(fallback) == 0) {
                 qt = fallback;
@@ -349,12 +375,11 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         }
 
         // Also handle granite enc F32→F16 downcast
-        bool granite_f16 = !should_quantize && granite_enc_to_f16 && t->type == GGML_TYPE_F32 &&
-                           sname.find("enc.") == 0 && sname.find("norm") == std::string::npos &&
-                           sname.find("running_mean") == std::string::npos &&
-                           sname.find("running_var") == std::string::npos &&
-                           sname.find("rel_pos") == std::string::npos &&
-                           sname.find("conv_bn") == std::string::npos && ggml_n_dims(t) == 2;
+        bool granite_f16 =
+            !should_quantize && granite_enc_to_f16 && t->type == GGML_TYPE_F32 && sname.find("enc.") == 0 &&
+            sname.find("norm") == std::string::npos && sname.find("running_mean") == std::string::npos &&
+            sname.find("running_var") == std::string::npos && sname.find("rel_pos") == std::string::npos &&
+            sname.find("conv_bn") == std::string::npos && ggml_n_dims(t) == 2;
 
         if (should_quantize) {
             target_types[i] = qt;
@@ -510,8 +535,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     gguf_get_meta_data(ctx_out, meta_data.data());
     size_t written = fwrite(meta_data.data(), 1, meta_size, fout);
     fflush(fout);
-    printf("%s: metadata rewrite: %zu / %zu bytes at offset 0, magic=0x%08x\n",
-           __func__, written, meta_size, *(uint32_t*)meta_data.data());
+    printf("%s: metadata rewrite: %zu / %zu bytes at offset 0, magic=0x%08x\n", __func__, written, meta_size,
+           *(uint32_t*)meta_data.data());
 
     fclose(fin);
     fclose(fout);

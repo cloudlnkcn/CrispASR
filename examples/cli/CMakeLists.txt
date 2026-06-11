@@ -17,6 +17,7 @@ add_executable(${TARGET}
     crispasr_backend_crispasr.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
+    crispasr_backend_lfm2_audio.cpp
     crispasr_backend_cohere.cpp
     crispasr_backend_granite.cpp
     crispasr_backend_granite_nle.cpp

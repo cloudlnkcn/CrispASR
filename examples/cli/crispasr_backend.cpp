@@ -9,6 +9,7 @@
 std::unique_ptr<CrispasrBackend> crispasr_make_whisper_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parakeet_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_canary_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_lfm2_audio_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_cohere_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_granite_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_granite_nle_backend();
@@ -80,6 +81,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
+    if (name == "lfm2-audio")
+        return crispasr_make_lfm2_audio_backend();
     if (name == "cohere")
         return crispasr_make_cohere_backend();
     if (name == "granite" || name == "granite-4.1" || name == "granite-4.1-plus")
@@ -198,6 +201,7 @@ std::vector<std::string> crispasr_list_backends() {
         "whisper",
         "parakeet",
         "canary",
+        "lfm2-audio",
         "cohere",
         "granite",
         "granite-4.1",
@@ -480,6 +484,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "fireredpunc";
     if (contains_ci("canary"))
         return "canary";
+    if (contains_ci("lfm2-audio") || contains_ci("lfm2_audio"))
+        return "lfm2-audio";
     if (contains_ci("cohere"))
         return "cohere";
     if (contains_ci("mega-asr") || contains_ci("mega_asr") || contains_ci("megaasr"))
@@ -582,6 +588,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "parakeet";
             else if (a == "canary")
                 result = "canary";
+            else if (a == "lfm2-audio")
+                result = "lfm2-audio";
             else if (a == "canary-ctc")
                 result = "canary";
             else if (a == "cohere")

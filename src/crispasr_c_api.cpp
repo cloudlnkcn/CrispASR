@@ -48,6 +48,10 @@
 #include "canary.h"
 #define CA_HAVE_CANARY 1
 #endif
+#if __has_include("lfm2_audio.h")
+#include "lfm2_audio.h"
+#define CA_HAVE_LFM2_AUDIO 1
+#endif
 #if __has_include("qwen3_asr.h")
 #include "qwen3_asr.h"
 #define CA_HAVE_QWEN3 1
@@ -1180,6 +1184,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "parakeet";
     else if (strcmp(arch, "canary") == 0)
         backend = "canary";
+    else if (strcmp(arch, "lfm2-audio") == 0)
+        backend = "lfm2-audio";
     else if (strcmp(arch, "cohere-transcribe") == 0)
         backend = "cohere";
     else if (strcmp(arch, "qwen3-asr") == 0 || strcmp(arch, "qwen3asr") == 0)
@@ -1400,6 +1406,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_CANARY
     canary_context* canary_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    lfm2_audio_context* lfm2_audio_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_QWEN3
     qwen3_asr_context* qwen3_ctx = nullptr;
@@ -1798,6 +1807,20 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.use_flash = g_open_flash_attn_tls;
         s->canary_ctx = canary_init_from_file(model_path, p);
         if (!s->canary_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->backend == "lfm2-audio") {
+        lfm2_audio_context_params p = lfm2_audio_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->lfm2_audio_ctx = lfm2_audio_init_from_file(model_path, p);
+        if (!s->lfm2_audio_ctx) {
             delete s;
             return nullptr;
         }
@@ -2779,6 +2802,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_CANARY
     list += ",canary";
 #endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    list += ",lfm2-audio";
+#endif
 #ifdef CA_HAVE_QWEN3
     list += ",qwen3";
 #endif
@@ -3455,6 +3481,22 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         seg.words = emit_words_from_tokens(toks);
         canary_result_free(cr);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->backend == "lfm2-audio" && s->lfm2_audio_ctx) {
+        char* text = lfm2_audio_transcribe(s->lfm2_audio_ctx, pcm, n_samples, nullptr, 0);
+        if (!text) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        free(text);
         r->segments.push_back(std::move(seg));
         return r;
     }
@@ -6054,6 +6096,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_CANARY
     if (s->canary_ctx)
         canary_free(s->canary_ctx);
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->lfm2_audio_ctx)
+        lfm2_audio_free(s->lfm2_audio_ctx);
 #endif
 #ifdef CA_HAVE_QWEN3
     if (s->qwen3_ctx)

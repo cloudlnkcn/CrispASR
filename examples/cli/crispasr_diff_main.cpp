@@ -66,6 +66,7 @@
 #include "parler_tts.h"
 #include "melotts.h"
 #include "moss_audio.h"
+#include "lfm2_audio.h"
 #if __has_include("kugelaudio.h")
 #include "kugelaudio.h"
 #define CA_HAVE_KUGELAUDIO 1
@@ -5344,13 +5345,194 @@ int main(int argc, char** argv) {
 
         zonos_tts_free(ctx);
 
+    } else if (backend_name == "lfm2-audio") {
+        auto lp = lfm2_audio_context_default_params();
+        lp.n_threads = 4;
+        lp.verbosity = 0;
+        lfm2_audio_context* ctx = lfm2_audio_init_from_file(model_path.c_str(), lp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load lfm2-audio model\n");
+            return 4;
+        }
+
+        // Stage: mel_spectrogram
+        {
+            int T_mel = 0, n_mels = 0;
+            float* mel = lfm2_audio_compute_mel(ctx, samples.data(), (int)samples.size(), &T_mel, &n_mels);
+            if (!mel) {
+                printf("[ERR ] mel_spectrogram         lfm2_audio_compute_mel returned null\n");
+                n_fail++;
+            } else {
+                // Output is (T_mel, n_mels) TimeMels layout — ref is the same.
+                auto rep = ref.compare("mel_spectrogram", mel, (size_t)T_mel * n_mels);
+                print_row("mel_spectrogram", rep, COS_THRESHOLD);
+                record(rep);
+                free(mel);
+            }
+        }
+
+        // Stage: encoder_output — feed REFERENCE mel to isolate encoder from mel
+        {
+            // Try reference mel first (eliminates mel divergence from encoder comparison)
+            const float* mel_data = nullptr;
+            int T_mel = 0, n_mels = 0;
+            auto ref_mel = ref.get_f32("mel_spectrogram");
+            auto ref_mel_shp = ref.shape("mel_spectrogram");
+            bool used_ref_mel = false;
+            if (ref_mel.first && ref_mel_shp.size() >= 2) {
+                // Reference mel is (T_mel, n_mels) TimeMels layout
+                n_mels = (int)ref_mel_shp[0];
+                T_mel = (int)ref_mel_shp[1];
+                mel_data = ref_mel.first;
+                used_ref_mel = true;
+            } else {
+                // Fallback to C++ mel
+                float* cmel = lfm2_audio_compute_mel(ctx, samples.data(), (int)samples.size(), &T_mel, &n_mels);
+                mel_data = cmel;
+            }
+
+            if (mel_data) {
+                int T_enc = 0, d_model = 0;
+                float* enc = lfm2_audio_run_encoder(ctx, mel_data, T_mel, n_mels, &T_enc, &d_model);
+                if (!enc) {
+                    printf("[ERR ] encoder_output          lfm2_audio_run_encoder returned null\n");
+                    n_fail++;
+                } else {
+                    auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_model);
+                    char extra[64] = "";
+                    if (used_ref_mel)
+                        snprintf(extra, sizeof(extra), " (ref mel)");
+                    print_row("encoder_output", rep, COS_THRESHOLD, extra);
+                    record(rep);
+                    free(enc);
+                }
+                if (!used_ref_mel)
+                    free((void*)mel_data);
+            } else {
+                printf("[ERR ] encoder_output          no mel available\n");
+                n_fail++;
+            }
+        }
+
+        // Stage: pre_encode_output (TODO: staged encoder API)
+        if (ref.has("pre_encode_output")) {
+            printf("[SKIP] pre_encode_output       (staged encoder not yet wired)\n");
+            n_skip++;
+        }
+        for (int il = 0; il < 17; il++) {
+            char stage[32];
+            snprintf(stage, sizeof(stage), "encoder_layer_%d", il);
+            if (ref.has(stage)) {
+                printf("[SKIP] %-22s (staged encoder not yet wired)\n", stage);
+                n_skip++;
+            }
+        }
+
+        // Stage: adapter_output
+        if (ref.has("adapter_output")) {
+            // Run mel → encoder → adapter
+            auto ref_mel = ref.get_f32("mel_spectrogram");
+            auto ref_mel_shp = ref.shape("mel_spectrogram");
+            if (ref_mel.first && ref_mel_shp.size() >= 2) {
+                int nm = (int)ref_mel_shp[0], tm = (int)ref_mel_shp[1];
+                int T_enc = 0, d_model = 0;
+                float* enc = lfm2_audio_run_encoder(ctx, ref_mel.first, tm, nm, &T_enc, &d_model);
+                if (enc) {
+                    int hidden = 0;
+                    float* adap = lfm2_audio_run_adapter(ctx, enc, T_enc, d_model, &hidden);
+                    free(enc);
+                    if (adap) {
+                        auto rep = ref.compare("adapter_output", adap, (size_t)T_enc * hidden);
+                        print_row("adapter_output", rep, COS_THRESHOLD);
+                        record(rep);
+                        free(adap);
+                    } else {
+                        printf("[ERR ] adapter_output          lfm2_audio_run_adapter returned null\n");
+                        n_fail++;
+                    }
+                } else {
+                    printf("[ERR ] adapter_output          encoder failed\n");
+                    n_fail++;
+                }
+            }
+        }
+
+        // Stage: lfm_audio_only_output + per-layer staged comparison
+        {
+            // Collect per-layer snapshots via staged callback
+            struct LfmStageCap {
+                std::map<std::string, std::vector<float>> stages;
+            };
+            auto lfm_stage_cb = [](const char* name, const float* data, int rows, int cols, void* ud) {
+                auto* cap = (LfmStageCap*)ud;
+                cap->stages[name].assign(data, data + (size_t)rows * cols);
+            };
+
+            LfmStageCap cap;
+            int T_lfm = 0, hidden = 0;
+            float* lfm_out = nullptr;
+
+            // Check if any per-layer refs exist
+            bool has_layer_refs = false;
+            for (int i = 0; i < 16; i++) {
+                char stage[32];
+                snprintf(stage, sizeof(stage), "lfm_ao_layer_%d", i);
+                if (ref.has(stage)) {
+                    has_layer_refs = true;
+                    break;
+                }
+            }
+
+            if (has_layer_refs) {
+                // Use staged path
+                lfm2_audio_run_lfm_staged(ctx, samples.data(), (int)samples.size(), lfm_stage_cb, &cap);
+                // Also get the final output
+                lfm_out = lfm2_audio_run_lfm(ctx, samples.data(), (int)samples.size(), &T_lfm, &hidden);
+            } else if (ref.has("lfm_audio_only_output")) {
+                lfm_out = lfm2_audio_run_lfm(ctx, samples.data(), (int)samples.size(), &T_lfm, &hidden);
+            }
+
+            // Compare per-layer
+            for (int i = 0; i < 16; i++) {
+                char stage[32];
+                snprintf(stage, sizeof(stage), "lfm_ao_layer_%d", i);
+                if (!ref.has(stage))
+                    continue;
+                if (cap.stages.count(stage)) {
+                    auto& v = cap.stages[stage];
+                    auto rep = ref.compare(stage, v.data(), v.size());
+                    print_row(stage, rep, 0.990f);
+                    record(rep);
+                } else {
+                    printf("[SKIP] %-22s (no C++ snapshot)\n", stage);
+                    n_skip++;
+                }
+            }
+
+            // Compare final output
+            if (ref.has("lfm_audio_only_output") && lfm_out) {
+                auto rep = ref.compare("lfm_audio_only_output", lfm_out, (size_t)T_lfm * hidden);
+                print_row("lfm_audio_only_output", rep, 0.990f);
+                record(rep);
+            }
+            free(lfm_out);
+        }
+
+        // Stage: lfm_output (full with text tokens — needs tokenizer)
+        if (ref.has("lfm_output") && !ref.has("lfm_audio_only_output")) {
+            printf("[SKIP] lfm_output              (full prefill needs tokenizer)\n");
+            n_skip++;
+        }
+
+        lfm2_audio_free(ctx);
+
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
                 "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
                 "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
                 "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, paraformer, sensevoice, "
-                "cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts.\n",
+                "cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts, lfm2-audio.\n",
                 backend_name.c_str());
         return 5;
     }

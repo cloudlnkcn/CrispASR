@@ -363,6 +363,30 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# LFM2 Audio — LiquidAI LFM2.5-Audio-1.5B-JP (FastConformer enc + LFM2 hybrid
+# conv+attention backbone + depthformer). ASR + TTS in one model.
+# ---------------------------------------------------------------------------
+add_library(lfm2_audio STATIC
+            lfm2_audio.h
+            lfm2_audio.cpp
+            )
+target_include_directories(lfm2_audio PUBLIC . ../include)
+target_compile_features   (lfm2_audio PUBLIC cxx_std_17)
+set_target_properties(lfm2_audio PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (lfm2_audio PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(lfm2_audio PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(lfm2_audio PRIVATE GGML_USE_METAL)
+    target_link_libraries(lfm2_audio PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(lfm2_audio PRIVATE GGML_USE_CUDA)
+    target_link_libraries(lfm2_audio PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # OpenMP — optional shared dependency for parallelisable hot loops in the
 # per-model encoders (currently cohere; granite linked as preparation for
 # follow-up parallelisation). find_package runs once here so every model
@@ -1486,6 +1510,9 @@ if (TARGET parakeet)
 endif()
 if (TARGET canary)
     target_link_libraries(crispasr-lib PUBLIC canary)
+endif()
+if (TARGET lfm2_audio)
+    target_link_libraries(crispasr-lib PUBLIC lfm2_audio)
 endif()
 if (TARGET qwen3_asr)
     target_link_libraries(crispasr-lib PUBLIC qwen3_asr)

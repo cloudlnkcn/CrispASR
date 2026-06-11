@@ -1,0 +1,76 @@
+// src/lfm2_audio.h — public C API for LiquidAI LFM2.5-Audio ggml runtime
+//
+// End-to-end multimodal audio model: FastConformer encoder → audio adapter
+// → LFM2 hybrid conv+attention backbone → depthformer. Supports ASR (audio
+// → text) and TTS (text → audio via depthformer + Mimi detokenizer).
+//
+// Models are loaded from GGUF files produced by:
+//   python models/convert-lfm2-audio-to-gguf.py
+//       --input LiquidAI/LFM2.5-Audio-1.5B-JP --output lfm2-audio.gguf
+//
+// License: LFM Open License v1.0 ($10M revenue cap for commercial use).
+
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct lfm2_audio_context;
+
+struct lfm2_audio_context_params {
+    int n_threads;
+    int verbosity; // 0=silent 1=normal 2=verbose
+    bool use_gpu;
+};
+
+struct lfm2_audio_context_params lfm2_audio_context_default_params(void);
+
+struct lfm2_audio_context* lfm2_audio_init_from_file(const char* path_model, struct lfm2_audio_context_params params);
+
+void lfm2_audio_free(struct lfm2_audio_context* ctx);
+
+// Transcribe raw 16 kHz mono PCM. Returns malloc'd string the caller must free().
+// prompt: system prompt (e.g. "Perform ASR in japanese."). NULL for default.
+// max_tokens: max text tokens to generate (0 = default 512).
+char* lfm2_audio_transcribe(struct lfm2_audio_context* ctx, const float* samples, int n_samples, const char* prompt,
+                            int max_tokens);
+
+// Hyper-parameters
+int lfm2_audio_n_mels(struct lfm2_audio_context* ctx);
+int lfm2_audio_sample_rate(struct lfm2_audio_context* ctx);
+
+// ---- Stage-level entry points (for crispasr-diff testing) ----
+
+// Log-mel spectrogram. Row-major (T_mel, n_mels). Caller frees.
+float* lfm2_audio_compute_mel(struct lfm2_audio_context* ctx, const float* samples, int n_samples, int* out_T_mel,
+                              int* out_n_mels);
+
+// FastConformer encoder. Row-major (T_enc, d_model). Caller frees.
+float* lfm2_audio_run_encoder(struct lfm2_audio_context* ctx, const float* mel, int T_mel, int n_mels, int* out_T_enc,
+                              int* out_d_model);
+
+// Audio adapter MLP. Row-major (T_enc, hidden_size). Caller frees.
+float* lfm2_audio_run_adapter(struct lfm2_audio_context* ctx, const float* encoder_out, int T_enc, int d_model,
+                              int* out_hidden_size);
+
+// LFM2 backbone. Row-major (T, hidden_size). Caller frees.
+// Runs on the full input sequence (text tokens + audio embeddings).
+float* lfm2_audio_run_lfm(struct lfm2_audio_context* ctx, const float* samples, int n_samples, int* out_T,
+                          int* out_hidden_size);
+
+// Staged LFM backbone: invokes cb at every layer boundary.
+typedef void (*lfm2_audio_stage_cb)(const char* stage_name, const float* data, int rows, int cols, void* userdata);
+int lfm2_audio_run_lfm_staged(struct lfm2_audio_context* ctx, const float* samples, int n_samples,
+                              lfm2_audio_stage_cb cb, void* userdata);
+
+// Internal smoke test.
+int lfm2_audio_test_load(struct lfm2_audio_context* ctx);
+
+#ifdef __cplusplus
+}
+#endif

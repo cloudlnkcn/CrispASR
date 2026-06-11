@@ -253,6 +253,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     #   ZONOS_TTS_LANGUAGE (default "en-us")
     # Stages: conditioning_prefix, phoneme_ids, prefill_logits, output_codes.
     "zonos-tts":  "reference_backends.zonos_tts_reference",
+    # LiquidAI LFM2.5-Audio-1.5B-JP: FastConformer encoder + LFM2 hybrid
+    # conv+attention backbone + depthformer. ASR+TTS in one model.
+    # model_dir = LiquidAI/LFM2.5-Audio-1.5B-JP HF id or local snapshot.
+    # Prompt from LFM2_PROMPT env var (default "Perform ASR in japanese.").
+    "lfm2-audio": "reference_backends.lfm2_audio",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
@@ -467,7 +472,7 @@ def main() -> None:
                     "VOXCPM2_SYN_TEXT", "VOXCPM2_USE_REF",
                     "F5_TTS_SYN_TEXT", "F5_TTS_REF_TEXT", "F5_TTS_SEED",
                     "F5_TTS_STEPS", "F5_TTS_CFG", "F5_TTS_SWAY",
-                    "LID_TEXT", "CLD3_TEXT"):
+                    "LID_TEXT", "CLD3_TEXT", "LFM2_PROMPT"):
         val = os.environ.get(env_key)
         if val is not None:
             meta[env_key.lower()] = val
