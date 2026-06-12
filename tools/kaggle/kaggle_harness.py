@@ -213,6 +213,47 @@ _HAS_MOLD = False
 _HAS_NINJA = False
 
 
+def _warm_ccache_from_dataset(ccache_dir: Path) -> None:
+    """Copy a ccache seed from an attached Kaggle dataset into the build
+    ccache directory. Looks for `crispasr-ccache/ccache.tar` (a tar of the
+    ccache dir) or a bare `crispasr-ccache/.ccache/` tree at the standard
+    Kaggle mount paths. Silently no-ops if no dataset is attached.
+
+    To create/update the dataset:
+        cd /kaggle/working && tar cf ccache.tar .ccache/
+        # then upload as chr1s4/crispasr-ccache
+    Attach via kernel-metadata.json:
+        "dataset_sources": ["chr1s4/crispasr-ccache", ...]
+    Shaves ~15 min off incremental CUDA builds."""
+    import tarfile
+    search_paths = [
+        Path("/kaggle/input/crispasr-ccache"),
+        Path("/kaggle/input/datasets/chr1s4/crispasr-ccache"),
+        Path("/kaggle/input/datasets/chr1str/crispasr-ccache"),
+    ]
+    for base in search_paths:
+        tar_path = base / "ccache.tar"
+        if tar_path.exists():
+            try:
+                with tarfile.open(tar_path, "r") as tf:
+                    tf.extractall(str(ccache_dir))
+                n = sum(1 for _ in ccache_dir.rglob("*") if _.is_file())
+                print(f"  ccache: warmed from {tar_path} ({n} files)", flush=True)
+                return
+            except Exception as e:
+                print(f"  ccache: failed to extract {tar_path}: {e}", flush=True)
+        bare_dir = base / ".ccache"
+        if bare_dir.is_dir():
+            try:
+                shutil.copytree(str(bare_dir), str(ccache_dir), dirs_exist_ok=True)
+                n = sum(1 for _ in ccache_dir.rglob("*") if _.is_file())
+                print(f"  ccache: warmed from {bare_dir} ({n} files)", flush=True)
+                return
+            except Exception as e:
+                print(f"  ccache: failed to copy {bare_dir}: {e}", flush=True)
+    print("  ccache: no seed dataset found (cold build)", flush=True)
+
+
 def install_build_toolchain() -> dict:
     """apt-install ninja + ccache + mold (best effort) and prime the
     ccache at /kaggle/working/.ccache (the only dir Kaggle persists
@@ -230,6 +271,9 @@ def install_build_toolchain() -> dict:
         ccache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["CCACHE_DIR"] = str(ccache_dir)
         os.environ["CCACHE_MAXSIZE"] = "5G"
+        # Warm ccache from attached dataset (chr1s4/crispasr-ccache or
+        # chr1str/crispasr-ccache). Shaves ~15 min off incremental builds.
+        _warm_ccache_from_dataset(ccache_dir)
         if _HAS_CCACHE:
             subprocess.run("ccache -M 5G && ccache -z", shell=True,
                            capture_output=True)
