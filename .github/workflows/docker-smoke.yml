@@ -102,4 +102,4 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Build Hugging Face Space image
-        run: docker build -f hf-space/Dockerfile -t crispasr-hf-space .
+        run: docker build -t crispasr-hf-space hf-space/
