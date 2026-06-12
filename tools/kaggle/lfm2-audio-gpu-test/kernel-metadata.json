@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-lfm2-audio-gpu-test",
+  "id": "chr1s4/crispasr-lfm2-audio-gpu-test-asr-tts",
   "title": "CrispASR LFM2-Audio GPU Test (ASR + TTS)",
   "code_file": "lfm2-audio-gpu-test.py",
   "language": "python",
@@ -8,7 +8,7 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "competition_sources": [],
-  "dataset_sources": ["chr1str/crispasr-hf-token"],
+  "dataset_sources": ["chr1s4/crispasr-hf-token"],
   "kernel_sources": [],
   "model_sources": []
 }

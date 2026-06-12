@@ -177,6 +177,7 @@ struct lfm2_audio_context {
     int verbosity = 1;
     bool use_gpu = false;
     ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
 
     // Compute buffers: large for prefill, small for decode steps
     std::vector<uint8_t> compute_meta; // 256 MB for prefill (T >> 1)
@@ -546,7 +547,15 @@ lfm2_audio_context* lfm2_audio_init_from_file(const char* path_model, lfm2_audio
     ctx->n_threads = params.n_threads;
     ctx->verbosity = params.verbosity;
     ctx->use_gpu = params.use_gpu;
-    ctx->backend = ggml_backend_cpu_init();
+    // Initialize backend: GPU if available and requested, else CPU
+    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    if (!ctx->backend)
+        ctx->backend = ggml_backend_cpu_init();
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    if (ctx->backend_cpu)
+        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    if (ggml_backend_is_cpu(ctx->backend))
+        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads);
     ctx->compute_meta.resize(256ULL * 1024 * 1024); // 256 MB scratch for prefill
     ctx->decode_meta.resize(64ULL * 1024 * 1024);   // 64 MB scratch for T=1 decode
 
@@ -608,7 +617,9 @@ void lfm2_audio_free(lfm2_audio_context* ctx) {
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend)
-        ggml_backend_free(ctx->backend);
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+            ggml_backend_free(ctx->backend_cpu);
+    ggml_backend_free(ctx->backend);
     delete ctx;
 }
 
