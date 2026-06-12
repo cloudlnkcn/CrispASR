@@ -29,9 +29,34 @@ driver 596.36, Windows 11).
 - **#152** — the box builds + runs the CUDA 13.0 toolkit on Windows; `02fdc310`'s
   runtime-version guard prints the "compiled 13.0, runtime 13.2" warning and
   proceeds cleanly.
-- **#125** — firered-asr2 on > 50 s audio (`issue19-70s.wav`) hangs indefinitely
-  on CUDA (killed after ~5 min, no output); 5 s works but runs at 0.2× RT
-  (27.8 s for 5 s). Confirms montvid's "stuck on long audio" — fix pending.
+- **#125** — firered-asr2 on > 50 s audio (`issue19-70s.wav`) hung indefinitely
+  on CUDA (full pass through an O(T²) CPU self-attention). **Fixed**
+  (`28d1ac69`): the backend now declares `CAP_UNBOUNDED_INPUT` so the issue #89
+  30 s auto-chunk fallback fires — it had deliberately omitted the flag on the
+  inverted belief that this made the dispatcher chunk it, but
+  `should_auto_chunk_long()` only chunks *unbounded-input* backends. 70 s now
+  auto-chunks to 3 slices and completes; 35 s transcribes correctly across 2
+  chunks. (firered is still ~0.2× RT here — inherent CPU-attention cost.) A
+  prerequisite Windows build break was also fixed (`cc9115ad`): `lfm2_audio.cpp`
+  used POSIX `setenv`/`unsetenv` (MSVC C3861) — guarded with `_putenv_s`.
+
+## 2026-06-12 #89 — parakeet-ja long-audio: CUDA data point
+
+The issue #89 reporter (AMD Vulkan, RX 7900 GRE) still loses everything past
+~20 s on `parakeet-tdt-0.6b-ja`, even after the streamed-pipeline + 30 s
+auto-chunk fixes. Tested on the RTX A1000 (CUDA) with synthetic JA (qwen3-tts,
+夏目漱石 text, 29.3 s, doubled to 58.6 s):
+
+- **Single-pass** (`--chunk-seconds 0`) on 58.6 s covers the *full* timestamp
+  range (→ 58.4 s) — **not** the reporter's collapse-at-20 s — but
+  under-transcribes (186 chars).
+- **Default 30 s auto-chunk** recovers +25 % text (232 chars), 2 slices, full
+  coverage.
+
+So CUDA is markedly less affected than Vulkan/AMD (a backend numerical-stability
+difference), and the auto-chunk fallback still measurably helps. Caveat: this is
+clean synthetic TTS audio; the bug is input-specific (real YouTube speech), so
+this isn't conclusive — but it's the CUDA data point the issue lacked.
 
 ## 2026-06-10 #155 — Vulkan col2im_1d kernel: full-GPU qwen3-tts codec on Vulkan
 
