@@ -1,0 +1,142 @@
+# Sync upstream CrispStrobe/CrispASR tags to this fork and trigger
+# the existing release.yml to build + publish all platform binaries.
+#
+# Trigger mechanisms:
+#   1. Scheduled: cron (every 6 hours) — checks for new upstream tags
+#   2. Manual:    workflow_dispatch with optional tag override
+#
+# Prerequisites:
+#   - UPSTREAM_SYNC_PAT secret: a GitHub PAT with repo scope
+#     (needed to push tags back to the fork and trigger release.yml)
+#   - Ensure GitHub Actions are enabled for this fork repo
+name: Sync Upstream & Release
+
+on:
+  schedule:
+    # Every 6 hours at :05 to avoid top-of-hour load
+    - cron: '5 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream tag to sync (e.g. v0.5.0). Leave empty to auto-detect latest.'
+        required: false
+        type: string
+      force_resync:
+        description: 'Re-sync even if tag already exists in fork'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: CrispStrobe/CrispASR
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      synced_tag: ${{ steps.sync.outputs.tag }}
+      had_updates: ${{ steps.sync.outputs.had_updates }}
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git 2>/dev/null || true
+          git fetch upstream --tags --force
+
+      - name: Determine target tag
+        id: target
+        run: |
+          CUSTOM_TAG="${{ github.event.inputs.upstream_tag }}"
+          if [ -n "$CUSTOM_TAG" ]; then
+            echo "Using manually specified tag: $CUSTOM_TAG"
+            echo "tag=$CUSTOM_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Find the latest semver tag on upstream
+          LATEST_TAG=$(git tag -l 'v*' --sort=-version:refname upstream/* 2>/dev/null | head -1)
+          if [ -z "$LATEST_TAG" ]; then
+            # Fetch upstream tags directly (prefix with 'upstream/' stripped)
+            LATEST_TAG=$(git ls-remote --tags --sort=-version:refname \
+              https://github.com/${{ env.UPSTREAM_REPO }}.git 'refs/tags/v*' \
+              | head -1 | sed 's|.*refs/tags/||')
+          fi
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "::warning::No upstream tags found"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Latest upstream tag: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check if sync is needed
+        id: sync
+        if: steps.target.outputs.tag != ''
+        run: |
+          TAG="${{ steps.target.outputs.tag }}"
+          FORCE="${{ github.event.inputs.force_resync }}"
+
+          # Check if this tag already exists in our fork
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            if [ "$FORCE" != "true" ]; then
+              echo "Tag $TAG already exists in fork. Skipping."
+              echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+              echo "had_updates=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Force resync requested — deleting existing tag $TAG"
+            git tag -d "$TAG" || true
+            git push origin ":refs/tags/$TAG" || true
+          fi
+
+          # Sync main branch from upstream
+          echo "Syncing main branch from upstream..."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Merge upstream/main into our main (prefer upstream changes)
+          git merge "upstream/${{ env.UPSTREAM_BRANCH }}" --no-edit \
+            -m "sync: merge upstream ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}"
+
+          # Create the tag pointing at the merged commit
+          git tag "$TAG" -m "Sync upstream release $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "had_updates=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push to fork
+        if: steps.sync.outputs.had_updates == 'true'
+        run: |
+          TAG="${{ steps.sync.outputs.tag }}"
+          git push origin main
+          git push origin "$TAG"
+          echo "Pushed main + tag $TAG to fork. release.yml will trigger automatically."
+
+      - name: Summary
+        if: always()
+        run: |
+          TAG="${{ steps.sync.outputs.tag }}"
+          UPDATED="${{ steps.sync.outputs.had_updates }}"
+          echo "## Sync Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$UPDATED" = "true" ]; then
+            echo "Synced upstream tag **$TAG** and pushed to fork." >> "$GITHUB_STEP_SUMMARY"
+            echo "The [release workflow](./actions/workflows/release.yml) will start building shortly." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No new upstream tags to sync. Latest upstream tag: **$TAG**" >> "$GITHUB_STEP_SUMMARY"
+          fi
