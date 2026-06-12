@@ -1709,10 +1709,18 @@ int lfm2_audio_run_lfm_staged(lfm2_audio_context* ctx, const float* samples, int
     ctx->lfm_stage_ud = userdata;
 
     // Force layer snaps on
+#if defined(_WIN32)
+    _putenv_s("LFM2_SNAP_LAYERS", "1");
+#else
     setenv("LFM2_SNAP_LAYERS", "1", 1);
+#endif
     int T = 0, hidden = 0;
     float* result = lfm2_audio_run_lfm(ctx, samples, n_samples, &T, &hidden);
+#if defined(_WIN32)
+    _putenv_s("LFM2_SNAP_LAYERS", "");
+#else
     unsetenv("LFM2_SNAP_LAYERS");
+#endif
 
     ctx->lfm_stage_cb = nullptr;
     ctx->lfm_stage_ud = nullptr;
