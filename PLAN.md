@@ -97,6 +97,91 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 
 ---
 
+## §166 Cross-surface feature parity (CLI / server / C-ABI / wrappers)
+
+PR #166 ("honor `--punc-model` in server mode") fixed one instance of a wider
+pattern: a feature wired into the CLI (`examples/cli/crispasr_run.cpp`) but not
+into the other front-ends. Audited all four surfaces 2026-06-13. The
+`--punc-model` gap is now closed on the server and the alias→model table is
+shared (see "Shipped" below); the remaining gaps below are open.
+
+**Shipped 2026-06-13** (commits `36f35f2a` PR cherry-pick → `8d803f04` parity → `c04f70fb` robustness):
+- Server now honors `--punc-model` (FireRedPunc), adds the **PCS** path, and
+  **auto-enables** punctuation for non-PnC CTC backends — full CLI parity.
+- Alias→(cache filename, URL) table extracted to a pure, unit-tested resolver
+  `examples/cli/crispasr_punc_loader.h`, shared by CLI **and** server so they
+  can't drift again. Unit test `tests/test_punc_resolve.cpp` (`[unit]`), live
+  test `tests/test-server-punc.sh` (parakeet + `--punc-model fullstop`, verified
+  on M1 Metal).
+
+**Open parity gaps (priority order — we want these):**
+1. **`--punc-model` selection missing from the C-ABI and all wrappers.** The
+   C-ABI exposes only `crispasr_session_set_punctuation(bool)` plus the raw
+   building blocks (`crispasr_punc_init/process`, `crispasr_pcs_init`,
+   `crispasr_truecase_*`). There is no session-level "select alias → auto-
+   download → apply per segment" — so Python/Go/Dart can toggle punctuation on a
+   PnC backend but cannot add FireRedPunc to a parakeet session the way the
+   CLI/server now do. **Fix:** add `crispasr_session_set_punc_model(s, "auto"|
+   "fullstop"|path)` in `crispasr_c_api.cpp` reusing the resolver, then wrap in
+   Python/Go/Dart.
+2. **Truecase entirely absent from the server.** CLI applies `--truecase-model`;
+   `crispasr_server.cpp` has zero truecase references. Wire it the same way the
+   punc model was wired (resident context + per-segment apply).
+3. **Server diarization advanced knobs are startup-only.** `/inference` and
+   `/v1/audio/transcriptions` read `diarize` + `diarize_method` per request, but
+   `diarize_embedder` / `diarize_cluster_threshold` / `diarize_max_speakers` are
+   only inherited from CLI launch flags. Add them as form params.
+4. **No streaming-transcription HTTP endpoint.** The whole CLI `--stream` /
+   `--mic` / `--live` / `--stream-json` / `--stream-punc` surface has no server
+   equivalent (server streaming exists only for TTS / chat). Larger design item.
+5. **Node addon (`examples/addon.node/addon.cpp`) is the most threadbare
+   wrapper:** no punctuation, grammar, alt-n, decode-extras, or fallback
+   thresholds. Bring up to the Python/Go session surface.
+6. **Translator stage + post-ASR text LID are CLI-only.** `--translate-source/
+   target-lang` (m2m100), `--text`, `--lid-on-transcript`, `--lid-backend` have
+   no server/wrapper exposure.
+
+**Minor model-resolution bug found during the audit:** `-m parakeet-tdt_ctc-110m`
+(and `-m parakeet-tdt_ctc-110m-q4_k`) mis-resolve to the 467 MB
+`parakeet-tdt-0.6b-v3` default instead of the registered 91 MB 110m entry — the
+registry alias isn't matched by `-m`. Affects any small-variant alias that is a
+prefix-collision with the default.
+
+---
+
+## §165 Server fails to launch on Vulkan build (GitHub #165)
+
+External reporter: `crispasr.exe -m parakeet.gguf --server` on a **Vulkan build**
+(Windows 11, AMD Radeon 780M, proprietary driver) prints up to parakeet init
+then the process stops with no error. CPU build works; Vulkan file-transcription
+works. The log stops **before** `warmup completed` → the always-on server warmup
+transcribe hangs/crashes inside the driver.
+
+**Could not reproduce on M1 + MoltenVK** (2026-06-13): the Vulkan server warmup
+completes in ~893 ms and transcribes correctly here, so the crash is specific to
+the reporter's AMD 780M Vulkan driver, not a portable CrispASR bug.
+
+**Shipped 2026-06-13 (`c04f70fb`):**
+- `--no-warmup` flag (+ `CRISPASR_NO_WARMUP=1`) — skips the server's always-on
+  warmup; the escape hatch that was previously missing.
+- Warmup call wrapped in try/catch so a soft (throwing) failure degrades to "no
+  warmup" instead of preventing `listen()`. (A hard GPU device-lost still won't
+  be catchable — `--no-warmup` sidesteps it.)
+- **Bonus bugs found while debugging, fixed:** (a) route-handler exceptions
+  became a bare 500 with empty body, mislabeled by the error handler as "not
+  found" — added `set_exception_handler` to log + return the real reason; (b)
+  `scratch_dir()` used the throwing `create_directories` on the per-request path,
+  so an unwritable/odd cache dir 500'd **every** transcription — now uses the
+  non-throwing overload with a system-temp fallback.
+- Tests: `tests/test-server-warmup.sh` (default warmup + `--no-warmup`, verified
+  on Metal **and** Vulkan/MoltenVK builds); `whisper_params` default unit test.
+
+**Open:** reporter to confirm `--no-warmup` unblocks them on the AMD 780M; if a
+specific parakeet warmup op crashes their RADV/proprietary driver, a minimal
+Vulkan repro + upstream report would be the proper fix.
+
+---
+
 ## WASM Browser build — all backends, multithreaded
 
 ### Goal
