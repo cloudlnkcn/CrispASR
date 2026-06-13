@@ -391,7 +391,17 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
     // memory bounded. The slice t0 values become the absolute timestamp base
     const int SR = 16000;
     const int n_samples = (int)pcmf32.size();
-    const auto slices = crispasr_compute_audio_slices(pcmf32.data(), n_samples, SR, rp.chunk_seconds, rp);
+    // Mirror the CLI (crispasr_run.cpp): when VAD is active on a
+    // CAP_UNBOUNDED_INPUT backend and chunk_seconds wasn't set explicitly, drop
+    // the fixed max-split (0) so VAD slices aren't over-subdivided into 30 s
+    // pieces — VAD already bounds them. Fewer, larger slices ⇒ less chunk-
+    // boundary-overlap recompute (the server made ~2× the slices the CLI does on
+    // the same VAD segments, #165). Without VAD the 30 s fixed chunking stays
+    // (keeps parakeet et al. inside their safe single-pass window, #89).
+    int effective_chunk_seconds = rp.chunk_seconds;
+    if (rp.vad && !rp.chunk_seconds_explicit && (backend->capabilities() & CAP_UNBOUNDED_INPUT))
+        effective_chunk_seconds = 0;
+    const auto slices = crispasr_compute_audio_slices(pcmf32.data(), n_samples, SR, effective_chunk_seconds, rp);
     if (slices.empty()) {
         result.ok = true;
         return result;
@@ -937,6 +947,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.detect_language = form_bool(req, "detect_language", rp.detect_language);
         rp.lid_backend = form_string(req, "lid_backend", rp.lid_backend);
         rp.lid_model = form_string(req, "lid_model", rp.lid_model);
+        if (req.has_file("chunk_seconds") || req.has_param("chunk_seconds"))
+            rp.chunk_seconds_explicit = true;
         rp.chunk_seconds = form_int(req, "chunk_seconds", rp.chunk_seconds);
         rp.no_timestamps = form_bool(req, "no_timestamps", rp.no_timestamps);
         rp.split_on_word = form_bool(req, "split_on_word", rp.split_on_word);
@@ -1089,6 +1101,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.detect_language = form_bool(req, "detect_language", rp.detect_language);
         rp.lid_backend = form_string(req, "lid_backend", rp.lid_backend);
         rp.lid_model = form_string(req, "lid_model", rp.lid_model);
+        if (req.has_file("chunk_seconds") || req.has_param("chunk_seconds"))
+            rp.chunk_seconds_explicit = true;
         rp.chunk_seconds = form_int(req, "chunk_seconds", rp.chunk_seconds);
         rp.no_timestamps = form_bool(req, "no_timestamps", rp.no_timestamps);
         rp.split_on_word = form_bool(req, "split_on_word", rp.split_on_word);
