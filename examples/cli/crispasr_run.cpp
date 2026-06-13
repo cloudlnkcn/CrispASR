@@ -17,6 +17,7 @@
 #include "crispasr_vad_cli.h"
 #include "crispasr_output.h"
 #include "crispasr_punctuation_policy.h"
+#include "crispasr_punc_loader.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_aligner_cli.h"
@@ -1631,30 +1632,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
     // Optional punctuation restoration post-processor.
     // `--punc-model auto` or `--punc-model firered` → auto-download Q4_K (~50 MB).
+    // The alias → model mapping is shared with the HTTP server via the resolver
+    // in crispasr_punc_loader.h, so the two front-ends can't drift apart.
+    const crispasr_punc_spec punc_spec = crispasr_resolve_punc_model(params.punc_model);
     std::unique_ptr<fireredpunc_context, decltype(&fireredpunc_free)> punc_ctx(nullptr, fireredpunc_free);
-    {
-        std::string punc_path = params.punc_model;
-        if (punc_path == "none" || punc_path == "off")
-            punc_path.clear();
-        if (punc_path == "auto" || punc_path == "firered") {
-            punc_path = crispasr_cache::ensure_cached_file(
-                "fireredpunc-q4_k.gguf",
-                "https://huggingface.co/cstr/fireredpunc-GGUF/resolve/main/fireredpunc-q4_k.gguf", params.no_prints,
-                "crispasr[punc]", params.cache_dir);
-        } else if (punc_path == "fullstop") {
-            punc_path = crispasr_cache::ensure_cached_file(
-                "fullstop-punc-q4_k.gguf",
-                "https://huggingface.co/cstr/fullstop-punc-multilang-GGUF/resolve/main/fullstop-punc-q4_k.gguf",
-                params.no_prints, "crispasr[punc]", params.cache_dir);
-        } else if (punc_path == "punctuate-all") {
-            punc_path = crispasr_cache::ensure_cached_file(
-                "punctuate-all-q4_k.gguf",
-                "https://huggingface.co/cstr/punctuate-all-GGUF/resolve/main/punctuate-all-q4_k.gguf", params.no_prints,
-                "crispasr[punc]", params.cache_dir);
-        } else if (punc_path == "pcs" || punc_path.find("pcs") != std::string::npos) {
-            // PCS is handled separately below — skip fireredpunc loading
-            punc_path.clear();
-        }
+    if (punc_spec.kind == crispasr_punc_kind::fireredpunc) {
+        std::string punc_path = punc_spec.direct_path;
+        if (punc_path.empty() && !punc_spec.cache_filename.empty())
+            punc_path = crispasr_cache::ensure_cached_file(punc_spec.cache_filename, punc_spec.url, params.no_prints,
+                                                           "crispasr[punc]", params.cache_dir);
         if (!punc_path.empty()) {
             punc_ctx.reset(fireredpunc_init(punc_path.c_str()));
             if (!punc_ctx) {
@@ -1670,20 +1656,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
     // `--punc-model pcs` loads the 1-800-BAD-CODE XLM-RoBERTa model which
     // handles punc, truecasing, and SBD together. When PCS is active, it
     // replaces both fireredpunc and the statistical truecaser.
-    // PCS: detect from keyword or filename containing "pcs"
     std::unique_ptr<pcs_context, decltype(&pcs_free)> pcs_ctx(nullptr, pcs_free);
-    {
-        std::string pcs_path;
-        if (params.punc_model == "pcs") {
-            pcs_path = crispasr_cache::ensure_cached_file(
-                "pcs-xlmr-base-q4_k.gguf",
-                "https://huggingface.co/cstr/pcs-xlmr-base-GGUF/resolve/main/pcs-xlmr-base-q4_k.gguf", params.no_prints,
-                "crispasr[pcs]", params.cache_dir);
-        } else if (params.punc_model.find("pcs") != std::string::npos &&
-                   params.punc_model.find(".gguf") != std::string::npos) {
-            // Direct path to a PCS GGUF file
-            pcs_path = params.punc_model;
-        }
+    if (punc_spec.kind == crispasr_punc_kind::pcs) {
+        std::string pcs_path = punc_spec.direct_path;
+        if (pcs_path.empty() && !punc_spec.cache_filename.empty())
+            pcs_path = crispasr_cache::ensure_cached_file(punc_spec.cache_filename, punc_spec.url, params.no_prints,
+                                                          "crispasr[pcs]", params.cache_dir);
         if (!pcs_path.empty()) {
             pcs_ctx.reset(pcs_init(pcs_path.c_str()));
             if (pcs_ctx) {

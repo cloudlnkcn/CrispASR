@@ -31,8 +31,11 @@
 #include "crispasr_vad_cli.h"
 #include "crispasr_aligner_cli.h"
 #include "whisper_params.h"
-#include "fireredpunc.h"   // server-mode punctuation restoration (--punc-model)
-#include "crispasr_cache.h" // ensure_cached_file() for resolving the punc model
+#include "fireredpunc.h"                 // server-mode punctuation restoration (--punc-model)
+#include "pcs.h"                         // PCS (punctuation + caps + segmentation) model
+#include "crispasr_cache.h"              // ensure_cached_file() for resolving the punc model
+#include "crispasr_punc_loader.h"        // shared --punc-model alias resolution (CLI parity)
+#include "crispasr_punctuation_policy.h" // crispasr_should_auto_enable_punctuation()
 
 #include "common-crispasr.h" // read_audio_data
 #include "crispasr_chat.h"   // /v1/chat/completions
@@ -331,7 +334,7 @@ struct transcription_result {
 // Acquires model_mutex internally.
 static transcription_result do_transcribe(const httplib::MultipartFormData& audio_file, CrispasrBackend* backend,
                                           std::mutex& model_mutex, whisper_params rp, bool need_timestamps,
-                                          fireredpunc_context* punc_ctx = nullptr) {
+                                          fireredpunc_context* punc_ctx = nullptr, pcs_context* pcs_ctx = nullptr) {
     transcription_result result;
     result.language = rp.language;
 
@@ -525,18 +528,21 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                 crispasr_strip_punctuation(seg);
         }
         // Otherwise, when a punctuation model is loaded (--punc-model), restore
-        // punctuation on each segment via FireRedPunc — the post-processor the CLI
-        // applies but the server path previously skipped, so non-PnC backends
-        // (e.g. parakeet RNNT/CTC) can return punctuated text. Serialized on its
-        // own mutex because the shared punc context is not re-entrant.
-        else if (punc_ctx) {
+        // punctuation on each segment — the post-processor the CLI applies but
+        // the server path previously skipped, so non-PnC backends (e.g. parakeet
+        // RNNT/CTC) can return punctuated text. PCS (one model for punctuation +
+        // capitalization + segmentation) takes precedence over FireRedPunc when
+        // loaded; only one is ever resident. Serialized on its own mutex because
+        // neither context is re-entrant.
+        else if (punc_ctx || pcs_ctx) {
             static std::mutex punc_mtx;
             std::lock_guard<std::mutex> plk(punc_mtx);
             for (auto& seg : result.segs) {
-                char* punctuated = fireredpunc_process(punc_ctx, seg.text.c_str());
-                if (punctuated) {
-                    seg.text = punctuated;
-                    free(punctuated);
+                char* out =
+                    pcs_ctx ? pcs_process(pcs_ctx, seg.text.c_str()) : fireredpunc_process(punc_ctx, seg.text.c_str());
+                if (out) {
+                    seg.text = out;
+                    free(out);
                 }
             }
         }
@@ -746,38 +752,42 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 params.model.c_str());
     }
 
-    // Load the FireRedPunc post-processor once (resident) when the operator
-    // passes --punc-model. The server path previously ignored it (the punctuation
-    // step lived only in the CLI layer), so non-PnC backends such as parakeet
-    // RNNT came back unpunctuated. Resolves the same aliases the CLI does; the
-    // model auto-downloads on first use.
+    // Punctuation restoration post-processor, loaded once (resident). The
+    // server path originally ignored --punc-model entirely (the step lived only
+    // in the CLI layer), so non-PnC backends such as parakeet RNNT came back
+    // unpunctuated. Mirror the CLI exactly:
+    //   1. auto-enable FireRedPunc for backends that emit no punctuation and
+    //      don't toggle it natively (CTC family), and
+    //   2. resolve the same --punc-model aliases via the shared resolver,
+    //      supporting both FireRedPunc and the PCS model.
+    // The model auto-downloads on first use.
+    if (crispasr_should_auto_enable_punctuation(backend->capabilities(), params)) {
+        params.punc_model = "auto";
+        fprintf(stderr, "crispasr-server: auto-enabling punctuation restoration for backend '%s'\n", backend->name());
+    }
+
     std::unique_ptr<fireredpunc_context, decltype(&fireredpunc_free)> punc_ctx(nullptr, fireredpunc_free);
+    std::unique_ptr<pcs_context, decltype(&pcs_free)> pcs_ctx(nullptr, pcs_free);
     {
-        std::string punc_path = params.punc_model;
-        if (punc_path == "none" || punc_path == "off")
-            punc_path.clear();
-        else if (punc_path == "auto" || punc_path == "firered")
-            punc_path = crispasr_cache::ensure_cached_file(
-                "fireredpunc-q4_k.gguf",
-                "https://huggingface.co/cstr/fireredpunc-GGUF/resolve/main/fireredpunc-q4_k.gguf",
-                params.no_prints, "crispasr[punc]", params.cache_dir);
-        else if (punc_path == "fullstop")
-            punc_path = crispasr_cache::ensure_cached_file(
-                "fullstop-punc-q4_k.gguf",
-                "https://huggingface.co/cstr/fullstop-punc-multilang-GGUF/resolve/main/fullstop-punc-q4_k.gguf",
-                params.no_prints, "crispasr[punc]", params.cache_dir);
-        else if (punc_path == "punctuate-all")
-            punc_path = crispasr_cache::ensure_cached_file(
-                "punctuate-all-q4_k.gguf",
-                "https://huggingface.co/cstr/punctuate-all-GGUF/resolve/main/punctuate-all-q4_k.gguf",
-                params.no_prints, "crispasr[punc]", params.cache_dir);
-        if (!punc_path.empty()) {
-            punc_ctx.reset(fireredpunc_init(punc_path.c_str()));
+        const crispasr_punc_spec spec = crispasr_resolve_punc_model(params.punc_model);
+        std::string path = spec.direct_path;
+        if (path.empty() && !spec.cache_filename.empty())
+            path = crispasr_cache::ensure_cached_file(spec.cache_filename, spec.url, params.no_prints, "crispasr[punc]",
+                                                      params.cache_dir);
+        if (spec.kind == crispasr_punc_kind::fireredpunc && !path.empty()) {
+            punc_ctx.reset(fireredpunc_init(path.c_str()));
             if (!punc_ctx)
                 fprintf(stderr, "crispasr-server: warning: failed to load punc model '%s' — continuing without\n",
-                        punc_path.c_str());
+                        path.c_str());
             else
-                fprintf(stderr, "crispasr-server: loaded punctuation model '%s'\n", punc_path.c_str());
+                fprintf(stderr, "crispasr-server: loaded punctuation model '%s'\n", path.c_str());
+        } else if (spec.kind == crispasr_punc_kind::pcs && !path.empty()) {
+            pcs_ctx.reset(pcs_init(path.c_str()));
+            if (!pcs_ctx)
+                fprintf(stderr, "crispasr-server: warning: failed to load PCS model '%s' — continuing without\n",
+                        path.c_str());
+            else
+                fprintf(stderr, "crispasr-server: loaded PCS model '%s'\n", path.c_str());
         }
     }
 
@@ -872,7 +882,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.split_on_word = form_bool(req, "split_on_word", rp.split_on_word);
         rp.max_len = form_int(req, "max_len", rp.max_len);
 
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, /*need_timestamps=*/true, punc_ctx.get());
+        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, /*need_timestamps=*/true,
+                                    punc_ctx.get(), pcs_ctx.get());
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -1008,7 +1019,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
         const bool need_timestamps =
             response_format == "verbose_json" || response_format == "srt" || response_format == "vtt";
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps, punc_ctx.get());
+        auto result =
+            do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps, punc_ctx.get(), pcs_ctx.get());
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;

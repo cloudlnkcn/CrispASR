@@ -377,6 +377,26 @@ catch_discover_tests(test-punctuation-policy
     PROPERTIES LABELS "unit"
 )
 
+# ─── test - punc - resolve — Catch2 unit tests for the shared --punc-model
+# resolver (CLI/server parity). Pure string mapping, header-only, no model load.
+add_executable(test-punc-resolve
+    test_punc_resolve.cpp
+)
+target_include_directories(test-punc-resolve PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-punc-resolve PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-punc-resolve
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test - diarize - global — Catch2 unit tests for global diarization logic (#110)
 add_executable(test-diarize-global
     test_diarize_global.cpp
