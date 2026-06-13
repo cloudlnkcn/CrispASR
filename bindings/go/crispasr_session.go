@@ -29,6 +29,7 @@ int              crispasr_session_set_source_language(CrispasrSession* s, const 
 int              crispasr_session_set_target_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_punctuation(CrispasrSession* s, int enable);
 int              crispasr_session_set_punc_model(CrispasrSession* s, const char* punc_model);
+int              crispasr_session_set_hotwords(CrispasrSession* s, const char* hotwords, float boost);
 int              crispasr_session_set_translate(CrispasrSession* s, int enable);
 int              crispasr_session_set_temperature(CrispasrSession* s, float temperature, unsigned long long seed);
 int              crispasr_session_set_tts_seed(CrispasrSession* s, unsigned long long seed);
@@ -395,6 +396,19 @@ func (s *CrispasrSession) SetPuncModel(model string) error {
 	rc := C.crispasr_session_set_punc_model(s.handle, cm)
 	if rc != 0 {
 		return errors.New("crispasr_session_set_punc_model failed")
+	}
+	return nil
+}
+
+// SetHotwords sets comma-separated hotwords for contextual biasing, boosted by
+// `boost` log-prob per token match (parakeet CTC/TDT trie, LLM backends prompt
+// injection). Empty string clears.
+func (s *CrispasrSession) SetHotwords(hotwords string, boost float32) error {
+	ch := C.CString(hotwords)
+	defer C.free(unsafe.Pointer(ch))
+	rc := C.crispasr_session_set_hotwords(s.handle, ch, C.float(boost))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_hotwords failed")
 	}
 	return nil
 }

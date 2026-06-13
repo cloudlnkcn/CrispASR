@@ -2454,6 +2454,24 @@ class CrispasrSession {
     }
   }
 
+  /// Select the G2P pronunciation dictionary for TTS phonemization
+  /// (`olaph` / `open-dict` or a path). Empty string keeps the default.
+  void setG2pDict(String source) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_g2p_dict')) {
+      throw UnsupportedError('crispasr_session_set_g2p_dict not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_g2p_dict');
+    final p = source.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc != 0) throw Exception('setG2pDict failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
   /// Whisper sticky `--translate`. For canary/cohere/voxtral the equivalent
   /// is [setTargetLanguage] ≠ source.
   void setTranslate(bool enable) {

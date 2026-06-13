@@ -435,6 +435,15 @@ extern "C" {
         lang: *const c_char,
     ) -> c_int;
     pub fn crispasr_session_set_punctuation(s: *mut CrispasrSession, enable: c_int) -> c_int;
+    pub fn crispasr_session_set_punc_model(s: *mut CrispasrSession, punc_model: *const c_char)
+        -> c_int;
+    pub fn crispasr_session_set_hotwords(
+        s: *mut CrispasrSession,
+        hotwords: *const c_char,
+        boost: c_float,
+    ) -> c_int;
+    pub fn crispasr_session_set_g2p_dict(s: *mut CrispasrSession, source: *const c_char) -> c_int;
+    pub fn crispasr_session_set_speaker_id(s: *mut CrispasrSession, id: c_int) -> c_int;
     pub fn crispasr_session_set_translate(s: *mut CrispasrSession, enable: c_int) -> c_int;
     // --- Text-to-text translation (m2m100 / m2m100-wmt21 / madlad / gemma4-e2b) ---
     //

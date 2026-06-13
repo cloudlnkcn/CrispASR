@@ -1569,6 +1569,29 @@ class Session:
         if rc != 0:
             raise RuntimeError(f"set_punc_model failed (rc={rc})")
 
+    def set_hotwords(self, hotwords: str, boost: float = 2.0) -> None:
+        """Contextual biasing: comma-separated words/phrases to boost during
+        decoding. Parakeet CTC/TDT use an Aho-Corasick trie; LLM backends inject
+        them into the prompt. Empty string clears."""
+        if not hasattr(self._lib, "crispasr_session_set_hotwords"):
+            raise RuntimeError("session-state API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_hotwords.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_float]
+        self._lib.crispasr_session_set_hotwords.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_hotwords(self._handle, (hotwords or "").encode("utf-8"), float(boost))
+        if rc != 0:
+            raise RuntimeError(f"set_hotwords failed (rc={rc})")
+
+    def set_g2p_dict(self, source: str) -> None:
+        """Select the G2P pronunciation dictionary for TTS phonemization
+        (``olaph`` / ``open-dict`` or a path). Empty string keeps the default."""
+        if not hasattr(self._lib, "crispasr_session_set_g2p_dict"):
+            raise RuntimeError("session-state API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_g2p_dict.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_g2p_dict.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_g2p_dict(self._handle, (source or "").encode("utf-8"))
+        if rc != 0:
+            raise RuntimeError(f"set_g2p_dict failed (rc={rc})")
+
     def set_translate(self, enable: bool) -> None:
         """Whisper sticky ``--translate``. For canary/cohere/voxtral the
         equivalent is :meth:`set_target_language` ≠ source."""
