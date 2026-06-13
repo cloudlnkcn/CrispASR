@@ -218,18 +218,17 @@ try:
     print("\n=== Config A: VOXCPM2_USE_GRAPH=0 (baseline) ===", flush=True)
     results.append(run_tts("nograph", {"VOXCPM2_USE_GRAPH": "0"}))
 
-    # -- Config B: graph=1, CUDA + NaN check (find the guilty ggml op) --
-    print("\n=== Config B: VOXCPM2_USE_GRAPH=1 + NAN_CHECK (CUDA) ===", flush=True)
-    results.append(run_tts("graph_nancheck", {
+    # -- Config B: graph=1, CUDA (default — known NaN on P100) --
+    print("\n=== Config B: VOXCPM2_USE_GRAPH=1 (CUDA, default) ===", flush=True)
+    results.append(run_tts("graph_default", {
         "VOXCPM2_USE_GRAPH": "1",
-        "VOXCPM2_NAN_CHECK": "1",
     }))
 
-    # -- Config C: graph=1, CUDA, NO_BUCKET + NaN check --
-    print("\n=== Config C: graph=1, NO_BUCKET + NAN_CHECK (CUDA) ===", flush=True)
-    results.append(run_tts("graph_nobucket_nancheck", {
+    # -- Config C: graph=1, CUDA + FA_CPU (LocDiT/LocEnc on CPU) --
+    print("\n=== Config C: graph=1 + FA_CPU (LocDiT/LocEnc on CPU) ===", flush=True)
+    results.append(run_tts("graph_fa_cpu", {
         "VOXCPM2_USE_GRAPH": "1",
-        "VOXCPM2_NO_BUCKET": "1",
+        "VOXCPM2_FA_CPU": "1",
     }))
 except Exception as e:
     step("ERROR", error=str(e))
