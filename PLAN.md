@@ -107,6 +107,21 @@ Vulkan repro + upstream report would be the proper fix.
 
 ---
 
+## §166 follow-up — WASM `asr*` session surface needs a build-verify (OPEN)
+
+Round 4 (2026-06-13, see HISTORY) added a backend-agnostic ASR session surface to
+the WASM/JS binding (`bindings/javascript/emscripten.cpp`:
+`asrOpen`/`asrTranscribe`/`asrSet*`) — the WASM ASR path was whisper-only
+(`init`/`full_default`) before. Verified by inspection (all C-ABI decls present;
+mirrors the existing `tts*` Embind patterns) but **not built locally**: emsdk
+won't resolve a fetchable arm64-mac SDK on this dev box (every version errors at
+manifest resolution; no Homebrew emscripten either). **Open:** build via
+`build-wasm.sh` / the WASM CI and smoke-test `asrTranscribe` in node/browser once
+an emcc toolchain is available. The §166 native-wrapper + server + Node-addon
+parity is DONE (HISTORY).
+
+---
+
 ## WASM Browser build — all backends, multithreaded
 
 ### Goal
@@ -117,10 +132,11 @@ backends run in the browser. Multithreaded via `-pthread` +
 
 ### Architecture
 
-The existing `bindings/javascript/emscripten.cpp` already exposes ~50
-functions via Embind (`--bind`): ASR transcription (`sessionTranscribe`),
-TTS synthesis (`ttsSynthesize`), streaming, language detection,
-punctuation, backend registry, and ~25 decode-parameter setters.
+The `bindings/javascript/emscripten.cpp` exposes ~60 functions via Embind
+(`--bind`): whisper ASR (`init`/`full_default`), the backend-agnostic ASR session
+surface (`asrOpen`/`asrTranscribe`/`asrSet*`, added 2026-06-13 — see the §166
+follow-up above), TTS synthesis (`ttsSynthesize` + the `tts*` setters), kokoro
+language routing, and registry helpers.
 
 All ~70 backend static libs link into `crispasr-lib` via the `whisper`
 alias target. The JS binding links against `whisper`, pulling everything in.
