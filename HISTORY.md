@@ -6,6 +6,27 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-13 #164 voxcpm2 VOXCPM2_USE_GRAPH — VAE Vulkan crash fixed, stop predictor WIP
+
+**Issue:** Two bugs in the graph fast path (VOXCPM2_USE_GRAPH=1):
+1. Stop predictor never fires — AR loop always hits max_len ceiling.
+2. VAE decode segfaults (0xC0000005) on Vulkan/CUDA.
+
+**VAE crash (fixed):** `vae_decode_graph` mixed CPU-resident bias/alpha
+tensors with GPU-resident WN-reconstructed weights. On discrete GPU
+backends (Vulkan, CUDA) the graph compute crashed accessing CPU pointers.
+Fix: create GPU copies of all bias + alpha tensors in `vae_wn_init_ggml`;
+`Bias()`/`Alpha()` lambdas prefer GPU copy. Confirmed working on P100.
+
+**Stop predictor (in progress):** Root cause is numerical divergence
+between CUDA and CPU matmul paths for Q4_K weights compounding over
+28 transformer layers. Approach: replay prefill through graph KV,
+compute FSQ + stop inside the TSLM step graph, scan graph nodes
+directly for the stop_probs tensor. Diagnostic kernel queued to
+verify tensor lookup and stop score values.
+
+Commits: `7449f793`, `a6aef4cf`, `f94e84c2`, `022cbaa3`.
+
 ## 2026-06-13 #89 parakeet-ja auto-VAD for long audio
 
 parakeet-ja's FastConformer encoder degenerates past ~12 s on real audio

@@ -5652,27 +5652,39 @@ Fix: enable the extension + cast kernel element to float in `fma()`.
 
 ### Part 2 — VOXCPM2_USE_GRAPH stop predictor — IN PROGRESS
 
-**Root cause (confirmed across 8 Kaggle iterations):**
+**Root cause:** For quantised models (Q4_K), CUDA dequantization + matmul
+produces different hidden states than CPU. `ggml_flash_attn_ext` vs legacy
+scalar attention compound across 28 layers, so any stop predictor computed
+from a different numerical path never fires.
 
-1. `ggml_flash_attn_ext` vs legacy scalar attention produce ~0.09 max_diff
-   at step 0 that compounds across 64 AR steps, so the CPU-computed
-   `stop_score` never crosses the threshold.
+**Approach (on main, 4 commits so far):**
 
-2. The fix (compute stop_proj + stop_head + softmax inside the TSLM step
-   graph as a `stop_probs` output tensor) was implemented but the tensor
-   lookup via `ggml_graph_get_tensor` silently failed on reused bucket
-   graphs because `ggml_gallocr_reserve` resets the internal hash table.
+1. Replace `sync_tslm_kv_cpu_to_backend` with prefill replay through the
+   TSLM step graph — populates backend KV via the same flash_attn path
+   as AR steps. (`7449f793`)
 
-3. Final fix (`ab39ea61` on branch `worktree-fix-vulkan-and-voxcpm2`):
-   cache "hidden_out" and "stop_probs" tensor pointers in TslmBucket at
-   build time (before `ggml_gallocr_reserve`), reuse on subsequent calls.
+2. Compute FSQ + stop predictor inside `build_tslm_step_graph`:
+   `hidden → fsq_in_proj → tanh → round(×9)/9 → fsq_out_proj →
+   stop_proj+bias → SiLU → stop_head → softmax`. (`a6aef4cf`)
 
-**Status:** Fix committed on feature branch. Kaggle quota exhausted before
-verification — needs one more Kaggle run to confirm the stop predictor fires.
+3. Direct `ggml_graph_node` scan instead of `ggml_graph_get_tensor`
+   for tensor lookup after gallocr. (`f94e84c2`)
 
-### Part 3 — VAE decode crash (SIGABRT) — NOT STARTED
+4. Unconditional debug logging for first 5 AR steps. (`022cbaa3`)
 
-The graph-path VAE crashes with rc=-6 after the AR loop. Separate from the
-stop predictor issue. The reporter also saw this on Vulkan (Intel Arc B580).
-May be related to the conv_transpose_1d_f16 shader fix or a separate tensor
-layout issue in the graph VAE path.
+**Kaggle results (5 runs so far):** Baseline (graph=0) fires correctly
+(stop=0.999 at step 7). Graph=1 still hits max_len ceiling. VAE decode
+works (no crash, clean audio). Stop_probs tensor lookup is the suspect —
+diagnostic kernel queued to confirm whether the tensor exists in the
+graph and what values it produces. chr1s4 GPU quota exhausted; waiting
+for session release.
+
+### Part 3 — VAE decode crash on Vulkan — DONE
+
+Root cause: `vae_decode_graph` mixed CPU-resident bias/alpha tensors
+(from `ctx->tensors`) with GPU-resident weight tensors (from
+`vae_wn_ggml_tensors`). Vulkan crashed accessing CPU pointers.
+
+Fix (`7449f793`): `vae_wn_init_ggml` now creates GPU copies of all bias
+and alpha tensors; `Bias()`/`Alpha()` lambdas prefer the GPU copy.
+Confirmed working on P100 CUDA (5 Kaggle runs, exit 0, audio produced).
