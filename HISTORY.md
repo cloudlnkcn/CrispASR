@@ -6,230 +6,39 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
-## 2026-06-13 §166 cross-surface parity — round 4 (full wrapper setter parity, WASM ASR, cmake-js)
+## 2026-06-12 Mini-Omni2 — full ASR+TTS+S2S backend (gpt-omni/mini-omni2)
 
-Closed the remaining wrapper/server gaps so every front-end exposes the complete
-`crispasr_session_set_*` surface (`include/crispasr_session.h`).
+New multimodal speech backend: Whisper-small encoder (80 mel, 12L, 768d)
++ whisperMLP SwiGLU adapter (768→4864→896) + Qwen2-0.5B LLM (896d, 24L,
+GQA 14/2, RoPE θ=1M). Supports ASR, TTS (via SNAC 24kHz), and
+speech-to-speech.
 
-- **All six native wrappers → full setter parity**, each compile-verified on M1:
-  Python (`set_hotwords`, `set_g2p_dict`), Go (`SetHotwords`), **Rust**
-  (`crispasr-sys`+`crispasr` at the *repo root*, not `bindings/`:
-  `set_punc_model`/`set_hotwords`/`set_g2p_dict`/`set_speaker_id`/`set_instruct`),
-  Dart (`setG2pDict`), Java/JNA (`setSpeakerId`/`setPuncModel`/`setHotwords`/
-  `setG2pDict`), Ruby C-ext (same four). Verified: `cargo build`, Go package
-  build, `dart analyze`, `javac` (JNA), Ruby `cc -fsyntax-only`, Python
-  import+runtime, binding-parity 153.
-- **Server**: exposed the ~14 remaining per-request transcription params on
-  `/inference` + `/v1/audio/transcriptions` (offset/duration, max_context,
-  audio_ctx, word_thold, split_on_punct, carry_initial_prompt, chunk_overlap,
-  lcs_dedup/min_length, parakeet_decoder, no_auto_aligner, show_alternatives,
-  alt_n).
-- **WASM/JS** (`bindings/javascript/emscripten.cpp`): added a backend-agnostic
-  ASR session surface (`asrOpen`/`asrTranscribe`/`asrSet*`) — it was whisper-only.
-  Built with emcc (not in the dev env; verified by inspection + C-ABI decls;
-  builds in the WASM CI).
-- **cmake-js**: ran the official Node-addon build (376 steps) — links libcrispasr
-  + the addon; the produced `.node` loads in node and exports `transcribeSession`.
-  (cmake-js defaults its build dir to `build/` and clobbered the ninja `build/`
-  on a root run; recovered via reconfigure+rebuild, then re-ran with `-O
-  build-addon`. Lesson in LEARNINGS.)
-- Docs: `docs/bindings.md` setter table + parity callout; `docs/contributing.md`
-  "adding a session setter" checklist across all six wrappers + server.
+**Diff-validated** against Python reference: mel, Whisper encoder, adapter
+all at cos_min=1.000000. ASR transcript matches: "and so my fellow
+americans ask not what your country can do for you ask what you can do
+for your country".
 
-## 2026-06-13 #164 voxcpm2 VOXCPM2_USE_GRAPH — VAE Vulkan crash fixed, stop predictor WIP
+Key implementation discoveries:
+- 400-point DFT required (NOT zero-padded to 512) — Whisper's torch.stft
+  uses n_fft=400 directly; zero-padding changes frequency bin spacing
+- Periodic Hann window (torch.hann_window) vs symmetric (np.hanning)
+  causes cos_min≈0.95 if wrong variant stored
+- ASR requires `_asr` token (151940), not `_answer_t` — switches model
+  from conversational to transcription mode
+- Decode step uses `pad_a=4097` (snac_config.end_of_audio), not `eoa=4096`
+- Audio features replace pad positions in streams 0-6 only (not text stream 7)
+- LitGPT fused QKV is interleaved per query group, not sequential Q,K,V
+- 8-stream embeddings batched into single ggml_get_rows for ~4× speedup
 
-**Issue:** Two bugs in the graph fast path (VOXCPM2_USE_GRAPH=1):
-1. Stop predictor never fires — AR loop always hits max_len ceiling.
-2. VAE decode segfaults (0xC0000005) on Vulkan/CUDA.
+Quantization: F16 (1.46 GB), Q8_0 (1.15 GB), Q4_K (0.99 GB) all produce
+identical ASR transcripts. Uploaded to `cstr/mini-omni2-GGUF`.
 
-**VAE crash (fixed):** `vae_decode_graph` mixed CPU-resident bias/alpha
-tensors with GPU-resident WN-reconstructed weights. On discrete GPU
-backends (Vulkan, CUDA) the graph compute crashed accessing CPU pointers.
-Fix: create GPU copies of all bias + alpha tensors in `vae_wn_init_ggml`;
-`Bias()`/`Alpha()` lambdas prefer GPU copy. Confirmed working on P100.
+Also refactored SNAC decoder from `orpheus_snac.{h,cpp}` to `core/snac.{h,cpp}`
+as a standalone shared target — now used by both orpheus and mini-omni2.
+Added 3 SNAC unit tests + 3 live tests (433 total unit tests).
 
-**Stop predictor (in progress):** Root cause is numerical divergence
-between CUDA and CPU matmul paths for Q4_K weights compounding over
-28 transformer layers. Approach: replay prefill through graph KV,
-compute FSQ + stop inside the TSLM step graph, scan graph nodes
-directly for the stop_probs tensor. Diagnostic kernel queued to
-verify tensor lookup and stop score values.
-
-Commits: `7449f793`, `a6aef4cf`, `f94e84c2`, `022cbaa3`.
-
-## 2026-06-13 #89 parakeet-ja auto-VAD for long audio
-
-parakeet-ja's FastConformer encoder degenerates past ~12 s on real audio
-(repetition loops from z-norm drift). Fixed-size chunks (10 s or 30 s) still
-produce garbage because the collapse happens inside each chunk. VAD gives
-silence-bounded segments matching the model's ~10-15 s training utterances.
-
-Added `CrispasrBackend::prefers_vad()` virtual. `ParakeetBackend` returns true
-for JA models (vocab ≤ 4096). `crispasr_run.cpp` auto-enables `params.vad`
-when `prefers_vad() && audio > 30 s && no explicit --vad/--chunk-seconds`.
-
-Kaggle-validated on `reazon_baseball_14s` ×3 (42 s): auto-VAD recovers
-3/3 keyword 岡本 (442 chars, byte-identical to explicit `--vad`); old 30 s
-chunking gets 1/3 (596 chars of repetitive output). Short audio (14 s)
-unaffected — no auto-VAD triggered.
-
-## 2026-06-13 §166 cross-surface parity — round 3 (streaming endpoint, node-addon session migration, /v1/translate)
-
-Closed the three remaining §166 items (the larger features).
-
-- **Streaming-transcription HTTP endpoint.** Wired the existing ws_stream
-  listener (previously only in the standalone examples/server) into the main
-  OpenAI-compatible server: opt-in `--ws-port N` (-1 off default, 0 = http
-  port+1). Clients send binary 16 kHz mono float32 PCM, receive JSON
-  {text,t0,t1,counter[,final]} partial/final events via the streaming session
-  API — the server analogue of the CLI `--stream` path. **Fixed two pre-existing
-  ws_stream bugs** that made the handshake fail for every spec-compliant client
-  (browsers, the `websockets` lib): the RFC 6455 magic GUID was mistyped
-  (...5AB5DC11D585 vs correct ...C5AB0DC85B11), and the upgrade request was read
-  in a single recv() (truncating handshakes split across TCP segments). The
-  streaming server never actually worked with real clients until this fix. Test
-  tests/test-server-ws-stream.py (live, stdlib raw WS client) pins the handshake
-  accept + a streaming transcription.
-- **Node addon → session C-ABI.** examples/addon.node was whisper-only
-  (whisper_full). Added `transcribeSession(params, cb)` on the crispasr_session
-  C-ABI — reaches every backend (parakeet/canary/moonshine/…) + the session
-  post-processors (punctuation, --punc-model, beam, translate, src/tgt lang,
-  temperature), returning the same shape as whisper(). Additive; legacy whisper()
-  + its progress callback untouched. No CMakeLists change (the addon links the
-  `whisper` alias = crispasr-lib, which exports the session symbols). Verified on
-  M1 via node: whisper + moonshine backends transcribe jfk.wav.
-- **POST /v1/translate.** Text-to-text translation endpoint (the HTTP analogue
-  of the CLI `--text` mode) backed by `backend->translate_text` (CAP_TRANSLATE,
-  e.g. m2m100). Verified: m2m100-418m, 'Hello world…' → 'Hallo Welt, wie bist du
-  heute?'. Test tests/test-server-translate.sh.
-
-§166 is now fully closed.
-
-## 2026-06-13 §166 cross-surface parity — round 2 (C-ABI punc-model, server truecase/diarize/LID, alias preview)
-
-Follow-up to the §166 audit: closed five of the open parity gaps.
-
-- **C-ABI `--punc-model` (gap 1).** Added `crispasr_session_set_punc_model(s,
-  alias|path)` — resolves + auto-downloads + loads a FireRedPunc or PCS context
-  onto the session and applies it per segment in `transcribe_lang` (covers
-  direct + VAD + best-of), gated on the session punctuation flag, freed in
-  `crispasr_session_close`. Moved the pure resolver to `src/crispasr_punc_model.h`
-  so the C-ABI shares it with the CLI/server (the CLI-layer
-  `examples/cli/crispasr_punc_loader.h` now re-exports it). Wrapped in Python
-  (`set_punc_model`), Go (`SetPuncModel`), Dart (`setPuncModel`). Binding-parity
-  manifest 149 → 150. Verified live: Python Session over parakeet,
-  `set_punc_model('fullstop')` rewrites segment text.
-- **Server truecase (gap 2).** Server now applies `--truecase-model` (previously
-  CLI-only). Extracted the 3-flavour (statistical/CRF/BiLSTM) resolution + apply
-  into a shared `examples/cli/crispasr_truecase_loader.h` used by both the CLI
-  (refactored to call it) and the server; applied after punctuation, skipped
-  when PCS is active.
-- **Server diarize knobs (gap 3)** + **LID (gap 6 half).** `diarize_embedder` /
-  `diarize_cluster_threshold` / `diarize_max_speakers` / `lid_backend` /
-  `lid_model` are now per-request form params on `/inference` and
-  `/v1/audio/transcriptions`.
-- **Dry-run alias bug.** `build_preview()` skipped the literal-arg backend-key
-  lookup that the real resolver does, so `-m parakeet-tdt_ctc-110m
-  --dry-run-resolve` previewed the 467 MB 0.6b default instead of the 91 MB 110m
-  entry (actual load was already correct — only the preview lied). Fixed +
-  offline regression `tests/test-dry-run-resolve.sh`.
-
-Remaining §166 items (streaming HTTP endpoint, node-addon session migration,
-m2m100 `/v1/translate`) are larger features, not parity plumbing — see PLAN §166.
-
-## 2026-06-13 #166 server `--punc-model` parity + #165 Vulkan-server robustness
-
-**#166 — server honors `--punc-model` (+ PCS + CTC auto-enable).** The
-punctuation post-processor lived only in the CLI layer (`crispasr_run.cpp`), so a
-server started with `--punc-model fullstop` and a non-PnC backend (parakeet
-RNNT/CTC) returned lowercase, unpunctuated text. Cherry-picked the PR commit
-(`36f35f2a`; the PR branch was based on a stale main so a full merge would have
-reverted thousands of lines), then extended it (`8d803f04`):
-- Extracted the `--punc-model` alias → (cache filename, URL) table into a pure,
-  dependency-free resolver `examples/cli/crispasr_punc_loader.h`, now shared by
-  **both** CLI and server so they can't drift on which model an alias selects.
-  CLI's two inline resolution blocks now call the resolver.
-- Server: added the **PCS** model path and **auto-enable** of punctuation for
-  non-PnC CTC backends (`crispasr_should_auto_enable_punctuation`) — full CLI
-  parity. PCS takes precedence over FireRedPunc when loaded.
-- Tests: `tests/test_punc_resolve.cpp` (`[unit]`, 5 cases / 41 assertions — pins
-  every alias/direct-path/edge case); `tests/test-server-punc.sh` (`[live]`,
-  parakeet + `--punc-model fullstop`, asserts punctuated output and that
-  `punctuation=false` strips). Live-verified 3/3 on M1 Metal.
-
-**#165 — server fails to launch on a Vulkan build** (external reporter: Windows
-11, AMD Radeon 780M; CPU build + Vulkan file-transcription work, but `--server`
-stops right after parakeet init). Root cause: the server (unlike the CLI) always
-runs a warmup transcribe before `listen()`, and the reporter's log stops *before*
-`warmup completed` → warmup hangs/crashes in their Vulkan driver. **Could not
-reproduce on M1 + MoltenVK** (warmup completes ~893 ms, transcribes fine) — so
-it's specific to the AMD 780M driver. Shipped (`c04f70fb`):
-- `--no-warmup` flag (+ `CRISPASR_NO_WARMUP=1`) — the previously-missing escape
-  hatch — and wrapped the warmup call in try/catch so a soft failure degrades to
-  "no warmup" instead of preventing `listen()`.
-- **Two server-robustness bugs found while debugging, fixed:** (a) route-handler
-  exceptions became a bare 500 with empty body, which the error handler
-  mislabeled as "not found. Use POST /v1/audio/transcriptions" — added
-  `set_exception_handler` to log + return the real reason; (b) `scratch_dir()`
-  used the throwing `create_directories` on the per-request path, so an
-  unwritable/odd cache dir 500'd **every** transcription — now uses the
-  non-throwing overload with a system-temp fallback.
-- Test `tests/test-server-warmup.sh` (default warmup + `--no-warmup`), verified
-  on both Metal and Vulkan/MoltenVK builds; `whisper_params` default unit test.
-- Also unblocked a pre-existing nemotron Metal/CUDA build break (missing
-  `ggml-metal.h`/`ggml-cuda.h` includes in the #81 scaffold, `cb98d218`).
-
-See LEARNINGS "Server warmup is the launch-time differentiator vs the CLI" and
-PLAN §165/§166 for the open tails.
-
-## 2026-06-05 #58 MOSS-Audio-4B-Instruct — audio understanding + ASR backend
-
-New audio-understanding backend: 32-layer Whisper-style encoder (1280d,
-20 heads, 128-mel, sliding-window attention w=100) with DeepStack 3-tap
-cross-layer injection (taps at L8/16/24) + GatedMLP adapter (1280→8192→2560)
-+ 36-layer Qwen3 LM (2560d, 32Q/8KV, SwiGLU, RoPE θ=1M). Apache-2.0.
-First backend that handles audio QA, scene description, and time-aware ASR
-in addition to plain transcription — prompt-driven via `--prompt` / `set_ask()`.
-
-Architecture highlights:
-- **Conv2d stem**: 3× Conv2d (stride 2 each) → 8× downsample → stem_proj
-  Linear(7680, 1280). Slaney mel filterbank with reflect padding.
-- **DeepStack**: encoder taps at layers 8, 16, 24 projected through
-  independent GatedMLP heads and injected as residual adds at LM blocks
-  0, 1, 2. Preserves multi-resolution features (prosody + semantics).
-- **Time markers**: explicit time-marker tokens inserted between audio
-  frame embeddings; supports word/sentence-level timestamp ASR.
-- **Tokenizer**: GPT-2 BPE via `core_bpe` (same as qwen3_asr).
-
-Key fixes during the port (20 commits, 2026-06-03 to 2026-06-05):
-1. Conv2d layout: transpose mel input ne=(freq,time) + kernel permute
-2. Slaney mel filterbank + reflect padding + 3000-frame padding
-3. Chunked encoder processing (400-frame chunks, per-chunk attention)
-4. Manual attention (Q@K^T → softmax → @V) with NaN-safe padding mask
-5. GPT-2 BPE tokenizer via core_bpe
-6. Time marker insertion in prompt
-7. DeepStack re-enabled (initially disabled for debugging)
-8. Selective quantization (encoder F16, LLM Q4_K)
-
-Diff-validated: all 6 stages PASS at cos ≥ 0.999. GGUFs at
-`cstr/MOSS-Audio-4B-Instruct-GGUF` (F16 + Q4_K). Model registry,
-auto-download, C-ABI, CLI backend, and diff harness all wired.
-
-## 2026-06-12 §164 Mini-Omni2 — full ASR+TTS+S2S backend
-
-New multimodal speech backend: Whisper-small (80 mel, 12L, 768d) +
-whisperMLP SwiGLU adapter (768→4864→896) + Qwen2-0.5B LLM (896d, 24L,
-GQA 14/2, RoPE θ=1M). ASR, TTS (SNAC 24kHz), and speech-to-speech.
-
-Diff-validated: mel, encoder, adapter all cos_min=1.000. All 3 quants
-(F16/Q8_0/Q4_K) produce identical ASR transcripts. Uploaded to
-`cstr/mini-omni2-GGUF`. Also refactored SNAC to `core/snac.{h,cpp}`.
-
-Key discoveries: 400-point DFT (not 512), periodic Hann window, `_asr`
-token for transcription mode, `pad_a` not `eoa` for decode, audio features
-in streams 0-6 only, LitGPT fused QKV interleaved per query group.
-
-10 commits, 13 files, ~2500 LOC. See PLAN §164.
+Files: 13 new/modified, ~2500 LOC added. 6 commits on feat/mini-omni2
+branch + 4 follow-up commits on main.
 
 ## 2026-06-11 #161 / #155 / #152 confirmed on CUDA (RTX A1000 4 GB, Windows) + #125 firered repro
 
@@ -8701,10 +8510,7 @@ Mimi) → ISTFT detokenizer → 24 kHz PCM.
 `tests/test_lfm2_audio_live.cpp`, `tests/CMakeLists.txt`, `tests/env-live-tests.sh`,
 `tools/kaggle/lfm2-audio-gpu-test/{kernel-metadata.json,lfm2-audio-gpu-test.py}`.
 
-**Phase 4 — ALL DONE (4d5d3ff7):**
-- `ggml_backend_sched` → NOT NEEDED (gallocr works directly with CUDA)
-- Streaming Mimi decode → `lfm2_audio_synthesize_stream()` callback API
-- `causal_conv1d` CUDA kernel → migrated all 5 conv sites from `ggml_conv_2d_dw_direct`
-  to `ggml_conv_1d_dw` which has native CUDA dispatch via im2col+mul_mat
-- Prefill gallocr (TTS/S2S) → extracted shared `lfm2_backbone_step()` (55c90314)
-- Kaggle T4 GPU test → kernel COMPLETE, proved gallocr+CUDA works end-to-end
+**Remaining (tracked in PLAN §163 Phase 4):**
+- `ggml_backend_sched` migration for full GPU compute offload
+- Streaming Mimi decode
+- `causal_conv1d` CUDA kernel
