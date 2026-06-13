@@ -145,7 +145,8 @@ struct whisper_params {
     // 3-4 if your audio has long-silence regions where blank tokens
     // dominate the boundary token run (avoids over-slicing).
     int lcs_min_length = 1;
-    bool warmup = false;          // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
+    bool warmup = false;    // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
+    bool no_warmup = false; // --no-warmup: skip the always-on server warmup (e.g. crashes on some Vulkan drivers, #165)
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
     std::string hotwords;         // comma-separated hotword list (PLAN #98)
     float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches

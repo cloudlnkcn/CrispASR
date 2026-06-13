@@ -87,18 +87,29 @@
 // ---------------------------------------------------------------------------
 
 static std::string scratch_dir() {
-    const char* env = std::getenv("CRISPASR_SCRATCH_DIR");
-    if (env && *env)
-        return std::string(env);
-    const char* cache = std::getenv("XDG_CACHE_HOME");
-    if (cache && *cache) {
-        std::string d = std::string(cache) + "/crispasr/scratch";
-        std::filesystem::create_directories(d);
-        return d;
+    // Pick a writable scratch dir, preferring explicit overrides. Use the
+    // non-throwing create_directories overload and fall back to the system temp
+    // dir on failure: this runs on the per-request transcription path, so a
+    // create_directories exception (e.g. a dangling cache symlink or read-only
+    // HOME) must not blow up every request.
+    std::string d;
+    if (const char* env = std::getenv("CRISPASR_SCRATCH_DIR"); env && *env)
+        return std::string(env); // explicit override: trust the caller, don't mkdir
+    else if (const char* cache = std::getenv("XDG_CACHE_HOME"); cache && *cache)
+        d = std::string(cache) + "/crispasr/scratch";
+    else if (const char* home = std::getenv("HOME"); home && *home)
+        d = std::string(home) + "/.cache/crispasr/scratch";
+    else
+        d = ".cache/crispasr/scratch";
+
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
+    if (ec || !std::filesystem::is_directory(d, ec)) {
+        std::error_code tec;
+        std::filesystem::path fallback = std::filesystem::temp_directory_path(tec) / "crispasr-scratch";
+        std::filesystem::create_directories(fallback, tec);
+        return fallback.string();
     }
-    const char* home = std::getenv("HOME");
-    std::string d = std::string(home && *home ? home : ".") + "/.cache/crispasr/scratch";
-    std::filesystem::create_directories(d);
     return d;
 }
 
@@ -738,14 +749,30 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             fprintf(stderr, "crispasr-server: failed to init backend '%s'\n", backend_name.c_str());
             return 1;
         }
-        // #80e: warmup in server mode — always enabled (amortized over
-        // many requests).  Skipped if --no-prints is set and warmup takes
-        // < 10 ms (no point logging a trivial warmup).
-        {
+        // #80e: warmup in server mode — on by default (amortized over many
+        // requests). Opt out with --no-warmup (or CRISPASR_NO_WARMUP=1): some
+        // GPU drivers crash or hang inside the warmup transcribe — e.g. the
+        // parakeet warmup on certain Vulkan drivers (#165) — which would
+        // otherwise prevent the server from ever reaching listen(). Guard the
+        // call so a soft (throwing) warmup failure degrades to "no warmup"
+        // instead of taking the whole server down before it can serve.
+        const bool skip_warmup = params.no_warmup || [] {
+            const char* e = std::getenv("CRISPASR_NO_WARMUP");
+            return e && e[0] && e[0] != '0';
+        }();
+        if (skip_warmup) {
+            fprintf(stderr, "crispasr-server: warmup skipped (--no-warmup)\n");
+        } else {
             auto t0 = std::chrono::steady_clock::now();
-            backend->warmup();
-            auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            fprintf(stderr, "crispasr-server: warmup completed in %.0f ms\n", dt * 1000.0);
+            try {
+                backend->warmup();
+                auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                fprintf(stderr, "crispasr-server: warmup completed in %.0f ms\n", dt * 1000.0);
+            } catch (const std::exception& e) {
+                fprintf(stderr, "crispasr-server: warning: warmup failed (%s) — continuing without warmup\n", e.what());
+            } catch (...) {
+                fprintf(stderr, "crispasr-server: warning: warmup failed — continuing without warmup\n");
+            }
         }
         ready.store(true);
         fprintf(stderr, "crispasr-server: backend '%s' loaded, model '%s'\n", backend_name.c_str(),
@@ -2118,6 +2145,24 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         fprintf(stderr, "crispasr-server: %s %s → %d (no matching route)\n", req.method.c_str(), req.path.c_str(),
                 res.status);
         res.set_content("{\"error\": \"not found. Use POST /v1/audio/transcriptions\"}", "application/json");
+    });
+
+    // When a route handler throws, cpp-httplib turns it into a bare 500 with an
+    // empty body — which the error handler above then mislabels as "not found".
+    // Surface the real reason instead: log it and return a structured 500 so an
+    // exception in e.g. transcription isn't silently disguised as a 404.
+    svr.set_exception_handler([&](const Request& req, Response& res, std::exception_ptr ep) {
+        std::string what = "unknown error";
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            what = e.what();
+        } catch (...) {
+        }
+        fprintf(stderr, "crispasr-server: %s %s → 500 (exception: %s)\n", req.method.c_str(), req.path.c_str(),
+                what.c_str());
+        res.status = 500;
+        json_error(res, 500, std::string("internal error: ") + what);
     });
 
     // Start

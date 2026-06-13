@@ -439,6 +439,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.hotwords_boost = std::stof(ARGV_NEXT);
     } else if (arg == "--warmup") {
         params.warmup = true;
+    } else if (arg == "--no-warmup") {
+        params.no_warmup = true;
     } else if (arg == "--parakeet-decoder") {
         params.parakeet_decoder = ARGV_NEXT;
     } else if (arg == "--lid-backend") {
@@ -985,6 +987,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "  --port PORT                       [%-7d] server port\n", params.server_port);
     fprintf(stderr, "  --api-keys K1,K2                  [%-7s] comma-separated server API keys\n",
             params.server_api_keys.empty() ? "" : "(set)");
+    fprintf(
+        stderr,
+        "  --no-warmup                       [%-7s] server: skip startup warmup (workaround for Vulkan hangs, #165)\n",
+        params.no_warmup ? "true" : "false");
     fprintf(stderr, "  --stream-step N                   [%-7d] chunk size in ms for streaming\n",
             params.stream_step_ms);
     fprintf(stderr,

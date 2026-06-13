@@ -22,13 +22,17 @@ cd "$(dirname "$0")/.."
 
 PORT=${PORT:-11453}
 KEEP_SERVER=0
+CACHE_DIR="${CRISPASR_TEST_CACHE:-}"
 for arg in "$@"; do
     case "$arg" in
         --port=*) PORT="${arg#--port=}" ;;
         --port) shift; PORT="$1" ;;
+        --cache-dir=*) CACHE_DIR="${arg#--cache-dir=}" ;;
         --keep-server) KEEP_SERVER=1 ;;
     esac
 done
+CACHE_ARG=()
+[ -n "$CACHE_DIR" ] && CACHE_ARG=(--cache-dir "$CACHE_DIR")
 
 # Locate the binary.
 CRISPASR=""
@@ -74,7 +78,7 @@ trap 'if [ "$KEEP_SERVER" -eq 0 ] && [ -n "${SERVER_PID:-}" ]; then kill "$SERVE
 
 echo "Starting crispasr-server on :$PORT with --punc-model fullstop…"
 "$CRISPASR" --server -m "$MODEL" --punc-model fullstop \
-    --host 127.0.0.1 --port "$PORT" --auto-download \
+    --host 127.0.0.1 --port "$PORT" --auto-download ${CACHE_ARG[@]+"${CACHE_ARG[@]}"} \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
