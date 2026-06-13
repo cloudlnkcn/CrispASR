@@ -181,6 +181,11 @@ public:
         return {};
     }
 
+    // Per-model preferred auto-chunk window in seconds. Backends that
+    // need a shorter window than the global 30s default (e.g. parakeet-ja
+    // collapses past ~12s) override this. Returns 0 to use the default.
+    virtual int preferred_chunk_seconds() const { return 0; }
+
     // Warmup: run a short dummy transcribe to amortize first-call
     // overhead (graph allocation, GPU kernel compilation, gallocr shape
     // setup).  Called once after init(), before the first real audio.
