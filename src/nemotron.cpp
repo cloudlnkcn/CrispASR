@@ -1215,16 +1215,24 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
             std::vector<float> new_output((size_t)n_new * d);
             ggml_backend_tensor_get(out_t, new_output.data(), 0, new_output.size() * sizeof(float));
 
-            // Read post-FFN1 cache output
+            // Update cache: use post-FFN1 if available, else block output.
+            // FFN1 is pointwise so caching block output and re-running FFN1
+            // on cached frames produces the same result — no corruption.
             ggml_tensor* cco = ggml_graph_get_tensor(lg.gf, "cache_ch_out");
+            const float* cache_src = cco ? nullptr : new_output.data();
+            std::vector<float> post_ffn1_data;
             if (cco) {
-                std::vector<float> new_post_ffn1((size_t)n_new * d);
-                ggml_backend_tensor_get(cco, new_post_ffn1.data(), 0, new_post_ffn1.size() * sizeof(float));
-                // Append to cache, keep last L frames
+                post_ffn1_data.resize((size_t)n_new * d);
+                ggml_backend_tensor_get(cco, post_ffn1_data.data(), 0, post_ffn1_data.size() * sizeof(float));
+                cache_src = post_ffn1_data.data();
+            } else {
+                cache_src = new_output.data(); // fall back to block output
+            }
+            {
                 std::vector<float> combined;
                 if (n_ctx > 0)
                     combined.assign(cache.k_cache.begin(), cache.k_cache.begin() + (size_t)cache.n_cached * d);
-                combined.insert(combined.end(), new_post_ffn1.begin(), new_post_ffn1.end());
+                combined.insert(combined.end(), cache_src, cache_src + (size_t)n_new * d);
                 int total = (int)(combined.size() / d);
                 int keep = std::min(L, total);
                 int skip = total - keep;
