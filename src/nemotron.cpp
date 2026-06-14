@@ -620,44 +620,54 @@ static ggml_tensor* nemotron_build_pre_encode(ggml_context* ctx0, ggml_tensor* m
     // For W even: (2,1) gives (W+3-3)/2+1 = W/2+1, (2,2) gives (W+4-3)/2+1 = (W+1)/2+1
     // When W is even: W/2+1 vs (W+1)/2+1. floor((W+1)/2)+1 = W/2+1. Same! Good.
 
+    // Causal Conv2d padding: (left=k-1=2, right=s-1=1) on BOTH freq and time.
+    // ggml_conv_2d only supports symmetric padding, so we use pad=(2,2) and
+    // trim the last element from BOTH freq (ne[0]) and time (ne[1]) after
+    // each strided conv to match the asymmetric causal padding result.
+    // For even input size W: pad(2,1) gives W/2+1, pad(2,2) also gives W/2+1 → no trim.
+    // For odd input size W: pad(2,1) gives (W+1)/2, pad(2,2) gives (W+1)/2+1 → trim 1.
+    // Safest: always trim both dims when the pad(2,2) output exceeds the expected causal size.
+    auto trim_causal = [&](ggml_tensor* t, int expected_freq, int expected_time) {
+        int64_t W = t->ne[0], H = t->ne[1];
+        if (W > expected_freq || H > expected_time) {
+            t = ggml_view_4d(ctx0, t, expected_freq, expected_time, t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3],
+                             0);
+            t = ggml_cont(ctx0, t);
+        }
+        return t;
+    };
+
+    // Stage 0: Conv2d(1, C, k=3, s=2) — mel (128, T_mel) → (65, T_mel/2+1)
+    int T_mel_in = (int)mel->ne[1];
+    int freq0 = 128 / 2 + 1;        // 65 (causal on even input)
+    int time0 = (T_mel_in + 1) / 2; // causal: (T+2+1-3)/2+1 = T/2+1 for even T, (T+1)/2 for odd
+    // More precisely: causal output = (input + left + right - kernel) / stride + 1
+    //               = (input + 2 + 1 - 3) / 2 + 1 = input / 2 + 1 for even, (input+1)/2 for odd
+    freq0 = (128 + 2 + 1 - 3) / 2 + 1;      // 65
+    time0 = (T_mel_in + 2 + 1 - 3) / 2 + 1; // (T_mel_in) / 2 + 1 for even
     ggml_tensor* cur = ggml_conv_2d(ctx0, w.conv0_w, mel, 2, 2, 2, 2, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv0_b));
+    cur = trim_causal(cur, freq0, time0);
     cur = ggml_relu(ctx0, cur);
 
     // Stage 2: DW Conv2d(C, k=3, s=2)
-    // Input freq after stage 0 with pad(2,2) on 128: (128+4-3)/2+1 = 65
-    // Causal pad on 65: (65+3-3)/2+1 = 33
-    // Our pad(2,2) on 65: (65+4-3)/2+1 = 34. Need to trim to 33.
+    int freq2 = ((int)cur->ne[0] + 2 + 1 - 3) / 2 + 1;
+    int time2 = ((int)cur->ne[1] + 2 + 1 - 3) / 2 + 1;
     cur = ggml_conv_2d_dw(ctx0, w.conv2_w, cur, 2, 2, 2, 2, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv2_b));
-    // Trim: freq is cur->ne[0]. Trim last element: view with ne[0]-1
-    {
-        int64_t W = cur->ne[0] - 1;
-        int64_t H = cur->ne[1];
-        int64_t C = cur->ne[2];
-        int64_t N = cur->ne[3];
-        cur = ggml_view_4d(ctx0, cur, W, H, C, N, cur->nb[1], cur->nb[2], cur->nb[3], 0);
-        cur = ggml_cont(ctx0, cur);
-    }
+    cur = trim_causal(cur, freq2, time2);
 
-    // Stage 3: PW Conv2d(C, C, k=1, s=1)
+    // Stage 3: PW Conv2d(C, C, k=1, s=1) — no padding change
     cur = ggml_conv_2d(ctx0, w.conv3_w, cur, 1, 1, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv3_b));
     cur = ggml_relu(ctx0, cur);
 
     // Stage 5: DW Conv2d(C, k=3, s=2)
-    // Input freq = 33. Causal pad: (33+3-3)/2+1 = 17.
-    // Our pad(2,2): (33+4-3)/2+1 = 18. Trim to 17.
+    int freq5 = ((int)cur->ne[0] + 2 + 1 - 3) / 2 + 1;
+    int time5 = ((int)cur->ne[1] + 2 + 1 - 3) / 2 + 1;
     cur = ggml_conv_2d_dw(ctx0, w.conv5_w, cur, 2, 2, 2, 2, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv5_b));
-    {
-        int64_t W = cur->ne[0] - 1;
-        int64_t H = cur->ne[1];
-        int64_t C = cur->ne[2];
-        int64_t N = cur->ne[3];
-        cur = ggml_view_4d(ctx0, cur, W, H, C, N, cur->nb[1], cur->nb[2], cur->nb[3], 0);
-        cur = ggml_cont(ctx0, cur);
-    }
+    cur = trim_causal(cur, freq5, time5);
 
     // Stage 6: PW Conv2d(C, C, k=1, s=1)
     cur = ggml_conv_2d(ctx0, w.conv6_w, cur, 1, 1, 0, 0, 1, 1);
@@ -1002,6 +1012,8 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     // ----- Causal pre-encode (asymmetric padding, 17 freq bins) -----
     int T = 0;
     ggml_tensor* cur = nemotron_build_pre_encode(ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T);
+    ggml_set_name(cur, "pre_enc_out");
+    ggml_set_output(cur);
 
     // nemotron has xscaling=false, so no scaling step
 
@@ -1098,6 +1110,16 @@ static bool nemotron_run_encoder(nemotron_context* ctx, const float* mel, int n_
     // Read output: (d_model, T_enc) in column-major → row-major (T_enc, d_model)
     enc_out.resize((size_t)T_enc * d_model_out);
     ggml_backend_tensor_get(enc_out_t, enc_out.data(), 0, enc_out.size() * sizeof(float));
+
+    // Debug: pre-encode output
+    ggml_tensor* pre_enc_t = ggml_graph_get_tensor(gf, "pre_enc_out");
+    if (pre_enc_t) {
+        int T_pre = (int)pre_enc_t->ne[1];
+        std::vector<float> pre_data(5);
+        ggml_backend_tensor_get(pre_enc_t, pre_data.data(), 0, 5 * sizeof(float));
+        fprintf(stderr, "nemotron: pre_enc T=%d frame0[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", T_pre, pre_data[0],
+                pre_data[1], pre_data[2], pre_data[3], pre_data[4]);
+    }
 
     ggml_gallocr_free(alloc);
     return true;
