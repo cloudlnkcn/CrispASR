@@ -57,6 +57,19 @@ jobs:
           git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git 2>/dev/null || true
           git fetch upstream --tags --force
 
+      - name: Check UPSTREAM_SYNC_PAT
+        id: pat
+        # The default GITHUB_TOKEN cannot trigger downstream release.yml
+        # (a documented GitHub Actions limitation). Warn loudly so users
+        # don't end up with tags pushed but no release artifacts built.
+        run: |
+          if [ -z "${{ secrets.UPSTREAM_SYNC_PAT }}" ]; then
+            echo "::warning::UPSTREAM_SYNC_PAT secret is not set. Tags will be pushed with the default GITHUB_TOKEN, which CANNOT trigger release.yml. Set a PAT with repo scope in repo Settings → Secrets and variables → Actions."
+            echo "has_pat=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pat=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Determine target tag
         id: target
         run: |
@@ -67,14 +80,17 @@ jobs:
             exit 0
           fi
 
-          # Find the latest semver tag on upstream
-          LATEST_TAG=$(git tag -l 'v*' --sort=-version:refname upstream/* 2>/dev/null | head -1)
-          if [ -z "$LATEST_TAG" ]; then
-            # Fetch upstream tags directly (prefix with 'upstream/' stripped)
-            LATEST_TAG=$(git ls-remote --tags --sort=-version:refname \
+          # Query upstream tags via ls-remote and pick the latest semver.
+          # IMPORTANT: annotated tags produce two refs — `refs/tags/vX.Y.Z`
+          # and its dereferenced commit `refs/tags/vX.Y.Z^{}`. The `^{}`
+          # line sorts *higher* under --sort=-version:refname, so head -1
+          # would otherwise return a malformed `vX.Y.Z^{}` tag name.
+          # Filter those out with `grep -v '{}$'` before picking the top.
+          LATEST_TAG=$(git ls-remote --tags --sort=-version:refname \
               https://github.com/${{ env.UPSTREAM_REPO }}.git 'refs/tags/v*' \
-              | head -1 | sed 's|.*refs/tags/||')
-          fi
+            | grep -v '{}$' \
+            | head -1 \
+            | sed 's|.*refs/tags/||')
 
           if [ -z "$LATEST_TAG" ]; then
             echo "::warning::No upstream tags found"
