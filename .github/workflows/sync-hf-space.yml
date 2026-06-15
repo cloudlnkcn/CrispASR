@@ -10,6 +10,10 @@ on:
 
 jobs:
   sync:
+    # Only run in the upstream repo — forks don't sync to HuggingFace.
+    # The guard prevents confusing skips when HF_TOKEN isn't configured in
+    # forks, and survives `git merge upstream/main` in sync-upstream.yml.
+    if: github.repository == 'CrispStrobe/CrispASR'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
