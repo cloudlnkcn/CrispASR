@@ -137,7 +137,7 @@ std::vector<float> compute_log_mel(const float* pcm_16k, int n_samples, int& T_o
 // `mel_in_T` is the input tensor (mel) the caller has already created and
 // set as input. Allocates intermediate ops onto `ctx0`/`gf`.
 static ggml_tensor* build_encoder_graph(ggml_context* ctx0, ggml_cgraph* gf, const cb_s3tok_model& m,
-                                        ggml_tensor* mel_in, int T) {
+                                        ggml_tensor* mel_in, int /*T*/) {
     // mel_in ne = (T, n_mels=128) — channel-first row-major matches the
     // chatterbox_ve / voxtral conv1d input convention. After conv1 (s=2)
     // and conv2 (s=2) we end up at ceil(ceil(T/2)/2) ≈ T/4 frames.

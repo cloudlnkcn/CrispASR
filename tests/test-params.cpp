@@ -38,6 +38,13 @@ TEST_CASE("whisper_params: chunk_seconds defaults to 30", "[unit]") {
     REQUIRE(kDefaults.chunk_seconds == 30);
 }
 
+TEST_CASE("whisper_params: warmup off by default, no_warmup off by default", "[unit]") {
+    // The server warms up by default (no_warmup=false); --no-warmup flips it on
+    // as an escape hatch for drivers that crash/hang in warmup (#165).
+    REQUIRE(kDefaults.warmup == false);
+    REQUIRE(kDefaults.no_warmup == false);
+}
+
 // ─── VAD fields ───────────────────────────────────────────────────────────────
 
 TEST_CASE("whisper_params: vad disabled by default", "[unit]") {
@@ -62,8 +69,8 @@ TEST_CASE("whisper_params: best_of defaults to sensible value", "[unit]") {
     REQUIRE(kDefaults.best_of >= 1);
 }
 
-TEST_CASE("whisper_params: beam_size defaults to sensible value", "[unit]") {
-    REQUIRE(kDefaults.beam_size >= 1);
+TEST_CASE("whisper_params: beam_size defaults to greedy (-1)", "[unit]") {
+    REQUIRE(kDefaults.beam_size == -1);
 }
 
 TEST_CASE("whisper_params: n_threads defaults to sensible value", "[unit]") {

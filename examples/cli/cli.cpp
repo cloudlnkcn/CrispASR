@@ -439,6 +439,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.hotwords_boost = std::stof(ARGV_NEXT);
     } else if (arg == "--warmup") {
         params.warmup = true;
+    } else if (arg == "--no-warmup") {
+        params.no_warmup = true;
     } else if (arg == "--parakeet-decoder") {
         params.parakeet_decoder = ARGV_NEXT;
     } else if (arg == "--lid-backend") {
@@ -506,7 +508,11 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
     std::string arg = argv[i];
 #define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
 
-    if (arg == "--tts") {
+    if (arg == "--s2s") {
+        params.s2s = true;
+    } else if (arg == "--s2s-output") {
+        params.s2s_output = ARGV_NEXT;
+    } else if (arg == "--tts") {
         params.tts_text = ARGV_NEXT;
     } else if (arg == "--tts-output") {
         params.tts_output = ARGV_NEXT;
@@ -605,6 +611,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.server_host = ARGV_NEXT;
     } else if (arg == "--port") {
         params.server_port = std::stoi(ARGV_NEXT);
+    } else if (arg == "--ws-port") {
+        params.server_ws_port = std::stoi(ARGV_NEXT);
     } else if (arg == "--api-keys") {
         params.server_api_keys = ARGV_NEXT;
     } else if (arg == "--stream-step") {
@@ -747,7 +755,7 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
 static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params& params) {
     fprintf(stderr, "\n");
     fprintf(stderr, "usage: %s [options] file0 file1 ...\n", argv[0]);
-    fprintf(stderr, "supported audio formats: flac, mp3, ogg, wav\n");
+    fprintf(stderr, "supported audio formats: wav, mp3, flac, ogg (native); m4a, aac, opus, webm, wma (via ffmpeg)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h,        --help                 [default] show this help message and exit\n");
@@ -770,7 +778,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "  -sow,      --split-on-word        [%-7s] split on word rather than on token\n",
             params.split_on_word ? "true" : "false");
     fprintf(stderr, "  -bo N,     --best-of N            [%-7d] number of best candidates to keep\n", params.best_of);
-    fprintf(stderr, "  -bs N,     --beam-size N          [%-7d] beam size for beam search\n", params.beam_size);
+    fprintf(stderr, "  -bs N,     --beam-size N          [%-7s] beam size (default: greedy, -bs 5 for beam search)\n",
+            params.beam_size > 0 ? std::to_string(params.beam_size).c_str() : "greedy");
     fprintf(stderr, "  -ac N,     --audio-ctx N          [%-7d] audio context size (0 - all)\n", params.audio_ctx);
     fprintf(stderr, "  -wt N,     --word-thold N         [%-7.2f] word timestamp probability threshold\n",
             params.word_thold);
@@ -978,8 +987,16 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.server ? "true" : "false");
     fprintf(stderr, "  --host HOST                       [%-7s] server bind address\n", params.server_host.c_str());
     fprintf(stderr, "  --port PORT                       [%-7d] server port\n", params.server_port);
+    fprintf(stderr,
+            "  --ws-port PORT                    [%-7d] server: real-time WebSocket ASR streaming port "
+            "(-1 off, 0 = port+1)\n",
+            params.server_ws_port);
     fprintf(stderr, "  --api-keys K1,K2                  [%-7s] comma-separated server API keys\n",
             params.server_api_keys.empty() ? "" : "(set)");
+    fprintf(
+        stderr,
+        "  --no-warmup                       [%-7s] server: skip startup warmup (workaround for Vulkan hangs, #165)\n",
+        params.no_warmup ? "true" : "false");
     fprintf(stderr, "  --stream-step N                   [%-7d] chunk size in ms for streaming\n",
             params.stream_step_ms);
     fprintf(stderr,
@@ -1027,6 +1044,12 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.lcs_min_length);
     fprintf(stderr, "             -m auto                        download a default model for the chosen backend\n");
     // Text-To-Speech (TTS) parameters — vibevoice and qwen3-tts backends
+    fprintf(stderr, "\nSpeech-to-speech (S2S) options:\n");
+    fprintf(stderr, "             --s2s                   [%-7s] speech-to-speech mode: audio input → audio output\n",
+            params.s2s ? "true" : "false");
+    fprintf(stderr, "             --s2s-output FNAME      [%-7s] output WAV path (default: s2s_output.wav)\n",
+            params.s2s_output.c_str());
+
     fprintf(stderr, "\nText-to-speech (TTS) options:\n");
     fprintf(stderr,
             "             --tts \"TEXT\"            synthesise TEXT and write WAV to --tts-output (24 kHz mono)\n");
@@ -2260,9 +2283,9 @@ int main(int argc, char** argv) {
                     "%s: processing '%s' (%d samples, %.1f sec), %d threads, %d processors, %d beams + best of %d, "
                     "lang = %s, task = %s, %stimestamps = %d ...\n",
                     __func__, fname_inp.c_str(), int(pcmf32.size()), float(pcmf32.size()) / CRISPASR_SAMPLE_RATE,
-                    params.n_threads, params.n_processors, params.beam_size, params.best_of, params.language.c_str(),
-                    params.translate ? "translate" : "transcribe", params.tinydiarize ? "tdrz = 1, " : "",
-                    params.no_timestamps ? 0 : 1);
+                    params.n_threads, params.n_processors, std::max(1, params.beam_size), params.best_of,
+                    params.language.c_str(), params.translate ? "translate" : "transcribe",
+                    params.tinydiarize ? "tdrz = 1, " : "", params.no_timestamps ? 0 : 1);
 
             if (params.print_colors) {
                 fprintf(stderr, "%s: color scheme: red (low confidence), yellow (medium), green (high confidence)\n",
@@ -2311,7 +2334,7 @@ int main(int argc, char** argv) {
             wparams.carry_initial_prompt = params.carry_initial_prompt;
 
             wparams.greedy.best_of = params.best_of;
-            wparams.beam_search.beam_size = params.beam_size;
+            wparams.beam_search.beam_size = params.beam_size > 0 ? params.beam_size : 5;
 
             wparams.temperature_inc = params.no_fallback ? 0.0f : params.temperature_inc;
             wparams.temperature = params.temperature;

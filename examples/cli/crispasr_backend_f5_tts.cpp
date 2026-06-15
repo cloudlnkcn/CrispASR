@@ -30,14 +30,14 @@ static std::vector<float> read_wav_mono(const std::string& path, int* out_sr) {
     if (!f)
         return {};
     char riff[4];
-    fread(riff, 1, 4, f);
+    (void)!fread(riff, 1, 4, f);
     if (memcmp(riff, "RIFF", 4) != 0) {
         fclose(f);
         return {};
     }
     fseek(f, 8, SEEK_SET); // skip file size
     char wave[4];
-    fread(wave, 1, 4, f);
+    (void)!fread(wave, 1, 4, f);
     if (memcmp(wave, "WAVE", 4) != 0) {
         fclose(f);
         return {};
@@ -54,16 +54,16 @@ static std::vector<float> read_wav_mono(const std::string& path, int* out_sr) {
             break;
         if (memcmp(id, "fmt ", 4) == 0) {
             uint16_t fmt;
-            fread(&fmt, 2, 1, f);
+            (void)!fread(&fmt, 2, 1, f);
             uint16_t ch;
-            fread(&ch, 2, 1, f);
+            (void)!fread(&ch, 2, 1, f);
             channels = ch;
             uint32_t s;
-            fread(&s, 4, 1, f);
+            (void)!fread(&s, 4, 1, f);
             sr = (int)s;
             fseek(f, 6, SEEK_CUR); // byte rate + block align
             uint16_t b;
-            fread(&b, 2, 1, f);
+            (void)!fread(&b, 2, 1, f);
             bits = b;
             if (sz > 16)
                 fseek(f, sz - 16, SEEK_CUR);
@@ -75,11 +75,11 @@ static std::vector<float> read_wav_mono(const std::string& path, int* out_sr) {
                 for (int c = 0; c < channels; c++) {
                     if (bits == 16) {
                         int16_t v;
-                        fread(&v, 2, 1, f);
+                        (void)!fread(&v, 2, 1, f);
                         sum += (float)v / 32768.0f;
                     } else if (bits == 32) {
                         int32_t v;
-                        fread(&v, 4, 1, f);
+                        (void)!fread(&v, 4, 1, f);
                         sum += (float)v / 2147483648.0f;
                     }
                 }

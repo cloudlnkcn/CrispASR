@@ -2075,7 +2075,7 @@ extern "C" int cosyvoice3_tts_init_flow_from_file(struct cosyvoice3_tts_context*
 //
 //   AdaLayerNormZero.forward(x, emb):
 //     emb = self.linear(self.silu(emb))                              # (B, 6d)
-//     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp \
+//     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 //         = torch.chunk(emb, 6, dim=1)
 //     x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
 //     return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
@@ -3837,7 +3837,7 @@ ggml_cgraph* cv3_build_hift_decode_graph(cosyvoice3_tts_context* ctx, int T_mel)
 
     for (int i = 0; i < 3; i++) {
         const int u = up_rates[i];
-        const int ch_out = base >> (i + 1); // 256, 128, 64
+        // ch_out = base >> (i + 1) = 256, 128, 64
 
         // LeakyReLU(slope=0.1) → CausalConv1dUpsample = Upsample(nearest, u) + CausalConv1d(K, left-pad K-1).
         x = ggml_leaky_relu(ctx0, x, slope, /*inplace*/ false);

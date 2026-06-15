@@ -87,6 +87,7 @@ to the [TTS table](#text-to-speech-models) for the synthesis side.
 | **canary** | [`nvidia/canary-1b-v2`](https://huggingface.co/nvidia/canary-1b-v2) | FastConformer + Transformer decoder | 25 EU (explicit `-sl/-tl`) | CC-BY-4.0 |
 | **lfm2-audio** | [`LiquidAI/LFM2.5-Audio-1.5B`](https://huggingface.co/cstr/lfm2-audio-1.5b-GGUF) | FastConformer + LFM2 hybrid conv+attention backbone (ASR+TTS) | en | LFM Open v1.0 |
 | **lfm2-audio** | [`LiquidAI/LFM2.5-Audio-1.5B-JP`](https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF) | FastConformer + LFM2 hybrid conv+attention backbone (ASR+TTS) | ja | LFM Open v1.0 |
+| **mini-omni2** | [`gpt-omni/mini-omni2`](https://huggingface.co/gpt-omni/mini-omni2) | Whisper-small + Qwen2-0.5B (ASR+TTS+S2S) | en | MIT |
 | **cohere** | [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | Conformer + Transformer | 13 | Apache-2.0 |
 | **cohere** | [`efwkjn/cohere-asr-ja-v0.1`](https://huggingface.co/TransWithAI/cohere-transcribe-ja-v0.1-GGUF) | Japanese fine-tune of cohere-transcribe-03-2026 (TedX/JSUT-tuned) | Japanese | Apache-2.0 |
 | **granite** | [`ibm-granite/granite-speech-{3.2-8b,3.3-2b,3.3-8b}`](https://huggingface.co/ibm-granite/granite-speech-3.3-2b), [`granite-4.0-1b-speech`](https://huggingface.co/ibm-granite/granite-4.0-1b-speech) | Conformer + Q-Former + Granite LLM (μP) ([more](docs/architecture.md#granite--granite-41--granite-41-plus--granite-41-nar)) | en fr de es pt ja | Apache-2.0 |

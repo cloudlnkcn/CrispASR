@@ -33,6 +33,13 @@ See `tests/env-live-tests.sh` for the full list.
 
 Must use clang-format v18 — `tools/format.sh` enforces this.
 
+## Storage
+
+- **GGUF models**: `/mnt/storage/gguf-models` — all converted GGUF files live here
+- **NEVER use `/tmp`** — it is a tiny tmpfs that fills up and kills processes. Use `/mnt/volume1/tmp-overflow` for temp files, or write directly to `/mnt/storage` or `/mnt/volume1`.
+- **HuggingFace cache**: `/mnt/akademie_storage/huggingface/hub/`
+- **ccache**: `/mnt/volume1/.ccache`
+
 ## Commit workflow
 
 - No PRs — merge locally and push to main directly

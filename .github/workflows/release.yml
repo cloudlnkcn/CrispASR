@@ -31,7 +31,9 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_OPENBLAS=ON
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
       - name: Package
@@ -136,6 +138,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
@@ -196,6 +199,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
@@ -255,6 +259,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_VULKAN=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
             -DCRISPASR_BUILD_SERVER=OFF
@@ -336,6 +341,7 @@ jobs:
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PLATFORM_NO_VERSIONED_SONAME=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF
           cmake --build build -j$(nproc)
@@ -591,6 +597,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF
@@ -859,7 +866,8 @@ jobs:
       - name: Build (shared libs, Vulkan)
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build-libs ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DBUILD_SHARED_LIBS=ON ^
@@ -965,6 +973,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
@@ -1012,7 +1021,8 @@ jobs:
   # tarball is self-contained for downstream Windows consumers — matches
   # the existing build-windows-cuda EXE bundle's pattern.
   build-libs-windows-x86_64-cuda:
-    runs-on: windows-latest
+    # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
+    runs-on: windows-2022
     env:
       CUDA_VERSION: "12.8.0"
     steps:
@@ -1031,7 +1041,8 @@ jobs:
       - name: Build (shared libs, CUDA)
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build-libs -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DBUILD_SHARED_LIBS=ON ^
@@ -1238,7 +1249,8 @@ jobs:
 
   # ── Windows CUDA (dynamic, requires NVIDIA driver on target machine) ─────────
   build-windows-cuda:
-    runs-on: windows-latest
+    # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
+    runs-on: windows-2022
     env:
       CUDA_VERSION: "12.8.0"
     steps:
@@ -1263,7 +1275,8 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
@@ -1320,7 +1333,8 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_VULKAN=ON ^

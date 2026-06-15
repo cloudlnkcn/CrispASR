@@ -695,9 +695,18 @@ def convert(model_dir: Path, out_path: Path) -> None:
             continue
         tensors.append((gguf_name, f32(emb)))
 
-    # --- Add tokenizer vocab ---
+    # --- Add tokenizer vocab + merges ---
     if vocab:
         metadata["tokenizer.ggml.tokens"] = vocab
+
+    # BPE merges from tokenizer.json
+    if tokenizer_path.exists():
+        with open(tokenizer_path, encoding="utf-8") as f:
+            tok_data = json.load(f)
+        merges = tok_data.get("model", {}).get("merges", [])
+        if merges:
+            metadata["tokenizer.ggml.merges"] = merges
+            print(f"  Added {len(merges)} BPE merges")
 
     # --- Compute and add preprocessor mel filterbank + window ---
     # The liquid-audio conformer uses librosa.filters.mel with slaney norm,

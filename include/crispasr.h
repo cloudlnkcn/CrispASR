@@ -616,6 +616,24 @@ CRISPASR_API float* crispasr_session_synthesize(struct crispasr_session* s, cons
 CRISPASR_API float* crispasr_session_synthesize_raw(struct crispasr_session* s, const char* text, int* out_n_samples);
 CRISPASR_API void crispasr_pcm_free(float* pcm);
 
+// Speech-to-Speech — audio in → audio out via a single model pass.
+// Supported on backends with S2S capability (lfm2-audio, mini-omni2).
+// Returns malloc'd float32 PCM; caller frees with crispasr_pcm_free().
+// out_text (optional): if non-null, receives the intermediate transcript
+// (malloc'd, caller frees with free()). Returns nullptr on failure or
+// if the backend doesn't support S2S.
+CRISPASR_API float* crispasr_session_speech_to_speech(struct crispasr_session* s,
+                                                       const float* in_samples, int n_in_samples,
+                                                       char** out_text, int* out_n_samples);
+
+// Set hotwords for contextual biasing. Comma-separated list of words or
+// phrases. For CTC/TDT backends (parakeet), configures the Aho-Corasick
+// trie with the given boost factor. For LLM backends, the hotwords are
+// prepended to the ask prompt on the next transcribe call.
+// Pass NULL or empty string to clear. Returns 0 on success.
+CRISPASR_API int crispasr_session_set_hotwords(struct crispasr_session* s,
+                                                const char* hotwords, float boost);
+
 // Human-readable error from the last failed synthesize call. Empty string
 // when the last call succeeded. Pointer owned by the session.
 CRISPASR_API const char* crispasr_session_last_synth_error(struct crispasr_session* s);

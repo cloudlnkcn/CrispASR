@@ -1377,7 +1377,7 @@ class Session:
             self._lib.crispasr_session_result_free(res)
 
     # ---------------------------------------------------------------------
-    # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada)
+    # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio)
     # ---------------------------------------------------------------------
 
     def set_codec_path(self, path: str) -> None:
@@ -1551,6 +1551,46 @@ class Session:
         rc = self._lib.crispasr_session_set_punctuation(self._handle, 1 if enable else 0)
         if rc != 0:
             raise RuntimeError(f"set_punctuation failed (rc={rc})")
+
+    def set_punc_model(self, punc_model: str) -> None:
+        """Select + load a punctuation-restoration model on the session.
+
+        ``punc_model`` is an alias (``auto`` / ``firered`` / ``fullstop`` /
+        ``punctuate-all`` / ``pcs``) or a path to a ``.gguf``; ``"none"`` or
+        ``""`` unloads. The model auto-downloads on first use. This restores
+        punctuation on backends that emit none (parakeet RNNT/CTC, etc.) —
+        the same post-processor the CLI ``--punc-model`` and server apply.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_punc_model"):
+            raise RuntimeError("punc-model API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_punc_model.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_punc_model.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_punc_model(self._handle, (punc_model or "").encode("utf-8"))
+        if rc != 0:
+            raise RuntimeError(f"set_punc_model failed (rc={rc})")
+
+    def set_hotwords(self, hotwords: str, boost: float = 2.0) -> None:
+        """Contextual biasing: comma-separated words/phrases to boost during
+        decoding. Parakeet CTC/TDT use an Aho-Corasick trie; LLM backends inject
+        them into the prompt. Empty string clears."""
+        if not hasattr(self._lib, "crispasr_session_set_hotwords"):
+            raise RuntimeError("session-state API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_hotwords.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_float]
+        self._lib.crispasr_session_set_hotwords.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_hotwords(self._handle, (hotwords or "").encode("utf-8"), float(boost))
+        if rc != 0:
+            raise RuntimeError(f"set_hotwords failed (rc={rc})")
+
+    def set_g2p_dict(self, source: str) -> None:
+        """Select the G2P pronunciation dictionary for TTS phonemization
+        (``olaph`` / ``open-dict`` or a path). Empty string keeps the default."""
+        if not hasattr(self._lib, "crispasr_session_set_g2p_dict"):
+            raise RuntimeError("session-state API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_g2p_dict.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_g2p_dict.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_g2p_dict(self._handle, (source or "").encode("utf-8"))
+        if rc != 0:
+            raise RuntimeError(f"set_g2p_dict failed (rc={rc})")
 
     def set_translate(self, enable: bool) -> None:
         """Whisper sticky ``--translate``. For canary/cohere/voxtral the
@@ -1795,7 +1835,13 @@ class Session:
             raise RuntimeError(f"set_whisper_decode_extras failed (rc={rc})")
 
     def set_ask(self, prompt: str) -> None:
-        """Set a free-form prompt passed to the backend on the next transcribe/synthesize call."""
+        """Set a free-form prompt passed to the backend on the next transcribe/synthesize call.
+
+        Supported by: granite, voxtral, qwen3-asr, glm-asr, gemma4-e2b,
+        mimo-asr, moss-audio, lfm2-audio, mini-omni2. For moss-audio this
+        enables audio understanding beyond ASR (e.g. "Describe the sounds
+        in this clip." or "What language is spoken?").
+        """
         if not hasattr(self._lib, "crispasr_session_set_ask"):
             return
         self._lib.crispasr_session_set_ask.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -2040,7 +2086,7 @@ class Session:
         ``kokoro``, ``orpheus``, ``chatterbox``, ``indextts``, ``voxcpm2-tts``,
         ``csm``, ``dia``, ``fastpitch``, ``speecht5``, ``melotts``, ``piper``,
         ``parler-tts``, ``outetts``, ``cosyvoice3-tts``, ``pocket-tts``,
-        ``f5-tts``, ``bark``, ``kugelaudio``, ``tada``.
+        ``f5-tts``, ``bark``, ``kugelaudio``, ``tada``, ``lfm2-audio``.
         For qwen3-tts call :meth:`set_codec_path` and one of:
 
         * :meth:`set_voice` — Base variants (WAV + ref_text, or voice-pack GGUF)
@@ -2071,6 +2117,51 @@ class Session:
         finally:
             self._lib.crispasr_pcm_free(ptr)
         return arr
+
+    def speech_to_speech(self, input_pcm: "np.ndarray", language: str = None) -> tuple:
+        """Speech-to-speech: audio in → audio out via a single model pass.
+
+        Supported on backends with S2S capability (``lfm2-audio``,
+        ``mini-omni2``).  Input is 16 kHz mono float32 PCM.  Returns a
+        tuple ``(output_pcm, transcript)`` where *output_pcm* is a
+        float32 numpy array at the backend's TTS sample rate (typically
+        24 kHz) and *transcript* is the intermediate ASR text (may be
+        empty if the backend doesn't produce one).
+
+        Raises :class:`RuntimeError` if the C ABI lacks the symbol or
+        if the backend doesn't support S2S.
+        """
+        if not hasattr(self._lib, "crispasr_session_speech_to_speech"):
+            raise RuntimeError("S2S API not present in this libcrispasr build")
+        self._lib.crispasr_session_speech_to_speech.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self._lib.crispasr_session_speech_to_speech.restype = ctypes.POINTER(ctypes.c_float)
+        self._lib.crispasr_pcm_free.argtypes = [ctypes.POINTER(ctypes.c_float)]
+        self._lib.crispasr_pcm_free.restype = None
+        import numpy as np
+        in_arr = np.ascontiguousarray(input_pcm, dtype=np.float32)
+        in_ptr = in_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        text_out = ctypes.c_char_p(None)
+        n_out = ctypes.c_int(0)
+        ptr = self._lib.crispasr_session_speech_to_speech(
+            self._handle, in_ptr, len(in_arr),
+            ctypes.byref(text_out), ctypes.byref(n_out))
+        if not ptr or n_out.value <= 0:
+            raise RuntimeError(f"speech_to_speech returned no audio for backend {self.backend!r}")
+        try:
+            arr = np.ctypeslib.as_array(ptr, shape=(n_out.value,)).copy()
+        finally:
+            self._lib.crispasr_pcm_free(ptr)
+        transcript = text_out.value.decode("utf-8") if text_out.value else ""
+        if text_out.value and hasattr(self._lib, "crispasr_session_translate_text_free"):
+            self._lib.crispasr_session_translate_text_free.argtypes = [ctypes.c_char_p]
+            self._lib.crispasr_session_translate_text_free.restype = None
+            self._lib.crispasr_session_translate_text_free(text_out)
+        return arr, transcript
 
     def close(self) -> None:
         if getattr(self, "_handle", None):

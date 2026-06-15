@@ -12,6 +12,8 @@
 // published — these are part of CrispASR's published ABI contract shared
 // across all four consumers above.
 
+#include "crispasr_session.h"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +22,7 @@
 #include <cmath>
 #include <algorithm>
 #include <string>
+#include <sstream>
 #include <vector>
 
 #include "crispasr.h"
@@ -33,6 +36,7 @@
 #include "crispasr_aligner.h"        // CTC / forced-aligner word timings (shared with CLI)
 #include "crispasr_cache.h"          // HF download + filesystem cache (shared with CLI)
 #include "crispasr_model_registry.h" // Known-model lookup (shared with CLI)
+#include "crispasr_punc_model.h"     // shared --punc-model alias resolution (CLI/server/C-ABI parity)
 #include "core/beam_decode.h"        // Shared autoregressive beam-search decode helper
 #include "core/greedy_decode.h"      // Shared autoregressive greedy decode helper
 #include "grammar-parser.h"          // GBNF parser for grammar-constrained sampling
@@ -51,6 +55,10 @@
 #if __has_include("lfm2_audio.h")
 #include "lfm2_audio.h"
 #define CA_HAVE_LFM2_AUDIO 1
+#endif
+#if __has_include("mini_omni2.h")
+#include "mini_omni2.h"
+#define CA_HAVE_MINI_OMNI2 1
 #endif
 #if __has_include("qwen3_asr.h")
 #include "qwen3_asr.h"
@@ -1313,6 +1321,13 @@ struct crispasr_session {
     std::string target_language; // canary/cohere/voxtral target-lang (≠ source ⇒ translate)
     bool punctuation = true;     // canary/cohere per-call arg + post-process gate
     bool translate = false;      // whisper sticky --translate (others: use src/tgt mismatch)
+
+    // --punc-model post-processor (set via crispasr_session_set_punc_model).
+    // Held as void* so the struct doesn't depend on the optionally-compiled
+    // fireredpunc/pcs headers; at most one is non-null. Applied per segment
+    // after transcription (gated on `punctuation`), mirroring the CLI/server.
+    void* punc_ctx = nullptr; // fireredpunc_context*
+    void* pcs_ctx = nullptr;  // pcs_context*
     // Free-form audio Q&A prompt for instruct-tuned audio-LLM backends
     // (voxtral / voxtral4b / qwen3-asr). When non-empty, replaces the
     // standard "lang:<X>[TRANSCRIBE]" suffix with `[/INST]<prompt>`,
@@ -1399,6 +1414,14 @@ struct crispasr_session {
     uint32_t grammar_root_rule_id = 0;
     bool grammar_active = false;
 
+    // Session-level hotwords for contextual biasing (PLAN §5.26.2).
+    // Stored as a comma-separated string; parsed into per-backend form
+    // on the next transcribe call. For parakeet CTC/TDT, the parsed
+    // words are fed to parakeet_set_hotwords(); for LLM backends, they
+    // are injected into the ask prompt.
+    std::string hotwords;
+    float hotwords_boost = 1.5f;
+
     // Exactly one of these pointers is non-null based on `backend`.
     whisper_context* whisper_ctx = nullptr;
 #ifdef CA_HAVE_PARAKEET
@@ -1409,6 +1432,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_LFM2_AUDIO
     lfm2_audio_context* lfm2_audio_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    mini_omni2_context* mini_omni2_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_QWEN3
     qwen3_asr_context* qwen3_ctx = nullptr;
@@ -1821,6 +1847,20 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.use_gpu = g_open_use_gpu_tls;
         s->lfm2_audio_ctx = lfm2_audio_init_from_file(model_path, p);
         if (!s->lfm2_audio_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if (s->backend == "mini-omni2" || s->backend == "mini_omni2" || s->backend == "miniomni2") {
+        mini_omni2_context_params p = mini_omni2_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->mini_omni2_ctx = mini_omni2_init_from_file(model_path, p);
+        if (!s->mini_omni2_ctx) {
             delete s;
             return nullptr;
         }
@@ -2805,6 +2845,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_LFM2_AUDIO
     list += ",lfm2-audio";
 #endif
+#ifdef CA_HAVE_MINI_OMNI2
+    list += ",mini-omni2";
+#endif
 #ifdef CA_HAVE_QWEN3
     list += ",qwen3";
 #endif
@@ -3211,6 +3254,10 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
 static crispasr_session_result* transcribe_single(crispasr_session* s, const float* pcm, int n_samples,
                                                   const char* language);
 
+// Applies the session's resident --punc-model (if any) to a result in place.
+// Defined further down next to crispasr_session_set_punc_model.
+static void apply_session_punc_model(crispasr_session* s, crispasr_session_result* r);
+
 CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_session* s, const float* pcm,
                                                                     int n_samples, const char* language) {
     if (!s || !pcm || n_samples <= 0)
@@ -3220,8 +3267,11 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
     // highest average per-token confidence. Whisper handles best_of internally
     // via greedy.best_of, so we only loop externally for non-whisper backends.
     const int n_runs = (s->best_of > 1 && s->backend != "whisper") ? s->best_of : 1;
-    if (n_runs <= 1)
-        return transcribe_single(s, pcm, n_samples, language);
+    if (n_runs <= 1) {
+        crispasr_session_result* r = transcribe_single(s, pcm, n_samples, language);
+        apply_session_punc_model(s, r);
+        return r;
+    }
 
     crispasr_session_result* best = nullptr;
     double best_avg_p = -1.0;
@@ -3248,6 +3298,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
             delete candidate;
         }
     }
+    apply_session_punc_model(s, best);
     return best;
 }
 
@@ -3255,6 +3306,28 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                                                   const char* language) {
     const std::string lang = (language && *language) ? language : "en";
     const bool lang_set = (language && *language);
+
+    // §5.26.2 — Hotword injection for LLM backends. Temporarily prepend
+    // the hotword phrasing to s->ask so every LLM dispatch path picks it
+    // up through the existing ask-prompt injection. Parakeet CTC/TDT
+    // hotwords are applied directly via parakeet_set_hotwords() in
+    // crispasr_session_set_hotwords() — no ask-prompt injection needed.
+    std::string saved_ask;
+    if (!s->hotwords.empty()) {
+        saved_ask = s->ask;
+        const std::string hw_hint = "The following words may appear in the audio: " + s->hotwords + ". ";
+        s->ask = s->ask.empty() ? hw_hint : hw_hint + s->ask;
+    }
+    // Scope guard: restore original ask on all exit paths.
+    struct AskGuard {
+        crispasr_session* s;
+        std::string* saved;
+        bool active;
+        ~AskGuard() {
+            if (active)
+                s->ask = std::move(*saved);
+        }
+    } ask_guard{s, &saved_ask, !s->hotwords.empty()};
 
     auto* r = new crispasr_session_result();
     r->backend = s->backend;
@@ -3487,7 +3560,30 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
 #endif
 #ifdef CA_HAVE_LFM2_AUDIO
     if (s->backend == "lfm2-audio" && s->lfm2_audio_ctx) {
-        char* text = lfm2_audio_transcribe(s->lfm2_audio_ctx, pcm, n_samples, nullptr, 0);
+        // Forward language hint or ask prompt; fall back to the session language
+        const char* lfm2_prompt = nullptr;
+        if (!s->ask.empty())
+            lfm2_prompt = s->ask.c_str();
+        else if (lang_set)
+            lfm2_prompt = lang.c_str();
+        char* text = lfm2_audio_transcribe(s->lfm2_audio_ctx, pcm, n_samples, lfm2_prompt, 0);
+        if (!text) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        free(text);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if ((s->backend == "mini-omni2" || s->backend == "mini_omni2" || s->backend == "miniomni2") && s->mini_omni2_ctx) {
+        mini_omni2_set_ask(s->mini_omni2_ctx, s->ask.empty() ? nullptr : s->ask.c_str());
+        char* text = mini_omni2_transcribe(s->mini_omni2_ctx, pcm, n_samples);
         if (!text) {
             delete r;
             return nullptr;
@@ -4383,6 +4479,8 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (!text && s->backend == "funasr" && s->funasr_ctx) {
             if (s->beam_size > 1)
                 funasr_set_beam_size(s->funasr_ctx, s->beam_size);
+            if (!s->source_language.empty())
+                funasr_set_language(s->funasr_ctx, s->source_language.c_str());
             text = funasr_transcribe(s->funasr_ctx, pcm, n_samples);
             need_free = true;
         }
@@ -5712,6 +5810,11 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         return lfm2_audio_synthesize(s->lfm2_audio_ctx, text, nullptr, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if (s->mini_omni2_ctx) {
+        return mini_omni2_synthesize(s->mini_omni2_ctx, text, out_n_samples);
+    }
+#endif
 #ifdef CA_HAVE_CSM
     if (s->csm_tts_ctx) {
         // CSM emits 24 kHz mono float — same convention as the other TTS
@@ -5954,6 +6057,96 @@ CA_EXPORT void crispasr_pcm_free(float* pcm) {
     free(pcm);
 }
 
+// =========================================================================
+// Speech-to-Speech — audio in → audio out via a single model pass.
+// =========================================================================
+
+CA_EXPORT float* crispasr_session_speech_to_speech(crispasr_session* s, const float* in_samples, int n_in_samples,
+                                                   char** out_text, int* out_n_samples) {
+    if (!s || !in_samples || n_in_samples <= 0)
+        return nullptr;
+    if (out_n_samples)
+        *out_n_samples = 0;
+    if (out_text)
+        *out_text = nullptr;
+
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->lfm2_audio_ctx) {
+        char* text = nullptr;
+        int n = 0;
+        float* pcm =
+            lfm2_audio_speech_to_speech(s->lfm2_audio_ctx, in_samples, n_in_samples,
+                                        s->source_language.empty() ? nullptr : s->source_language.c_str(), &text, &n);
+        if (out_n_samples)
+            *out_n_samples = n;
+        if (out_text)
+            *out_text = text;
+        else
+            free(text);
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if (s->mini_omni2_ctx) {
+        char* text = nullptr;
+        int n = 0;
+        float* pcm = mini_omni2_speech_to_speech(s->mini_omni2_ctx, in_samples, n_in_samples, &text, &n);
+        if (out_n_samples)
+            *out_n_samples = n;
+        if (out_text)
+            *out_text = text;
+        else
+            free(text);
+        return pcm;
+    }
+#endif
+
+    s->last_synth_error = "backend '" + s->backend + "' does not support speech-to-speech";
+    return nullptr;
+}
+
+// =========================================================================
+// Hotwords / contextual biasing — session-level setter.
+// =========================================================================
+
+CA_EXPORT int crispasr_session_set_hotwords(crispasr_session* s, const char* hotwords, float boost) {
+    if (!s)
+        return -1;
+    s->hotwords = hotwords ? hotwords : "";
+    s->hotwords_boost = boost > 0.0f ? boost : 1.5f;
+
+    // For parakeet CTC/TDT, apply immediately to the trie.
+#ifdef CA_HAVE_PARAKEET
+    if (s->parakeet_ctx) {
+        if (s->hotwords.empty()) {
+            parakeet_set_hotwords(s->parakeet_ctx, nullptr, 0, 0.0f);
+        } else {
+            // Parse comma-separated hotwords into an array of C strings.
+            std::vector<std::string> hw_strings;
+            std::istringstream iss(s->hotwords);
+            std::string token;
+            while (std::getline(iss, token, ',')) {
+                // Trim whitespace.
+                size_t start = token.find_first_not_of(" \t");
+                size_t end = token.find_last_not_of(" \t");
+                if (start != std::string::npos)
+                    hw_strings.push_back(token.substr(start, end - start + 1));
+            }
+            std::vector<const char*> ptrs;
+            ptrs.reserve(hw_strings.size());
+            for (auto& w : hw_strings)
+                ptrs.push_back(w.c_str());
+            parakeet_set_hotwords(s->parakeet_ctx, ptrs.data(), (int)ptrs.size(), s->hotwords_boost);
+        }
+    }
+#endif
+
+    // For LLM backends, hotwords are injected into the ask prompt at
+    // transcribe time. The stored string is consumed in the transcribe
+    // dispatch path via s->hotwords. No immediate action needed.
+    return 0;
+}
+
 // Returns a human-readable error description when the last synthesize call
 // returned nullptr. Empty string when the last call succeeded or no error
 // detail is available. The returned pointer is owned by the session — valid
@@ -6092,6 +6285,14 @@ CA_EXPORT crispasr_stream* crispasr_session_stream_open(crispasr_session* s, int
 CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (!s)
         return;
+#ifdef CA_HAVE_FIREREDPUNC
+    if (s->punc_ctx)
+        fireredpunc_free((fireredpunc_context*)s->punc_ctx);
+#endif
+#ifdef CA_HAVE_PCS
+    if (s->pcs_ctx)
+        pcs_free((pcs_context*)s->pcs_ctx);
+#endif
     if (s->whisper_ctx)
         whisper_free(s->whisper_ctx);
 #ifdef CA_HAVE_PARAKEET
@@ -6105,6 +6306,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_LFM2_AUDIO
     if (s->lfm2_audio_ctx)
         lfm2_audio_free(s->lfm2_audio_ctx);
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if (s->mini_omni2_ctx)
+        mini_omni2_free(s->mini_omni2_ctx);
 #endif
 #ifdef CA_HAVE_QWEN3
     if (s->qwen3_ctx)
@@ -6306,7 +6511,7 @@ CA_EXPORT const char* crispasr_punc_process(void* ctx, const char* text) {
 }
 
 CA_EXPORT void crispasr_punc_free_text(const char* text) {
-    free((void*)text);
+    free(const_cast<char*>(text));
 }
 
 CA_EXPORT void crispasr_punc_free(void* ctx) {
@@ -6341,7 +6546,7 @@ CA_EXPORT const char* crispasr_truecase_process(void* ctx, const char* text) {
     return truecaser_lstm_process((truecaser_lstm_context*)ctx, text);
 }
 CA_EXPORT void crispasr_truecase_free_text(const char* text) {
-    free((void*)text);
+    free(const_cast<char*>(text));
 }
 CA_EXPORT void crispasr_truecase_free(void* ctx) {
     truecaser_lstm_free((truecaser_lstm_context*)ctx);
@@ -6354,7 +6559,7 @@ CA_EXPORT const char* crispasr_truecase_process(void* ctx, const char* text) {
     return truecaser_process((truecaser_context*)ctx, text);
 }
 CA_EXPORT void crispasr_truecase_free_text(const char* text) {
-    free((void*)text);
+    free(const_cast<char*>(text));
 }
 CA_EXPORT void crispasr_truecase_free(void* ctx) {
     truecaser_free((truecaser_context*)ctx);
@@ -6383,7 +6588,7 @@ CA_EXPORT const char* crispasr_pcs_process(void* ctx, const char* text) {
     return pcs_process((pcs_context*)ctx, text);
 }
 CA_EXPORT void crispasr_pcs_free_text(const char* text) {
-    free((void*)text);
+    free(const_cast<char*>(text));
 }
 CA_EXPORT void crispasr_pcs_free(void* ctx) {
     pcs_free((pcs_context*)ctx);
@@ -6535,6 +6740,82 @@ CA_EXPORT int crispasr_session_set_punctuation(crispasr_session* s, int enable) 
         return -1;
     s->punctuation = (enable != 0);
     return 0;
+}
+
+// Select + load a punctuation-restoration model on the session, the same way
+// the CLI `--punc-model` and the server do. `punc_model` is an alias
+// (auto|firered|fullstop|punctuate-all|pcs) or a direct .gguf path; the model
+// auto-downloads on first use. Pass "none"/""/NULL to unload. Restores
+// punctuation on non-PnC backends (parakeet RNNT/CTC, etc.) that emit none.
+// Returns 0 on success (incl. unload), -1 on bad handle, -2 if the requested
+// model failed to load, -3 if punctuation support wasn't compiled in.
+CA_EXPORT int crispasr_session_set_punc_model(crispasr_session* s, const char* punc_model) {
+    if (!s)
+        return -1;
+        // Unload any currently-resident context first.
+#ifdef CA_HAVE_FIREREDPUNC
+    if (s->punc_ctx) {
+        fireredpunc_free((fireredpunc_context*)s->punc_ctx);
+        s->punc_ctx = nullptr;
+    }
+#endif
+#ifdef CA_HAVE_PCS
+    if (s->pcs_ctx) {
+        pcs_free((pcs_context*)s->pcs_ctx);
+        s->pcs_ctx = nullptr;
+    }
+#endif
+
+    const crispasr_punc_spec spec = crispasr_resolve_punc_model(punc_model ? punc_model : "");
+    if (spec.kind == crispasr_punc_kind::none)
+        return 0; // unloaded / disabled
+
+    std::string path = spec.direct_path;
+    if (path.empty() && !spec.cache_filename.empty())
+        path = crispasr_cache::ensure_cached_file(spec.cache_filename, spec.url, /*quiet=*/true, "crispasr[punc]", "");
+    if (path.empty())
+        return -2;
+
+    if (spec.kind == crispasr_punc_kind::fireredpunc) {
+#ifdef CA_HAVE_FIREREDPUNC
+        s->punc_ctx = (void*)fireredpunc_init(path.c_str());
+        return s->punc_ctx ? 0 : -2;
+#else
+        return -3;
+#endif
+    }
+    if (spec.kind == crispasr_punc_kind::pcs) {
+#ifdef CA_HAVE_PCS
+        s->pcs_ctx = (void*)pcs_init(path.c_str());
+        return s->pcs_ctx ? 0 : -2;
+#else
+        return -3;
+#endif
+    }
+    return -2;
+}
+
+// Apply the session's resident punctuation model (if any) to every segment's
+// text, in place. PCS takes precedence over FireRedPunc. Gated on
+// `s->punctuation` so a caller that disabled punctuation still gets plain text.
+static void apply_session_punc_model(crispasr_session* s, crispasr_session_result* r) {
+    if (!s || !r || !s->punctuation)
+        return;
+    for (auto& seg : r->segments) {
+        char* out = nullptr;
+#ifdef CA_HAVE_PCS
+        if (s->pcs_ctx)
+            out = pcs_process((pcs_context*)s->pcs_ctx, seg.text.c_str());
+#endif
+#ifdef CA_HAVE_FIREREDPUNC
+        if (!out && s->punc_ctx)
+            out = fireredpunc_process((fireredpunc_context*)s->punc_ctx, seg.text.c_str());
+#endif
+        if (out) {
+            seg.text = out;
+            free(out);
+        }
+    }
 }
 
 // Sticky --translate toggle (whisper). For canary/cohere/voxtral the

@@ -377,6 +377,26 @@ catch_discover_tests(test-punctuation-policy
     PROPERTIES LABELS "unit"
 )
 
+# ─── test - punc - resolve — Catch2 unit tests for the shared --punc-model
+# resolver (CLI/server parity). Pure string mapping, header-only, no model load.
+add_executable(test-punc-resolve
+    test_punc_resolve.cpp
+)
+target_include_directories(test-punc-resolve PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-punc-resolve PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-punc-resolve
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test - diarize - global — Catch2 unit tests for global diarization logic (#110)
 add_executable(test-diarize-global
     test_diarize_global.cpp
@@ -409,6 +429,93 @@ target_link_libraries(test-paraformer PRIVATE
 )
 catch_discover_tests(test-paraformer
     TEST_SPEC "[paraformer]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - lfm2-audio — live integration tests for LFM2-Audio ASR + TTS
+add_executable(test-lfm2-audio
+    test_lfm2_audio_live.cpp
+)
+target_include_directories(test-lfm2-audio PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-lfm2-audio PRIVATE
+    Catch2::Catch2WithMain
+    lfm2_audio
+)
+catch_discover_tests(test-lfm2-audio
+    TEST_SPEC "[lfm2]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - snac — unit + live tests for core/snac.h (SNAC 24kHz decoder)
+add_executable(test-snac
+    test_snac_unit.cpp
+)
+target_include_directories(test-snac PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-snac PRIVATE
+    Catch2::Catch2WithMain
+    snac
+)
+catch_discover_tests(test-snac
+    TEST_SPEC "[unit][snac]"
+    PROPERTIES
+        LABELS unit
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+catch_discover_tests(test-snac
+    TEST_SPEC "[live][snac]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - mini-omni2 — live integration tests for Mini-Omni2 ASR + TTS + S2S
+add_executable(test-mini-omni2
+    test_mini_omni2_live.cpp
+)
+target_include_directories(test-mini-omni2 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-mini-omni2 PRIVATE
+    Catch2::Catch2WithMain
+    mini-omni2
+    orpheus
+)
+catch_discover_tests(test-mini-omni2
+    TEST_SPEC "[mini-omni2]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - moss-audio — live integration tests for MOSS-Audio-4B audio understanding
+add_executable(test-moss-audio
+    test_moss_audio_live.cpp
+)
+target_include_directories(test-moss-audio PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-moss-audio PRIVATE
+    Catch2::Catch2WithMain
+    moss_audio
+)
+catch_discover_tests(test-moss-audio
+    TEST_SPEC "[moss-audio]"
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4
@@ -502,6 +609,13 @@ target_link_libraries(test-flash-attn-defaults PRIVATE
     Catch2::Catch2WithMain
     crispasr-lib
 )
+# On MinGW's single-pass linker, kokoro (a transitive dep of crispasr-lib)
+# references phonemizer symbols that live in crispasr-lib itself. By the
+# time the linker reaches kokoro, those symbols have been discarded.
+# Linking crispasr-lib a second time lets the linker resolve the cycle.
+if (MINGW)
+    target_link_libraries(test-flash-attn-defaults PRIVATE crispasr-lib)
+endif()
 catch_discover_tests(test-flash-attn-defaults
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;flash_attn"
@@ -1286,6 +1400,26 @@ add_test(NAME test-progress-output
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-progress-output PROPERTIES
     LABELS "live;progress"
+    TIMEOUT 300)
+
+# ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
+# the same model a real `-m <alias>` would load (sub-variant keys, §166).
+# Needs only the built binary (no models / network); SKIPs if absent.
+add_test(NAME test-dry-run-resolve
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-dry-run-resolve.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-dry-run-resolve PROPERTIES
+    LABELS "cli"
+    TIMEOUT 60)
+
+# ─── test-server-ws-stream — live: --ws-port real-time WebSocket ASR streaming.
+# Raw-socket client (stdlib only) verifies the RFC 6455 handshake + a streaming
+# transcription. Needs a whisper ggml model; SKIPs otherwise.
+add_test(NAME test-server-ws-stream
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-server-ws-stream.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-ws-stream PROPERTIES
+    LABELS "live;server"
     TIMEOUT 300)
 
 # ─── test-release-workflow — validate release.yml targets (issue #131).

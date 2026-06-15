@@ -33,6 +33,9 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_alt_n(n)` | `set_alt_n` / `set_alt_n` / `SetAltN` / `setAltN` | Per-token alternative candidates (whisper greedy) |
 | `set_whisper_decode_extras(...)` | `set_whisper_decode_extras` / `set_whisper_decode_extras` / `SetWhisperDecodeExtras` / `setWhisperDecodeExtras` | suppress_nst, suppress_regex, carry_initial_prompt |
 | `set_ask(prompt)` | `set_ask` / `set_ask` / `SetAsk` / `setAsk` | Free-form prompt for instruct-tuned audio-LLM backends (granite, voxtral, qwen3-asr, glm-asr, gemma4-e2b, mimo-asr). Empty string clears. |
+| `set_punc_model(alias\|path)` | `set_punc_model` / `set_punc_model` / `SetPuncModel` / `setPuncModel` | Load FireRedPunc/PCS punctuation restoration on the session (`auto`/`firered`/`fullstop`/`punctuate-all`/`pcs`/path; auto-downloads). Restores punctuation on backends that emit none (parakeet RNNT/CTC, …). `"none"`/`""` unloads. (Also Java/Ruby.) |
+| `set_hotwords(words, boost)` | `set_hotwords` / `set_hotwords` / `SetHotwords` / `setHotwords` | Comma-separated contextual-biasing hotwords, boosted per token match (parakeet CTC/TDT trie; LLM-backend prompt injection). Empty string clears. (All six wrappers.) |
+| `set_g2p_dict(source)` | `set_g2p_dict` / `set_g2p_dict` / `SetG2PDict` / `setG2pDict` | Select the G2P pronunciation dictionary for TTS phonemization (`olaph`/`open-dict`/path). (All six wrappers.) |
 
 > **Tip — chunk-boundary dedup for bindings.** When a binding drives a
 > CAP_UNBOUNDED_INPUT backend (parakeet, canary, …) chunk-by-chunk and
@@ -51,9 +54,16 @@ backend doesn't expose that knob, but the call is safe to make.
 | Rust | ✓ | Full — same surface as Python |
 | Dart / Flutter | ✓ | Full — used by [CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver) |
 | Go | ✓ | Full (all 11 capabilities) |
-| Java | ✓ | Transcribe + align + LID |
-| Ruby | ✓ | Transcribe |
-| JavaScript | partial | WebAssembly approach; see PLAN.md #59 |
+| Java | ✓ | Transcribe + align + LID; full session-setter parity (JNA) |
+| Ruby | ✓ | Transcribe; full session-setter parity (C ext) |
+| JavaScript / WASM | ✓ | `asrOpen`/`asrTranscribe` + session setters (backend-agnostic); plus the whisper-only `init`/`full_default` and the TTS surface. Built with emcc. |
+
+> **Setter parity.** Python, Rust (`crispasr-sys` + `crispasr` at the repo root),
+> Go, Dart, Java, and Ruby all expose the complete `crispasr_session_set_*`
+> surface from `include/crispasr_session.h`. The native Node addon
+> (`examples/addon.node`) reaches it via `transcribeSession`; the WASM/JS binding
+> (`bindings/javascript/emscripten.cpp`) via the `asr*` functions
+> (`asrOpen`/`asrTranscribe`/`asrSet…`).
 
 ## Python
 
@@ -188,6 +198,28 @@ segs = sess.transcribe(pcm)
 
 Gem: `bindings/ruby/`.
 
+## Node.js addon
+
+`examples/addon.node` is a native N-API addon (built via cmake-js). Besides the
+legacy whisper-only `whisper()` entry point, it exposes `transcribeSession()`
+over the `crispasr_session` C-ABI — reaching every ASR backend plus the session
+post-processors (punctuation, `punc_model`, beam, translate, src/tgt lang):
+
+```js
+const { transcribeSession } = require('./build/Release/addon.node');
+const { promisify } = require('util');
+const run = promisify(transcribeSession);
+
+const r = await run({
+  model: 'parakeet.gguf', backend: 'parakeet', language: 'en',
+  punctuation: true, punc_model: 'fullstop',   // restore punctuation
+  fname_inp: 'audio.wav',
+});
+// { language, transcription: [[t0, t1, text], ...] }
+```
+
+For browser / pure-WASM use, see `bindings/javascript` (emscripten).
+
 ## Mobile
 
 ```bash
@@ -215,7 +247,8 @@ so there is nothing TTS-specific per wrapper:
 Open the TTS model GGUF like any other; the backend auto-detects from
 the GGUF architecture. Supported TTS backends: `kokoro`, `qwen3-tts`
 (+ customvoice), `vibevoice-tts` / `vibevoice-1.5b`, `orpheus`,
-`chatterbox`, `indextts`, `voxcpm2-tts`, and `cosyvoice3-tts`. See
+`chatterbox`, `indextts`, `voxcpm2-tts`, `cosyvoice3-tts`,
+`lfm2-audio`, and `mini-omni2`. See
 [`tts.md`](tts.md) for per-backend cloning + voice details.
 
 **Provenance:** `synthesize()` automatically embeds the AI-generated
@@ -235,4 +268,37 @@ pcm = s.synthesize("Hallo, das ist ein Test.")    # float32 @ 24 kHz
 # Voice cloning from a WAV:
 s.set_voice("ref.wav", ref_text="exact transcription of ref.wav")
 pcm = s.synthesize("Clone my voice.")
+```
+
+## Speech-to-speech
+
+Backends with S2S capability (`lfm2-audio`, `mini-omni2`) support
+end-to-end audio-in → audio-out transformation through a single model
+pass. Available in Python, Go, Dart/Flutter, and the HTTP server
+(`POST /v1/audio/speech-to-speech`).
+
+- `speech_to_speech(pcm_16khz) -> (float32 PCM @ 24 kHz, transcript)`
+  (`crispasr_session_speech_to_speech`)
+
+Input is 16 kHz mono float32 PCM. Returns output audio at the backend's
+TTS sample rate (24 kHz) plus an optional intermediate ASR transcript.
+Output is automatically watermarked, same as TTS.
+
+```python
+# Python
+import numpy as np, soundfile as sf
+s = crispasr.Session("lfm2-audio-1.5b-q5_k.gguf")
+audio, sr = sf.read("input.wav", dtype="float32")  # must be 16 kHz mono
+out_pcm, transcript = s.speech_to_speech(audio)
+print(f"Transcript: {transcript}")
+sf.write("output.wav", out_pcm, 24000)
+```
+
+```go
+// Go
+s, _ := whisper.SessionOpen("lfm2-audio-1.5b-q5_k.gguf", 4)
+defer s.Close()
+result, _ := s.SpeechToSpeech(inputPCM)
+fmt.Println("Transcript:", result.Transcript)
+// result.PCM is []float32 at 24 kHz
 ```

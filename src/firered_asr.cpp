@@ -692,27 +692,39 @@ static void read_f32_vec(ggml_tensor* t, std::vector<float>& out) {
 
 // CPU matmul: C = A @ B^T where A is [M,K], B is [N,K] → C is [M,N]
 // (B stored as [N,K] row-major, like ggml weight [K,N] with ne[0]=K)
+// Dot product of two length-K float vectors using four independent
+// accumulator chains so the compiler can vectorize the reduction even under
+// strict FP (no -ffast-math / /fp:fast needed). Float accumulation over
+// K~1280 is well within tolerance for ASR logits; the old double-accumulate
+// form forced scalar, non-vectorized code and dominated the decoder.
+static inline float cpu_dot(const float* a, const float* b, int K) {
+    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    int k = 0;
+    for (; k + 4 <= K; k += 4) {
+        s0 += a[k + 0] * b[k + 0];
+        s1 += a[k + 1] * b[k + 1];
+        s2 += a[k + 2] * b[k + 2];
+        s3 += a[k + 3] * b[k + 3];
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    for (; k < K; k++)
+        s += a[k] * b[k];
+    return s;
+}
+
 static void cpu_matmul_bt(const float* A, const float* B, float* C, int M, int K, int N) {
     if (M == 1) {
         // Single-vector × matrix: parallelize over output dimension N.
         // This is the decoder hot path (one token per step).
 #pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; n++) {
-            double s = 0;
-            const float* brow = B + n * K;
-            for (int k = 0; k < K; k++)
-                s += (double)A[k] * (double)brow[k];
-            C[n] = (float)s;
-        }
+        for (int n = 0; n < N; n++)
+            C[n] = cpu_dot(A, B + (size_t)n * K, K);
     } else {
 #pragma omp parallel for schedule(static)
         for (int m = 0; m < M; m++) {
-            for (int n = 0; n < N; n++) {
-                double s = 0;
-                for (int k = 0; k < K; k++)
-                    s += (double)A[m * K + k] * (double)B[n * K + k];
-                C[m * N + n] = (float)s;
-            }
+            const float* arow = A + (size_t)m * K;
+            for (int n = 0; n < N; n++)
+                C[(size_t)m * N + n] = cpu_dot(arow, B + (size_t)n * K, K);
         }
     }
 }
@@ -2162,96 +2174,120 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                 }
             }
 
-            for (int bi = 0; bi < beam_size; bi++) {
-                if (beams[bi].finished || beams[bi].score <= -1e8f)
-                    continue;
-                int cur_token = beams[bi].tokens.back();
+            // Collect active (non-finished) beam indices
+            std::vector<int> active_beams;
+            active_beams.reserve(beam_size);
+            for (int bi = 0; bi < beam_size; bi++)
+                if (!beams[bi].finished && beams[bi].score > -1e8f)
+                    active_beams.push_back(bi);
+            const int n_active = (int)active_beams.size();
+            if (n_active == 0)
+                break;
 
-                // Embed
-                std::vector<float> x(d);
+            // Batched hidden state: X[n_active, d] — one row per active beam
+            std::vector<float> X(n_active * d);
+
+            // Embed all active beams
+            for (int a = 0; a < n_active; a++) {
+                int cur_token = beams[active_beams[a]].tokens.back();
+                float* xi = X.data() + a * d;
                 for (int i = 0; i < d; i++) {
-                    x[i] = emb_w[cur_token * d + i] * scale;
+                    xi[i] = emb_w[cur_token * d + i] * scale;
                     if (step < (int)(m.dec.pe->ne[1]))
-                        x[i] += pe_dec[step * d + i];
+                        xi[i] += pe_dec[step * d + i];
+                }
+            }
+
+            // Batched scratch buffers (allocated once, reused per layer)
+            std::vector<float> XN(n_active * d);
+            std::vector<float> Q_batch(n_active * d), K_batch(n_active * d), V_batch(n_active * d);
+            std::vector<float> sa_out_batch(n_active * d);
+            std::vector<float> fc_batch(n_active * d);
+            std::vector<float> Qx_batch(n_active * d);
+            std::vector<float> xattn_out_batch(n_active * d);
+
+            for (int li = 0; li < hp.n_layers_dec; li++) {
+                auto& c = dec_cache[li];
+
+                // === Self-attention (causal, attend to history) ===
+                // Batched LayerNorm
+                for (int a = 0; a < n_active; a++)
+                    cpu_layernorm(X.data() + a * d, c.sattn_norm_w.data(), c.sattn_norm_b.data(), XN.data() + a * d, 1,
+                                  d);
+
+                // Batched QKV projections: read each weight matrix once for all beams
+                cpu_matmul_bt(XN.data(), c.sattn_w_qs.data(), Q_batch.data(), n_active, d, d);
+                if (!c.sattn_w_qs_b.empty())
+                    for (int a = 0; a < n_active; a++)
+                        for (int i = 0; i < d; i++)
+                            Q_batch[a * d + i] += c.sattn_w_qs_b[i];
+                cpu_matmul_bt(XN.data(), c.sattn_w_ks.data(), K_batch.data(), n_active, d, d);
+                cpu_matmul_bt(XN.data(), c.sattn_w_vs.data(), V_batch.data(), n_active, d, d);
+                if (!c.sattn_w_vs_b.empty())
+                    for (int a = 0; a < n_active; a++)
+                        for (int i = 0; i < d; i++)
+                            V_batch[a * d + i] += c.sattn_w_vs_b[i];
+
+                // Per-beam self-attention scoring (different KV history per beam)
+                for (int a = 0; a < n_active; a++) {
+                    int bi = active_beams[a];
+                    if (!beams[bi].sa_k[li].unique())
+                        beams[bi].sa_k[li] = std::make_shared<std::vector<float>>(*beams[bi].sa_k[li]);
+                    if (!beams[bi].sa_v[li].unique())
+                        beams[bi].sa_v[li] = std::make_shared<std::vector<float>>(*beams[bi].sa_v[li]);
+                    auto& sa_k_hist = *beams[bi].sa_k[li];
+                    auto& sa_v_hist = *beams[bi].sa_v[li];
+                    sa_k_hist.insert(sa_k_hist.end(), K_batch.data() + a * d, K_batch.data() + (a + 1) * d);
+                    sa_v_hist.insert(sa_v_hist.end(), V_batch.data() + a * d, V_batch.data() + (a + 1) * d);
+
+                    int n_hist = (int)(sa_k_hist.size() / d);
+                    float* Q_sa = Q_batch.data() + a * d;
+                    float* sa_out = sa_out_batch.data() + a * d;
+                    memset(sa_out, 0, d * sizeof(float));
+                    for (int h = 0; h < nh_dec; h++) {
+                        std::vector<float> scores(n_hist);
+                        for (int t = 0; t < n_hist; t++)
+                            scores[t] = cpu_dot(Q_sa + h * hd_dec, sa_k_hist.data() + t * d + h * hd_dec, hd_dec) *
+                                        inv_sqrt_hd_dec;
+                        cpu_softmax_rows(scores.data(), 1, n_hist);
+                        for (int dd = 0; dd < hd_dec; dd++) {
+                            double s = 0;
+                            for (int t = 0; t < n_hist; t++)
+                                s += scores[t] * sa_v_hist[t * d + h * hd_dec + dd];
+                            sa_out[h * hd_dec + dd] = (float)s;
+                        }
+                    }
                 }
 
-                for (int li = 0; li < hp.n_layers_dec; li++) {
-                    auto& c = dec_cache[li];
+                // Batched SA FC projection + residual
+                cpu_matmul_bt(sa_out_batch.data(), c.sattn_fc_w.data(), fc_batch.data(), n_active, d, d);
+                for (int a = 0; a < n_active; a++)
+                    for (int i = 0; i < d; i++)
+                        X[a * d + i] += fc_batch[a * d + i] + (c.sattn_fc_b.empty() ? 0 : c.sattn_fc_b[i]);
 
-                    // === Self-attention (causal, attend to history) ===
-                    {
-                        std::vector<float> xn(d);
-                        cpu_layernorm(x.data(), c.sattn_norm_w.data(), c.sattn_norm_b.data(), xn.data(), 1, d);
+                // === Cross-attention: attend to encoder output (pre-computed K/V) ===
+                // Batched LayerNorm
+                for (int a = 0; a < n_active; a++)
+                    cpu_layernorm(X.data() + a * d, c.xattn_norm_w.data(), c.xattn_norm_b.data(), XN.data() + a * d, 1,
+                                  d);
 
-                        // Q/K/V projections via parallelized matmul
-                        std::vector<float> Q_sa(d), K_cur(d), V_cur(d);
-                        cpu_matmul_bt(xn.data(), c.sattn_w_qs.data(), Q_sa.data(), 1, d, d);
-                        if (!c.sattn_w_qs_b.empty())
-                            for (int i = 0; i < d; i++)
-                                Q_sa[i] += c.sattn_w_qs_b[i];
-                        cpu_matmul_bt(xn.data(), c.sattn_w_ks.data(), K_cur.data(), 1, d, d);
-                        cpu_matmul_bt(xn.data(), c.sattn_w_vs.data(), V_cur.data(), 1, d, d);
-                        if (!c.sattn_w_vs_b.empty())
-                            for (int i = 0; i < d; i++)
-                                V_cur[i] += c.sattn_w_vs_b[i];
-                        if (!beams[bi].sa_k[li].unique())
-                            beams[bi].sa_k[li] = std::make_shared<std::vector<float>>(*beams[bi].sa_k[li]);
-                        if (!beams[bi].sa_v[li].unique())
-                            beams[bi].sa_v[li] = std::make_shared<std::vector<float>>(*beams[bi].sa_v[li]);
-                        auto& sa_k_hist = *beams[bi].sa_k[li];
-                        auto& sa_v_hist = *beams[bi].sa_v[li];
-                        sa_k_hist.insert(sa_k_hist.end(), K_cur.begin(), K_cur.end());
-                        sa_v_hist.insert(sa_v_hist.end(), V_cur.begin(), V_cur.end());
-
-                        int n_hist = (int)(sa_k_hist.size() / d); // step + 1
-
-                        // Multi-head attention: Q[d] @ K_history[n_hist, d]
-                        std::vector<float> sa_out(d, 0);
-                        for (int h = 0; h < nh_dec; h++) {
-                            std::vector<float> scores(n_hist);
-                            for (int t = 0; t < n_hist; t++) {
-                                double s = 0;
-                                for (int dd = 0; dd < hd_dec; dd++)
-                                    s += Q_sa[h * hd_dec + dd] * sa_k_hist[t * d + h * hd_dec + dd];
-                                scores[t] = (float)s * inv_sqrt_hd_dec;
-                            }
-                            cpu_softmax_rows(scores.data(), 1, n_hist);
-                            for (int dd = 0; dd < hd_dec; dd++) {
-                                double s = 0;
-                                for (int t = 0; t < n_hist; t++)
-                                    s += scores[t] * sa_v_hist[t * d + h * hd_dec + dd];
-                                sa_out[h * hd_dec + dd] = (float)s;
-                            }
-                        }
-
-                        // FC + residual
-                        std::vector<float> sa_fc(d);
-                        cpu_matmul_bt(sa_out.data(), c.sattn_fc_w.data(), sa_fc.data(), 1, d, d);
+                // Batched cross-attention Q projection
+                cpu_matmul_bt(XN.data(), c.xattn_w_qs.data(), Qx_batch.data(), n_active, d, d);
+                if (!c.xattn_w_qs_b.empty())
+                    for (int a = 0; a < n_active; a++)
                         for (int i = 0; i < d; i++)
-                            x[i] += sa_fc[i] + (c.sattn_fc_b.empty() ? 0 : c.sattn_fc_b[i]);
-                    }
+                            Qx_batch[a * d + i] += c.xattn_w_qs_b[i];
 
-                    // === Cross-attention: attend to encoder output (pre-computed K/V) ===
-                    std::vector<float> xn(d);
-                    cpu_layernorm(x.data(), c.xattn_norm_w.data(), c.xattn_norm_b.data(), xn.data(), 1, d);
-
-                    std::vector<float> Qx(d);
-                    cpu_matmul_bt(xn.data(), c.xattn_w_qs.data(), Qx.data(), 1, d, d);
-                    if (!c.xattn_w_qs_b.empty())
-                        for (int i = 0; i < d; i++)
-                            Qx[i] += c.xattn_w_qs_b[i];
-
-                    int nh_dec = hp.n_head_dec;
-                    int hd_dec = d / nh_dec;
-                    std::vector<float> attn_out(d, 0);
+                // Per-beam cross-attention scoring (shared K_enc/V_enc)
+                for (int a = 0; a < n_active; a++) {
+                    float* Qx = Qx_batch.data() + a * d;
+                    float* attn_out = xattn_out_batch.data() + a * d;
+                    memset(attn_out, 0, d * sizeof(float));
                     for (int h = 0; h < nh_dec; h++) {
                         std::vector<float> scores(T_sub);
-                        for (int t = 0; t < T_sub; t++) {
-                            double s = 0;
-                            for (int dd = 0; dd < hd_dec; dd++)
-                                s += Qx[h * hd_dec + dd] * K_enc[li][t * d + h * hd_dec + dd];
-                            scores[t] = (float)s * inv_sqrt_hd_dec;
-                        }
+                        for (int t = 0; t < T_sub; t++)
+                            scores[t] = cpu_dot(Qx + h * hd_dec, K_enc[li].data() + t * d + h * hd_dec, hd_dec) *
+                                        inv_sqrt_hd_dec;
                         cpu_softmax_rows(scores.data(), 1, T_sub);
                         for (int dd = 0; dd < hd_dec; dd++) {
                             double s = 0;
@@ -2260,17 +2296,21 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                             attn_out[h * hd_dec + dd] = (float)s;
                         }
                     }
+                }
 
-                    // FC output projection + residual
-                    std::vector<float> fc_out(d);
-                    cpu_matmul_bt(attn_out.data(), c.xattn_fc_w.data(), fc_out.data(), 1, d, d);
+                // Batched cross-attention FC + residual
+                cpu_matmul_bt(xattn_out_batch.data(), c.xattn_fc_w.data(), fc_batch.data(), n_active, d, d);
+                for (int a = 0; a < n_active; a++)
                     for (int i = 0; i < d; i++)
-                        x[i] += fc_out[i] + (c.xattn_fc_b.empty() ? 0 : c.xattn_fc_b[i]);
+                        X[a * d + i] += fc_batch[a * d + i] + (c.xattn_fc_b.empty() ? 0 : c.xattn_fc_b[i]);
 
-                    // MLP: LN → Linear(d→4d) → GELU → Linear(4d→d) + residual
-                    cpu_layernorm(x.data(), c.mlp_norm_w.data(), c.mlp_norm_b.data(), xn.data(), 1, d);
-                    std::vector<float> h_up(c.di);
-                    cpu_matmul_bt(xn.data(), c.mlp_w1.data(), h_up.data(), 1, d, c.di);
+                // === MLP: LN → Linear(d→4d) → GELU → Linear(4d→d) + residual ===
+                for (int a = 0; a < n_active; a++)
+                    cpu_layernorm(X.data() + a * d, c.mlp_norm_w.data(), c.mlp_norm_b.data(), XN.data() + a * d, 1, d);
+                std::vector<float> h_up_batch(n_active * c.di);
+                cpu_matmul_bt(XN.data(), c.mlp_w1.data(), h_up_batch.data(), n_active, d, c.di);
+                for (int a = 0; a < n_active; a++) {
+                    float* h_up = h_up_batch.data() + a * c.di;
                     if (!c.mlp_b1.empty())
                         for (int i = 0; i < c.di; i++)
                             h_up[i] += c.mlp_b1[i];
@@ -2278,21 +2318,29 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                         float v = h_up[i];
                         h_up[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
                     }
-                    std::vector<float> mlp_out(d);
-                    cpu_matmul_bt(h_up.data(), c.mlp_w2.data(), mlp_out.data(), 1, c.di, d);
+                }
+                std::vector<float> mlp_out_batch(n_active * d);
+                cpu_matmul_bt(h_up_batch.data(), c.mlp_w2.data(), mlp_out_batch.data(), n_active, c.di, d);
+                for (int a = 0; a < n_active; a++) {
+                    float* mlp_out = mlp_out_batch.data() + a * d;
                     if (!c.mlp_b2.empty())
                         for (int i = 0; i < d; i++)
                             mlp_out[i] += c.mlp_b2[i];
                     for (int i = 0; i < d; i++)
-                        x[i] += mlp_out[i];
+                        X[a * d + i] += mlp_out[i];
                 }
+            }
 
-                // Final LN + projection
-                std::vector<float> xn(d);
-                cpu_layernorm(x.data(), norm_w.data(), norm_b.data(), xn.data(), 1, d);
-                std::vector<float> logits(odim);
-                if (!project_decoder_logits(xn.data(), logits))
-                    cpu_matmul_bt(xn.data(), prj_w.data(), logits.data(), 1, d, odim);
+            // Batched final LN + logit projection
+            for (int a = 0; a < n_active; a++)
+                cpu_layernorm(X.data() + a * d, norm_w.data(), norm_b.data(), XN.data() + a * d, 1, d);
+            std::vector<float> logits_batch(n_active * odim);
+            cpu_matmul_bt(XN.data(), prj_w.data(), logits_batch.data(), n_active, d, odim);
+
+            // Per-beam top-k + candidate generation
+            for (int a = 0; a < n_active; a++) {
+                int bi = active_beams[a];
+                float* logits = logits_batch.data() + a * odim;
 
                 float mx = logits[0];
                 for (int i = 1; i < odim; i++)
@@ -2326,7 +2374,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                         cands.push_back({bi, top_idx[k], beams[bi].score + top_score[k], top_score[k]});
                     }
                 }
-            } // end per-beam computation
+            } // end batched beam computation
 
             for (int bi = 0; bi < beam_size; bi++)
                 if (beams[bi].finished)

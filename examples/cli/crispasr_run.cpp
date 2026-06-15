@@ -17,6 +17,8 @@
 #include "crispasr_vad_cli.h"
 #include "crispasr_output.h"
 #include "crispasr_punctuation_policy.h"
+#include "crispasr_punc_loader.h"
+#include "crispasr_truecase_loader.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_aligner_cli.h"
@@ -424,6 +426,21 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // otherwise fire because effective_chunk_seconds == 0 satisfies its
     // "not explicitly chunked" path. Guard with chunk_seconds_explicit.
     constexpr int kLongAudioFallbackChunkSeconds = 30;
+    // Issue #89: backends that degenerate on arbitrary-length chunks
+    // (e.g. parakeet-ja) auto-enable VAD for long audio so the model
+    // gets silence-bounded segments matching its training distribution.
+    const bool is_long_audio = (int)samples.size() > kLongAudioFallbackChunkSeconds * SR;
+    if (backend.prefers_vad() && is_long_audio && !params.vad && params.vad_model.empty() &&
+        !params.chunk_seconds_explicit) {
+        params.vad = true;
+        if (!params.no_prints) {
+            fprintf(stderr,
+                    "crispasr: %s backend auto-enabling --vad on %.1fs audio "
+                    "(this model needs utterance-bounded segments for clean output; "
+                    "pass --chunk-seconds N to override)\n",
+                    backend.name(), (double)samples.size() / SR);
+        }
+    }
     const bool wants_vad = params.vad || !params.vad_model.empty();
     const bool long_audio_no_vad =
         !params.chunk_seconds_explicit &&
@@ -1557,6 +1574,67 @@ int crispasr_run_backend(const whisper_params& params_in) {
         return 0;
     }
 
+    // ---- S2S mode: speech-to-speech (audio in → audio out) ----
+    if (params.s2s) {
+        if (!(backend->capabilities() & CAP_S2S)) {
+            fprintf(stderr, "crispasr: error: backend '%s' does not support S2S\n", backend_name.c_str());
+            return 14;
+        }
+        if (params.fname_inp.empty() || params.fname_inp[0].empty()) {
+            fprintf(stderr, "crispasr: error: S2S requires audio input (-f <file>)\n");
+            return 3;
+        }
+
+        // Load input audio (16 kHz mono PCM)
+        std::vector<float> s2s_samples;
+        std::vector<std::vector<float>> s2s_stereo_unused;
+        if (!read_audio_data(params.fname_inp[0], s2s_samples, s2s_stereo_unused, false)) {
+            fprintf(stderr, "crispasr: error: failed to read audio '%s'\n", params.fname_inp[0].c_str());
+            return 20;
+        }
+
+        if (!params.watermark_model.empty()) {
+            crispasr_wm_dispatch::init(params.watermark_model);
+        }
+
+        std::string transcript;
+        auto audio = backend->speech_to_speech(s2s_samples.data(), (int)s2s_samples.size(), &transcript, params);
+        if (audio.empty()) {
+            fprintf(stderr, "crispasr: error: S2S synthesis failed\n");
+            return 15;
+        }
+
+        const int sr_out = backend->tts_sample_rate();
+
+        // Print transcript if available
+        if (!transcript.empty()) {
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: S2S transcript: %s\n", transcript.c_str());
+            printf("%s\n", transcript.c_str());
+        }
+
+        // Embed watermark
+        crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_out);
+
+        // Write output WAV
+        std::string out_path = params.s2s_output.empty() ? "s2s_output.wav" : params.s2s_output;
+        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_out);
+        crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
+        FILE* fout = fopen(out_path.c_str(), "wb");
+        if (!fout) {
+            fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
+            return 16;
+        }
+        fwrite(wav.data(), 1, wav.size(), fout);
+        fclose(fout);
+
+        if (!params.no_prints)
+            fprintf(stderr, "crispasr: S2S output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
+                    audio.size(), sr_out, (double)audio.size() / (double)sr_out);
+        crispasr_wm_dispatch::shutdown();
+        return 0;
+    }
+
     // Auto-punctuation for CTC backends: when the user hasn't set --punc-model
     // and the backend doesn't natively toggle punctuation, auto-enable
     // FireRedPunc. This gives CTC backends (fc-ctc, wav2vec2, firered-asr,
@@ -1570,30 +1648,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
     // Optional punctuation restoration post-processor.
     // `--punc-model auto` or `--punc-model firered` → auto-download Q4_K (~50 MB).
+    // The alias → model mapping is shared with the HTTP server via the resolver
+    // in crispasr_punc_loader.h, so the two front-ends can't drift apart.
+    const crispasr_punc_spec punc_spec = crispasr_resolve_punc_model(params.punc_model);
     std::unique_ptr<fireredpunc_context, decltype(&fireredpunc_free)> punc_ctx(nullptr, fireredpunc_free);
-    {
-        std::string punc_path = params.punc_model;
-        if (punc_path == "none" || punc_path == "off")
-            punc_path.clear();
-        if (punc_path == "auto" || punc_path == "firered") {
-            punc_path = crispasr_cache::ensure_cached_file(
-                "fireredpunc-q4_k.gguf",
-                "https://huggingface.co/cstr/fireredpunc-GGUF/resolve/main/fireredpunc-q4_k.gguf", params.no_prints,
-                "crispasr[punc]", params.cache_dir);
-        } else if (punc_path == "fullstop") {
-            punc_path = crispasr_cache::ensure_cached_file(
-                "fullstop-punc-q4_k.gguf",
-                "https://huggingface.co/cstr/fullstop-punc-multilang-GGUF/resolve/main/fullstop-punc-q4_k.gguf",
-                params.no_prints, "crispasr[punc]", params.cache_dir);
-        } else if (punc_path == "punctuate-all") {
-            punc_path = crispasr_cache::ensure_cached_file(
-                "punctuate-all-q4_k.gguf",
-                "https://huggingface.co/cstr/punctuate-all-GGUF/resolve/main/punctuate-all-q4_k.gguf", params.no_prints,
-                "crispasr[punc]", params.cache_dir);
-        } else if (punc_path == "pcs" || punc_path.find("pcs") != std::string::npos) {
-            // PCS is handled separately below — skip fireredpunc loading
-            punc_path.clear();
-        }
+    if (punc_spec.kind == crispasr_punc_kind::fireredpunc) {
+        std::string punc_path = punc_spec.direct_path;
+        if (punc_path.empty() && !punc_spec.cache_filename.empty())
+            punc_path = crispasr_cache::ensure_cached_file(punc_spec.cache_filename, punc_spec.url, params.no_prints,
+                                                           "crispasr[punc]", params.cache_dir);
         if (!punc_path.empty()) {
             punc_ctx.reset(fireredpunc_init(punc_path.c_str()));
             if (!punc_ctx) {
@@ -1609,20 +1672,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
     // `--punc-model pcs` loads the 1-800-BAD-CODE XLM-RoBERTa model which
     // handles punc, truecasing, and SBD together. When PCS is active, it
     // replaces both fireredpunc and the statistical truecaser.
-    // PCS: detect from keyword or filename containing "pcs"
     std::unique_ptr<pcs_context, decltype(&pcs_free)> pcs_ctx(nullptr, pcs_free);
-    {
-        std::string pcs_path;
-        if (params.punc_model == "pcs") {
-            pcs_path = crispasr_cache::ensure_cached_file(
-                "pcs-xlmr-base-q4_k.gguf",
-                "https://huggingface.co/cstr/pcs-xlmr-base-GGUF/resolve/main/pcs-xlmr-base-q4_k.gguf", params.no_prints,
-                "crispasr[pcs]", params.cache_dir);
-        } else if (params.punc_model.find("pcs") != std::string::npos &&
-                   params.punc_model.find(".gguf") != std::string::npos) {
-            // Direct path to a PCS GGUF file
-            pcs_path = params.punc_model;
-        }
+    if (punc_spec.kind == crispasr_punc_kind::pcs) {
+        std::string pcs_path = punc_spec.direct_path;
+        if (pcs_path.empty() && !punc_spec.cache_filename.empty())
+            pcs_path = crispasr_cache::ensure_cached_file(punc_spec.cache_filename, punc_spec.url, params.no_prints,
+                                                          "crispasr[pcs]", params.cache_dir);
         if (!pcs_path.empty()) {
             pcs_ctx.reset(pcs_init(pcs_path.c_str()));
             if (pcs_ctx) {
@@ -1640,75 +1695,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
     std::unique_ptr<truecaser_context, decltype(&truecaser_free)> tc_ctx(nullptr, truecaser_free);
     std::unique_ptr<truecaser_crf_context, decltype(&truecaser_crf_free)> tc_crf_ctx(nullptr, truecaser_crf_free);
     std::unique_ptr<truecaser_lstm_context, decltype(&truecaser_lstm_free)> tc_lstm_ctx(nullptr, truecaser_lstm_free);
-    {
-        std::string tc_path = params.truecase_model;
-        if (tc_path == "none" || tc_path == "off")
-            tc_path.clear();
-        if (tc_path == "lstm" || tc_path == "lstm-de" || tc_path == "lstm-en" || tc_path == "lstm-es" ||
-            tc_path == "lstm-ru") {
-            // Map language suffix to filename
-            std::string lang = "de";
-            if (tc_path == "lstm-en")
-                lang = "en";
-            else if (tc_path == "lstm-es")
-                lang = "es";
-            else if (tc_path == "lstm-ru")
-                lang = "ru";
-            std::string fname = "truecaser-lstm-" + lang + ".bin";
-            std::string url = "https://huggingface.co/cstr/truecaser-de/resolve/main/" + fname;
-            tc_path =
-                crispasr_cache::ensure_cached_file(fname, url, params.no_prints, "crispasr[tc]", params.cache_dir);
-            if (!tc_path.empty()) {
-                tc_lstm_ctx.reset(truecaser_lstm_init(tc_path.c_str()));
-                if (tc_lstm_ctx && !params.no_prints)
-                    fprintf(stderr, "crispasr: loaded BiLSTM truecaser '%s'\n", tc_path.c_str());
-            }
-            tc_path.clear();
-        } else if (tc_path == "crf" || tc_path == "crf-de") {
-            tc_path = crispasr_cache::ensure_cached_file(
-                "truecaser-crf-de.bin", "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-crf-de.bin",
-                params.no_prints, "crispasr[tc]", params.cache_dir);
-            if (!tc_path.empty()) {
-                tc_crf_ctx.reset(truecaser_crf_init(tc_path.c_str()));
-                if (tc_crf_ctx && !params.no_prints)
-                    fprintf(stderr, "crispasr: loaded CRF truecaser '%s'\n", tc_path.c_str());
-            }
-            tc_path.clear();
-        } else if (!tc_path.empty() && tc_path != "auto" && tc_path != "de") {
-            // Direct path — detect format by magic bytes
-            FILE* probe = fopen(tc_path.c_str(), "rb");
-            if (probe) {
-                char magic[4] = {};
-                fread(magic, 1, 4, probe);
-                fclose(probe);
-                if (memcmp(magic, "LSTM", 4) == 0) {
-                    tc_lstm_ctx.reset(truecaser_lstm_init(tc_path.c_str()));
-                    if (tc_lstm_ctx && !params.no_prints)
-                        fprintf(stderr, "crispasr: loaded BiLSTM truecaser '%s'\n", tc_path.c_str());
-                    tc_path.clear();
-                } else if (memcmp(magic, "CRF1", 4) == 0) {
-                    tc_crf_ctx.reset(truecaser_crf_init(tc_path.c_str()));
-                    if (tc_crf_ctx && !params.no_prints)
-                        fprintf(stderr, "crispasr: loaded CRF truecaser '%s'\n", tc_path.c_str());
-                    tc_path.clear();
-                }
-            }
-        }
-        if (tc_path == "auto" || tc_path == "de") {
-            tc_path = crispasr_cache::ensure_cached_file(
-                "truecaser-de.bin", "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-de.bin",
-                params.no_prints, "crispasr[tc]", params.cache_dir);
-        }
-        if (!tc_path.empty()) {
-            tc_ctx.reset(truecaser_init(tc_path.c_str()));
-            if (!tc_ctx) {
-                fprintf(stderr, "crispasr: warning: failed to load truecaser '%s' — continuing without\n",
-                        tc_path.c_str());
-            } else if (!params.no_prints) {
-                fprintf(stderr, "crispasr: loaded truecaser '%s'\n", tc_path.c_str());
-            }
-        }
-    }
+    crispasr_load_truecase(params.truecase_model, params.no_prints, params.cache_dir, tc_ctx, tc_crf_ctx, tc_lstm_ctx,
+                           "crispasr[tc]");
 
     // ---- Streaming mode: read raw PCM from stdin, transcribe chunks ----
     if (params.stream) {

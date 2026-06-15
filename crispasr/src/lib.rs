@@ -1061,6 +1061,58 @@ impl Session {
         Ok(())
     }
 
+    /// qwen3-tts VoiceDesign: natural-language voice description.
+    pub fn set_instruct(&self, instruct: &str) -> Result<(), String> {
+        let c = CString::new(instruct).map_err(|e| e.to_string())?;
+        let rc = unsafe { crispasr_sys::crispasr_session_set_instruct(self.handle, c.as_ptr()) };
+        if rc != 0 {
+            return Err(format!("set_instruct failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Select + load a punctuation-restoration model (`auto`/`firered`/`fullstop`/
+    /// `punctuate-all`/`pcs`/path; `"none"`/`""` unloads). Auto-downloads on first use.
+    pub fn set_punc_model(&self, punc_model: &str) -> Result<(), String> {
+        let c = CString::new(punc_model).map_err(|e| e.to_string())?;
+        let rc = unsafe { crispasr_sys::crispasr_session_set_punc_model(self.handle, c.as_ptr()) };
+        if rc != 0 {
+            return Err(format!("set_punc_model failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Comma-separated hotwords for contextual biasing, boosted by `boost` per
+    /// token match. Empty string clears.
+    pub fn set_hotwords(&self, hotwords: &str, boost: f32) -> Result<(), String> {
+        let c = CString::new(hotwords).map_err(|e| e.to_string())?;
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_hotwords(self.handle, c.as_ptr(), boost) };
+        if rc != 0 {
+            return Err(format!("set_hotwords failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Select the G2P pronunciation dictionary for TTS (`olaph`/`open-dict`/path).
+    pub fn set_g2p_dict(&self, source: &str) -> Result<(), String> {
+        let c = CString::new(source).map_err(|e| e.to_string())?;
+        let rc = unsafe { crispasr_sys::crispasr_session_set_g2p_dict(self.handle, c.as_ptr()) };
+        if rc != 0 {
+            return Err(format!("set_g2p_dict failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Select a multi-speaker backend's speaker by index.
+    pub fn set_speaker_id(&self, id: i32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_speaker_id(self.handle, id) };
+        if rc != 0 {
+            return Err(format!("set_speaker_id failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
     /// Auto-detect spoken language on raw 16 kHz mono PCM.
     ///
     /// `method`: 0=Whisper, 1=Silero (default), 2=Firered, 3=Ecapa.

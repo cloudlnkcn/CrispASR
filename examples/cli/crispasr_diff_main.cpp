@@ -48,7 +48,7 @@
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
 #include "mimo_tokenizer.h"
-#include "orpheus_snac.h"
+#include "core/snac.h"
 #include "chatterbox.h"
 #include "csm_tts.h"
 #include "lid_cld3.h"
@@ -67,6 +67,7 @@
 #include "melotts.h"
 #include "moss_audio.h"
 #include "lfm2_audio.h"
+#include "mini_omni2.h"
 #if __has_include("kugelaudio.h")
 #include "kugelaudio.h"
 #define CA_HAVE_KUGELAUDIO 1
@@ -4947,7 +4948,7 @@ int main(int argc, char** argv) {
             } else {
                 printf("[INFO] %-22s ref shape=[", stage);
                 for (size_t i = 0; i < ref_shape.size(); i++)
-                    printf("%s%d", i ? "," : "", ref_shape[i]);
+                    printf("%s%ld", i ? "," : "", (long)ref_shape[i]);
                 printf("]  (stage comparison not yet wired)\n");
             }
             n_skip++;
@@ -4980,7 +4981,7 @@ int main(int argc, char** argv) {
                 n_mels = 128;
                 T_mel = (int)(sz / sizeof(float) / n_mels);
                 mel = (float*)malloc(sz);
-                fread(mel, 1, sz, mf);
+                (void)!fread(mel, 1, sz, mf);
                 fclose(mf);
                 printf("  (mel override from %s: %d x %d)\n", mel_override, n_mels, T_mel);
             }
@@ -5526,13 +5527,142 @@ int main(int argc, char** argv) {
 
         lfm2_audio_free(ctx);
 
+    } else if (backend_name == "mini-omni2") {
+        auto mp = mini_omni2_context_default_params();
+        mp.n_threads = 4;
+        mp.verbosity = 0;
+        mini_omni2_context* ctx = mini_omni2_init_from_file(model_path.c_str(), mp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load mini-omni2 model\n");
+            return 4;
+        }
+
+        // Mini-Omni2 pads/trims audio to 30s (480000 samples @ 16kHz)
+        // before computing mel, matching whisper.pad_or_trim(). The Python
+        // reference does this, so we must too for element-wise comparison.
+        const int MO2_30S = 480000;
+        std::vector<float> mo2_audio(MO2_30S, 0.0f);
+        int copy_len = std::min((int)samples.size(), MO2_30S);
+        memcpy(mo2_audio.data(), samples.data(), copy_len * sizeof(float));
+
+        // ---- mel_spectrogram ----
+        {
+            int n_mels = 0, T_mel = 0;
+            float* mel = mini_omni2_compute_mel(ctx, mo2_audio.data(), MO2_30S, &n_mels, &T_mel);
+            if (mel) {
+                std::vector<float> mv(mel, mel + (size_t)n_mels * T_mel);
+                free(mel);
+                auto rep = ref.compare("mel_spectrogram", mv.data(), mv.size());
+                print_row("mel_spectrogram", rep, COS_THRESHOLD);
+                record(rep);
+            } else {
+                printf("[ERR ] mel_spectrogram         mini_omni2_compute_mel returned null\n");
+                n_fail++;
+            }
+        }
+
+        // ---- whisper_encoder_output ----
+        {
+            int n_mels = 0, T_mel = 0;
+            float* mel = mini_omni2_compute_mel(ctx, mo2_audio.data(), MO2_30S, &n_mels, &T_mel);
+            if (!mel) {
+                printf("[ERR ] whisper_encoder_output   mini_omni2_compute_mel returned null\n");
+                n_fail++;
+            } else {
+                int T_enc = 0, dim = 0;
+                float* enc = mini_omni2_run_encoder(ctx, mel, n_mels, T_mel, &T_enc, &dim);
+                free(mel);
+                if (enc) {
+                    auto rep = ref.compare("whisper_encoder_output", enc, (size_t)T_enc * dim);
+                    print_row("whisper_encoder_output", rep, COS_THRESHOLD);
+                    record(rep);
+                    free(enc);
+                } else {
+                    printf("[ERR ] whisper_encoder_output   mini_omni2_run_encoder returned null\n");
+                    n_fail++;
+                }
+            }
+        }
+
+        // ---- adapter_output ----
+        if (ref.has("adapter_output")) {
+            int n_mels = 0, T_mel = 0;
+            float* mel = mini_omni2_compute_mel(ctx, mo2_audio.data(), MO2_30S, &n_mels, &T_mel);
+            if (!mel) {
+                printf("[ERR ] adapter_output          mini_omni2_compute_mel returned null\n");
+                n_fail++;
+            } else {
+                int T_enc = 0, enc_dim = 0;
+                float* enc = mini_omni2_run_encoder(ctx, mel, n_mels, T_mel, &T_enc, &enc_dim);
+                free(mel);
+                if (!enc) {
+                    printf("[ERR ] adapter_output          mini_omni2_run_encoder returned null\n");
+                    n_fail++;
+                } else {
+                    int out_T = 0, out_dim = 0;
+                    float* adap = mini_omni2_run_adapter(ctx, enc, T_enc, enc_dim, &out_T, &out_dim);
+                    free(enc);
+                    if (adap) {
+                        auto rep = ref.compare("adapter_output", adap, (size_t)out_T * out_dim);
+                        print_row("adapter_output", rep, COS_THRESHOLD);
+                        record(rep);
+                        free(adap);
+                    } else {
+                        printf("[ERR ] adapter_output          mini_omni2_run_adapter returned null\n");
+                        n_fail++;
+                    }
+                }
+            }
+        } else {
+            printf("[SKIP] adapter_output          (not in ref archive)\n");
+            n_skip++;
+        }
+
+        // ---- end-to-end transcribe (always run as smoke test) ----
+        {
+            char* text = mini_omni2_transcribe(ctx, samples.data(), (int)samples.size());
+            if (text) {
+                printf("[INFO] transcribe              %s\n", text);
+                free(text);
+            } else {
+                printf("[ERR ] transcribe              mini_omni2_transcribe returned null\n");
+                n_fail++;
+            }
+        }
+
+        // ---- S2S smoke test (if SNAC available next to model) ----
+        {
+            // Try to load SNAC from same directory as model
+            std::string model_dir = model_path.substr(0, model_path.find_last_of("/\\"));
+            std::string snac_path = model_dir + "/snac-24khz.gguf";
+            if (mini_omni2_load_snac(ctx, snac_path.c_str())) {
+                char* s2s_text = nullptr;
+                int s2s_n = 0;
+                float* s2s_pcm =
+                    mini_omni2_speech_to_speech(ctx, samples.data(), (int)samples.size(), &s2s_text, &s2s_n);
+                if (s2s_pcm && s2s_n > 0) {
+                    printf("[INFO] s2s                     %d samples @ 24kHz (%.2fs)", s2s_n, (double)s2s_n / 24000.0);
+                    if (s2s_text)
+                        printf(" text: %s", s2s_text);
+                    printf("\n");
+                    free(s2s_pcm);
+                } else {
+                    printf("[INFO] s2s                     no audio output (model may not support s2s well)\n");
+                }
+                if (s2s_text)
+                    free(s2s_text);
+            }
+        }
+
+        mini_omni2_free(ctx);
+
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
                 "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
                 "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
                 "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, paraformer, sensevoice, "
-                "cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts, lfm2-audio.\n",
+                "cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts, lfm2-audio, mini-omni2.\n",
                 backend_name.c_str());
         return 5;
     }

@@ -1,10 +1,11 @@
 package whisper
 
-// Minimal TTS surface for the Go binding. Exposes the unified
+// Minimal TTS + S2S surface for the Go binding. Exposes the unified
 // CrispASR Session API for TTS-capable backends (kokoro, vibevoice,
 // qwen3-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
 // melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
-// cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, ...) plus the kokoro
+// cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio, ...)
+// and S2S-capable backends (lfm2-audio, mini-omni2), plus the kokoro
 // per-language model + voice resolver (PLAN #56 opt 2b).
 
 /*
@@ -27,6 +28,8 @@ int              crispasr_session_set_codec_path(CrispasrSession* s, const char*
 int              crispasr_session_set_source_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_target_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_punctuation(CrispasrSession* s, int enable);
+int              crispasr_session_set_punc_model(CrispasrSession* s, const char* punc_model);
+int              crispasr_session_set_hotwords(CrispasrSession* s, const char* hotwords, float boost);
 int              crispasr_session_set_translate(CrispasrSession* s, int enable);
 int              crispasr_session_set_temperature(CrispasrSession* s, float temperature, unsigned long long seed);
 int              crispasr_session_set_tts_seed(CrispasrSession* s, unsigned long long seed);
@@ -65,6 +68,9 @@ int              crispasr_session_set_instruct(CrispasrSession* s, const char* i
 int              crispasr_session_is_custom_voice(CrispasrSession* s);
 int              crispasr_session_is_voice_design(CrispasrSession* s);
 float*           crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
+float*           crispasr_session_speech_to_speech(CrispasrSession* s, const float* in_samples, int n_in_samples,
+                                                    char** out_text, int* out_n_samples);
+void             crispasr_session_translate_text_free(char* text);
 void             crispasr_pcm_free(float* pcm);
 int              crispasr_session_kokoro_clear_phoneme_cache(CrispasrSession* s);
 
@@ -299,7 +305,7 @@ import (
 	"unsafe"
 )
 
-// CrispasrSession is a TTS-capable session (kokoro, vibevoice, qwen3-tts, orpheus, parler-tts, pocket-tts, tada).
+// CrispasrSession is a TTS/S2S-capable session (kokoro, vibevoice, qwen3-tts, orpheus, parler-tts, pocket-tts, tada, lfm2-audio, mini-omni2).
 type CrispasrSession struct {
 	handle *C.CrispasrSession
 }
@@ -375,6 +381,34 @@ func (s *CrispasrSession) SetPunctuation(enable bool) error {
 	rc := C.crispasr_session_set_punctuation(s.handle, v)
 	if rc != 0 {
 		return errors.New("crispasr_session_set_punctuation failed")
+	}
+	return nil
+}
+
+// SetPuncModel selects + loads a punctuation-restoration model on the session.
+// model is an alias (auto|firered|fullstop|punctuate-all|pcs) or a .gguf path;
+// "none" or "" unloads. Auto-downloads on first use. Restores punctuation on
+// backends that emit none (parakeet RNNT/CTC, etc.) — the same post-processor
+// the CLI --punc-model and the server apply.
+func (s *CrispasrSession) SetPuncModel(model string) error {
+	cm := C.CString(model)
+	defer C.free(unsafe.Pointer(cm))
+	rc := C.crispasr_session_set_punc_model(s.handle, cm)
+	if rc != 0 {
+		return errors.New("crispasr_session_set_punc_model failed")
+	}
+	return nil
+}
+
+// SetHotwords sets comma-separated hotwords for contextual biasing, boosted by
+// `boost` log-prob per token match (parakeet CTC/TDT trie, LLM backends prompt
+// injection). Empty string clears.
+func (s *CrispasrSession) SetHotwords(hotwords string, boost float32) error {
+	ch := C.CString(hotwords)
+	defer C.free(unsafe.Pointer(ch))
+	rc := C.crispasr_session_set_hotwords(s.handle, ch, C.float(boost))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_hotwords failed")
 	}
 	return nil
 }
@@ -872,6 +906,40 @@ func (s *CrispasrSession) Synthesize(text string) ([]float32, error) {
 	src := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), int(n))
 	copy(samples, src)
 	return samples, nil
+}
+
+// SpeechToSpeechResult holds the output of a speech-to-speech call.
+type SpeechToSpeechResult struct {
+	PCM        []float32 // output audio at 24 kHz mono
+	Transcript string    // intermediate ASR transcript (may be empty)
+}
+
+// SpeechToSpeech runs end-to-end audio-in → audio-out on backends with
+// S2S capability (lfm2-audio, mini-omni2). Input is 16 kHz mono float32 PCM.
+func (s *CrispasrSession) SpeechToSpeech(samples []float32) (*SpeechToSpeechResult, error) {
+	if len(samples) == 0 {
+		return nil, errors.New("SpeechToSpeech: empty input")
+	}
+	var textOut *C.char
+	var nOut C.int
+	ptr := C.crispasr_session_speech_to_speech(
+		s.handle,
+		(*C.float)(unsafe.Pointer(&samples[0])),
+		C.int(len(samples)),
+		&textOut, &nOut)
+	if ptr == nil || nOut <= 0 {
+		return nil, errors.New("crispasr_session_speech_to_speech: no audio produced")
+	}
+	defer C.crispasr_pcm_free(ptr)
+	out := make([]float32, int(nOut))
+	src := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), int(nOut))
+	copy(out, src)
+	var transcript string
+	if textOut != nil {
+		transcript = C.GoString(textOut)
+		C.crispasr_session_translate_text_free(textOut)
+	}
+	return &SpeechToSpeechResult{PCM: out, Transcript: transcript}, nil
 }
 
 // KokoroResolved is the result of KokoroResolveForLang. Mirrors the

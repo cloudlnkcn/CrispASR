@@ -27,7 +27,7 @@ struct whisper_params {
     int32_t max_len = 0;
     bool split_on_punct = false;
     int32_t best_of = whisper_full_default_params(CRISPASR_SAMPLING_GREEDY).greedy.best_of;
-    int32_t beam_size = whisper_full_default_params(CRISPASR_SAMPLING_BEAM_SEARCH).beam_search.beam_size;
+    int32_t beam_size = -1; // -1 = greedy; beam search only when explicitly set via -bs N
     int32_t audio_ctx = 0;
 
     float word_thold = 0.01f;
@@ -145,7 +145,8 @@ struct whisper_params {
     // 3-4 if your audio has long-silence regions where blank tokens
     // dominate the boundary token run (avoids over-slicing).
     int lcs_min_length = 1;
-    bool warmup = false;          // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
+    bool warmup = false;    // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
+    bool no_warmup = false; // --no-warmup: skip the always-on server warmup (e.g. crashes on some Vulkan drivers, #165)
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
     std::string hotwords;         // comma-separated hotword list (PLAN #98)
     float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches
@@ -185,6 +186,9 @@ struct whisper_params {
     std::string server_host = "127.0.0.1";
     int32_t server_port = 8080;
     std::string server_api_keys;
+    // --ws-port: real-time WebSocket ASR streaming on a second port.
+    //   -1 = disabled (default), 0 = server_port + 1, N = port N.
+    int32_t server_ws_port = -1;
     int32_t stream_step_ms = 3000;
     int32_t stream_length_ms = 10000;
     int32_t stream_keep_ms = 200;
@@ -254,6 +258,8 @@ struct whisper_params {
     std::string hf_file;
     std::string tts_text;
     std::string tts_output;
+    bool s2s = false;       // speech-to-speech mode: audio in → audio out
+    std::string s2s_output; // S2S output WAV path (default: s2s_output.wav)
     std::string tts_voice;
     int tts_steps = 20;
     std::string tts_codec_model;

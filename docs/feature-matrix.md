@@ -3,65 +3,84 @@
 
 # Feature matrix
 
-All 52 backends compiled into the `crispasr` binary, with their declared capability bits. For an interactive sortable/filterable view, open [`feature-matrix.html`](feature-matrix.html).
+All 75 backends compiled into the `crispasr` binary, with their declared capability bits. For an interactive sortable/filterable view, open [`feature-matrix.html`](feature-matrix.html).
 
-| Backend | TTS | Voice cloning | Translate | Src/Tgt language | Language detect | Auto-download | Timestamps (native) | Timestamps (CTC) | Word timestamps | Token confidence | Temperature | Beam search | Punctuation toggle | Flash attention | Diarize | GBNF grammar | VAD (internal) | Parallel processors | Punctuation Native |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| `whisper` |  |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ |  |
-| `parakeet` |  |  |  |  |  | ✓ | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `canary` |  |  | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `cohere` |  |  |  |  |  | ✓ | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `granite` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `granite-4.1` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `granite-4.1-plus` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `granite-4.1-nar` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |  | ✓ |
-| `voxtral` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `voxtral4b` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ |  | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `qwen3` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `qwen3-1.7b` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `mega-asr` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |
-| `fastconformer-ctc` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |
-| `wav2vec2` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |
-| `hubert` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |
-| `data2vec` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |
-| `vibevoice` | ✓ |  |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |
-| `qwen3-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `vibevoice-1.5b` | ✓ | ✓ |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |
-| `qwen3-tts-customvoice` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `qwen3-tts-1.7b-base` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `qwen3-tts-1.7b-customvoice` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `qwen3-tts-1.7b-voicedesign` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `orpheus` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `lex-au-orpheus-de` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `kartoffel-orpheus-de-natural` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `kartoffel-orpheus-de-synthetic` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `chatterbox` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `chatterbox-turbo` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `kartoffelbox-turbo` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `lahgtna-chatterbox` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `indextts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `kokoro` | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `voxcpm2-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `cosyvoice3-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |
-| `m2m100` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `m2m100-wmt21` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `madlad` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `glm-asr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |  |
-| `kyutai-stt` |  |  |  |  |  | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |  |
-| `firered-asr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ |  |  |  |  |
-| `moonshine` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |  |
-| `moonshine-streaming` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |  |  |
-| `gemma4-e2b` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  | ✓ |  |
-| `omniasr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |
-| `omniasr-300m` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |
-| `omniasr-llm` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |
-| `omniasr-llm-1b` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |
-| `mimo-asr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ |  |  | ✓ | ✓ |  |  |  |  |
-| `moss-audio` |  |  |  |  |  |  |  | ✓ |  |  |  |  |  | ✓ |  | ✓ |  |  |  |
-| `kugelaudio` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `funasr` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
-| `fun-asr-mlt-nano` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
-| `paraformer` |  |  |  |  |  | ✓ |  |  |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
-| `sensevoice` |  |  |  |  | ✓ | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
+| Backend | TTS | Voice cloning | Translate | Src/Tgt language | Language detect | Auto-download | Timestamps (native) | Timestamps (CTC) | Word timestamps | Token confidence | Temperature | Beam search | Punctuation toggle | Flash attention | Diarize | GBNF grammar | VAD (internal) | Parallel processors | Punctuation Native | S2S |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| `whisper` |  |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |
+| `parakeet` |  |  |  |  |  | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `canary` |  |  | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `lfm2-audio` | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  | ✓ |
+| `mini-omni2` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  | ✓ |
+| `cohere` |  |  |  |  |  | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `granite` |  |  | ✓ | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `granite-4.1` |  |  | ✓ | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `granite-4.1-plus` |  |  | ✓ | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `granite-4.1-nar` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |  | ✓ |  |
+| `voxtral` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `voxtral4b` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `qwen3` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `qwen3-1.7b` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `mega-asr` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |  |  |
+| `fastconformer-ctc` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |
+| `wav2vec2` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |
+| `hubert` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |
+| `data2vec` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |
+| `vibevoice` | ✓ |  |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |  |
+| `kugelaudio` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `qwen3-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `vibevoice-1.5b` | ✓ | ✓ |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |  |
+| `qwen3-tts-customvoice` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `qwen3-tts-1.7b-base` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `qwen3-tts-1.7b-customvoice` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `qwen3-tts-1.7b-voicedesign` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `orpheus` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `lex-au-orpheus-de` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `kartoffel-orpheus-de-natural` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `kartoffel-orpheus-de-synthetic` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `chatterbox` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `chatterbox-turbo` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `kartoffelbox-turbo` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `lahgtna-chatterbox` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `indextts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `f5-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `pocket-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
+| `fastpitch` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `kokoro` | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `melotts` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `piper` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `outetts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `voxcpm2-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `cosyvoice3-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `m2m100` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |
+| `m2m100-wmt21` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |
+| `madlad` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |
+| `glm-asr` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |  |  |
+| `kyutai-stt` |  |  |  |  |  | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |  |  |
+| `firered-asr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  | ✓ |  | ✓ | ✓ |  |  |  |  |  |
+| `moonshine` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |  |  |
+| `moonshine-streaming` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |  |
+| `gemma4-e2b` |  |  | ✓ | ✓ |  | ✓ |  | ✓ |  |  | ✓ | ✓ |  | ✓ | ✓ |  |  | ✓ |  |  |
+| `omniasr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |  |
+| `omniasr-300m` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |  |
+| `omniasr-llm` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |  |
+| `omniasr-llm-1b` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |  |
+| `mimo-asr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ |  |  | ✓ | ✓ |  |  |  |  |  |
+| `moss-audio` |  |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  | ✓ |  |
+| `funasr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |  |  |
+| `fun-asr-mlt-nano` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |  |  |  |  |
+| `paraformer` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |  |
+| `sensevoice` |  |  |  |  | ✓ | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |  |
+| `bark` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
+| `bark-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
+| `speecht5` | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `dia` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
+| `dia-tts` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
+| `parler-tts` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
+| `zonos` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `zonos-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |
+| `csm` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
+| `csm-tts` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
+| `sesame` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |
 
 Regenerate with `python tools/gen-feature-matrix.py`.

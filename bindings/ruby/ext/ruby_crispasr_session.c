@@ -35,6 +35,10 @@ extern int                     crispasr_session_set_codec_path(struct CrispasrSe
 extern int                     crispasr_session_set_voice(struct CrispasrSession* s, const char* path,
                                                           const char* ref_text_or_null);
 extern int                     crispasr_session_set_speaker_name(struct CrispasrSession* s, const char* name);
+extern int                     crispasr_session_set_speaker_id(struct CrispasrSession* s, int id);
+extern int                     crispasr_session_set_punc_model(struct CrispasrSession* s, const char* punc_model);
+extern int                     crispasr_session_set_hotwords(struct CrispasrSession* s, const char* hotwords, float boost);
+extern int                     crispasr_session_set_g2p_dict(struct CrispasrSession* s, const char* source);
 extern int                     crispasr_session_n_speakers(struct CrispasrSession* s);
 extern const char*             crispasr_session_get_speaker_name(struct CrispasrSession* s, int i);
 extern int                     crispasr_session_set_instruct(struct CrispasrSession* s, const char* instruct);
@@ -547,6 +551,35 @@ static VALUE rb_session_set_speaker_name(VALUE self, VALUE handle, VALUE name) {
     if (rc == -2) rb_raise(rb_eArgError, "unknown speaker: %s", StringValueCStr(name));
     if (rc == -3) rb_raise(rb_eRuntimeError, "backend has no preset speakers; use set_voice instead");
     if (rc != 0) rb_raise(rb_eRuntimeError, "set_speaker_name failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_speaker_id(VALUE self, VALUE handle, VALUE id) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_speaker_id(s, NUM2INT(id));
+    if (rc != 0 && rc != -2) rb_raise(rb_eRuntimeError, "set_speaker_id failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_punc_model(VALUE self, VALUE handle, VALUE punc_model) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_punc_model(s, NIL_P(punc_model) ? "" : StringValueCStr(punc_model));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_punc_model failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_hotwords(VALUE self, VALUE handle, VALUE hotwords, VALUE boost) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_hotwords(s, NIL_P(hotwords) ? "" : StringValueCStr(hotwords),
+                                           (float)NUM2DBL(boost));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_hotwords failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_g2p_dict(VALUE self, VALUE handle, VALUE source) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_g2p_dict(s, NIL_P(source) ? "" : StringValueCStr(source));
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_g2p_dict failed (rc=%d)", rc);
     return Qnil;
 }
 
@@ -1281,6 +1314,10 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_codec_path",       rb_session_set_codec_path,   2);
     rb_define_singleton_method(mSession, "set_voice",            rb_session_set_voice,       -1);
     rb_define_singleton_method(mSession, "set_speaker_name",     rb_session_set_speaker_name, 2);
+    rb_define_singleton_method(mSession, "set_speaker_id",       rb_session_set_speaker_id,   2);
+    rb_define_singleton_method(mSession, "set_punc_model",       rb_session_set_punc_model,   2);
+    rb_define_singleton_method(mSession, "set_hotwords",         rb_session_set_hotwords,     3);
+    rb_define_singleton_method(mSession, "set_g2p_dict",         rb_session_set_g2p_dict,     2);
     rb_define_singleton_method(mSession, "speakers",             rb_session_speakers,         1);
     rb_define_singleton_method(mSession, "set_instruct",         rb_session_set_instruct,     2);
     rb_define_singleton_method(mSession, "is_custom_voice",      rb_session_is_custom_voice,  1);

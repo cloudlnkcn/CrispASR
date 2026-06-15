@@ -114,6 +114,10 @@ int canary_ctc_sample_rate(struct canary_ctc_context* ctx);
 float* canary_ctc_compute_mel_debug(struct canary_ctc_context* ctx, const float* samples, int n_samples,
                                     int* out_n_mels, int* out_T_mel);
 
+// Debug: run CTC logits from pre-computed mel (diff harness).
+int canary_ctc_compute_logits_from_mel_debug(struct canary_ctc_context* ctx, const float* mel, int T_mel,
+                                             float** out_logits, int* out_T_enc, int* out_vocab_total);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,9 +15,11 @@ add_executable(${TARGET}
     cli.cpp
     crispasr_backend.cpp
     crispasr_backend_crispasr.cpp
+    crispasr_backend_nemotron.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
     crispasr_backend_lfm2_audio.cpp
+    crispasr_backend_mini_omni2.cpp
     crispasr_backend_cohere.cpp
     crispasr_backend_granite.cpp
     crispasr_backend_granite_nle.cpp
@@ -71,6 +73,9 @@ add_executable(${TARGET}
     crispasr_run.cpp
     crispasr_server.cpp
     crispasr_tts_chunking.cpp
+    # Real-time WebSocket ASR streaming, shared with the standalone server
+    # (examples/server). Wired into `crispasr --server` via --ws-port.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../server/ws_stream.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -193,6 +198,7 @@ target_link_libraries(crispasr-diff PRIVATE
     cosyvoice3_tts
     csm-tts
     parler-tts
+    mini-omni2
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}

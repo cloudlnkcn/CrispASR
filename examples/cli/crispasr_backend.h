@@ -89,6 +89,7 @@ enum crispasr_capability : uint32_t {
     CAP_PARALLEL_PROCESSORS = 1u << 14, // whisper-style n_processors
     CAP_VAD_INTERNAL = 1u << 15,        // backend handles VAD internally (whisper)
     CAP_TTS = 1u << 16,                 // text-to-speech synthesis
+    CAP_S2S = 1u << 21,                 // speech-to-speech (audio in → audio out)
     CAP_VOICE_CLONING = 1u << 17,       // TTS: synthesise with --voice <reference.wav>
     CAP_PUNCTUATION_NATIVE = 1u << 18,  // backend already emits punctuation by default
     CAP_UNBOUNDED_INPUT = 1u << 19,     // encoder handles arbitrary-length audio without chunking
@@ -157,6 +158,18 @@ public:
     // 48 kHz) override this.
     virtual int tts_sample_rate() const { return 24000; }
 
+    // S2S: speech-to-speech transform. Takes 16 kHz mono PCM input, returns
+    // PCM output at `tts_sample_rate()`. If out_text is non-null, writes the
+    // intermediate transcript. Default returns empty (not supported). Only
+    // backends with CAP_S2S override.
+    virtual std::vector<float> speech_to_speech(const float* samples, int n_samples, std::string* out_text,
+                                                const whisper_params& /*params*/) {
+        (void)samples;
+        (void)n_samples;
+        (void)out_text;
+        return {};
+    }
+
     // Text-to-text translation. m2m100 and any future translate-only
     // backend overrides this. Default returns empty (not supported).
     // src_lang / tgt_lang are ISO-639-1 codes ("en", "de", …).
@@ -167,6 +180,12 @@ public:
         (void)tgt_lang;
         return {};
     }
+
+    // Whether the backend should auto-enable VAD for long audio when the
+    // user didn't explicitly set --chunk-seconds or --vad. Backends whose
+    // encoder degenerates on arbitrary-length chunks (e.g. parakeet-ja)
+    // override this to get silence-bounded segments that match training.
+    virtual bool prefers_vad() const { return false; }
 
     // Warmup: run a short dummy transcribe to amortize first-call
     // overhead (graph allocation, GPU kernel compilation, gallocr shape

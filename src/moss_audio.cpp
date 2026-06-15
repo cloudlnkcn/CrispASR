@@ -1904,12 +1904,12 @@ extern "C" char* moss_audio_process(struct moss_audio_context* ctx, const float*
     if (logits)
         free(logits);
 
-    // 10. Decode tokens to text
+    // 10. Decode tokens to text (GPT-2 byte-level BPE → raw UTF-8)
     std::string result;
     for (int id : generated) {
         const char* t = moss_audio_token_text(ctx, id);
         if (t)
-            result += t;
+            result += core_bpe::token_bytes_to_utf8(t);
     }
 
     if (ctx->params.verbosity >= 1)

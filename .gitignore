@@ -111,3 +111,4 @@ samples/qwen3_tts/
 .local/
 SESSION_HANDOVER.md
 /handover-prompts/
+.ccache/

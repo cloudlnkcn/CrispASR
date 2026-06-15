@@ -913,6 +913,7 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
         const auto& ph = arpa_phones[pi];
         std::string base_ph = ph;
         int ph_stress = -1;
+        (void)ph_stress;
         if (!base_ph.empty() && base_ph.back() >= '0' && base_ph.back() <= '2') {
             ph_stress = base_ph.back() - '0';
             base_ph.pop_back();

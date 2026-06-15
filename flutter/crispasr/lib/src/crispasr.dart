@@ -2342,7 +2342,7 @@ class CrispasrSession {
   }
 
   // ---------------------------------------------------------------------------
-  // TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, zonos-tts, and others)
+  // TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, and others)
   // ---------------------------------------------------------------------------
 
   /// Load a separate codec GGUF (qwen3-tts only; no-op for other backends).
@@ -2430,6 +2430,46 @@ class CrispasrSession {
         int Function(Pointer<Void>, int)>('crispasr_session_set_punctuation');
     final rc = fn(_handle, enable ? 1 : 0);
     if (rc != 0) throw Exception('setPunctuation failed (rc=$rc)');
+  }
+
+  /// Select + load a punctuation-restoration model on the session.
+  ///
+  /// [model] is an alias (`auto` / `firered` / `fullstop` / `punctuate-all` /
+  /// `pcs`) or a path to a `.gguf`; `'none'` or `''` unloads. Auto-downloads on
+  /// first use. Restores punctuation on backends that emit none (parakeet
+  /// RNNT/CTC, etc.) — the same post-processor the CLI `--punc-model` applies.
+  void setPuncModel(String model) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_punc_model')) {
+      throw UnsupportedError('punc-model API not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_punc_model');
+    final p = model.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc != 0) throw Exception('setPuncModel failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  /// Select the G2P pronunciation dictionary for TTS phonemization
+  /// (`olaph` / `open-dict` or a path). Empty string keeps the default.
+  void setG2pDict(String source) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_g2p_dict')) {
+      throw UnsupportedError('crispasr_session_set_g2p_dict not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_g2p_dict');
+    final p = source.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc != 0) throw Exception('setG2pDict failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
   }
 
   /// Whisper sticky `--translate`. For canary/cohere/voxtral the equivalent
@@ -3202,6 +3242,110 @@ class CrispasrSession {
     } finally {
       calloc.free(textPtr);
       calloc.free(nPtr);
+    }
+  }
+
+  /// Speech-to-Speech: audio in → audio out via a single model pass.
+  ///
+  /// Supported on backends with S2S capability (lfm2-audio, mini-omni2).
+  /// Returns a record of (pcm, transcript) where `pcm` is the output
+  /// audio and `transcript` is the intermediate text (may be empty if
+  /// the backend doesn't produce one).
+  ///
+  /// Throws [UnsupportedError] when the loaded dylib predates the S2S
+  /// API, [StateError] when the session is closed, and [Exception]
+  /// when the backend doesn't support S2S.
+  ({Float32List pcm, String transcript}) speechToSpeech(Float32List inputPcm) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_speech_to_speech')) {
+      throw UnsupportedError(
+          'speechToSpeech API not available in this libcrispasr build');
+    }
+    final s2sFn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Pointer<Float>, Int32,
+            Pointer<Pointer<Utf8>>, Pointer<Int32>),
+        Pointer<Float> Function(Pointer<Void>, Pointer<Float>, int,
+            Pointer<Pointer<Utf8>>, Pointer<Int32>)>(
+      'crispasr_session_speech_to_speech',
+    );
+    final freeFn = _lib.lookupFunction<Void Function(Pointer<Float>),
+        void Function(Pointer<Float>)>('crispasr_pcm_free');
+    // Allocate native buffers for input PCM and output pointers.
+    final inPtr = calloc<Float>(inputPcm.length);
+    final nOutPtr = calloc<Int32>();
+    final textOutPtr = calloc<Pointer<Utf8>>();
+    try {
+      // Copy input PCM to native memory.
+      for (var i = 0; i < inputPcm.length; i++) {
+        inPtr[i] = inputPcm[i];
+      }
+      final pcmOut =
+          s2sFn(_handle, inPtr, inputPcm.length, textOutPtr, nOutPtr);
+      final n = nOutPtr.value;
+      if (pcmOut == nullptr || n <= 0) {
+        String reason = '';
+        if (_lib.providesSymbol('crispasr_session_last_synth_error')) {
+          final errFn = _lib.lookupFunction<
+              Pointer<Utf8> Function(Pointer<Void>),
+              Pointer<Utf8> Function(Pointer<Void>)>(
+            'crispasr_session_last_synth_error',
+          );
+          final errPtr = errFn(_handle);
+          if (errPtr != nullptr) {
+            final msg = errPtr.toDartString();
+            if (msg.isNotEmpty) reason = msg;
+          }
+        }
+        throw Exception(reason.isNotEmpty
+            ? reason
+            : 'speechToSpeech returned no audio for backend $_backend');
+      }
+      String transcript = '';
+      final txtPtr = textOutPtr.value;
+      if (txtPtr != nullptr) {
+        transcript = txtPtr.toDartString();
+        calloc.free(txtPtr);
+      }
+      try {
+        final view = pcmOut.asTypedList(n);
+        return (pcm: Float32List.fromList(view), transcript: transcript);
+      } finally {
+        freeFn(pcmOut);
+      }
+    } finally {
+      calloc.free(inPtr);
+      calloc.free(nOutPtr);
+      calloc.free(textOutPtr);
+    }
+  }
+
+  /// Set hotwords for contextual biasing.
+  ///
+  /// [hotwords] is a comma-separated list of words/phrases. For CTC/TDT
+  /// backends (parakeet), this configures the Aho-Corasick trie with the
+  /// given [boost] factor. For LLM backends, the hotwords are prepended
+  /// to the ask prompt on the next transcribe call.
+  ///
+  /// Pass an empty string to clear. Gracefully degrades on older dylibs
+  /// that don't have the symbol.
+  void setHotwords(String hotwords, {double boost = 1.5}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_hotwords')) {
+      // Graceful degradation: older dylibs don't have the symbol.
+      // Hotwords are still delivered via the ask-prompt merge path
+      // in the Dart layer for LLM backends.
+      return;
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>, Float),
+        int Function(
+            Pointer<Void>, Pointer<Utf8>, double)>('crispasr_session_set_hotwords');
+    final p = hotwords.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p, boost);
+      if (rc != 0) throw Exception('setHotwords failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
     }
   }
 

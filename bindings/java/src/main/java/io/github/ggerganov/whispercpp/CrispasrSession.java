@@ -35,6 +35,10 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_codec_path(Pointer session, String path);
         int     crispasr_session_set_voice(Pointer session, String path, String refTextOrNull);
         int     crispasr_session_set_speaker_name(Pointer session, String name);
+        int     crispasr_session_set_speaker_id(Pointer session, int id);
+        int     crispasr_session_set_punc_model(Pointer session, String puncModel);
+        int     crispasr_session_set_hotwords(Pointer session, String hotwords, float boost);
+        int     crispasr_session_set_g2p_dict(Pointer session, String source);
         int     crispasr_session_n_speakers(Pointer session);
         String  crispasr_session_get_speaker_name(Pointer session, int i);
         int     crispasr_session_set_instruct(Pointer session, String instruct);
@@ -531,6 +535,35 @@ public final class CrispasrSession implements AutoCloseable {
         if (rc == -2) throw new IllegalArgumentException("unknown speaker: " + name + "; call speakers() to enumerate");
         if (rc == -3) throw new IllegalStateException("backend has no preset speakers; use setVoice() instead");
         if (rc != 0) throw new IllegalStateException("set_speaker_name failed (rc=" + rc + ")");
+    }
+
+    /** Select a multi-speaker backend's speaker by index. */
+    public void setSpeakerId(int id) {
+        int rc = Lib.INSTANCE.crispasr_session_set_speaker_id(handle, id);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_speaker_id failed (rc=" + rc + ")");
+    }
+
+    /**
+     * Select + load a punctuation-restoration model on the session
+     * ({@code auto}/{@code firered}/{@code fullstop}/{@code punctuate-all}/{@code pcs}/path;
+     * {@code "none"}/{@code ""} unloads). Auto-downloads on first use. Restores
+     * punctuation on backends that emit none (parakeet RNNT/CTC, …).
+     */
+    public void setPuncModel(String puncModel) {
+        int rc = Lib.INSTANCE.crispasr_session_set_punc_model(handle, puncModel);
+        if (rc != 0) throw new IllegalStateException("set_punc_model failed (rc=" + rc + ")");
+    }
+
+    /** Comma-separated hotwords for contextual biasing, boosted by {@code boost} per token match. */
+    public void setHotwords(String hotwords, float boost) {
+        int rc = Lib.INSTANCE.crispasr_session_set_hotwords(handle, hotwords, boost);
+        if (rc != 0) throw new IllegalStateException("set_hotwords failed (rc=" + rc + ")");
+    }
+
+    /** Select the G2P pronunciation dictionary for TTS ({@code olaph}/{@code open-dict}/path). */
+    public void setG2pDict(String source) {
+        int rc = Lib.INSTANCE.crispasr_session_set_g2p_dict(handle, source);
+        if (rc != 0) throw new IllegalStateException("set_g2p_dict failed (rc=" + rc + ")");
     }
 
     /**

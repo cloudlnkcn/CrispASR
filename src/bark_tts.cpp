@@ -2260,7 +2260,7 @@ float* bark_synthesize(struct bark_context* ctx, const char* text, int* out_n_sa
                 FILE* f = fopen(path.c_str(), "rb");
                 if (f && n_cb > 0 && n_t > 0) {
                     std::vector<int32_t> codes((size_t)(n_cb * n_t));
-                    fread(codes.data(), sizeof(int32_t), codes.size(), f);
+                    (void)!fread(codes.data(), sizeof(int32_t), codes.size(), f);
                     fclose(f);
                     fprintf(stderr, "bark: BARK_DECODE_CODES: loaded %d×%d codes from %s\n", n_cb, n_t, path.c_str());
                     std::vector<float> pcm = encodec_decode(ctx, codes.data(), n_cb, n_t);

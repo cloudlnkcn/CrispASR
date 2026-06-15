@@ -44,6 +44,14 @@ public:
                CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_TRANSLATE | CAP_SRC_TGT_LANGUAGE;
     }
 
+    bool prefers_vad() const override {
+        // gemma4-e2b is trained on ~30 s windows. Arbitrary 30 s chunks
+        // (hard splices) degenerate — the encoder embeddings collapse and
+        // the LM hits <eos> immediately. VAD gives silence-bounded
+        // segments matching the model's training distribution.
+        return true;
+    }
+
     bool init(const whisper_params& params) override {
         gemma4_e2b_context_params cp = gemma4_e2b_context_default_params();
         cp.n_threads = params.n_threads;

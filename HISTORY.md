@@ -6,6 +6,115 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-13 #164 voxcpm2 graph path — NaN + SIGABRT fix
+
+Three-layer bug in the `VOXCPM2_USE_GRAPH=1` fast path, reported by HubSana
+(Arc B580 Vulkan) and reproduced on P100 CUDA (Kaggle).
+
+**Layer 1 — NaN from pos=5 onwards:** RALM has `rope_theta=0` (no positional
+encoding). `ggml_rope_ext` computed `powf(0, -2/d) = inf`, cascading NaN
+through the entire RALM → mu → CFM → LocEnc → enc_lm → TSLM pipeline.
+Fix: skip RoPE when `rope_theta <= 0` in `core/attention.h`.
+
+**Layer 2 — SIGABRT (`GGML_ASSERT(tensor)`):** Intermediate commits between
+`3683ad0a` and `657e851e` (FSQ removal, PREC_F32, RALM replay, ggml_cont
+fallback) changed graph topology, causing `ggml_graph_get_tensor` to return
+NULL. Fix: reverted to `3683ad0a` base + RoPE skip + FA_CPU (`6679f485`).
+
+**Layer 3 — FSQ broadcast SIGABRT + unguarded tensor lookups:** The in-graph
+FSQ rounding used a 1-element `fsq_half` tensor in `ggml_add([512,1], [1])` —
+broadcast across ne[0] SIGABRTs on CUDA/Vulkan. Shaped to `th->ne[0]`.
+Also null-guarded all 13 `ggml_graph_get_tensor` → `ggml_backend_tensor_set/get`
+chains across tslm, ralm, locenc, locdit, and vae_decode graph functions —
+graceful fallback instead of SIGABRT on any future tensor name mismatch.
+
+VAE decode Vulkan crash (separate, Part 3 of §166) was already fixed in
+`7449f793` (GPU copies of bias/alpha tensors). graph=0 path unaffected
+throughout.
+
+**Layer 4 — RALM noise on Vulkan (2026-06-14):** HubSana retested on
+Arc B580 — crash gone but audio was static. RALM `positions` tensor was
+unused after RoPE skip (rope_theta=0 + F32 KV cache = no consumer), so
+`ggml_graph_get_tensor` returned NULL and the null-guard returned zeros.
+Fix (`602308fc`): positions is optional in `ralm_step_graph`.
+
+**Validated with ASR roundtrip on Kaggle T4 (2026-06-14):** all 3 configs
+pass — stop fires at step 7, audio is speech (RMS 2500-3070, 1.12s), and
+parakeet ASR transcribes "Hello world." on every path. Graph path 5×
+faster (4.5s vs 21.9s). FA_CPU only needed on P100 (sm_60) where F16
+flash_attn accumulator overflows.
+
+**HubSana Arc B580 Vulkan confirmation (2026-06-14, `602308fc`):** All
+four fixes confirmed working end-to-end. 5 voice-clone runs clean, stop
+fires (scores 0.70-0.98), ~180 ms/step (13-15× speedup vs graph=0).
+Reporter's production workflow: 81 hours → 5 hours with graph=1+server.
+FA_CPU not needed on Intel Vulkan. Separate long-sequence VAE crash
+found (Vulkan maxComputeWorkGroupCount overflow at ~60s output) — tracked
+as Part 4, not blocking.
+
+## 2026-06-13 #165 server perf round — resident LID, CLI-matching VAD slicing, silero GPU crash
+
+Follow-ups after the #165 launch bug was fixed + reporter-confirmed (`--no-warmup`).
+The reporter profiled server-vs-CLI speed (server 16.6× vs CLI 19.0× on a 2-min
+clip); root-caused and fixed:
+
+- **Resident LID models.** The server ran `crispasr_lid_free_cache()` after every
+  request, so a non-PnC backend with `language=auto` reloaded the whisper-LID
+  model (`ggml-tiny`) per transcription. Moved the free to shutdown (mirroring the
+  VAD cache, #132) → LID loads once. Also added the same process-lifetime cache to
+  the silero/firered/ecapa LID backends (they were `_init`/`_free` per call; only
+  whisper was cached). Verified on M1: LID model loads 1× across N requests.
+- **Server VAD slicing now matches the CLI.** The server passed raw
+  `chunk_seconds=30` to `crispasr_compute_audio_slices` even with VAD on, so VAD
+  slices on a `CAP_UNBOUNDED_INPUT` backend (parakeet) were capped at 30 s — 4
+  slices where the CLI made 2 (extra boundary-overlap recompute). Mirror the CLI:
+  VAD on + `CAP_UNBOUNDED_INPUT` + `chunk_seconds` not explicit ⇒
+  `effective_chunk_seconds=0` (VAD bounds the slices). Verified server slice count
+  == CLI's on the same clip; non-VAD path unchanged (keeps 30 s, #89-safe).
+- **silero LID crashed on GPU builds — fixed.** `silero_lid_init` called
+  `ggml_backend_cpu_set_n_threads()` on the `ggml_backend_init_best()` backend
+  (Metal/CUDA), which asserts CPU → `GGML_ASSERT(ggml_backend_is_cpu)` abort on
+  every `--lid-backend silero` load. Guarded with `ggml_backend_is_cpu()`. (ecapa
+  was already safe; firered uses no ggml backend.) Surfaced while live-testing the
+  LID cache on M1 Metal; now 3 requests return 200 + detect correctly.
+
+All verified on M1 (cached whisper-tiny/moonshine/parakeet/silero models); #165
+fully resolved + closed. See LEARNINGS for the `init_best` + CPU-thread gotcha.
+
+## 2026-06-12 Mini-Omni2 — full ASR+TTS+S2S backend (gpt-omni/mini-omni2)
+
+New multimodal speech backend: Whisper-small encoder (80 mel, 12L, 768d)
++ whisperMLP SwiGLU adapter (768→4864→896) + Qwen2-0.5B LLM (896d, 24L,
+GQA 14/2, RoPE θ=1M). Supports ASR, TTS (via SNAC 24kHz), and
+speech-to-speech.
+
+**Diff-validated** against Python reference: mel, Whisper encoder, adapter
+all at cos_min=1.000000. ASR transcript matches: "and so my fellow
+americans ask not what your country can do for you ask what you can do
+for your country".
+
+Key implementation discoveries:
+- 400-point DFT required (NOT zero-padded to 512) — Whisper's torch.stft
+  uses n_fft=400 directly; zero-padding changes frequency bin spacing
+- Periodic Hann window (torch.hann_window) vs symmetric (np.hanning)
+  causes cos_min≈0.95 if wrong variant stored
+- ASR requires `_asr` token (151940), not `_answer_t` — switches model
+  from conversational to transcription mode
+- Decode step uses `pad_a=4097` (snac_config.end_of_audio), not `eoa=4096`
+- Audio features replace pad positions in streams 0-6 only (not text stream 7)
+- LitGPT fused QKV is interleaved per query group, not sequential Q,K,V
+- 8-stream embeddings batched into single ggml_get_rows for ~4× speedup
+
+Quantization: F16 (1.46 GB), Q8_0 (1.15 GB), Q4_K (0.99 GB) all produce
+identical ASR transcripts. Uploaded to `cstr/mini-omni2-GGUF`.
+
+Also refactored SNAC decoder from `orpheus_snac.{h,cpp}` to `core/snac.{h,cpp}`
+as a standalone shared target — now used by both orpheus and mini-omni2.
+Added 3 SNAC unit tests + 3 live tests (433 total unit tests).
+
+Files: 13 new/modified, ~2500 LOC added. 6 commits on feat/mini-omni2
+branch + 4 follow-up commits on main.
+
 ## 2026-06-11 #161 / #155 / #152 confirmed on CUDA (RTX A1000 4 GB, Windows) + #125 firered repro
 
 The #161 and #155 fixes were code-correct but their CUDA wall-clock wins were
@@ -29,9 +138,45 @@ driver 596.36, Windows 11).
 - **#152** — the box builds + runs the CUDA 13.0 toolkit on Windows; `02fdc310`'s
   runtime-version guard prints the "compiled 13.0, runtime 13.2" warning and
   proceeds cleanly.
-- **#125** — firered-asr2 on > 50 s audio (`issue19-70s.wav`) hangs indefinitely
-  on CUDA (killed after ~5 min, no output); 5 s works but runs at 0.2× RT
-  (27.8 s for 5 s). Confirms montvid's "stuck on long audio" — fix pending.
+- **#125** — firered-asr2 on > 50 s audio (`issue19-70s.wav`) hung indefinitely
+  on CUDA (full pass through an O(T²) CPU self-attention). **Fixed**
+  (`28d1ac69`): the backend now declares `CAP_UNBOUNDED_INPUT` so the issue #89
+  30 s auto-chunk fallback fires — it had deliberately omitted the flag on the
+  inverted belief that this made the dispatcher chunk it, but
+  `should_auto_chunk_long()` only chunks *unbounded-input* backends. 70 s now
+  auto-chunks to 3 slices and completes; 35 s transcribes correctly across 2
+  chunks. (firered is still ~0.2× RT here — inherent CPU-attention cost.) A
+  prerequisite Windows build break was also fixed (`cc9115ad`): `lfm2_audio.cpp`
+  used POSIX `setenv`/`unsetenv` (MSVC C3861) — guarded with `_putenv_s`.
+
+## 2026-06-12 #89 — parakeet-ja long-audio: reproduced on CUDA with real speech
+
+The issue #89 reporter (AMD Vulkan, RX 7900 GRE) loses everything past ~20 s on
+`parakeet-tdt-0.6b-ja`, even after the streamed-pipeline + 30 s auto-chunk
+fixes. Tested on the RTX A1000 (CUDA).
+
+**First, a false negative worth recording:** synthetic JA (qwen3-tts, 夏目漱石
+text, 58.6 s) did *not* collapse — single-pass covered the full range. That was
+misleading: the bug is **input-specific** (the maintainer had already noted two
+perceptually-identical files behaving differently). Clean TTS audio doesn't
+trigger the z-norm/PE drift; real speech does.
+
+**With real JA** (`reazon_baseball_14s` from the regression-fixtures HF repo,
+concatenated ×3 → 42.2 s; ideal output repeats the keyword 岡本 three times):
+
+| Mode | 岡本 recovered | last timestamp |
+|---|---|---|
+| single-pass (`--chunk-seconds 0`) | **1 / 3** | 12.4 s (collapses) |
+| auto-chunk 30 s (current default) | 1 / 3 | 40 s but sparse |
+| `--chunk-seconds 15` | 1 / 3 | — |
+| `--chunk-seconds 10` | 2 / 3 | — |
+| **`--vad`** | **3 / 3** | full |
+
+So the drop **is** real on CUDA (not an AMD-only numerical issue), the safe
+single-pass window is **~12 s**, and the 30 s auto-chunk fallback is too coarse —
+the collapse happens *inside* each 30 s chunk, which is exactly why the reporter
+still lost content. **`--vad` (silence-bounded slices) recovers everything.**
+Actionable: parakeet-ja's auto-chunk should use a ≤~12 s window or prefer VAD.
 
 ## 2026-06-10 #155 — Vulkan col2im_1d kernel: full-GPU qwen3-tts codec on Vulkan
 
@@ -8397,3 +8542,50 @@ not F16 KV. Likely a graph-topology-specific scheduling issue.
 `454e9ef8` (QKV fusion), `f94fec90` (final: split + fusion + KV-CPU).
 
 **Also:** merged stray PR #134 (session-beam test fixes).
+
+## §163 LFM2-Audio — ASR + TTS + S2S (complete)
+
+**Dates:** 2026-06-11 – 2026-06-12
+
+**Summary:** Full LiquidAI LFM2.5-Audio-1.5B backend: ASR, TTS, and
+speech-to-speech in a single model. 27 commits from `470d56f2` to
+`cd77c75e`. English and Japanese variants. HF repos:
+`cstr/lfm2-audio-1.5b-GGUF`, `cstr/lfm2-audio-1.5b-jp-GGUF`.
+
+**Architecture:** FastConformer encoder (17L, 512-dim) → audio adapter
+MLP → LFM2 hybrid backbone (16L, 2048-dim: 10 ShortConv + 6 GQA attn,
+interleaved `ccaccaccacacacac`) → depthformer (6L, 1024-dim, 8-codebook
+Mimi) → ISTFT detokenizer → 24 kHz PCM.
+
+**Key technical innovations:**
+- **Hybrid conv+attn caching:** KV cache for attention (core_attn) +
+  CPU-side Bx column cache for ShortConv layers (first such hybrid in CrispASR)
+- **Depthformer manual KV cache:** O(n) per audio frame via CPU-side K/V arrays
+  + ggml_concat (core_attn::kv_self_attn didn't work for fused QKV)
+- **Slaney mel filterbank:** stored in GGUF from librosa (cos=0.9999 match)
+- **BPE tokenizer with merges** from tokenizer.json
+- **Detokenizer fallback search** for quantized models
+
+**Performance (CPU, 4-core):**
+- ASR Q4_K: ~1m for 10s audio
+- TTS: ~1m per utterance
+- TTS→ASR roundtrip: "こんにちは" → "こんにちは。" verified
+
+**Files touched (28 total):**
+`src/lfm2_audio.{h,cpp}`, `models/convert-lfm2-audio-to-gguf.py`,
+`tools/reference_backends/lfm2_audio.py`, `tools/dump_reference.py`,
+`examples/cli/crispasr_backend_lfm2_audio.cpp`,
+`examples/cli/crispasr_backend.cpp`, `examples/cli/crispasr_diff_main.cpp`,
+`examples/cli/CMakeLists.txt`, `examples/crispasr-quantize/main.cpp`,
+`src/CMakeLists.txt`, `src/crispasr_c_api.cpp`, `src/crispasr_model_registry.cpp`,
+`python/crispasr/_binding.py`, `bindings/go/crispasr_session.go`,
+`flutter/crispasr/lib/src/crispasr.dart`,
+`README.md`, `docs/tts.md`, `docs/architecture.md`, `docs/performance.md`,
+`PLAN.md`, `LEARNINGS.md`,
+`tests/test_lfm2_audio_live.cpp`, `tests/CMakeLists.txt`, `tests/env-live-tests.sh`,
+`tools/kaggle/lfm2-audio-gpu-test/{kernel-metadata.json,lfm2-audio-gpu-test.py}`.
+
+**Remaining (tracked in PLAN §163 Phase 4):**
+- `ggml_backend_sched` migration for full GPU compute offload
+- Streaming Mimi decode
+- `causal_conv1d` CUDA kernel

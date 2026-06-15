@@ -234,7 +234,7 @@ if (CRISPASR_EXTRA_FLAGS)
 endif()
 
 find_package(Threads REQUIRED)
-target_link_libraries(crispasr-lib PUBLIC ggml Threads::Threads audioseal)
+target_link_libraries(crispasr-lib PUBLIC ggml Threads::Threads audioseal crispasr-core snac)
 
 # `crispasr_cache.cpp` calls WinHTTP for HF auto-download on Windows. MSVC
 # auto-links winhttp.lib via `#pragma comment(lib, "winhttp.lib")` inside
@@ -431,6 +431,18 @@ endif()
 set_target_properties(crispasr-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
+# snac — Standalone SNAC 24 kHz codec decoder (shared by orpheus, mini-omni2)
+# ---------------------------------------------------------------------------
+add_library(snac STATIC core/snac.h core/snac.cpp)
+set_target_properties(snac PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(snac PUBLIC .)
+target_compile_features   (snac PUBLIC cxx_std_17)
+target_link_libraries     (snac PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(snac PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # crispasr-llama-core — vendored llama.cpp built as a private STATIC lib
 # so the chat / text-LLM C-ABI (src/chat.cpp, include/crispasr_chat.h) can
 # call into it without exposing `llama.h` types in the public surface and
@@ -510,6 +522,29 @@ endif()
 if(WIN32)
     # llama-mmap.cpp uses PrefetchVirtualMemory which needs Win 8.1+.
     target_compile_definitions(crispasr-llama-core PRIVATE _WIN32_WINNT=0x0602)
+endif()
+
+# ---------------------------------------------------------------------------
+# Nemotron — nvidia/nemotron-3.5-asr-streaming-0.6b (Cache-Aware FastConformer + RNNT)
+# ---------------------------------------------------------------------------
+add_library(nemotron STATIC
+            nemotron.h
+            nemotron.cpp
+            )
+target_include_directories(nemotron PUBLIC . ../include)
+target_compile_features   (nemotron PUBLIC cxx_std_17)
+set_target_properties(nemotron PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (nemotron PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(nemotron PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(nemotron PRIVATE GGML_USE_METAL)
+    target_link_libraries(nemotron PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(nemotron PRIVATE GGML_USE_CUDA)
+    target_link_libraries(nemotron PUBLIC ggml-cuda)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -742,6 +777,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# mini-omni2 — gpt-omni/mini-omni2 (Whisper-small + Qwen2-0.5B)
+# ---------------------------------------------------------------------------
+add_library(mini-omni2 STATIC mini_omni2.h mini_omni2.cpp)
+set_target_properties(mini-omni2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mini-omni2 PUBLIC .)
+target_compile_features   (mini-omni2 PUBLIC cxx_std_17)
+target_link_libraries     (mini-omni2 PUBLIC crispasr-core snac ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(mini-omni2 PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # kyutai-stt — Kyutai STT (stt-1b-en_fr, stt-2.6b-en)
 # ---------------------------------------------------------------------------
 add_library(kyutai-stt STATIC kyutai_stt.h kyutai_stt.cpp)
@@ -851,11 +898,11 @@ endif()
 # ---------------------------------------------------------------------------
 # orpheus — canopylabs/orpheus-3b-0.1-ft (Llama-3.2-3B + SNAC 24 kHz codec)
 # ---------------------------------------------------------------------------
-add_library(orpheus STATIC orpheus.h orpheus.cpp orpheus_snac.h orpheus_snac.cpp)
+add_library(orpheus STATIC orpheus.h orpheus.cpp)
 set_target_properties(orpheus PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(orpheus PUBLIC .)
 target_compile_features   (orpheus PUBLIC cxx_std_17)
-target_link_libraries     (orpheus PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries     (orpheus PUBLIC crispasr-core snac ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(orpheus PRIVATE -O3)
 endif()
@@ -1030,7 +1077,10 @@ endif()
 # ---------------------------------------------------------------------------
 # kokoro — hexgrad/Kokoro-82M + yl4579/StyleTTS2-LJSpeech (iSTFTNet TTS)
 # ---------------------------------------------------------------------------
-add_library(kokoro STATIC kokoro.h kokoro.cpp phonemizer.h phonemizer.cpp)
+# phonemizer.cpp is in crispasr-lib (line ~143); don't duplicate it here
+# or the all-in-one link (Linux/Android shared .so, iOS fat archive) gets
+# duplicate symbols. Symbols resolve at final link time.
+add_library(kokoro STATIC kokoro.h kokoro.cpp phonemizer.h)
 set_target_properties(kokoro PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kokoro PUBLIC .)
 target_compile_features   (kokoro PUBLIC cxx_std_17)
@@ -1348,6 +1398,13 @@ set_target_properties(firered-asr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(firered-asr PUBLIC .)
 target_compile_features   (firered-asr PUBLIC cxx_std_17)
 target_link_libraries     (firered-asr PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+# firered_asr.cpp's CPU decoder/encoder matmuls (cpu_matmul_bt) are
+# `#pragma omp parallel for`, but the target never linked OpenMP — so the
+# pragmas were no-ops and the AED beam decoder ran single-threaded
+# (~1.4 s/token at beam 5). Link OpenMP so the matmuls actually parallelize.
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(firered-asr PUBLIC OpenMP::OpenMP_CXX)
+endif()
 if(NOT MSVC)
     target_compile_options(firered-asr PRIVATE -O3)
 endif()
@@ -1505,6 +1562,9 @@ endif()
 # `target_link_libraries(crispasr-lib PUBLIC <target>)` below, (3) add the
 # `crispasr_<backend>_*` wrappers to crispasr_c_api.cpp.
 # ---------------------------------------------------------------------------
+if (TARGET nemotron)
+    target_link_libraries(crispasr-lib PUBLIC nemotron)
+endif()
 if (TARGET parakeet)
     target_link_libraries(crispasr-lib PUBLIC parakeet)
 endif()
@@ -1543,6 +1603,9 @@ if (TARGET ctc-align)
 endif()
 if (TARGET glm-asr)
     target_link_libraries(crispasr-lib PUBLIC glm-asr)
+endif()
+if (TARGET mini-omni2)
+    target_link_libraries(crispasr-lib PUBLIC mini-omni2)
 endif()
 if (TARGET kyutai-stt)
     target_link_libraries(crispasr-lib PUBLIC kyutai-stt)

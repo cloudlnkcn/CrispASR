@@ -10,6 +10,219 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## Never pass `ggml_graph_get_tensor` directly to `ggml_backend_tensor_set` (#164)
+
+`ggml_graph_get_tensor` returns NULL when a tensor name isn't found in the
+graph's leafs/nodes. Passing that NULL directly to `ggml_backend_tensor_set`
+triggers `GGML_ASSERT(tensor)` → SIGABRT. This is silent and hard to diagnose
+because the crash gives only a file:line in ggml-backend.cpp, not the tensor
+name or call site. Two rules:
+
+1. **Always null-check** the return of `ggml_graph_get_tensor` before passing
+   it to any `ggml_backend_tensor_*` function. Log the missing tensor name
+   and return zeros or fall back to the CPU path.
+2. **Shape input tensors to avoid broadcast.** `ggml_add(a, b)` where
+   `b->ne[0] != a->ne[0]` (e.g. a 1-element scalar broadcast) works on CPU
+   but SIGABRTs on some CUDA/Vulkan backends. Use `b->ne[0] == a->ne[0]` and
+   fill the buffer. The voxcpm2 `fsq_half` 1-element tensor was this exact bug.
+
+Both patterns existed in 13 call sites across 5 graph functions (tslm, ralm,
+locenc, locdit, vae_decode) and were only caught when an unrelated graph
+topology change made a name lookup fail.
+
+## `rope_theta=0` means "no positional encoding" — skip RoPE entirely (#164)
+
+Some sub-models (VoxCPM2 RALM) intentionally set `rope_theta=0` to disable
+positional encoding. `ggml_rope_ext` computes `powf(theta, -2k/d)` →
+`powf(0, negative) = inf` → NaN cascade. The NaN was latent (hidden by the
+CPU stop fallback) until the RoPE skip was needed to fix the graph path. If a
+model's attention has `rope_theta <= 0`, gate the RoPE call; don't pass zero
+through and hope the math works out.
+
+## A feature has ~8 front-ends — wiring it into one isn't "done" (§166)
+
+A user-facing option in this repo must be threaded through every surface or it
+silently drifts: the CLI (`crispasr_run.cpp`), the HTTP server
+(`crispasr_server.cpp` — per-request form params *and* resident startup state),
+the C-ABI (`crispasr_c_api.cpp` + `crispasr_session.h`), the six native wrappers
+(Python ctypes, Go cgo, **Rust at the repo root** `crispasr-sys`/`crispasr` — not
+under `bindings/`, Dart FFI, Java JNA, Ruby C-ext), the WASM/JS Embind binding,
+and the legacy Node addon. `--punc-model` started life CLI-only; closing the gap
+meant ~8 edits + a test per surface. Lessons that paid off:
+- **Share the resolution, don't copy it.** The `--punc-model` alias→model table
+  lives in one pure header (`src/crispasr_punc_model.h`) included by CLI, server,
+  and C-ABI; the truecase loader likewise. Copies drift the moment a backend or
+  URL changes.
+- **Audit by enumerating surfaces, then diff each against the C-ABI** (the source
+  of truth) — that's how the per-wrapper gaps (set_hotwords/set_g2p_dict/
+  set_punc_model/set_speaker_id missing in various wrappers) and the threadbare
+  Node addon were found.
+- **Verify per surface with the toolchain that exists** (cargo, go build, dart
+  analyze, javac+JNA, ruby `cc -fsyntax-only`, ctypes import). When a toolchain
+  is absent (emcc, cmake-js) say so and fall back to inspection — don't claim
+  green you didn't see.
+- **Resident vs per-request** is its own axis on the server: post-processors
+  (punc/truecase) and detectors (LID/VAD) should load once at startup and stay
+  resident, not reload per request (#165).
+
+## A dry-run "preview" must mirror the real resolver, or it lies (§166)
+
+`--dry-run-resolve` had its own `build_preview()` that re-implemented model
+resolution — and drifted: it skipped the literal-arg backend-key lookup the real
+`crispasr_resolve_model` does, so `-m parakeet-tdt_ctc-110m --dry-run-resolve`
+previewed the 0.6b default while an actual run loaded the correct 110m. Any
+preview/plan/dry-run that re-derives behavior instead of calling the real code
+path will eventually diverge from it. Prefer sharing the resolver; if you must
+duplicate, pin the duplicate against the original with a test (here:
+`tests/test-dry-run-resolve.sh`). Same lesson as the §166 punc-model resolver
+being shared across CLI/server/C-ABI rather than copied three times.
+
+## Graph input tensors that nothing consumes are invisible to `ggml_graph_get_tensor` (#164)
+
+`ggml_set_input(t)` marks a tensor as a graph input, but if no operation in the
+graph actually reads `t`, it's never added to the graph's leafs/nodes arrays.
+`ggml_graph_get_tensor(gf, name)` only searches those arrays, so it returns NULL
+for a "created but unused" input — even though the tensor exists in the ggml
+context.
+
+This bit VoxCPM2's RALM: `positions` was created and set as input, but after the
+RoPE skip fix (`rope_theta=0`), no op consumed it (RoPE skipped + F32 KV cache
+uses `ggml_cpy` not `ggml_set_rows`). The null-guard treated NULL positions as
+fatal and returned all-zero hidden states → noise output. Fix: make the positions
+tensor optional — if the graph doesn't need it, don't require it.
+
+**Rule:** if a graph input is conditionally consumed (e.g. only used when RoPE is
+active), the setter code must tolerate `ggml_graph_get_tensor` returning NULL for
+it. Don't fail on a legitimately unused input.
+
+## Orpheus/SNAC TTS: `token_embd` must stay F16 for sub-Q8 quants
+
+Orpheus (Llama-3.2-3B with SNAC 24kHz codec) uses tied weights:
+`talker.token_embd.weight` serves as both input embedding and LM head.
+The SNAC codec emits peaked distributions over 4096 audio tokens —
+quantization noise from Q4_K is enough to break the 7:1 super-frame
+slot pattern and produce gibberish. The upstream repo's README says
+"sub-Q8 quants tend to break the SNAC super-frame slot pattern."
+
+**Fix:** `crispasr-quantize` now has an `is_orpheus` guard that keeps
+`talker.token_embd.weight` at F16. Block projections (attn, FFN) quantize
+safely to Q4_K. Same reasoning as qwen3-tts `talker.token_embd`, bark
+`token_embd`, and LFM2's `lfm.embed_tokens` — tied/output weights on
+peaked-distribution codecs are always quant-sensitive.
+
+## `ggml_backend_cpu_set_n_threads` asserts CPU — guard it after `init_best()`
+
+`ggml_backend_init_best()` returns the *best* backend (Metal on Apple Silicon,
+CUDA on NVIDIA, CPU otherwise). Calling `ggml_backend_cpu_set_n_threads()` on the
+result aborts with `GGML_ASSERT(ggml_backend_is_cpu(backend_cpu))` on any GPU
+build — that setter is CPU-only. Always gate it: `if (ggml_backend_is_cpu(b))
+ggml_backend_cpu_set_n_threads(b, n);`. This bit silero-LID (`--lid-backend
+silero` aborted on every Metal/CUDA load, #165); it's an easy one to copy-paste
+wrong into any new backend's `*_init`. The crash only shows on a GPU build, so a
+CPU-only CI lane won't catch it. (Per-call model load + free also hides it as a
+fresh abort each request rather than once at startup — see the resident-cache
+work in the same fix.)
+
+## Regenerate Go cgo LDFLAGS from a *linux-equivalent* config, never macOS
+
+`tools/sync_go_cgo_ldflags.py` writes the SHARED `#cgo linux/darwin LDFLAGS`
+line from whatever CMake graphviz dot it's given. Run on macOS, the dot includes
+macOS-only ggml backends (`ggml-metal`, and `ggml-blas` via Accelerate even with
+`-DGGML_METAL=OFF`), so they leak into the *shared* line — which then (a) fails
+the CI `cgo-ldflags-drift` check (the linux runner's graph has neither) and (b)
+breaks the linux link (`-lggml-metal`/`-lggml-blas` don't exist there). macOS gets
+those from a separate `#cgo darwin LDFLAGS: -lggml-metal -lggml-blas` line, so the
+shared line must match the LINUX set: `ggml-base`/`ggml-cpu`/`ggml` + the
+platform-independent crispasr backends. To regenerate on macOS, configure with
+`-DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF -DGGML_CUDA=OFF` (what the
+CI drift job's linux defaults produce) before running the sync, then confirm with
+`--check --dot <that dot>`. (Cost me two wrong commits — metal, then blas.)
+
+## cmake-js defaults its build dir to `build/` — point it elsewhere (§166)
+
+Running `cmake-js compile` from the repo root reconfigured and clobbered the
+ninja `build/` (cmake-js's default `--out` is `build/`), wiping libcrispasr.dylib
++ bin/crispasr that the wrappers and tests link against. Always pass an explicit
+`-O <dir>` (and `-d <project-dir>`) so the Node-addon build lands in its own tree
+(e.g. `build-addon/`). Recovery is just a fresh `cmake -B build` + rebuild
+(ccache keeps it fast), but it's avoidable. The addon's own CMakeLists has no
+`cmake_minimum_required`/`project()` — it's meant to be `add_subdirectory`'d from
+the root under `CMAKE_JS_VERSION`, so cmake-js must run with `-d <root>`, not from
+the addon dir.
+
+## A WebSocket server that "works in the browser" can still be RFC-broken (§166)
+
+ws_stream's handshake had the RFC 6455 magic GUID mistyped
+(`...5AB5DC11D585` vs correct `...C5AB0DC85B11`), so `Sec-WebSocket-Accept` was
+always wrong — yet it had shipped. Lesson: verify a WS handshake against a
+*spec-compliant* client (the `websockets` lib, a real browser), not a hand-rolled
+client that echoes your own (possibly wrong) accept. The fastest localization was
+the canonical RFC vector: key `dGhlIHNhbXBsZSBub25jZQ==` must yield accept
+`s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`. Also: read the upgrade request in a loop until
+`\r\n\r\n` — a single recv() truncates handshakes split across TCP segments
+(works for a localhost one-shot client, fails for fragmented real ones). Both are
+"passes my own test, fails everyone else's" bugs — diff against the reference
+implementation, not a mirror of your own code.
+
+## Server warmup is the launch-time differentiator vs the CLI (#165)
+
+When "the CLI works but `--server` doesn't" on a given GPU/backend, suspect the
+**warmup** first. The server runs a dummy transcribe right after model load
+(`backend->warmup()` before `listen()`); the one-shot CLI does **not** warm up
+unless `--warmup` is passed. So a driver bug that only bites the warmup's
+input shape (e.g. parakeet's 0.5 s of silence) presents as "server hangs after
+model init, CLI transcribes fine." Diagnose by where the log stops: no
+`warmup completed in … ms` line ⇒ it died inside warmup. Fixes: an opt-out
+(`--no-warmup`) and a try/catch around the warmup call. A hard GPU device-lost
+won't be catchable, but the opt-out sidesteps it. Couldn't reproduce on
+M1/MoltenVK — Vulkan-driver bugs are RADV/AMD/proprietary-specific, not portable.
+
+## Don't throw on the per-request server path; surface the real error (#165)
+
+Two cpp-httplib server traps found together:
+- A route handler that **throws** becomes a bare 500 with an empty body.
+  cpp-httplib then invokes the *error* handler, which (if it fills empty bodies)
+  mislabels every exception as the generic "not found" 404 payload. Add
+  `svr.set_exception_handler` to log `e.what()` and return a structured 500 — a
+  thrown `std::filesystem_error` masquerading as "use POST /v1/..." cost real
+  debugging time here.
+- Anything on the per-request path that calls the **throwing**
+  `std::filesystem::create_directories` (e.g. a scratch/cache dir helper) will
+  500 *every* request when that dir is unwritable or odd (here: a dangling
+  `~/.cache/crispasr` symlink to an unmounted disk). Use the `std::error_code`
+  overload and fall back to `temp_directory_path()`.
+
+## FFT size must match upstream exactly (Mini-Omni2 / Whisper mel)
+
+Whisper's `torch.stft(n_fft=400)` runs a 400-point DFT. Zero-padding to
+512 (next power of 2) changes the frequency bin spacing from `k*sr/400`
+to `k*sr/512`. The mel filterbank expects bins at `k*40 Hz`; zero-padded
+bins land at `k*31.25 Hz`. Result: cos_min≈0.8 on mel comparison. Fix:
+use a 400-point DFT directly (O(N*N_freqs) is fast enough for N=400).
+
+Related: `torch.hann_window(N)` (periodic) differs from
+`np.hanning(N+1)[:-1]` (symmetric) by ~2.4e-7 per sample. Enough to
+cause cos_min≈0.95 on mel. Store the upstream variant in the GGUF.
+
+Also: Whisper drops the last STFT frame (`stft[..., :-1]`). core_mel
+produces one extra frame. Truncate: `T_mel = n_samples / hop_length`.
+
+## Multi-stream token architecture (Mini-Omni2)
+
+Models that interleave text + audio codec streams (8 in mini-omni2) embed
+each stream separately and average all 8 into a single hidden state per
+timestep. Key pitfalls:
+
+1. Audio features replace pad positions in **audio streams only** (0-6),
+   NOT the text stream (7). The Python `concat_feat` does `for i in range(7)`.
+2. Special task tokens at the end of each stream select the mode:
+   `_asr=151940` for transcription, `_answer_t` for chat/S2S.
+3. Decode step uses `snac_config.end_of_audio=4097` (pad_a), not `eoa=4096`.
+4. LitGPT's fused QKV is interleaved per query group: `[Q0×7, K0, V0, Q1×7,
+   K1, V1]`, not `[Q_all, K_all, V_all]`. Must deinterleave in converter.
+5. Batch all 8 token embeddings in one `ggml_get_rows` call per decode step
+   instead of 8 separate graph builds — ~4× speedup.
+
 ## Decompose ConvTranspose1d → mul_mat + col2im_1d; port col2im per-backend (#155)
 
 The native `conv_transpose_1d` GPU kernel is slow (each output thread loops the
@@ -9563,3 +9776,165 @@ coverage. For voxcpm2, TSLM (28L) + RALM (8L) + LocDiT (12L) + LocEnc
 (12L) + VAE decode now all run as GPU graphs. The remaining CPU-only ops
 (FSQ, stop, fusion, ~5-8 ms/step) are too small to justify graph-build
 overhead.
+
+### LFM2-Audio hybrid conv+attention backbone — 2026-06-11/12
+
+**Problem:** The LFM2 backbone has two layer types (10 ShortConv + 6 GQA
+attention) interleaved in a fixed pattern `ccaccaccacacacac`. Standard KV
+cache only works for the attention layers. The conv layers need their own
+state management.
+
+**Conv state caching:** Each ShortConv layer uses a depthwise causal
+conv1d with kernel_size=3. For T=1 decode, the conv needs the last K-1=2
+Bx columns from previous steps. Solution: store Bx columns in CPU-side
+float arrays (160 KB total for 10 layers × 2048 × 2). During decode:
+load cached columns → concat with new Bx via `ggml_concat` → run actual
+`ggml_conv_1d_dw` on K=3 tokens → take last output. Shift cache
+left by 1 after each step. (Originally used `ggml_conv_2d_dw_direct` with
+4D reshape/permute; migrated to `ggml_conv_1d_dw` which is cleaner and
+has native CUDA dispatch via im2col+mul_mat.)
+
+**Snapshot extraction:** To capture the Bx columns after prefill, compute
+Bx in a parallel graph branch (doesn't affect the main conv path, just
+duplicates the `in_proj` + elementwise multiply). Name the snapshot tensor
+with `ggml_set_name`, retrieve after graph eval with `ggml_graph_get_tensor`
+(or `ggml_backend_tensor_get` for gallocr-allocated graphs).
+
+**Causal mask bug:** `ggml_flash_attn_ext` with `mask=nullptr` does NOT
+default to causal attention. It does FULL (non-causal) attention. For the
+LFM2 backbone, every attention layer diverged without an explicit causal
+mask. The fix was trivial — build a (T, T) F16 mask with 0/−inf — but the
+debugging took hours because the divergence only showed at cos≈0.37 after
+16 layers, not as a crash. The per-layer diff harness (`lfm2_ao_layer_K`)
+was essential: it showed conv layers (0,1) were fine but layer 2 (first
+attention) dropped, proving the mask was the issue.
+
+**Depthformer KV cache:** The depthformer (6L, 1024-dim) generates 8
+codebooks per audio frame. `core_attn::kv_self_attn` with fused QKV
+produced degenerate output (all codebooks identical). The manual KV cache
+approach works: CPU-side K/V arrays, `ggml_concat` to build full K/V
+from cache + new, `ggml_flash_attn_ext` for attention. The QKV split in
+`kv_self_attn` should be compatible (checked: Q|K|V order matches) but
+something else in the helper's complex logic (GQA expansion, cache write
+path) doesn't work for this tiny (T≤8) use case. Manual KV cache is
+simpler and correct.
+
+**Mel filterbank:** The liquid-audio conformer uses librosa's slaney-
+normalized mel filterbank. CrispASR's `core_mel` uses HTK (non-slaney).
+The fix: store the slaney filterbank in the GGUF (via the converter) and
+load it at runtime. This gives cos=0.9999 mel match. The HTK filterbank
+gave cos=−0.1 (essentially wrong).
+
+**BPE merges:** Without merges, the per-byte BPE tokenizer tokenizes
+"こんにちは" as 15 tokens (5 chars × 3 bytes). With merges, it tokenizes
+correctly as 4-5 tokens. Merges need to be stored in the GGUF
+(`tokenizer.ggml.merges`) and loaded at runtime for `core_bpe::bpe_one`.
+
+**ggml_gallocr vs fixed buffer:** The 2 GB compute_meta buffer caused
+heavy page-fault overhead (sys time ~1 min). Migrating to `ggml_gallocr`
+for the decode step reduced sys time to ~7s. For the prefill, reducing
+to 256 MB (still bump-allocated) was sufficient since the graph actually
+uses ~200 MB. The gallocr approach is: `no_alloc=true` in `ggml_init`,
+`ggml_gallocr_alloc_graph` after graph build, `ggml_backend_tensor_set/get`
+for inputs/outputs.
+
+**GPU readiness:** The gallocr paths ARE GPU-compatible. With
+`backend = ggml_backend_init_best()`, weights load on GPU, gallocr
+allocates intermediates on GPU, and `ggml_backend_graph_compute(backend, gf)`
+runs on GPU. The remaining `compute_meta` (bump-allocated) paths need
+gallocr migration for full GPU coverage. Kaggle T4 test confirmed the
+CUDA build works and produces correct output.
+
+**Detokenizer companion GGUF:** TTS output requires a separate model for
+codes→PCM. The detokenizer path searches: exact match → strip quant
+suffix + try F16 → strip quant suffix + try base. This makes quantized
+models find the F16 detokenizer without needing per-quant detokenizer files.
+
+## beam_size default — greedy vs beam-5 (issue #161, 2026-06-12)
+
+### Problem
+
+`whisper_params.beam_size` defaulted to 5 (from `whisper_full_default_params`
+at compile time). This propagated to ALL backends via the shared `whisper_params`
+struct. For whisper itself this was intentional (beam search improves quality),
+but for TDT/RNNT backends like parakeet it caused a 4.5× latency regression
+with zero WER benefit — the beam-5 default silently switched every backend
+from greedy to beam search.
+
+### Fix
+
+Default `beam_size = -1` (greedy). All whisper dispatch sites clamp
+`beam_search.beam_size` to `max(bs, 5)` for grammar-forced beam search.
+Non-whisper backends already check `beam_size > 0` and fall to 1 (greedy)
+or their own default (firered uses 3).
+
+### Takeaway
+
+Shared param structs that set defaults from one backend's perspective
+silently affect all others. Defaults should be "unset" (-1) with per-backend
+policy, not one-size-fits-all.
+
+## ggml_graph_get_tensor hash invalidated by ggml_gallocr (issue #164, 2026-06-12)
+
+### Problem
+
+`ggml_graph_get_tensor(gf, "name")` uses an internal hash table for O(1) lookup.
+`ggml_gallocr_reserve()` and `ggml_gallocr_alloc_graph()` both call
+`ggml_gallocr_alloc_graph_impl()` which resets this hash table (line 790:
+`ggml_hash_set_reset`). After that, name-based tensor lookup silently
+returns nullptr even though the tensor is still in the graph's node list.
+
+### Symptoms
+
+In the voxcpm2 TSLM graph, the "stop_probs" output tensor was found on the
+first call (before reserve), but returned nullptr on all subsequent calls.
+The stop predictor fell back to CPU computation, which diverged due to
+`ggml_flash_attn_ext` vs scalar attention precision differences, and the
+stop never fired.
+
+### Fix
+
+Cache tensor pointers at build time (after `build_tslm_step_graph` but
+BEFORE `ggml_gallocr_reserve`). Store in the bucket struct and reuse on
+subsequent calls without any name-based lookup.
+
+### Takeaway
+
+**Never call `ggml_graph_get_tensor` after `ggml_gallocr_reserve` or
+`ggml_gallocr_alloc_graph` on a cached/reused graph.** The hash is
+destroyed. Look up tensors immediately after graph construction and cache
+the pointers. This affects any code that reuses ggml graphs across calls
+(bucket patterns, step-graph caching, etc).
+
+## flash_attn_ext vs scalar attention — numerical divergence (2026-06-12)
+
+### Problem
+
+`ggml_flash_attn_ext` (tiled softmax, SIMD accumulation) and hand-coded
+scalar `causal_attn_step` (sequential dot product + softmax + weighted sum)
+produce different FP32 results due to reduction order. On Q4_K weights with
+28 transformer layers, the max_diff was ~0.09 at step 0, compounding to
+divergence across 64 AR steps.
+
+### Impact
+
+Any code that mixes graph-path hidden states with legacy CPU-path
+operations (like computing stop_score via `matmul_mv` on graph-produced
+hidden) will see compounding divergence. The stop predictor in voxcpm2
+never fired because the graph's hidden trajectory was numerically
+different enough that the CPU-computed stop score stayed below threshold.
+
+### Fix
+
+Compute the stop predictor entirely inside the graph (stop_proj + SiLU +
+stop_head + softmax as a graph output tensor). This ensures the stop
+decision uses the same numerical path as the hidden state.
+
+### Takeaway
+
+**Don't mix graph-computed intermediates with legacy CPU operations for
+critical decisions.** If a graph produces hidden states, any downstream
+computation (stop prediction, scoring, etc.) should also be in the graph.
+The precision difference between `ggml_mul_mat` (SIMD/BLAS) and scalar
+loops is small per step but compounds exponentially across autoregressive
+decode steps.

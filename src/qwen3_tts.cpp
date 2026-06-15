@@ -715,6 +715,8 @@ struct qwen3_tts_context {
     ggml_backend_buffer_t cp_lm_slot_buf = nullptr;
     ggml_tensor* cp_lm_head_slot = nullptr;
     ggml_cgraph* cp_t1_gf = nullptr;
+    ggml_backend_sched_t cp_t1_sched = nullptr; // dedicated sched for O15 T=1 reuse
+    bool cp_t1_allocated = false;               // true once cp_t1_sched has allocated cp_t1_gf
 
     // Step-0 graph cache (PLAN #52 step 4 follow-on). The first cp_pred call
     // per frame is T=2 with lm_head[0]; the existing cp_t1_gf cache only
@@ -1434,6 +1436,7 @@ static float* run_talker_kv_dynamic(qwen3_tts_context* c, const float* embeds, i
     // Invalidate any cached T=1 code_pred graph — build_graph_talker_kv will
     // overwrite compute_meta, making cp_t1_gf stale.
     c->cp_t1_gf = nullptr;
+    c->cp_t1_allocated = false;
 
     const bool bench = env_bool("QWEN3_TTS_BENCH");
     const bool prof = env_bool("QWEN3_TTS_PROF");
@@ -1868,7 +1871,8 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     const bool prof = env_bool("QWEN3_TTS_PROF");
     const double t_build0 = bench ? now_ms() : 0.0;
 
-    // skip_plan=true: reuse the cached T=1 graph — no rebuild, no reset, no alloc.
+    // skip_plan=true: reuse the cached T=1 graph on a dedicated scheduler
+    // so the talker's sched operations don't invalidate our allocations.
     // The graph is valid because compute_meta wasn't touched since it was built.
     const bool can_skip = skip_plan && use_slot && (c->cp_t1_gf != nullptr);
     ggml_cgraph* gf;
@@ -1885,18 +1889,35 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     }
 
     const double t_build1 = bench ? now_ms() : 0.0;
-    ggml_backend_sched_t sched = code_pred_pick_sched(c);
-    if (!code_pred_reserve_sched(c, sched)) {
+
+    // O15 cached path: use a dedicated scheduler so the shared sched's
+    // reset/alloc from the talker doesn't invalidate our tensor buffers.
+    // This was the root cause of the CUDA GGML_ASSERT crash (#56).
+    ggml_backend_sched_t sched;
+    if (use_slot) {
+        if (!c->cp_t1_sched) {
+            ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
+            int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
+            c->cp_t1_sched = ggml_backend_sched_new(backends, nullptr, n_be, 4096, false, false);
+        }
+        sched = c->cp_t1_sched;
+    } else {
+        sched = code_pred_pick_sched(c);
+    }
+    if (!use_slot && !code_pred_reserve_sched(c, sched)) {
         return nullptr;
     }
     const double t_reset0 = bench ? now_ms() : 0.0;
-    if (!can_skip) {
+    if (!can_skip || !c->cp_t1_allocated) {
         ggml_backend_sched_reset(sched);
     }
     const double t_reset1 = bench ? now_ms() : 0.0;
-    if (!can_skip) {
+    if (!can_skip || !c->cp_t1_allocated) {
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             return nullptr;
+        }
+        if (use_slot) {
+            c->cp_t1_allocated = true;
         }
     }
     const double t_alloc1 = bench ? now_ms() : 0.0;
@@ -3784,7 +3805,7 @@ static bool load_codec(qwen3_tts_context* c, const char* path) {
         // Create permuted weight tensors and compute host-side buffers.
         auto mk_perm = [&](ggml_tensor* src, std::unique_ptr<float[]>& out_buf) -> ggml_tensor* {
             const int IC = (int)src->ne[2];
-            const int K  = (int)src->ne[0];
+            const int K = (int)src->ne[0];
             const int OC = (int)src->ne[1];
             ggml_tensor* dst = ggml_new_tensor_2d(codec.ctx_perm, GGML_TYPE_F32, IC, K * OC);
             out_buf = core_convt::permute_convt1d_weight(src);
@@ -6378,6 +6399,7 @@ extern "C" void qwen3_tts_sync(struct qwen3_tts_context* ctx) {
     sync_sched(ctx->codec_sched_gpu);
     sync_sched(ctx->talker_step_sched);
     sync_sched(ctx->cp_sched);
+    sync_sched(ctx->cp_t1_sched);
     sync_sched(ctx->cp_step0_sched);
 }
 
@@ -6401,6 +6423,9 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
         if (bk.ctx) {
             ggml_free(bk.ctx);
         }
+    }
+    if (ctx->cp_t1_sched) {
+        ggml_backend_sched_free(ctx->cp_t1_sched);
     }
     if (ctx->cp_step0_sched) {
         ggml_backend_sched_free(ctx->cp_step0_sched);

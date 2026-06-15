@@ -291,6 +291,10 @@ struct funasr_context {
     bool enc_flash_attn = true;
     bool step_graph_cache = false;
 
+    // Language hint from -l / set_language. Empty = default ("语音转写：").
+    // Non-empty = "语音转写成{language}：" matching upstream get_prompt().
+    std::string language;
+
     // Stage-capture state — set by funasr_extract_stage to request a
     // specific intermediate tensor; consumed by the encoder graph builder
     // (which wires a named ggml_dup snap at the requested stage so the
@@ -1667,8 +1671,22 @@ static std::vector<float> funasr_embed_tokens(funasr_context* ctx, const std::ve
 // High-level pipeline: build prompt, splice audio, run AR decode → text.
 // ===========================================================================
 
-static const char* PROMPT_PREFIX = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-                                   "\xE8\xAF\xAD\xE9\x9F\xB3\xE8\xBD\xAC\xE5\x86\x99\xEF\xBC\x9A"; // "语音转写："
+// Build the ChatML prompt prefix matching upstream get_prompt(language=...).
+// Default (empty language): "语音转写："
+// With language: "语音转写成{language}："
+static std::string funasr_build_prompt_prefix(const std::string& language) {
+    std::string prefix = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
+    // "语音转写" = speech transcription
+    prefix += "\xE8\xAF\xAD\xE9\x9F\xB3\xE8\xBD\xAC\xE5\x86\x99";
+    if (!language.empty()) {
+        // "成" = "to/into"
+        prefix += "\xE6\x88\x90";
+        prefix += language;
+    }
+    // "：" = Chinese colon
+    prefix += "\xEF\xBC\x9A";
+    return prefix;
+}
 static const char* PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n";
 
 static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm, int n_samples,
@@ -1707,7 +1725,8 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     std::vector<int32_t> suffix_ids;
     {
         funasr_bench_stage s("prompt_tokenize");
-        prefix_ids = funasr_bpe_encode(ctx->vocab, PROMPT_PREFIX);
+        std::string prompt_prefix = funasr_build_prompt_prefix(ctx->language);
+        prefix_ids = funasr_bpe_encode(ctx->vocab, prompt_prefix);
         suffix_ids = funasr_bpe_encode(ctx->vocab, PROMPT_SUFFIX);
     }
     const int fake_token_len = compute_fake_token_len(T_lfr, hp.use_low_frame_rate);
@@ -2110,6 +2129,12 @@ extern "C" void funasr_set_beam_size(funasr_context* ctx, int beam_size) {
     if (!ctx)
         return;
     ctx->beam_size = beam_size > 1 ? beam_size : 1;
+}
+
+extern "C" void funasr_set_language(funasr_context* ctx, const char* lang) {
+    if (!ctx)
+        return;
+    ctx->language = (lang && *lang) ? lang : "";
 }
 
 extern "C" void funasr_free(funasr_context* ctx) {

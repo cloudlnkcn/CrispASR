@@ -7,9 +7,11 @@
 // its own crispasr_backend_X.cpp file and compiled only if the backend's
 // library is linked in.
 std::unique_ptr<CrispasrBackend> crispasr_make_whisper_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_nemotron_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parakeet_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_canary_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_lfm2_audio_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_mini_omni2_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_cohere_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_granite_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_granite_nle_backend();
@@ -77,12 +79,17 @@ std::unique_ptr<CrispasrBackend> crispasr_make_csm_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name) {
     if (name == "whisper")
         return crispasr_make_whisper_backend();
+    if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
+        name == "nemotron-speech-streaming")
+        return crispasr_make_nemotron_backend();
     if (name == "parakeet")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
     if (name == "lfm2-audio")
         return crispasr_make_lfm2_audio_backend();
+    if (name == "mini-omni2" || name == "mini_omni2" || name == "miniomni2")
+        return crispasr_make_mini_omni2_backend();
     if (name == "cohere")
         return crispasr_make_cohere_backend();
     if (name == "granite" || name == "granite-4.1" || name == "granite-4.1-plus")
@@ -199,9 +206,11 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 std::vector<std::string> crispasr_list_backends() {
     return {
         "whisper",
+        "nemotron",
         "parakeet",
         "canary",
         "lfm2-audio",
+        "mini-omni2",
         "cohere",
         "granite",
         "granite-4.1",
@@ -301,6 +310,7 @@ static constexpr feature_col kFeatures[] = {
     {"src/tgt lang", CAP_SRC_TGT_LANGUAGE},
     {"auto-dl", CAP_AUTO_DOWNLOAD},
     {"tts", CAP_TTS},
+    {"s2s", CAP_S2S},
     {"voice-clone", CAP_VOICE_CLONING},
 };
 
@@ -375,6 +385,7 @@ static constexpr cap_slug kCapSlugs[] = {
     {"parallel-processors", CAP_PARALLEL_PROCESSORS},
     {"vad-internal", CAP_VAD_INTERNAL},
     {"tts", CAP_TTS},
+    {"s2s", CAP_S2S},
     {"voice-cloning", CAP_VOICE_CLONING},
 };
 
@@ -486,6 +497,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "canary";
     if (contains_ci("lfm2-audio") || contains_ci("lfm2_audio"))
         return "lfm2-audio";
+    if (contains_ci("mini-omni2") || contains_ci("mini_omni2") || contains_ci("miniomni2"))
+        return "mini-omni2";
     if (contains_ci("cohere"))
         return "cohere";
     if (contains_ci("mega-asr") || contains_ci("mega_asr") || contains_ci("megaasr"))
@@ -582,6 +595,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
             const std::string a = arch;
             if (a == "whisper")
                 result = "whisper";
+            else if (a == "nemotron" || a == "nemotron-asr" || a == "nemotron-streaming")
+                result = "nemotron";
             else if (a == "parakeet")
                 result = "parakeet";
             else if (a == "parakeet-tdt" || a == "parakeet-ja" || a == "parakeet_ja")
@@ -590,6 +605,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "canary";
             else if (a == "lfm2-audio")
                 result = "lfm2-audio";
+            else if (a == "mini-omni2")
+                result = "mini-omni2";
             else if (a == "canary-ctc")
                 result = "canary";
             else if (a == "cohere")

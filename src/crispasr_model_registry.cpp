@@ -60,6 +60,15 @@ constexpr Entry k_registry[] = {
      "~1.5 GB", nullptr, nullptr, nullptr,
      "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
      "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP)"},
+    // gpt-omni/mini-omni2: Whisper-small + Qwen2-0.5B multimodal (ASR+TTS+S2S).
+    // Q4_K is safe — identical ASR transcript to F16 on JFK 11s.
+    // SNAC 24kHz codec companion for TTS/S2S output.
+    {"mini-omni2", "mini-omni2-q4_k.gguf",
+     "https://huggingface.co/cstr/mini-omni2-GGUF/resolve/main/mini-omni2-q4_k.gguf",
+     "~1.0 GB",
+     "snac-24khz.gguf",
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
+     "~80 MB"},
     {"voxtral", "voxtral-mini-3b-2507-q4_k.gguf",
      "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-q4_k.gguf", "~2.5 GB", nullptr, nullptr},
     {"voxtral4b", "voxtral-mini-4b-realtime-q4_k.gguf",

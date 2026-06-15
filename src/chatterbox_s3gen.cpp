@@ -616,11 +616,12 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         std::unique_ptr<float[]> perm_bufs[3];
         for (int i = 0; i < n_ups; i++) {
             auto it = c->tensors.find(ups_names[i]);
-            if (it == c->tensors.end()) continue;
+            if (it == c->tensors.end())
+                continue;
             ggml_tensor* src = it->second;
             perm_bufs[i] = core_convt::permute_convt1d_weight(src);
-            c->ups_w_perm[i] = ggml_new_tensor_2d(c->ctx_perm, GGML_TYPE_F32,
-                                                   (int)src->ne[2], (int)src->ne[0] * (int)src->ne[1]);
+            c->ups_w_perm[i] =
+                ggml_new_tensor_2d(c->ctx_perm, GGML_TYPE_F32, (int)src->ne[2], (int)src->ne[0] * (int)src->ne[1]);
         }
         c->buf_perm = ggml_backend_alloc_ctx_tensors(c->ctx_perm, c->backend);
         for (int i = 0; i < n_ups; i++) {
@@ -888,7 +889,7 @@ extern "C" void chatterbox_s3gen_set_seed(struct chatterbox_s3gen_context* ctx, 
 // x: (D, T), returns: (D, T)
 static ggml_tensor* build_conformer_block(ggml_context* ctx, ggml_cgraph* gf, chatterbox_s3gen_context* c,
                                           ggml_tensor* x, int seq_len, const char* prefix, int n_heads, int head_dim,
-                                          int D, int ff_dim, ggml_tensor* pos_emb = nullptr) {
+                                          int D, int /*ff_dim*/, ggml_tensor* pos_emb = nullptr) {
     const int TT = seq_len; // renamed to avoid shadowing
     char key[64];
     auto W = [&](const char* suffix) -> ggml_tensor* {
@@ -1065,8 +1066,8 @@ static ggml_tensor* build_conformer_block(ggml_context* ctx, ggml_cgraph* gf, ch
         // contracts ne[0]: scores.ne[0]=TT, v_t.ne[0]=hd. No match!
 
         // Let me use a different approach: transpose scores to (TT_q, TT_k, H), then mul_mat with v_t
-        ggml_tensor* scores_t = ggml_cont(ctx, ggml_permute(ctx, scores, 1, 0, 2, 3)); // (TT_q, TT_k, H)
-        // Now ggml_mul_mat(v_t, scores_t): contracts ne[0]. v_t.ne[0]=hd, scores_t.ne[0]=TT_q. Still no.
+        // scores_t = ggml_cont(ctx, ggml_permute(ctx, scores, 1, 0, 2, 3)); // (TT_q, TT_k, H)
+        // ggml_mul_mat(v_t, scores_t): contracts ne[0]. v_t.ne[0]=hd, scores_t.ne[0]=TT_q. Still no.
 
         // Actually: we want out[d][q][h] = sum_k attn[k][q][h] * v[d][k][h]
         // This is: for each h: out[:,q] = V[:,:] @ attn[:,q]
@@ -1675,7 +1676,7 @@ static ggml_tensor* mul_mat_hp(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b
 
 // Helper: CausalResnetBlock1D — block1 + time_mlp + block2 + residual.
 static ggml_tensor* causal_resnet_block(ggml_context* ctx, ggml_tensor* x, ggml_tensor* t_emb,
-                                        chatterbox_s3gen_context* c, const char* prefix, ggml_tensor* mask) {
+                                        chatterbox_s3gen_context* c, const char* prefix, ggml_tensor* /*mask*/) {
     char key[64];
     auto W = [&](const char* suffix) -> ggml_tensor* {
         std::snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
@@ -1749,7 +1750,6 @@ static ggml_tensor* basic_transformer_block(ggml_context* ctx, ggml_tensor* x, /
         return core_gguf::try_get(c->tensors, key);
     };
 
-    int C = (int)x->ne[1];
     int TT = (int)x->ne[0];
 
     // Transpose to (T, C) for attention
@@ -1906,7 +1906,6 @@ static ggml_cgraph* build_graph_unet1d(chatterbox_s3gen_context* c, int T_mel) {
         if (mark_db_resnet)
             ggml_set_output(x);
         // 4 transformer blocks
-        ggml_tensor* xt = ggml_cont(ctx0, ggml_transpose(ctx0, x));
         for (int j = 0; j < 4; j++) {
             char prefix[48];
             std::snprintf(prefix, sizeof(prefix), "s3.fd.db.0.1.%d", j);
@@ -2527,7 +2526,6 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
                 int T_in = (int)x->ne[0];
                 x = ggml_conv_transpose_1d(ctx0, up_w, x, s, 0, 1);
                 if (p > 0) {
-                    int T_out = (int)((T_in - 1) * s + k);
                     int T_want = T_in * s;
                     int C_out = (int)x->ne[1];
                     x = ggml_view_2d(ctx0, x, T_want, C_out, x->nb[1], p * x->nb[0]);
@@ -2542,7 +2540,6 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
         if (stage == 2) {
             // Reflect-pad 1 sample on left: x[-1] is prepended
             // x has ne=(T, C). Take the second sample (index 1), prepend it.
-            int T_x = (int)x->ne[0];
             int C_x = (int)x->ne[1];
             // reflection pad left=1: new[0] = x[1], new[1..T] = x[0..T-1]
             ggml_tensor* pad_sample = ggml_view_2d(ctx0, x, 1, C_x, x->nb[1], 1 * x->nb[0]); // x[:,1]

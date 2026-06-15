@@ -258,6 +258,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = LiquidAI/LFM2.5-Audio-1.5B-JP HF id or local snapshot.
     # Prompt from LFM2_PROMPT env var (default "Perform ASR in japanese.").
     "lfm2-audio": "reference_backends.lfm2_audio",
+    # gpt-omni/mini-omni2: Whisper-small encoder + SwiGLU adapter +
+    # Qwen2-0.5B LLM. Custom litgpt framework (not HF). model_dir = cloned
+    # repo with lit_model.pth + small.pt + model_config.yaml. Needs the
+    # litgpt package on sys.path (set MINI_OMNI2_REPO or put it in model_dir).
+    "mini-omni2": "reference_backends.mini_omni2",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

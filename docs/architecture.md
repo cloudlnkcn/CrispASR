@@ -457,6 +457,30 @@ into `~/.cache/crispasr/`; the runtime auto-discovers
 `mimo-tokenizer-q4_k.gguf` next to the LM. Override with `--codec-model
 PATH/mimo-tokenizer-q4_k.gguf` if you keep the tokenizer elsewhere.
 
+### moss-audio
+
+32-layer Whisper-style audio encoder (1280d, 20 heads, 128-mel,
+sliding-window attention w=100) with **DeepStack** 3-tap cross-layer
+injection + 36-layer Qwen3 LM (2560d, 32Q/8KV, SwiGLU, RoPE θ=1M).
+Apache-2.0. First audio-understanding backend — supports transcription,
+audio QA, scene description, and time-aware ASR via prompt.
+
+**DeepStack architecture:** the encoder captures intermediate outputs at
+layers 8, 16, and 24. Each tap is projected through an independent
+GatedMLP (1280→8192→2560) into the LM embedding space. These projections
+are injected as residual adds at LM blocks 0, 1, and 2, preserving
+multi-resolution audio features (low-level prosody/transients alongside
+high-level semantics) through the LM's early layers.
+
+**Audio front-end:** 128-bin log-mel → 3×Conv2d (stride 2 each, 8×
+downsample total) → stem_proj Linear(7680, 1280) → sinusoidal position
+embeddings → 32 encoder blocks. Slaney mel filterbank normalization.
+Encoder output padded to 3000 frames (Whisper 30s convention).
+
+**Prompt format:** Qwen3 chat template with time-marker tokens inserted
+at fixed intervals between audio frame embeddings. Supports custom prompts
+via `--prompt` / `set_ask()` for audio understanding tasks beyond ASR.
+
 ### qwen3-tts
 
 Qwen3 talker LM + 12 Hz RVQ speech tokenizer. Three variants:
@@ -743,6 +767,48 @@ Converts text + reference audio to mel spectrograms via ODE-based diffusion
 (typically 32 Euler steps), then vocodes with a shared vocoder. Zero-shot
 voice cloning.
 
+### lfm2-audio
+
+LiquidAI LFM2.5-Audio (LFM Open v1.0, 1.5B): end-to-end multimodal
+ASR + TTS + speech-to-speech in a single model.
+
+**ASR path:** 16 kHz mono PCM → 128-mel NeMo-style spectrogram (slaney
+filterbank, ln + per-feature-z normalization) → 17L FastConformer encoder
+(512-dim, 8 heads, rel-pos attention, dw-striding 8× subsampling) → audio
+adapter MLP (LayerNorm → Linear(512→2048) → GELU → Linear(2048→2048)) →
+16L LFM2 hybrid backbone (2048-dim, 10 ShortConv + 6 GQA attention layers,
+SwiGLU FFN, RoPE θ=1M, QK layernorm) → greedy text decode via tied
+embed_tokens weight.
+
+The LFM2 backbone interleaves two layer types:
+- **ShortConv** (10 of 16 layers): depthwise causal conv1d (kernel=3) with
+  gated in/out projections. `BCx = in_proj(h)`, `Bx = B * x`, conv(Bx),
+  `y = C * conv_out`, `out = out_proj(y)`. Conv state cache stores last
+  K-1=2 Bx columns per layer for incremental decode.
+- **GQA attention** (6 of 16 layers): 32 query heads, 8 KV heads, head_dim=64.
+  Per-head QK RMSNorm before RoPE. Flash attention with explicit causal mask.
+  Standard F16 KV cache for incremental decode.
+
+Layer types follow the pattern `ccaccaccacacacac` (c=conv, a=attn).
+
+**TTS path:** text tokenized via GPT-2 BPE → interleaved generation
+(6 text tokens + 9 audio frames alternating) → depthformer (6L transformer,
+1024-dim, fused QKV, 8-codebook Mimi code generation) → ISTFT detokenizer
+(separate 8L LFM2 512-dim + Linear(512→1282) + ISTFT → 24 kHz PCM).
+The detokenizer loads from a companion `*-detokenizer.gguf`.
+
+**Speech-to-speech:** combines the ASR conformer encoder (audio input) with
+interleaved generation (text + audio output). System prompt:
+"Respond with interleaved text and audio."
+
+GGUF: single file for the main model (encoder + backbone + depthformer + Mimi
+codec + audio embedding) + companion detokenizer. Quantization: Q5_K
+recommended for EN, Q4_K for JP. crispasr-quantize keeps encoder, adapter,
+embeddings, and Mimi codec at F16; only backbone + depthformer layers quantized.
+
+Variants: English (`LiquidAI/LFM2.5-Audio-1.5B`) and Japanese
+(`LiquidAI/LFM2.5-Audio-1.5B-JP`).
+
 ### bark
 
 Suno Bark (MIT, ~400M): three-stage GPT-2 pipeline — text → semantic tokens
@@ -771,4 +837,30 @@ HumeAI TADA-3B-ML (`HumeAI/tada-3b-ml`). Two GGUFs: backbone talker + codec.
 
 Models: `HumeAI/tada-3b-ml` (backbone Q4_K ~2.2 GB) + companion codec GGUF
 (~1 GB). Pass `--codec-model <codec.gguf>`.
+
+### mini-omni2
+
+gpt-omni/mini-omni2 (`gpt-omni/mini-omni2`). Multimodal speech model
+supporting ASR, TTS, and speech-to-speech.
+
+- **Audio encoder**: Whisper-small (80 mel, 12 layers, 768-d, 12 heads,
+  sinusoidal positional embedding, LayerNorm with bias, GELU FFN).
+- **Adapter**: whisperMLP (SwiGLU gate: `fc_1(768,4864)`, `fc_2(768,4864)`
+  → `silu(fc_1) * fc_2` → `proj(4864,896)`). No bias (config.bias=false).
+- **LLM**: Qwen2-0.5B (896-d, 24 layers, 14 heads, 2 KV heads, GQA 7:1,
+  RoPE theta=1M, SwiGLU, RMSNorm eps=1e-6, QKV bias, no O/FFN bias).
+- **8-stream architecture**: 7 audio streams (SNAC codebooks, layershifted)
+  + 1 text stream, all embedded and averaged. Audio features replace pad
+  positions in streams 0-6 only (not text stream 7).
+- **Modes**: ASR uses `_asr` token (151940) for pure transcription. S2S
+  uses `_answer_a/_answer_t` for conversational audio response. TTS uses
+  text-only input with `_answer_a/_answer_t`.
+- **Audio output**: 7-stream SNAC tokens deinterleaved to 3 codebooks
+  (c0: stream 0, c1: streams 1+4, c2: streams 2+3+5+6) → SNAC 24kHz
+  decoder (separate GGUF, `hubertsiuzdak/snac_24khz`).
+- **Vocab**: text 152000 + 7x audio 4160 = 181120 padded. Tied word
+  embeddings (lm_head = token_embd).
+
+Models: single GGUF (F16 ~1.6 GB) converted from `lit_model.pth` + `small.pt`.
+For TTS/S2S, also needs SNAC codec GGUF (`--codec-model snac-24khz.gguf`).
 

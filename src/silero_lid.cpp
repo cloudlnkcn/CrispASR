@@ -369,7 +369,12 @@ extern "C" struct silero_lid_context* silero_lid_init(const char* gguf_path, int
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    // ggml_backend_init_best() returns the best available backend (Metal on
+    // Apple Silicon, CUDA on NVIDIA, …). ggml_backend_cpu_set_n_threads asserts
+    // the backend is CPU, so only call it on the CPU backend — otherwise this
+    // aborted on every silero-LID load on a GPU build (#165).
+    if (ggml_backend_is_cpu(ctx->backend))
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!lid_load(ctx->model, gguf_path, ctx->backend)) {
         delete ctx;
