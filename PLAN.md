@@ -2793,12 +2793,12 @@ so this is a small extension to the harness itself.
    the cache tensor layout (per-layer `[Dh, 70, n_heads]` for SA K
    and V, `[8, d_model]` for DW conv state) and check it survives
    the converter round-trip.
-2. **Rel-pos shift on `[cache | new]`.** The existing
+2. **Rel-pos shift on `[cache | new]`.** ~~The existing
    `core_conformer::rel_shift` operates on a square `(2T-1, T)`
-   tensor; with cached frames the table is `(2(L+R+1)-1, R+1)` —
-   different layout, different shift indexing. Either extend
-   `rel_shift` with a left-context offset or build a streaming-
-   specific variant.
+   tensor~~ **SOLVED 2026-06-15.** The asymmetric rel_shift uses the
+   same stride-trick formula as the symmetric case:
+   `view_3d(BD_raw, T_full, T_new, H, s1-s0, s2, (T_new-1)*s0)`.
+   Implemented in `nemotron_build_block_streaming`.
 3. **Decoder state across chunks.** RNN-T predictor is autoregressive
    over emitted tokens, not over time; its LSTM state carries
    forward across chunks naturally. Confirm with the Python ref
@@ -2874,8 +2874,20 @@ Additional fixes along the way:
 - German tested (works on DE audio; EN audio with DE prompt gives
   expected degradation)
 
-**Remaining:** proper streaming (chunked) path for real-time inference,
-WER benchmarking against NeMo on standard test sets.
+**2026-06-15 streaming + sched:**
+- Sched migration done (gallocr → ggml_backend_sched) — see §168
+- Streaming encoder architecture complete: `nemotron_build_block_streaming`
+  with cache_last_channel, asymmetric rel-pos bias (stride-trick rel_shift),
+  Q-from-new / KV-from-context, causal conv padding
+- `CRISPASR_NEMOTRON_STREAMING=1` + `CRISPASR_NEMOTRON_CONTEXT_PRESET=N`
+  env vars for A/B testing (0=R3/chunk4, 3=R13/chunk14)
+- Quality problem: streaming output diverges from full-sequence by frame 10;
+  preset 3 gives recognizable text, preset 0 gives blank. See §168 for
+  root cause analysis.
+- 3 live integration tests added (init, JFK, F16/Q4_K parity)
+
+**Remaining:** streaming quality investigation (NeMo Python ref dump comparison),
+WER benchmarking on standard test sets.
 
 ---
 
