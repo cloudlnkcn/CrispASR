@@ -58,6 +58,24 @@ per-frame values were wrong.
 gate and which is the value. `ggml_siglu` = `σ(a) × b` (swapped from the
 PyTorch convention). `ggml_siglu_swapped` = `a × σ(b)` (matches PyTorch).
 
+## Kaggle regression kernels: write output incrementally, crash-guard everything
+
+Kaggle kernels fail silently — the only output you get is `/kaggle/working` files.
+If the script crashes before writing anything, you get zero diagnostics. Rules:
+
+1. Write a `transcripts.json` crash marker at line 1 (before any imports that
+   might fail).
+2. Wrap the entire body in `main()` + `try/except` that always writes the
+   partial results dict to `transcripts.json`.
+3. After each backend, write incremental results AND delete the model file
+   (Kaggle scratch is ~20 GB; models are 500 MB-5 GB each).
+4. Use `progress.txt` as a human-readable append-only log.
+5. Stub out `kaggle_harness` imports — the harness can have import-time
+   crashes from missing deps; the kernel must survive without it.
+6. CPU-only workers may not have internet even with `enable_internet: true`.
+   GPU workers always get internet. Use GPU for any kernel that needs git
+   clone or pip install.
+
 ## Streaming conv modules need cached left context, not zero-padding (#81)
 
 NeMo's `CausalConv1D` in streaming mode does NOT zero-pad the left side.

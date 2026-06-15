@@ -57,8 +57,26 @@ backbone (too precision-sensitive). Q5_K works identically to F16. Registry
 + HF updated. JP variant Q5_K uploaded.
 
 **Testing:** 3 nemotron live integration tests. Env vars added for all
-migrated backends. 6 regression manifest PLACEHOLDER transcripts filled.
-435 unit tests pass.
+migrated backends. 435 unit tests pass.
+
+**Regression manifest:** 23 of 30 PLACEHOLDER transcripts filled:
+- 10 from VPS CPU (paraformer, sensevoice, fastconformer-ctc, wav2vec2,
+  hubert, data2vec, 4× parakeet variants)
+- 13 from Kaggle T4 GPU kernel (qwen3-asr, omniasr-ctc, omniasr-llm,
+  kyutai-stt, funasr-nano, funasr-mlt-nano, mini-omni2, voxtral-3b,
+  voxtral4b, gemma4-e2b, granite-4.1-plus, moss-audio-4b, vibevoice-asr)
+
+Remaining 7: TTS roundtrip backends, LID/speaker backends (special
+invocation), granite-4.1-nar (SIGABRT on CUDA), mimo-asr (tokenizer).
+
+**Diff harness:** nemotron wired — Python reference backend
+(`tools/reference_backends/nemotron.py`) + C++ branch in
+`crispasr_diff_main.cpp` (transcript-only; per-stage API TODO).
+
+**Docs updated:** streaming.md (nemotron context presets), quantize.md
+(6 backends added incl. lfm2 Q5_K-minimum), architecture.md (nemotron
+section), testing.md (new env vars + test groups), feature-matrix
+(nemotron row + beam search caps).
 
 ---
 
