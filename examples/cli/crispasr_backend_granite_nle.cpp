@@ -47,7 +47,12 @@ public:
         if (!ctx_)
             return out;
 
-        granite_nle_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1, 0.0f);
+        // Large BPE vocab (100K+) needs aggressive gamma pruning for beam to
+        // finish in time. Default gamma=2.3 matches parakeet/sensevoice tuning.
+        float gamma = 2.3f;
+        if (const char* v = std::getenv("CRISPASR_MAES_GAMMA"))
+            gamma = (float)atof(v);
+        granite_nle_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1, gamma);
         char* text = granite_nle_transcribe(ctx_, samples, n_samples);
         if (!text || !text[0]) {
             free(text);

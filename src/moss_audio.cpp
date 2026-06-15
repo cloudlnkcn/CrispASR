@@ -1896,6 +1896,9 @@ extern "C" char* moss_audio_process(struct moss_audio_context* ctx, const float*
         generated = std::move(br.tokens);
         // logits ownership transferred to core_beam_decode
         logits = nullptr;
+        // Strip trailing EOS (beam_decode includes it; greedy stops before pushing)
+        if (!generated.empty() && generated.back() == (int)hp.eos_token_id)
+            generated.pop_back();
     } else {
         // Greedy decode
         for (int step = 0; step < max_new; step++) {
