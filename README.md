@@ -697,6 +697,15 @@ loader, FastConformer / Conformer / Granite-LLM blocks, etc.).
   `tools/test-all-backends.py` capability tiers, cache modes
   (`keep` / `ephemeral`), `--skip-missing` for CI.
 
+**Shared libraries** (cross-repo with CrispEmbed):
+- `crisp_audio/` — Whisper-shape audio encoder (Conv-stem + Transformer)
+- `crisp_punc/` — punctuation restoration (FireRedPunc + PCS)
+
+Both are self-contained static libraries with CMakeLists.txt. CrispEmbed
+links them via `add_subdirectory(../CrispASR/crisp_*/)`; CrispASR uses
+them directly. If the shared dir is absent, both repos fall back to local
+copies of the source files.
+
 For benchmarks see [`PERFORMANCE.md`](PERFORMANCE.md); for the
 session-by-session port log and the bug-class lessons, see
 [`LEARNINGS.md`](LEARNINGS.md).
