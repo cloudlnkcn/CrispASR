@@ -294,10 +294,14 @@ unchanged — `parakeet-tdt_ctc-*.gguf` matches "parakeet" with the
   without instantiating the NeMo model (bypasses `att_chunk_context_size`).
   989 tensors extracted with actual data. Hparams: d_model=1024, n_layers=24,
   vocab=1025, pred=640, joint=640 — **same architecture as standard parakeet**.
-  **Remaining to convert:** (a) tokenizer not in .nemo — use parakeet-rnnt's
-  tokenizer (same vocab 1025); (b) `gguf` pip package missing in kernel;
-  (c) converter needs `--weights` flag for standalone `.pt` file. The existing
-  converter handles the same tensor names. This is a straightforward finish.
+  **v5 kernel — GGUF conversion succeeded (1181 MB F16).** Synthetic NeMo 1.x
+  tar (config + tokenizer from parakeet-rnnt + weights) fed to existing
+  converter. CrispASR test SIGABRT: runtime assumes 4x subsampling but
+  parakeet-unified uses 8x (3 strided convs vs 2). **Fix needed:**
+  `parakeet_build_pre_encode` in `src/parakeet.cpp` (or
+  `core/fastconformer.h`) must handle `subsampling_factor=8` — 3 Conv2d
+  layers with strides [1,2] instead of 2. Tensor shapes are already in
+  the GGUF; the graph builder just needs the extra conv layer.
 
 ### Won't do
 
