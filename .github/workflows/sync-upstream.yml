@@ -2,8 +2,8 @@
 # the existing release.yml to build + publish all platform binaries.
 #
 # Trigger mechanisms:
-#   1. Scheduled: cron (every 6 hours) — checks for new upstream tags
-#   2. Manual:    workflow_dispatch with optional tag override
+#   1. Manual only: workflow_dispatch with optional tag override
+#      (scheduled cron was removed — re-enable below if auto-sync is wanted)
 #
 # Prerequisites:
 #   - UPSTREAM_SYNC_PAT secret: a GitHub PAT with repo scope
@@ -12,9 +12,6 @@
 name: Sync Upstream & Release
 
 on:
-  schedule:
-    # Every 6 hours at :05 to avoid top-of-hour load
-    - cron: '5 */6 * * *'
   workflow_dispatch:
     inputs:
       upstream_tag:
