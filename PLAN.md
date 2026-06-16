@@ -5980,6 +5980,50 @@ Branch: `feat/beam-maes-cache`
 **§167d Sensevoice CTC beam**: Already implemented (core_ctc).
 **§167e–h**: Compile-verified; no local models for A/B testing.
 
+## §169 — Qwen3-ASR ChatML language prompt (non-English script output)
+
+**Status:** OPEN
+
+**Problem:** Qwen3-ASR supports 30 languages including Arabic, but our
+implementation (`src/qwen3_asr.cpp`) skips the ChatML prompt and builds
+the token sequence as bare `<|audio_start|>...<|audio_end|>` without a
+system/user message. The original HF model uses:
+
+```
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Transcribe the following audio in Arabic.
+<|audio_start|><|audio_pad|>×N<|audio_end|><|im_end|>
+<|im_start|>assistant
+```
+
+Without this, the model auto-detects language but may romanize
+non-Latin scripts (observed: Arabic AA0010.wav → `istagel` instead of
+native Arabic `استغل`; AA001.wav → `مرحبًا` works, so auto-detect is
+partial).
+
+**Impact:** All 30 Qwen3-ASR languages work in auto-detect mode for
+clean audio, but explicit language selection (`-l ar`) has no effect
+and ambiguous cases get romanized.
+
+**Fix:**
+1. Build the full ChatML prompt in `qwen3_asr_transcribe_with_probs`
+   when `-l LANG` is set (map ISO 639-1 → English name → prompt text)
+2. Fall back to bare audio-only prompt when no language specified
+   (current behaviour, preserves auto-detect)
+3. Wire `--language` / `-l` through the CLI adapter's transcribe call
+
+**Files:** `src/qwen3_asr.cpp` (~50 LOC), `examples/cli/crispasr_backend.cpp`
+
+**Effort:** MEDIUM — the ChatML token IDs (`<|im_start|>` etc.) need
+to be resolved from the GGUF vocab. The word-level timestamp alignment
+loop (lines 2074-2091) also needs adjustment since the prompt prefix
+shifts positions.
+
+**Test:** Arabic audio from `atishay23/Arabic_Audio` (AA001.wav →
+should output `مرحبًا` in native script with `-l ar`).
+
 **2026-06-16: GGUFs uploaded to `cstr/parakeet-unified-en-0.6b-GGUF`**
 (F16 1181 MB + Q4_K). v8: n_mels=128 fix → test_rc=0 (no crash) but
 transcript garbage. Tokenizer verified correct (same as parakeet-rnnt).
