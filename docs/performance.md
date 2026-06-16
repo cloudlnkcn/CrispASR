@@ -39,7 +39,8 @@ allocated via `ggml_backend_alloc_ctx_tensors`. The cache is a 4D tensor
 | kugelaudio | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | 7B Qwen2.5 + DiT diffusion |
 | voxcpm2_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Flow-matching diffusion |
 | vibevoice | `core_attn::kv_self_attn` | Conv cache | `ggml_backend_sched` | σ-VAE streaming |
-| **lfm2_audio** | `core_attn::kv_self_attn` | **Conv state cache** | `ggml_gallocr` | **Hybrid conv+attn backbone** |
+| **lfm2_audio** | `core_attn::kv_self_attn` | **Conv state cache** | `ggml_backend_sched` | **Hybrid conv+attn backbone** |
+| **nemotron** | cache_last_channel + cache_last_time | **Conv + attn cache** | `ggml_backend_sched` | **Cache-aware streaming FastConformer** |
 | bark_tts | None (3× non-cached forward) | — | `ggml_backend_sched` | Could benefit from KV cache |
 | chatterbox | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | T3 AR + S3Gen flow |
 
