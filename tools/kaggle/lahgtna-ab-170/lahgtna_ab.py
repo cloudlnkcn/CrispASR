@@ -48,38 +48,34 @@ subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
 step("Load Python model (oddadmix/lahgtna-chatterbox-v1)")
 import torch
 import soundfile as sf
-
-# The model auto-downloads from HF
-from chatterbox.tts import ChatterboxTTS
-
-# Try the multilingual path
-try:
-    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-    HAS_MTL = True
-    print("ChatterboxMultilingualTTS available")
-except ImportError:
-    HAS_MTL = False
-    print("WARNING: ChatterboxMultilingualTTS not available, using base")
+from huggingface_hub import snapshot_download
+from pathlib import Path
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {device}")
 
-if HAS_MTL:
-    model = ChatterboxMultilingualTTS.from_pretrained(
-        "oddadmix/lahgtna-chatterbox-v1", device=device)
-else:
-    model = ChatterboxTTS.from_pretrained(
-        "oddadmix/lahgtna-chatterbox-v1", device=device)
+# Download lahgtna model files
+lahgtna_dir = Path(snapshot_download(
+    "oddadmix/lahgtna-chatterbox-v1",
+    allow_patterns=["*.json", "*.safetensors", "*.pt", "ve.*"],
+    token=os.environ.get("HF_TOKEN"),
+))
+print(f"Model dir: {lahgtna_dir}")
+for f in sorted(os.listdir(lahgtna_dir)):
+    if not f.startswith('.'):
+        print(f"  {f} ({os.path.getsize(lahgtna_dir/f)/1e6:.1f} MB)")
+
+# Load with ChatterboxMultilingualTTS.from_local
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+model = ChatterboxMultilingualTTS.from_local(lahgtna_dir, device)
+print("Model loaded")
 
 step("Generate Python reference audio")
 py_results = []
 for lang, text in TEST_SENTENCES:
     print(f"\n--- Python: [{lang}] {text} ---", flush=True)
     t0 = time.time()
-    if HAS_MTL:
-        wav = model.generate(text, language_id=lang)
-    else:
-        wav = model.generate(text)
+    wav = model.generate(text, language_id=lang)
     elapsed = time.time() - t0
 
     # Save WAV
@@ -99,12 +95,9 @@ py_tokens = []
 for i, (lang, text) in enumerate(TEST_SENTENCES):
     print(f"\n--- T3 tokens: [{lang}] {text} ---", flush=True)
     try:
-        # Access T3 internals to get speech tokens before S3Gen
-        if HAS_MTL:
-            # Run just the T3 part
-            from chatterbox.models.tokenizers import MTLTokenizer
-            tok_text = model.tokenizer.encode(text, language_id=lang)
-            print(f"  Text token IDs ({len(tok_text)}): {tok_text[:20]}...")
+        # Access T3 internals to get text token IDs
+        tok_text = model.tokenizer.encode(text, language_id=lang)
+        print(f"  Text token IDs ({len(tok_text)}): {tok_text[:20]}...")
         py_tokens.append({"lang": lang, "text": text, "text_tokens": tok_text[:50]})
     except Exception as e:
         print(f"  Token capture failed: {e}")
