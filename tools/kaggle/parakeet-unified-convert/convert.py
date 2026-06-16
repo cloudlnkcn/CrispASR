@@ -155,7 +155,7 @@ def main():
         },
         "preprocessor": {
             "sample_rate": 16000,
-            "features": 80,
+            "features": 128,  # inferred from preprocessor.fb shape [257, 128]
             "n_fft": 512,
             "window_size": 0.025,
             "window_stride": 0.01,
