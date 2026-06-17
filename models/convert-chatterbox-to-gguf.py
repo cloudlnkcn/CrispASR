@@ -512,7 +512,7 @@ def write_t3_gguf(
 
     # ── Load and write precomputed conditioning ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
 
@@ -686,7 +686,7 @@ def write_turbo_t3_gguf(
 
     # ── Precomputed conditioning ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
 
@@ -857,7 +857,7 @@ def write_kartoffelbox_t3_gguf(
 
     # ── Precomputed conditioning (shared with turbo base) ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
         if t3_cond.get('speaker_emb') is not None:
