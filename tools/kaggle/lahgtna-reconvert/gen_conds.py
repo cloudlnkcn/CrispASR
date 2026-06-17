@@ -60,8 +60,22 @@ print(f"Conds prepared from {ref_wav}")
 new_conds_path = model_dir / "conds.pt"
 # Backup original
 shutil.copy2(new_conds_path, model_dir / "conds_original.pt")
-torch.save(model.conds, new_conds_path)
-print(f"Saved new conds to {new_conds_path}")
+# Save as a plain dict (converter expects dict, not Conditionals dataclass)
+conds_dict = {
+    "t3": {
+        "speaker_emb": model.conds.t3.speaker_emb.cpu(),
+        "cond_prompt_speech_tokens": model.conds.t3.cond_prompt_speech_tokens.cpu(),
+        "emotion_adv": model.conds.t3.emotion_adv.cpu(),
+    },
+    "gen": {
+        "prompt_token": model.conds.gen["prompt_token"].cpu(),
+        "prompt_token_len": model.conds.gen["prompt_token_len"].cpu(),
+        "prompt_feat": model.conds.gen["prompt_feat"].cpu(),
+        "embedding": model.conds.gen["embedding"].cpu(),
+    },
+}
+torch.save(conds_dict, new_conds_path)
+print(f"Saved new conds (dict) to {new_conds_path}")
 
 # Verify by generating Arabic
 print("=== Test: generate Arabic with new conds ===", flush=True)
