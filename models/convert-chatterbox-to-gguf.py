@@ -564,11 +564,15 @@ def write_t3_gguf(
 
     # Infer text_vocab_size from the actual embedding tensor — the
     # multilingual T3 has 2352 tokens vs 704 for the base model (#170).
-    if "text_embedding.weight" in t3_tensors:
-        actual_vocab = t3_tensors["text_embedding.weight"].shape[0]
-        if actual_vocab != T3_HPARAMS["text_vocab_size"]:
-            print(f"  text_vocab_size: {T3_HPARAMS['text_vocab_size']} -> {actual_vocab} (from embedding)")
-            T3_HPARAMS["text_vocab_size"] = actual_vocab
+    # Infer text_vocab_size from the actual embedding — try both naming
+    # conventions (base chatterbox uses text_emb, some forks use text_embedding).
+    for emb_key in ["text_emb.weight", "text_embedding.weight"]:
+        if emb_key in t3_tensors:
+            actual_vocab = t3_tensors[emb_key].shape[0]
+            if actual_vocab != T3_HPARAMS["text_vocab_size"]:
+                print(f"  text_vocab_size: {T3_HPARAMS['text_vocab_size']} -> {actual_vocab} (from {emb_key})")
+                T3_HPARAMS["text_vocab_size"] = actual_vocab
+            break
 
     n_t3 = 0
     for hf_name, tensor in sorted(t3_tensors.items()):
