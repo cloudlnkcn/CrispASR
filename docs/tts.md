@@ -9,7 +9,7 @@ trade-off:
 | **`melotts`** | Multilingual VITS2 (MeloTTS). 4 English speakers (US/BR/India/AU). 44.1 kHz output, ~102 MB GGUF. Neural G2P + CMU dict. BERT companion (Q4_K 52 MB) auto-downloads with `-m auto`; also via `--codec-model` or `MELOTTS_BERT` env. | No (per-speaker ID) | ~154 MB via `-m auto` |
 | **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
 | **`kokoro`** | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
-| **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). | Yes (WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
+| **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
 | **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs | ~636 MB via `-m auto` |
 | **`vibevoice-1.5b`** | Base VibeVoice TTS model with WAV cloning. | Yes (`VIBEVOICE_VOICE_AUDIO=<wav>` or `--voice <wav>`) | ~1.6 GB via `-m auto` |
 | **`orpheus`** | Llama-3.2-3B talker + SNAC 24 kHz codec. 8 baked English speakers; expressive output. Greedy loops — pass `--temperature 0.6`. | Preset names via `--voice tara/leah/...` | ~3.5 GB via `-m auto` (talker Q8 + 26 MB SNAC) |
@@ -198,11 +198,17 @@ pulled into `~/.cache/crispasr/` on first run (Q8_0 talker + F16
 codec by default).
 
 ```bash
-# Auto-download, runtime WAV clone (~1.3 GB on first run):
+# Zero-setup: auto-downloads talker + codec + default voice pack (~1.3 GB):
+./build/bin/crispasr \
+    --backend qwen3-tts -m auto \
+    --tts "Hello there" \
+    --tts-output hello.wav
+
+# Runtime WAV clone — supply your own reference:
 ./build/bin/crispasr \
     --backend qwen3-tts -m auto \
     --voice samples/qwen3_tts/clone.wav \
-    --ref-text "Okay, yeah. I resent you, I love you, I respect you. But you know what - You blew it, and thanks to you." \
+    --ref-text "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you." \
     --tts "Hello there" \
     --tts-output hello.wav
 
@@ -218,7 +224,7 @@ codec by default).
 # Baked voice-pack GGUF (skips the WAV+ref-text step):
 ./build/bin/crispasr \
     --backend qwen3-tts -m auto \
-    --voice /tmp/qwen3-tts-voice-pack.gguf \
+    --voice my-voice.gguf \
     --tts "Hello there" \
     --tts-output hello.wav
 
@@ -243,6 +249,10 @@ codec by default).
 ```
 
 Notes:
+- **No `--voice` needed**: `-m auto` downloads a baked default voice pack
+  (`qwen3-tts-voice-default.gguf`) alongside the talker and codec so the
+  Base model works out of the box. The default voice is auto-selected when
+  no `--voice` flag is given and the GGUF sits next to the talker.
 - When `--voice` points to a `.wav`, `--ref-text` is required. When it
   points to a `.gguf`, it is treated as a baked voice pack and
   `--ref-text` is ignored.

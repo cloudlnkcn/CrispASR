@@ -840,10 +840,21 @@ constexpr ExtraCompanion k_cosyvoice3_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// qwen3-tts Base variants need a default voice pack so synthesis works
+// without --voice. One pack covers both 0.6B and 1.7B Base since the
+// voice embedding format is model-size-agnostic (spk_embedding + ref_code).
+constexpr ExtraCompanion k_qwen3_tts_base_extras[] = {
+    {"qwen3-tts-voice-default.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/main/qwen3-tts-voice-default.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
+    {"qwen3-tts", k_qwen3_tts_base_extras},
+    {"qwen3-tts-1.7b-base", k_qwen3_tts_base_extras},
     {nullptr, nullptr},
 };
 // clang-format on

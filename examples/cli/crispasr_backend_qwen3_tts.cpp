@@ -42,19 +42,37 @@ static bool file_exists(const std::string& path) {
     return stat(path.c_str(), &st) == 0;
 }
 
+static std::string dir_of(const std::string& p) {
+    auto sep = p.find_last_of("/\\");
+    return (sep == std::string::npos) ? std::string(".") : p.substr(0, sep);
+}
+
 // Look for a sibling codec file next to the talker. The auto-download
 // path drops both files into the same cache dir, so this hits in most
 // real-world setups.
 static std::string discover_codec(const std::string& model_path) {
-    auto dir_of = [](const std::string& p) -> std::string {
-        auto sep = p.find_last_of("/\\");
-        return (sep == std::string::npos) ? std::string(".") : p.substr(0, sep);
-    };
     const std::string dir = dir_of(model_path);
     static const char* candidates[] = {
         "qwen3-tts-tokenizer-12hz.gguf",
         "qwen3-tts-tokenizer.gguf",
         "qwen3-tts-codec.gguf",
+    };
+    for (const char* name : candidates) {
+        std::string p = dir + "/" + name;
+        if (file_exists(p))
+            return p;
+    }
+    return "";
+}
+
+// Look for a baked default voice pack next to the talker (auto-downloaded
+// as an extra companion when the user runs --model auto --backend qwen3-tts).
+static std::string discover_default_voice(const std::string& model_path) {
+    const std::string dir = dir_of(model_path);
+    static const char* candidates[] = {
+        "qwen3-tts-voice-default.gguf",
+        "qwen3-tts-voice-default-q8_0.gguf",
+        "qwen3-tts-voice-default-f16.gguf",
     };
     for (const char* name : candidates) {
         std::string p = dir + "/" + name;
@@ -96,6 +114,7 @@ public:
             fprintf(stderr, "crispasr[qwen3-tts]: failed to load talker '%s'\n", p.model.c_str());
             return false;
         }
+        model_path_ = p.model;
 
         // Resolve the codec GGUF.
         std::string codec_path = p.tts_codec_model;
@@ -274,6 +293,30 @@ public:
                         return {};
                     }
                 }
+            } else {
+                // No --voice given for a Base model. Try the auto-downloaded default voice pack.
+                const std::string def = discover_default_voice(model_path_);
+                if (!def.empty()) {
+                    if (!params.no_prints)
+                        fprintf(stderr, "crispasr[qwen3-tts]: no --voice given, using default voice '%s'\n",
+                                def.c_str());
+                    if (qwen3_tts_load_voice_pack(ctx_, def.c_str()) != 0) {
+                        fprintf(stderr, "crispasr[qwen3-tts]: failed to load default voice '%s'\n", def.c_str());
+                        return {};
+                    }
+                    // Encode the resolved path into the key so the next call with
+                    // an explicit --voice still triggers a reload.
+                    voice_key = "base:default:" + def;
+                } else {
+                    fprintf(stderr,
+                            "crispasr[qwen3-tts]: no voice specified for Base model. Options:\n"
+                            "  --voice ref.wav --ref-text \"...\"   — clone from a WAV file\n"
+                            "  --voice voices/name.gguf           — load a baked voice pack\n"
+                            "  --backend qwen3-tts-customvoice    — use built-in fixed speakers (no --voice needed)\n"
+                            "A default voice pack (qwen3-tts-voice-default.gguf) can be auto-downloaded "
+                            "with: crispasr --model auto --backend qwen3-tts\n");
+                    return {};
+                }
             }
             last_voice_key_ = voice_key;
         }
@@ -299,6 +342,7 @@ private:
     bool is_base_ = false;
     qwen3_tts_context* ctx_ = nullptr;
     std::string last_voice_key_;
+    std::string model_path_;
 };
 
 } // namespace
