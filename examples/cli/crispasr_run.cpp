@@ -13,6 +13,7 @@
 #include "crispasr_lcs_dedup.h"
 #include "crispasr_long_audio_fallback.h"
 #include "crispasr_mic_cli.h"
+#include "crispasr_speaker.h"
 #include "crispasr_popen.h"
 #include "crispasr_vad_cli.h"
 #include "crispasr_output.h"
@@ -1570,6 +1571,24 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (!params.no_prints)
             fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
                     audio.size(), sr_in, (double)audio.size() / (double)sr_in);
+
+        // --tts-play: play the watermarked PCM on the local speaker.
+        // Uses the same audio[] buffer (already watermarked at line above).
+        if (params.tts_play) {
+            crispasr_speaker* spk = crispasr_speaker_open(sr_in, 1, params.tts_play_device);
+            if (!spk) {
+                fprintf(stderr, "crispasr: warning: --tts-play: could not open playback device\n");
+            } else {
+                if (!params.no_prints)
+                    fprintf(stderr, "crispasr: playing on '%s'\n", crispasr_speaker_default_device_name());
+                if (crispasr_speaker_play(spk, audio.data(), (int)audio.size()) == 0)
+                    crispasr_speaker_wait(spk);
+                else
+                    fprintf(stderr, "crispasr: warning: --tts-play: playback failed\n");
+                crispasr_speaker_close(spk);
+            }
+        }
+
         crispasr_wm_dispatch::shutdown();
         return 0;
     }

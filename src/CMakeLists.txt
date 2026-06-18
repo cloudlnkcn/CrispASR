@@ -120,6 +120,10 @@ add_library(crispasr-lib
             # ma_device for cross-platform live PCM. Symbols share the
             # MINIAUDIO_IMPLEMENTATION already linked from crispasr_audio.cpp.
             crispasr_mic.cpp
+            # Local speaker playback (issue #173) — miniaudio ma_device
+            # playback mode, mirrors crispasr_mic.cpp. Used by the CLI's
+            # --tts-play flag; server mode routes audio via HTTP.
+            crispasr_speaker.cpp
             # Silero-VAD-driven segmentation + crispasr.cpp-style stitching.
             # Consumed by the CLI and by the C-ABI `crispasr_session_transcribe_vad`
             # wrapper so every language binding benefits without re-implementing.
@@ -205,7 +209,7 @@ add_library(whisper ALIAS crispasr-lib)
 # C++ this fails on visionOS/tvOS/iOS xcframework builds. Setting the
 # source language to OBJCXX lets clang accept the ObjC headers.
 if(APPLE)
-    set_source_files_properties(crispasr_audio.cpp crispasr_mic.cpp
+    set_source_files_properties(crispasr_audio.cpp crispasr_mic.cpp crispasr_speaker.cpp
         PROPERTIES LANGUAGE OBJCXX)
 endif()
 

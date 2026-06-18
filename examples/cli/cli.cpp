@@ -576,6 +576,10 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.g2p_dict = ARGV_NEXT;
     } else if (arg == "--tts-trim-silence") {
         params.tts_trim_silence = true;
+    } else if (arg == "--tts-play") {
+        params.tts_play = true;
+    } else if (arg == "--tts-play-device") {
+        params.tts_play_device = std::stoi(ARGV_NEXT);
     } else if (arg == "--text") {
         params.text_input = ARGV_NEXT;
     } else if (arg == "--translate-max-tokens") {
@@ -1107,6 +1111,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_steps);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
+    fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",
+            params.tts_play ? "true" : "false");
+    fprintf(stderr, "             --tts-play-device N      [%-7d] speaker device index (-1 = default)\n",
+            params.tts_play_device);
     // Text-to-text translation (m2m100)
     fprintf(stderr, "\nText-to-text translation (m2m100) options:\n");
     fprintf(stderr, "             --text \"TEXT\"           translate TEXT and write result to stdout "

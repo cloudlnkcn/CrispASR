@@ -335,6 +335,12 @@ struct whisper_params {
     int tts_speaker_id = -1;        // piper multi-speaker model
     int tts_max_speech_tokens = -1; // chatterbox max AR tokens
 
+    // CLI: --tts-play plays synthesised output on the local default speaker.
+    // --tts-play-device N selects a non-default device by index (-1 = default).
+    // Playback uses the same watermarked PCM that is written to --tts-output.
+    bool tts_play = false;
+    int tts_play_device = -1;
+
     // G2P phonemizer dictionary source:
     //   ""           → auto (OLaPh MIT preferred, then open-dict-data CC-BY-SA)
     //   "olaph"      → OLaPh MIT dicts from cstr/g2p-dicts HuggingFace
