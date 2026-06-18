@@ -301,6 +301,14 @@ preset; the realtime `0.5B` flow is typically driven by a voice GGUF.
     --tts-output hello.wav
 ```
 
+The realtime backend preserves the beginning of the sigma-VAE decoder output.
+Older builds trimmed a fixed 100 ms warmup window, which could skip the clean
+first decoded chunk and create a click by starting on a later waveform peak.
+For parity debugging, `VIBEVOICE_TTS_LATENTS=/path/to/latents.bin` can replay a
+raw float32 latent stack, `VIBEVOICE_TTS_DUMP=/dir` writes `tts_scaled_latent`
+and `tts_raw_audio`, and `VIBEVOICE_TTS_DUMP_DECODER=1` adds per-stage decoder
+dumps.
+
 ## VibeVoice 1.5B — base TTS with WAV cloning
 
 The 1.5B base model supports both a generic no-clone voice and WAV
@@ -813,6 +821,9 @@ complementary layers. This is non-optional and cannot be bypassed.
 
 A frequency-domain watermark embedded in the PCM signal after synthesis.
 Survives re-encoding, volume normalization, and moderate compression.
+The embedder writes only a ramped watermark delta back into the signal and
+leaves under-covered FFT boundary samples untouched, so quiet starts/ends do
+not become click impulses.
 
 ```bash
 # Detect watermark in any audio file (C API)

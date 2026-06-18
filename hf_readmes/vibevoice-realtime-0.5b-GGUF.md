@@ -93,6 +93,11 @@ crispasr --backend vibevoice-tts \
 
 Output: 24 kHz mono WAV. Use `crispasr -m auto --backend vibevoice-tts` to auto-download the model + the default Emma voice.
 
+Runtime note: CrispASR keeps the initial sigma-VAE decoder samples for the
+realtime model. Builds after 2026-06-18 also avoid spread-spectrum watermark
+boundary amplification, fixing the earlier start-click artifact seen in some
+short generated WAVs.
+
 ## Architecture
 
 VibeVoice-Realtime-0.5B is a streaming text-to-speech model:
@@ -115,6 +120,11 @@ All quantisations produce exact ASR round-trip matches on English:
 | "Hello, how are you today?" | "Hello, how are you today?" |
 | "The quick brown fox jumps over the lazy dog" | "The quick brown fox jumps over the lazy dog." |
 | "Good morning everyone" | "Good morning, everyone." |
+
+Decoder-start parity was also checked against the official PyTorch decoder by
+replaying saved realtime latents: the C++ raw decoder output starts smoothly
+and matches the reference onset profile before CLI watermarking and WAV
+serialization.
 
 ## Conversion
 

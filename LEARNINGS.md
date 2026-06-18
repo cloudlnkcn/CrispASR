@@ -10119,3 +10119,46 @@ On macOS, platform-specific tests must guard on the backend target they link
 against, not only `APPLE`. A Vulkan-on-MoltenVK build is still Apple, but it does
 not provide `ggml-metal`; Metal-only repro tests should use
 `if(APPLE AND TARGET ggml-metal)`.
+
+## VibeVoice TTS start clicks: distinguish decoder PCM from CLI post-processing (issue #171, 2026-06-18)
+
+### Problem
+
+Recent VibeVoice realtime WAVs had loud clicks at the start, while the Python
+reference decoder output did not. The first instinct was to chase decoder
+parity (`conv_transpose_1d`, `col2im_1d`, or the upstream cached streaming
+decoder), but a latent-controlled comparison showed the C++ VAE raw output was
+clean and numerically matched the official PyTorch decoder:
+
+- Python decoder from saved latents: first samples around `0.005`, `peak250ms`
+  around `0.019`, `maxjump250ms` around `0.0013`.
+- C++ `tts_raw_audio` from the same latents: same clean start.
+- User-visible CLI WAV before the fix: first nonzero sample could jump to
+  `0.2` to `1.0`.
+
+The click came after VAE decode:
+
+1. VibeVoice realtime used a fixed 2400-sample start trim. That skipped the
+   clean initial decoded chunk and could land directly on a later waveform peak.
+2. The built-in spread-spectrum watermark was global CLI/server post-processing.
+   Its overlap-add normalization could be tiny at Hann-window boundaries, which
+   amplified boundary samples and created an impulse. This affected any backend
+   using the fallback spread-spectrum watermark, not just VibeVoice.
+
+### Fix
+
+- Preserve VibeVoice realtime's decoder start unless there is actual leading
+  digital silence; use only floor-based trim with attack margin.
+- Write the spread-spectrum watermark back as a ramped delta and ignore
+  under-covered boundary samples.
+- Keep VibeVoice debug hooks env-gated:
+  `VIBEVOICE_TTS_LATENTS` replays a raw float32 latent stack,
+  `VIBEVOICE_TTS_DUMP` writes `tts_scaled_latent` and `tts_raw_audio`, and
+  `VIBEVOICE_TTS_DUMP_DECODER=1` adds decoder stage dumps.
+
+### Takeaway
+
+When a generated WAV clicks but a reference decoder does not, diff every
+post-decoder stage too: backend PCM, backend trim/fade, watermark/provenance
+mutation, then file serialization. A clean `tts_raw_audio` plus a broken WAV is
+not a model-runtime bug; it is post-processing.
