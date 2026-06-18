@@ -7,7 +7,9 @@ when you don't pass `--backend`, whisper is the default.
 ## Contents
 
 - [Quick reference](#quick-reference) — most-used flag patterns
-- [Core flags](#core) — model, backend, input, language
+- [Core flags](#core) — model, backend, input, language, GPU backend
+  - [Model resolution flags](#model-resolution-flags) — `--model-quant`, `--auto-download`, `--cache-dir`, `--hf-repo`
+  - [TTS-specific flags](#tts-specific-flags) — voice, instruct, codec, steps, trim
 - [Output formats](#output) — txt / srt / vtt / json / csv / lrc
 - [Segmentation & chunking](#segmentation--chunking) — VAD, fixed chunks
 - [Word-level timestamps via CTC alignment](#word-level-timestamps-via-ctc-alignment)
@@ -79,15 +81,45 @@ crispasr --list-backends
 | `-f FNAME`, `--file FNAME` | Input audio (can repeat; also accepts positional filenames) |
 | `-t N`, `--threads N` | Thread count (default: `min(4, nproc)`) |
 | `-l LANG`, `--language LANG` | ISO-639-1 code (default: `en`) |
-| `--tts "TEXT"` | Synthesize speech from text (requires `CAP_TTS` backend). Output to `-o file.wav` |
-| `--tts-output FNAME` | Output path for TTS WAV (default: stdout / `tts_output.wav`) |
+| `--tts "TEXT"` | Synthesize speech from text (requires `CAP_TTS` backend). Output via `--tts-output` |
+| `--tts-output FNAME` | Output path for TTS WAV (default: `tts_output.wav`) |
 | `--s2s` | Speech-to-speech mode: audio in → audio out (requires `CAP_S2S` backend, e.g. `lfm2-audio`, `mini-omni2`) |
 | `--s2s-output FNAME` | Output path for S2S WAV |
-| `--voice PATH` | Voice reference for TTS cloning (WAV file or GGUF voice pack) |
+| `--voice PATH` | Voice reference for TTS: GGUF voice pack or reference WAV for cloning (`--i-have-rights` required for WAV cloning) |
 | `--server` | Run as HTTP server with persistent model (see [`server.md`](server.md)) |
 | `--ws-port N` | Server: real-time WebSocket ASR streaming port (`-1` off, `0` = HTTP port + 1) |
 | `--no-warmup` | Server: skip the startup warmup transcribe (workaround for GPU drivers that hang in warmup, #165) |
 | `--list-backends` | Print the capability matrix and exit |
+| `--gpu-backend NAME` | Force GPU backend: `cuda`, `vulkan`, `metal`, or `cpu` (default: `auto`) |
+| `--no-gpu` / `--device N` | Disable GPU entirely, or pin to GPU index N |
+
+### Model resolution flags
+
+| Flag | Meaning |
+|---|---|
+| `-m auto` | Download the registry default for `--backend` on first use; subsequent runs are instant |
+| `--model-quant Q` | Preferred quant for registry resolution; overrides the default. E.g. `--model-quant q8_0` to get Q8_0 instead of the default Q4_K. Also changes any companion model (voice pack, codec). |
+| `--auto-download` | Explicitly allow auto-download of missing registry models. Implied by `-m auto` and `--hf-repo`. |
+| `--cache-dir DIR` | Override the auto-download cache directory (default: `~/.cache/crispasr/`) |
+| `-hfr REPO`, `--hf-repo OWNER/REPO[:FILE]` | Fetch model from an arbitrary HuggingFace repo. E.g. `--hf-repo cstr/parakeet-tdt-0.6b-v3-GGUF:parakeet-tdt-0.6b-v3-q4_k.gguf`. Implies `--auto-download`. |
+| `-hff FNAME`, `--hf-file FNAME` | Filename within `--hf-repo` (alternative to the `OWNER/REPO:FILE` shorthand) |
+| `--dry-run-resolve` | Print the resolved model path + companion paths and exit — does not load or synthesize |
+| `--dry-run-ignore-cache` | As `--dry-run-resolve` but pretend the cache is empty (shows what would be downloaded) |
+
+### TTS-specific flags
+
+| Flag | Meaning |
+|---|---|
+| `--voice PATH` | GGUF voice pack or reference WAV. GGUF packs are used for VibeVoice/Qwen3-TTS/Orpheus style conditioning; WAV enables voice cloning (requires `--i-have-rights`) |
+| `--voice-dir PATH` | Server: directory of `<name>.gguf` or `<name>.wav` voice profiles. Enables `/v1/voices` listing and name-based voice selection in `/v1/audio/speech` |
+| `--ref-text "TEXT"` | Reference transcription for the ref audio (qwen3-tts, f5-tts). Auto-transcribed from `--voice <wav>` if omitted |
+| `--ref-asr BACKEND` | ASR backend to auto-transcribe the ref audio (default: `whisper`) |
+| `--instruct "TEXT"` | Natural-language voice/style description. For qwen3-tts: VoiceDesign mode (voice description) or CustomVoice mode (style control) |
+| `--codec-model FNAME` | Explicit path to the codec/companion GGUF (e.g. Qwen3-TTS codec encoder). Defaults to sibling / cache / registry auto-discovery |
+| `--codec-quant Q` | Preferred quant for registry companion resolution (codec model) |
+| `--tts-steps N` | DPM-Solver++ diffusion steps (VibeVoice only; default 20, valid range 10–20) |
+| `--tts-trim-silence` | Trim leading silence from TTS output |
+| `--tts-max-input-chars N` | Server: cap on `/v1/audio/speech` `input` length in characters (default 4096; `0` = no cap) |
 
 ## Output
 
@@ -757,7 +789,9 @@ default quantized model for the selected backend into
 `~/.cache/crispasr/` on first use. The registry (kept in sync with
 `src/crispasr_model_registry.cpp`):
 
-| Backend | Download | Approx size |
+**ASR backends**
+
+| Backend | Default download | Approx size |
 |---|---|---|
 | whisper | `ggerganov/whisper.cpp/ggml-base.en.bin` | ~147 MB |
 | parakeet | `cstr/parakeet-tdt-0.6b-v3-GGUF` | ~467 MB |
@@ -775,6 +809,20 @@ default quantized model for the selected backend into
 | omniasr-llm | `cstr/omniasr-llm-300m-v2-GGUF` | ~580 MB |
 | hubert | `cstr/hubert-large-ls960-ft-GGUF` | ~200 MB |
 | data2vec | `cstr/data2vec-audio-960h-GGUF` | ~60 MB |
+
+**TTS backends** — all auto-download the model + a default voice pack:
+
+| Backend | Default download | Approx size | Notes |
+|---|---|---|---|
+| vibevoice-tts | `cstr/vibevoice-realtime-0.5b-GGUF` (Q4_K) + `vibevoice-voice-emma.gguf` | ~636 MB + ~3 MB | `--model-quant q8_0` → ~1.1 GB higher-quality variant |
+| vibevoice | `cstr/vibevoice-asr-GGUF` (Q4_K) | ~4.5 GB | ASR + TTS combo model |
+| vibevoice-1.5b | `cstr/vibevoice-1.5b-GGUF` (Q4_K) | ~1.6 GB | Base model, runs without a voice pack |
+| kokoro | `cstr/kokoro-v1-GGUF` (Q8_0) | ~330 MB | German variant: `--backend kokoro-de` |
+| qwen3-tts | `cstr/qwen3-tts-0.6b-base-GGUF` (Q8_0) + F16 codec | ~690 MB + ~346 MB | Streaming-capable; codec auto-discovered |
+| qwen3-tts-1.7b-base | `cstr/qwen3-tts-1.7b-base-GGUF` (Q8_0) + F16 codec | ~1.9 GB + ~346 MB | Higher quality |
+| orpheus | `cstr/orpheus-3b-GGUF` (Q4_K) | ~1.9 GB | Llama-3 based; US-English |
+| chatterbox | `cstr/chatterbox-tts-GGUF` (Q4_K) | ~2 GB | S3Gen + T3; multilingual |
+| piper | `cstr/piper-en-hfc-medium-GGUF` | ~63 MB | Lightweight, many voices via `--voice` |
 
 Downloads go through `curl` (preferred) with a `wget` fallback — **no
 Python, no libcurl link dependency**. Works identically on Linux,
@@ -1008,11 +1056,8 @@ CRISPASR_KV_QUANT=q4_0 CRISPASR_GGUF_MMAP=1 \
   ./build/bin/crispasr --backend voxtral4b -m auto -f audio.wav
 ```
 
-**Not yet supported:** N-layer CPU offload (`--n-gpu-layers N` style)
-and KV-on-CPU-only modes — both tracked as PLAN #69 for future
-implementation. For most voxtral4b VRAM-pressure cases the
-`KV_QUANT=q4_0 + MMAP=1` combo above is sufficient; the layer-split
-features are only needed when even that doesn't fit.
+See the `CRISPASR_N_GPU_LAYERS` and `CRISPASR_KV_ON_CPU` sections above
+for the full layer-offload and KV-spill knobs — both are supported.
 
 ### TTS provenance & watermarking flags
 
@@ -1054,8 +1099,8 @@ map:
 | KV cache dtype | `--type-k q8_0 --type-v q8_0` (CLI flag, separate K/V) | `CRISPASR_KV_QUANT=q8_0` for symmetric, or `CRISPASR_KV_QUANT_K` / `_V` per half |
 | mmap weights | `--no-mmap` (mmap is default **on**) | `CRISPASR_GGUF_MMAP=0` (mmap is default **on** since 0.6.7) |
 | Lock pages in RAM | `--mlock` | (not supported — `mmap+preload` is the closest analogue) |
-| GPU layer count | `--n-gpu-layers N` / `-ngl N` (CLI flag) | not supported yet — see [PLAN #69a](https://github.com/CrispStrobe/CrispASR/blob/main/PLAN.md) |
-| KV-on-CPU-only | `--no-kv-offload` | not supported yet — see [PLAN #69b](https://github.com/CrispStrobe/CrispASR/blob/main/PLAN.md) |
+| GPU layer count | `--n-gpu-layers N` / `-ngl N` (CLI flag) | `CRISPASR_N_GPU_LAYERS=N` env var — 10 LLM backends |
+| KV-on-CPU-only | `--no-kv-offload` | `CRISPASR_KV_ON_CPU=1` env var |
 | Flash attention | `--flash-attn` / `-fa` | always-on where the backend's `capabilities()` declares `CAP_FLASH_ATTN` |
 | Threads | `--threads N` / `-t N` | `--threads N` / `-t N` (matched) |
 | Force CPU | `--gpu-layers 0` | `--no-gpu` / `--gpu-backend cpu` |
@@ -1079,11 +1124,10 @@ Differences worth flagging:
    parity, see open issue / PR — converting the env vars to flags
    is mechanical (`-DCRISPASR_KV_QUANT=val` style) but adds CLI
    surface area.
-4. **No `--n-gpu-layers` yet.** This is the biggest missing knob
-   for VRAM-constrained hosts. Tracked as PLAN #69a, prioritised by
-   external request on issue #60. Today the workaround is the
-   `KV_QUANT=q4_0 + MMAP=1` combo above, which usually clears
-   enough headroom for voxtral4b-class models.
+4. **`CRISPASR_N_GPU_LAYERS=N`.** Equivalent to `--n-gpu-layers N`.
+   Supported on 10 LLM-decode backends (voxtral, voxtral4b, qwen3-asr,
+   granite, glm-asr, orpheus, omniasr-llm, gemma4-e2b, mimo-asr,
+   vibevoice). See the section above for details.
 
 ---
 
