@@ -123,7 +123,7 @@ def main():
     # --- Tokenizer ---
     tok_path = os.path.join(model_dir, "tokenizer.json")
     if os.path.exists(tok_path):
-        with open(tok_path, "r") as f:
+        with open(tok_path, "r", encoding="utf-8") as f:
             tok_data = json.load(f)
         vocab = tok_data.get("model", {}).get("vocab", {})
         if vocab:

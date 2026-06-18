@@ -6,10 +6,15 @@ bytes as the system ANSI code page (e.g. GBK), corrupting tokenizer vocab in the
 
 import pathlib
 import re
+import sys
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODELS_DIR = ROOT / "models"
+sys.path.insert(0, str(MODELS_DIR))
+
+from chatterbox_paths import select_chatterbox_t3_checkpoint
 
 
 def _text_opens_without_encoding(path: pathlib.Path) -> list[tuple[int, str]]:
@@ -53,6 +58,26 @@ class TestConverterEncoding(unittest.TestCase):
             "Text-mode open() without encoding='utf-8' — will break on "
             f"Windows with non-UTF-8 locale:\n" + "\n".join(violations),
         )
+
+    def test_chatterbox_t3_checkpoint_selection_prefers_v3(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = pathlib.Path(td)
+            (model_dir / "t3_mtl23ls_v2.safetensors").touch()
+            (model_dir / "t3_mtl23ls_v3.safetensors").touch()
+            (model_dir / "t3_cfg.safetensors").touch()
+
+            self.assertEqual(select_chatterbox_t3_checkpoint(model_dir).name, "t3_mtl23ls_v3.safetensors")
+
+    def test_chatterbox_t3_checkpoint_selection_falls_back_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = pathlib.Path(td)
+            (model_dir / "t3_mtl11ls.safetensors").touch()
+            self.assertEqual(select_chatterbox_t3_checkpoint(model_dir).name, "t3_mtl11ls.safetensors")
+
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = pathlib.Path(td)
+            (model_dir / "t3_cfg.safetensors").touch()
+            self.assertEqual(select_chatterbox_t3_checkpoint(model_dir).name, "t3_cfg.safetensors")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,8 @@ from pathlib import Path
 
 import numpy as np
 
+from chatterbox_paths import select_chatterbox_t3_checkpoint
+
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
 except ImportError:
@@ -462,12 +464,7 @@ def write_t3_gguf(
     print(f"\n=== Writing T3 GGUF: {output_path} ===")
 
     # ── Pre-load T3 to infer vocab size before writing hparams ──
-    t3_path = None
-    for candidate in sorted(model_dir.glob("t3_mtl*.safetensors")):
-        t3_path = candidate
-        break
-    if t3_path is None:
-        t3_path = model_dir / "t3_cfg.safetensors"
+    t3_path = select_chatterbox_t3_checkpoint(model_dir)
     if not t3_path.exists():
         sys.exit(f"Missing T3 weights (tried t3_mtl*.safetensors and t3_cfg.safetensors in {model_dir})")
     print(f"  T3 weights: {t3_path.name}")

@@ -485,7 +485,10 @@ constexpr Entry k_registry[] = {
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
      "~80 MB"},
-    // Chatterbox family — ResembleAI MIT TTS. Two-GGUF runtime:
+    // Chatterbox family — ResembleAI MIT TTS. Base model is the 23-language
+    // multilingual Chatterbox; language-specific fine-tunes live in
+    // `kartoffelbox-turbo` (German turbo) and `lahgtna-chatterbox` (Arabic).
+    // Two-GGUF runtime:
     //   primary  = T3 (text → speech tokens) — also carries baked conds
     //   companion = S3Gen (tokens → 24 kHz waveform via CFM + HiFTGenerator)
     // CLI adapter (`crispasr_backend_chatterbox.cpp`) is shipped — surfaces

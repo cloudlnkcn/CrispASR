@@ -184,6 +184,22 @@ TEST_CASE("registry: companion_approx_size populated for chatterbox", "[unit][re
     REQUIRE(e.companion_approx_size != e.approx_size);
 }
 
+TEST_CASE("registry: chatterbox family keeps multilingual and finetunes separate", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+
+    REQUIRE(crispasr_registry_lookup("chatterbox", e));
+    REQUIRE(e.filename == "chatterbox-t3-q8_0.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
+
+    REQUIRE(crispasr_registry_lookup("kartoffelbox-turbo", e));
+    REQUIRE(e.filename.find("kartoffelbox-turbo-t3") != std::string::npos);
+    REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-f16.gguf");
+
+    REQUIRE(crispasr_registry_lookup("lahgtna-chatterbox", e));
+    REQUIRE(e.filename == "chatterbox-t3-f16.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
+}
+
 TEST_CASE("registry: companion_approx_size empty for backends without companion", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("whisper", e));

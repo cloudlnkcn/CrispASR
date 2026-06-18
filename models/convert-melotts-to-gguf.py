@@ -93,7 +93,7 @@ def main():
     args = ap.parse_args()
 
     # ── Load config ──
-    with open(args.config) as f:
+    with open(args.config, encoding="utf-8") as f:
         cfg = json.load(f)
 
     symbols = cfg["symbols"]
@@ -192,7 +192,7 @@ def main():
         else:
             # Read raw .rep format
             cmudict = {}
-            with open(cmudict_path) as f:
+            with open(cmudict_path, encoding="utf-8") as f:
                 for line_no, line in enumerate(f, 1):
                     if line_no < 49:
                         continue
@@ -277,7 +277,7 @@ def main():
         except ImportError:
             print("WARNING: g2p_en not available, neural G2P weights not embedded")
     else:
-        with open(g2p_weights_path) as f:
+        with open(g2p_weights_path, encoding="utf-8") as f:
             writer.add_string("melotts.g2p_en_json", f.read())
         print("g2p_en weights embedded from cache")
 

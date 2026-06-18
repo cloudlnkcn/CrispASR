@@ -71,7 +71,7 @@ def main():
     args = ap.parse_args()
 
     # ── Load config ──
-    with open(args.config) as f:
+    with open(args.config, encoding="utf-8") as f:
         cfg = json.load(f)
 
     model_cfg = cfg["model"]
