@@ -570,22 +570,24 @@ public:
         return out;
     }
 
-    void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_cs,
-                              const whisper_params& params,
+    void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_cs, const whisper_params& params,
                               crispasr_stream_callback on_text) override {
         (void)t_offset_cs; // For Qwen3 streaming we just stream text output
-        if (!ctx_) return;
+        if (!ctx_)
+            return;
 
         // ---- Mel ----
         int n_mels = 0, T_mel = 0;
         float* mel = qwen3_asr_compute_mel(ctx_, samples, n_samples, &n_mels, &T_mel);
-        if (!mel) return;
+        if (!mel)
+            return;
 
         // ---- Encoder ----
         int N_enc = 0, pdim = 0;
         float* audio_embeds = qwen3_asr_run_encoder(ctx_, mel, n_mels, T_mel, &N_enc, &pdim);
         free(mel);
-        if (!audio_embeds) return;
+        if (!audio_embeds)
+            return;
 
         // ---- Prompt ----
         std::string sys_instruction;
@@ -596,7 +598,8 @@ public:
             sys_instruction = "Translate the speech to " + tgt + ".";
         }
         if (!params.hotwords.empty()) {
-            if (!sys_instruction.empty() && sys_instruction.back() != ' ') sys_instruction += ' ';
+            if (!sys_instruction.empty() && sys_instruction.back() != ' ')
+                sys_instruction += ' ';
             sys_instruction += "The following words may appear in the audio: " + params.hotwords + ".";
         }
 
@@ -604,7 +607,8 @@ public:
                            "<|im_end|>\n"
                            "<|im_start|>user\n"
                            "<|audio_start|>";
-        for (int i = 0; i < N_enc; i++) text += "<|audio_pad|>";
+        for (int i = 0; i < N_enc; i++)
+            text += "<|audio_pad|>";
         text += "<|audio_end|><|im_end|>\n<|im_start|>assistant\n";
 
         int n_prompt = 0;
@@ -642,7 +646,7 @@ public:
             }
         }
         free(audio_embeds);
-        
+
         const int prompt_len = (int)ids.size();
 
         // ---- KV init ----
@@ -661,9 +665,11 @@ public:
         int eos_id = -1;
         int n_eos = 0;
         int32_t* eos_arr = qwen3_asr_tokenize(ctx_, "<|im_end|>", &n_eos);
-        if (eos_arr && n_eos >= 1) eos_id = eos_arr[0];
+        if (eos_arr && n_eos >= 1)
+            eos_id = eos_arr[0];
         free(eos_arr);
-        if (eos_id < 0) eos_id = 151645; // Fallback
+        if (eos_id < 0)
+            eos_id = 151645; // Fallback
 
         core_greedy_decode::Config dec_cfg;
         dec_cfg.max_new_tokens = params.max_new_tokens;
@@ -677,26 +683,33 @@ public:
         float first_prob = 1.0f;
         const int last_off = (n_t - 1) * vocab;
         if (params.temperature > 0.0f) {
-            std::mt19937_64 seed_rng((params.seed != 0 ? params.seed : (uint64_t)std::random_device{}()) ^ (uint64_t)0x9E3779B97F4A7C15ull);
+            std::mt19937_64 seed_rng((params.seed != 0 ? params.seed : (uint64_t)std::random_device{}()) ^
+                                     (uint64_t)0x9E3779B97F4A7C15ull);
             first_token = core_greedy_decode::sample_temp(logits + last_off, vocab, params.temperature, seed_rng);
         } else {
             first_token = core_greedy_decode::argmax(logits + last_off, vocab);
         }
-        first_prob = core_greedy_decode::softmax_of(logits + last_off, vocab, first_token, logits[last_off + first_token]);
+        first_prob =
+            core_greedy_decode::softmax_of(logits + last_off, vocab, first_token, logits[last_off + first_token]);
         free(logits);
 
         std::string accumulated_text;
         bool capture_language = false;
-        
+
         auto token_cb = [&](int32_t id, float prob) {
             (void)prob;
-            if (id == eos_id) return;
+            if (id == eos_id)
+                return;
             const char* raw_piece = qwen3_asr_token_text(ctx_, id);
-            if (!raw_piece || !*raw_piece) return;
+            if (!raw_piece || !*raw_piece)
+                return;
             std::string raw = raw_piece;
-            if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') return;
-            if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') return;
-            if (raw.size() >= 5 && raw[0] == '[' && raw[1] == 'P' && raw[2] == 'A' && raw[3] == 'D') return;
+            if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|')
+                return;
+            if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>')
+                return;
+            if (raw.size() >= 5 && raw[0] == '[' && raw[1] == 'P' && raw[2] == 'A' && raw[3] == 'D')
+                return;
             std::string txt = decode_token(raw);
             if (txt == "language") {
                 capture_language = true;

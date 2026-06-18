@@ -193,17 +193,17 @@ public:
     // Called with partial text (empty string counts as keep-alive)
     // and is_final flag. When is_final is true, partial_text is the
     // complete final result.
-    using crispasr_stream_callback =
-        std::function<void(const std::string& partial_text, bool is_final)>;
+    using crispasr_stream_callback = std::function<void(const std::string& partial_text, bool is_final)>;
 
     // Transcribe with streaming output. Default implementation falls back
     // to non-streaming transcribe().
-    virtual void transcribe_streaming(const float* samples, int n_samples,
-                                      int64_t t_offset_cs,
-                                      const whisper_params& params,
-                                      crispasr_stream_callback on_text) {
-        (void)samples; (void)n_samples; (void)t_offset_cs;
-        (void)params; (void)on_text;
+    virtual void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_cs,
+                                      const whisper_params& params, crispasr_stream_callback on_text) {
+        (void)samples;
+        (void)n_samples;
+        (void)t_offset_cs;
+        (void)params;
+        (void)on_text;
         // Fallback: run non-streaming, then push result at once.
         auto segments = transcribe(samples, n_samples, t_offset_cs, params);
         std::string full;
@@ -213,9 +213,9 @@ public:
             }
         }
         if (!full.empty()) {
-            on_text(full, false);  // partial
+            on_text(full, false); // partial
         }
-        on_text(full, true);       // final
+        on_text(full, true); // final
     }
 
     // Warmup: run a short dummy transcribe to amortize first-call

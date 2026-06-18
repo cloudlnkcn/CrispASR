@@ -376,13 +376,13 @@ inline Result run_with_probs(Ctx* ctx, int32_t first_token, float first_prob, in
 // run_with_probs + callback for true token streaming.
 template <typename Ctx, typename EmbedFn, typename ForwardFn, typename OnTokenFn>
 inline Result run_with_probs_cb(Ctx* ctx, int32_t first_token, float first_prob, int initial_n_past, EmbedFn embed_fn,
-                             ForwardFn forward_fn, OnTokenFn on_token, const Config& cfg) {
+                                ForwardFn forward_fn, OnTokenFn on_token, const Config& cfg) {
     Result r;
     r.tokens.reserve((size_t)cfg.max_new_tokens);
     r.probs.reserve((size_t)cfg.max_new_tokens);
     r.tokens.push_back(first_token);
     r.probs.push_back(first_prob);
-    
+
     // Call the callback for the first token
     on_token(first_token, first_prob);
 
@@ -425,7 +425,7 @@ inline Result run_with_probs_cb(Ctx* ctx, int32_t first_token, float first_prob,
         r.tokens.push_back(nx);
         r.probs.push_back(nx_p);
         count_generated_token(token_counts, nx);
-        
+
         // Notify the caller of the new token
         on_token(nx, nx_p);
     }

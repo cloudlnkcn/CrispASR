@@ -38,9 +38,9 @@
 #include "crispasr_truecase_loader.h"    // shared --truecase-model resolution + apply (CLI parity)
 #include "crispasr_punctuation_policy.h" // crispasr_should_auto_enable_punctuation()
 
-#include "common-crispasr.h"     // read_audio_data
-#include "crispasr_chat.h"       // /v1/chat/completions
-#include "../server/ws_stream.h" // real-time WebSocket ASR streaming (--ws-port)
+#include "common-crispasr.h"           // read_audio_data
+#include "crispasr_chat.h"             // /v1/chat/completions
+#include "../server/ws_stream.h"       // real-time WebSocket ASR streaming (--ws-port)
 #include "../server/realtime_server.h" // vLLM Realtime API
 #include "crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
@@ -1128,7 +1128,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         bool stream = form_bool(req, "stream", false);
 
         if (stream && (backend->capabilities() & CAP_STREAMING)) {
-            std::string tmp_path = write_temp_audio(audio_file.content.data(), audio_file.content.size(), audio_file.filename);
+            std::string tmp_path =
+                write_temp_audio(audio_file.content.data(), audio_file.content.size(), audio_file.filename);
             if (tmp_path.empty()) {
                 json_error(res, 500, "failed to create temporary file for audio");
                 return;
@@ -1149,13 +1150,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             }
 
             // Capture large vectors by value for the async provider
-            res.set_chunked_content_provider("text/event-stream",
-                [pcmf32, rp, &backend, &model_mutex](size_t /*offset*/, httplib::DataSink& sink) {
+            res.set_chunked_content_provider(
+                "text/event-stream", [pcmf32, rp, &backend, &model_mutex](size_t /*offset*/, httplib::DataSink& sink) {
                     std::lock_guard<std::mutex> lock(model_mutex);
                     std::string last_sent_text;
-                    
-                    backend->transcribe_streaming(pcmf32.data(), pcmf32.size(), 0, rp,
-                        [&](const std::string& partial, bool is_final) {
+
+                    backend->transcribe_streaming(
+                        pcmf32.data(), pcmf32.size(), 0, rp, [&](const std::string& partial, bool is_final) {
                             if (!partial.empty() || is_final) {
                                 std::string diff;
                                 if (partial.size() > last_sent_text.size() &&
@@ -1164,7 +1165,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                                 } else {
                                     diff = partial;
                                 }
-                                
+
                                 if (!diff.empty()) {
                                     std::ostringstream js;
                                     js << "data: {\"text\": \"" << crispasr_json_escape(diff) << "\"}\n\n";
@@ -2419,8 +2420,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         const int rt_port = ws_port + 1; // vLLM Realtime API on ws_port + 1
         if (realtime_server_start(backend.get(), model_mutex, params, rt_port) == 0) {
             rt_started = true;
-            fprintf(stderr, "  WS   ws://%s:%d/v1/realtime     — vLLM Realtime API (JSON WebSocket)\n",
-                    host.c_str(), rt_port);
+            fprintf(stderr, "  WS   ws://%s:%d/v1/realtime     — vLLM Realtime API (JSON WebSocket)\n", host.c_str(),
+                    rt_port);
         } else {
             fprintf(stderr, "crispasr-server: warning: failed to start vLLM Realtime API on port %d\n", rt_port);
         }

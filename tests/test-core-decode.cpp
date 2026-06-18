@@ -136,12 +136,12 @@ TEST_CASE("greedy_decode: run_with_probs_cb streams tokens", "[unit][decode]") {
     float first_prob = core_greedy_decode::softmax_of(logits, cfg.vocab_size, cfg.temperature, logits[first_token]);
 
     std::vector<int32_t> streamed_ids;
-    core_greedy_decode::run_with_probs_cb(&ctx, first_token, first_prob, 0,
-                                       [](MockCtx* c, const int32_t* ids, int n) { return mock_embed(c, ids, n); },
-                                       [](MockCtx* c, const float* emb, int n_tok, int past, int* on, int* ov) { return mock_llm(c, emb, n_tok, past, on, ov); },
-                                       [&](int32_t id, float prob) {
-                                           streamed_ids.push_back(id);
-                                       }, cfg);
+    core_greedy_decode::run_with_probs_cb(
+        &ctx, first_token, first_prob, 0, [](MockCtx* c, const int32_t* ids, int n) { return mock_embed(c, ids, n); },
+        [](MockCtx* c, const float* emb, int n_tok, int past, int* on, int* ov) {
+            return mock_llm(c, emb, n_tok, past, on, ov);
+        },
+        [&](int32_t id, float prob) { streamed_ids.push_back(id); }, cfg);
 
     // The initial call_count in mock_llm is 1 (for the initial logits), then run_with_probs_cb
     // calls it for each new token. mock_llm emits '3' up to call_count=3, so:

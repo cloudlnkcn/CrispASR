@@ -502,8 +502,8 @@ std::vector<crispasr_segment> crispasr_run_voxtral_style_pipeline_streamed(typen
     return out;
 }
 
-void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_cs,
-                          const whisper_params& params, crispasr_stream_callback on_text) override {
+void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_cs, const whisper_params& params,
+                          crispasr_stream_callback on_text) override {
     (void)t_offset_cs; // Simplified streaming doesn't use t_offset_cs for token events
     // ---- Prepare prompts ----------------------------------------------------
     std::string text_prompt = params.prompt;
@@ -557,7 +557,7 @@ void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_
     const int max_new_scaled = std::max(512, audio_seconds * 8);
     const int max_new = std::max(params.max_new_tokens, max_new_scaled);
     const int kv_budget = T_prompt + max_new + 64;
-    
+
     if (!Ops::kv_init(ctx, kv_budget)) {
         free(text_embeds);
         return;
@@ -593,7 +593,8 @@ void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_
     std::string accumulated_text;
     auto token_cb = [&](int32_t id, float prob) {
         (void)prob;
-        if (id == Ops::eos_id) return;
+        if (id == Ops::eos_id)
+            return;
         int len = 0;
         const uint8_t* bytes = Ops::token_text(ctx, id, &len);
         if (bytes && len > 0) {
@@ -605,7 +606,8 @@ void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_
         }
     };
 
-    core_greedy_decode::run_with_probs_cb(ctx, next, next_p, T_prompt, Ops::embed_tokens, Ops::run_llm_kv, token_cb, dec_cfg);
+    core_greedy_decode::run_with_probs_cb(ctx, next, next_p, T_prompt, Ops::embed_tokens, Ops::run_llm_kv, token_cb,
+                                          dec_cfg);
 
     if (!accumulated_text.empty()) {
         on_text(accumulated_text, true);
@@ -615,5 +617,3 @@ void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_
 
     free(text_embeds);
 }
-
-
