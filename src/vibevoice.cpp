@@ -16,6 +16,7 @@
 #include "vibevoice.h"
 #include "core/attention.h"
 #include "core/bpe.h"
+#include "core/conv.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "vibevoice_wav_ref.h"
@@ -108,6 +109,10 @@ struct vibevoice_context {
         ggml_backend_buffer_t buf = nullptr;
     } voice;
     std::vector<uint8_t> compute_meta;
+    // Pre-permuted ConvTranspose1d weights for decomposed col2im path.
+    std::vector<ggml_tensor*> dec_ups_w_perm;
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
     // Cached prediction head graph (reused across DPM steps)
     ggml_context* pred_graph_ctx = nullptr;
     ggml_cgraph* pred_graph = nullptr;
@@ -270,6 +275,24 @@ extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_m
     ctx->buf_cpu = wl.buf_cpu;
     m.tensors = wl.tensors;
 
+    // VibeVoice decoder upsampling is ConvTranspose1d. The decomposed
+    // mul_mat + col2im path has stable backend behavior across CPU/GPU.
+    if (hp.has_decoder && !hp.encoder_ratios.empty()) {
+        const int n_stages = (int)hp.encoder_ratios.size();
+        std::vector<ggml_tensor*> srcs(n_stages);
+        std::vector<ggml_tensor**> dsts(n_stages);
+        ctx->dec_ups_w_perm.resize(n_stages, nullptr);
+        for (int i = 0; i < n_stages; i++) {
+            char wn[128];
+            snprintf(wn, sizeof(wn), "at_dec.us.%d.0.convtr.weight", i + 1);
+            auto it = m.tensors.find(wn);
+            srcs[i] = (it != m.tensors.end()) ? it->second : nullptr;
+            dsts[i] = &ctx->dec_ups_w_perm[i];
+        }
+        core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n_stages, ctx->backend, &ctx->ctx_perm,
+                                                  &ctx->buf_perm);
+    }
+
     {
         int n_be = 0;
         ggml_backend_t backends[2];
@@ -326,6 +349,10 @@ extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
         ggml_free(ctx->kv_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm);
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->voice.buf)
         ggml_backend_buffer_free(ctx->voice.buf);
     if (ctx->voice.ctx)
@@ -810,6 +837,26 @@ static void vibevoice_dump_f32(const char* dir, const char* name, const float* d
         return;
     fwrite(data, sizeof(float), n, f);
     fclose(f);
+}
+
+static bool vibevoice_load_f32_file(const char* path, std::vector<float>& out) {
+    FILE* f = fopen(path, "rb");
+    if (!f)
+        return false;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+    long n_bytes = ftell(f);
+    if (n_bytes < 0 || (n_bytes % (long)sizeof(float)) != 0) {
+        fclose(f);
+        return false;
+    }
+    rewind(f);
+    out.resize((size_t)n_bytes / sizeof(float));
+    bool ok = out.empty() || fread(out.data(), sizeof(float), out.size(), f) == out.size();
+    fclose(f);
+    return ok;
 }
 
 // ===========================================================================
@@ -2244,7 +2291,13 @@ static ggml_cgraph* build_pred_head_graph(vibevoice_context* ctx, int n_frames) 
 // Input/output in [C, T] format. Upsamples by 'stride'.
 // Output trimmed to T_in * stride (removes K - stride from end).
 static ggml_tensor* build_transposed_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b,
-                                            int stride) {
+                                            int stride, ggml_tensor* w_perm = nullptr) {
+    if (w_perm) {
+        const int K = (int)w->ne[0];
+        return core_convt::convt1d_decomp(ctx, x, w_perm, b, stride, K, /*crop_left=*/0,
+                                          /*crop_right=*/K - stride);
+    }
+
     int T_in = (int)x->ne[1];
 
     // Transpose to [T, C_in] for ggml conv ops
@@ -2281,6 +2334,7 @@ static ggml_tensor* build_transposed_conv1d(ggml_context* ctx, ggml_tensor* x, g
 static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames) {
     auto& hp = ctx->model.hp;
     auto& ts = ctx->model.tensors;
+    const bool dump_decoder = getenv("VIBEVOICE_TTS_DUMP_DECODER") != nullptr;
     auto G = [&](const std::string& name) -> ggml_tensor* {
         auto it = ts.find(name);
         return it != ts.end() ? it->second : nullptr;
@@ -2304,6 +2358,10 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
 
     // 1. Stem conv (us.0): Conv1d(vae_dim → C_max, K=7, stride=1)
     h = build_causal_conv1d(ctx0, h, G("at_dec.us.0.0.conv.weight"), G("at_dec.us.0.0.conv.bias"), 1);
+    if (dump_decoder) {
+        ggml_set_name(h, "dec_stem");
+        ggml_set_output(h);
+    }
 
     // 2. Stage 0: ConvNeXt blocks at full channel width
     for (int bi = 0; bi < depths[0]; bi++) {
@@ -2315,6 +2373,10 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
                           G(std::string(base) + ".ffn.up.bias"), G(std::string(base) + ".ffn.down.weight"),
                           G(std::string(base) + ".ffn.down.bias"), G(std::string(base) + ".ffn_gamma"));
     }
+    if (dump_decoder) {
+        ggml_set_name(h, "dec_stage0");
+        ggml_set_output(h);
+    }
 
     // 3. Stages 1-6: transposed conv upsample + ConvNeXt blocks
     int n_upsample_stages = (int)ratios.size(); // 6
@@ -2323,7 +2385,14 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
         snprintf(wn, sizeof(wn), "at_dec.us.%d.0.convtr.weight", si);
         snprintf(bn_str, sizeof(bn_str), "at_dec.us.%d.0.convtr.bias", si);
         int stride = ratios[si - 1];
-        h = build_transposed_conv1d(ctx0, h, G(wn), G(bn_str), stride);
+        ggml_tensor* wp = (si - 1 < (int)ctx->dec_ups_w_perm.size()) ? ctx->dec_ups_w_perm[si - 1] : nullptr;
+        h = build_transposed_conv1d(ctx0, h, G(wn), G(bn_str), stride, wp);
+        if (dump_decoder) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dec_up%d", si);
+            ggml_set_name(h, nm);
+            ggml_set_output(h);
+        }
 
         int n_blocks = (si < (int)depths.size()) ? depths[si] : 3;
         for (int bi = 0; bi < n_blocks; bi++) {
@@ -2334,6 +2403,12 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
                               G(std::string(base) + ".ffn_ln.weight"), G(std::string(base) + ".ffn.up.weight"),
                               G(std::string(base) + ".ffn.up.bias"), G(std::string(base) + ".ffn.down.weight"),
                               G(std::string(base) + ".ffn.down.bias"), G(std::string(base) + ".ffn_gamma"));
+        }
+        if (dump_decoder) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dec_stage%d", si);
+            ggml_set_name(h, nm);
+            ggml_set_output(h);
         }
     }
 
@@ -4383,6 +4458,20 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
     } // end text/speech interleave loop
 
+    if (const char* latent_file = getenv("VIBEVOICE_TTS_LATENTS")) {
+        std::vector<float> override_latents;
+        if (!vibevoice_load_f32_file(latent_file, override_latents) || override_latents.empty() ||
+            (override_latents.size() % (size_t)vae_dim) != 0) {
+            fprintf(stderr, "vibevoice TTS: failed to load valid latent override '%s'\n", latent_file);
+            return nullptr;
+        }
+        all_latents.swap(override_latents);
+        if (verbosity >= 1) {
+            fprintf(stderr, "vibevoice TTS: using latent override '%s' (%zu frames)\n", latent_file,
+                    all_latents.size() / (size_t)vae_dim);
+        }
+    }
+
     int total_latent = (int)all_latents.size();
     if (verbosity >= 1) {
         float lmin = all_latents[0], lmax = all_latents[0], lsum = 0;
@@ -4410,6 +4499,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     std::vector<float> scaled_latent(total_latent);
     for (int i = 0; i < total_latent; i++)
         scaled_latent[i] = all_latents[i] / scaling_factor - bias_factor;
+    if (dump_dir) {
+        vibevoice_dump_f32(dump_dir, "tts_scaled_latent", scaled_latent.data(), scaled_latent.size());
+    }
 
     auto t_vae_build0 = std::chrono::high_resolution_clock::now();
     ggml_cgraph* dec_gf = build_vae_decoder_graph(ctx, actual_frames);
@@ -4483,25 +4575,32 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
     std::vector<float> raw_audio((size_t)total_audio);
     ggml_backend_tensor_get(audio_out, raw_audio.data(), 0, (size_t)total_audio * sizeof(float));
+    if (dump_dir) {
+        vibevoice_dump_f32(dump_dir, "tts_raw_audio", raw_audio.data(), raw_audio.size());
+        if (getenv("VIBEVOICE_TTS_DUMP_DECODER")) {
+            const char* names[] = {"dec_stem",   "dec_stage0", "dec_up1",    "dec_stage1", "dec_up2",
+                                   "dec_stage2", "dec_up3",    "dec_stage3", "dec_up4",    "dec_stage4",
+                                   "dec_up5",    "dec_stage5", "dec_up6",    "dec_stage6"};
+            for (const char* name : names) {
+                ggml_tensor* t = ggml_graph_get_tensor(dec_gf, name);
+                if (!t)
+                    continue;
+                std::vector<float> tmp((size_t)ggml_nelements(t));
+                ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size() * sizeof(float));
+                vibevoice_dump_f32(dump_dir, name, tmp.data(), tmp.size());
+            }
+        }
+    }
 
-    // ── Start trim: the σ-VAE decoder's first ~100ms is a deterministic
-    //               warmup transient from zero-pad propagation through 7
-    //               cascaded causal-conv stages. With the GELU FFN fix
-    //               (#39) the transient peaks reach ~0.18 — well above any
-    //               sensible noise floor — so the previous "find first
-    //               sample > 0.005, back up 800" heuristic kept the
-    //               transient in the output. Issue #40: that came out as
-    //               an audible click at the start.
-    //
-    //               Always skip at least the warmup samples; THEN apply
-    //               the noise-floor heuristic on the remainder so we still
-    //               include the attack of the first phoneme.
-    const int decoder_warmup_samples = 2400; // 100 ms @ 24 kHz
+    // ── Start trim: preserve the decoder's initial samples unless there is
+    //               leading digital silence. The official realtime path keeps
+    //               the first decoded chunk; a fixed warmup skip can jump into
+    //               a later waveform peak and create an audible click.
     const float noise_floor = 0.005f;
-    int trim_start = std::min(decoder_warmup_samples, total_audio);
-    for (int i = decoder_warmup_samples; i < total_audio; i++) {
+    int trim_start = 0;
+    for (int i = 0; i < total_audio; i++) {
         if (fabsf(raw_audio[i]) > noise_floor) {
-            trim_start = std::max(decoder_warmup_samples, i - 800); // ~33ms attack margin
+            trim_start = std::max(0, i - 800); // ~33ms attack margin
             break;
         }
     }
@@ -4528,8 +4627,8 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int trimmed_len = trim_end - trim_start;
     if (trimmed_len <= 0) {
         // Pathological case: no audio above floor (e.g. very short input).
-        // Fall back to the full decoder output minus the warmup, no tail trim.
-        trim_start = std::min(decoder_warmup_samples, total_audio);
+        // Fall back to the full decoder output, no tail trim.
+        trim_start = 0;
         trim_end = total_audio;
         trimmed_len = trim_end - trim_start;
     }
