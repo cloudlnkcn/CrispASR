@@ -3298,11 +3298,51 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
 // Language-aware session transcribe. `language` is an ISO 639-1 code
 // ("en", "de", "ja", ...). Passing NULL or empty keeps each backend's
 // historical default (usually "en") so this is a strict superset of
-// `crispasr_session_transcribe`. Backends that don't take a language
-// input (parakeet, qwen3, granite, wav2vec2, fastconformer-ctc) ignore
-// the hint silently — parakeet/qwen3 auto-detect, granite is instruction-
-// tuned with its own prompt, wav2vec2 is usually mono-lingual.
+// `crispasr_session_transcribe`. The instruction-tuned audio-LLM backends
+// (qwen3, granite, glm-asr, moss-audio, mimo-asr) inject a "transcribe in
+// <language>" prompt when a language is set; parakeet/wav2vec2 auto-detect
+// or are mono-lingual and ignore the hint silently.
 // ---------------------------------------------------------------------------
+
+// Map an ISO-639-1 code to a plain English language name for prompt
+// injection in the audio-LLM session dispatch. Mirrors the CLI-side
+// crispasr_iso_to_english_lang() (examples/cli/crispasr_backend_utils.h);
+// a bare two-letter code is unreliable in an LLM prompt ("de" reads as the
+// English "of"). Unknown codes pass through verbatim.
+static std::string ca_iso_to_english_lang(const std::string& code) {
+    if (code == "en")
+        return "English";
+    if (code == "de")
+        return "German";
+    if (code == "fr")
+        return "French";
+    if (code == "es")
+        return "Spanish";
+    if (code == "it")
+        return "Italian";
+    if (code == "pt")
+        return "Portuguese";
+    if (code == "ru")
+        return "Russian";
+    if (code == "ja")
+        return "Japanese";
+    if (code == "ko")
+        return "Korean";
+    if (code == "zh")
+        return "Chinese";
+    if (code == "nl")
+        return "Dutch";
+    if (code == "pl")
+        return "Polish";
+    if (code == "tr")
+        return "Turkish";
+    if (code == "ar")
+        return "Arabic";
+    if (code == "hi")
+        return "Hindi";
+    return code;
+}
+
 // Internal single-pass transcribe (used by best-of-N wrapper below).
 static crispasr_session_result* transcribe_single(crispasr_session* s, const float* pcm, int n_samples,
                                                   const char* language);
@@ -3707,15 +3747,24 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             return nullptr;
         }
 
-        // ChatML prompt: <|im_start|>system\n<|im_end|>\n<|im_start|>user\n
+        // ChatML prompt: <|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n
         // <|audio_start|><|audio_pad|>×N<|audio_end|>{question}<|im_end|>\n
         // <|im_start|>assistant\n
         //
         // When `s->ask` is set, inject the question between the audio
         // close token and the user-turn end so the LLM answers it
-        // instead of producing a verbatim transcript. Empty ask keeps
-        // the historical transcribe-only template.
-        std::string text = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>";
+        // instead of producing a verbatim transcript. Otherwise, when a
+        // language is set (per-call or sticky source_language), inject a
+        // "Transcribe the speech in <lang>." system instruction — mirrors
+        // the CLI adapter (crispasr_backend_qwen3.cpp). Empty ask + no
+        // language keeps the historical transcribe-only template.
+        std::string sys_instruction;
+        if (s->ask.empty()) {
+            const std::string eff_lang = lang_set ? lang : s->source_language;
+            if (!eff_lang.empty() && eff_lang != "auto")
+                sys_instruction = "Transcribe the speech in " + ca_iso_to_english_lang(eff_lang) + ".";
+        }
+        std::string text = "<|im_start|>system\n" + sys_instruction + "<|im_end|>\n<|im_start|>user\n<|audio_start|>";
         text.reserve(text.size() + (size_t)N_enc * 13 + 64 + s->ask.size());
         for (int i = 0; i < N_enc; i++)
             text += "<|audio_pad|>";
@@ -3945,14 +3994,24 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         // granite-3.x uses control-token chat template; granite-4.0 uses
         // "USER: …\n ASSISTANT:". Discriminator: audio_token < 50000 ⇒ v3.
         const bool use_v3_template = (audio_tok < 50000);
+        // Language steering (mirrors crispasr_backend_granite.cpp): when a
+        // language is set and no explicit ask overrides it, replace the
+        // default "transcribe into a written format" instruction with
+        // "transcribe into <language>".
+        const std::string eff_lang = lang_set ? lang : s->source_language;
+        const bool want_lang = s->ask.empty() && !eff_lang.empty() && eff_lang != "auto";
         std::vector<int32_t> prefix_ids, suffix_ids;
         if (use_v3_template) {
             const std::string prefix_str = "<|start_of_role|>user<|end_of_role|>";
-            const std::string suffix_str = (!s->ask.empty() ? s->ask
-                                                            : std::string("can you transcribe the speech into a "
-                                                                          "written format?")) +
-                                           "<|end_of_text|>\n"
-                                           "<|start_of_role|>assistant<|end_of_role|>";
+            std::string suffix_core;
+            if (!s->ask.empty())
+                suffix_core = s->ask;
+            else if (want_lang)
+                suffix_core = "can you transcribe the speech into " + ca_iso_to_english_lang(eff_lang) + "?";
+            else
+                suffix_core = "can you transcribe the speech into a written format?";
+            const std::string suffix_str = suffix_core + "<|end_of_text|>\n"
+                                                         "<|start_of_role|>assistant<|end_of_role|>";
             int n = 0;
             int32_t* a = granite_speech_tokenize(s->granite_ctx, prefix_str.c_str(), &n);
             if (a && n > 0) {
@@ -3970,8 +4029,11 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             // granite-4.0-1b legacy hardcoded ids: "USER: " + transcription request.
             static const int32_t kPrefix4[] = {6584, 25, 220};
             prefix_ids.assign(kPrefix4, kPrefix4 + (sizeof(kPrefix4) / sizeof(kPrefix4[0])));
-            if (!s->ask.empty()) {
-                const std::string suffix4_str = s->ask + "\nASSISTANT:";
+            if (!s->ask.empty() || want_lang) {
+                const std::string instr =
+                    !s->ask.empty() ? s->ask
+                                    : "can you transcribe the speech into " + ca_iso_to_english_lang(eff_lang) + "?";
+                const std::string suffix4_str = instr + "\nASSISTANT:";
                 int n = 0;
                 int32_t* a = granite_speech_tokenize(s->granite_ctx, suffix4_str.c_str(), &n);
                 if (a && n > 0) {
@@ -4342,7 +4404,18 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (s->beam_size > 1) {
             glm_asr_set_beam_size((glm_asr_context*)s->glmasr_ctx, s->beam_size);
         }
-        glm_asr_set_ask((glm_asr_context*)s->glmasr_ctx, s->ask.empty() ? nullptr : s->ask.c_str());
+        // ask > language instruction > default (mirrors crispasr_backend_glm_asr.cpp).
+        if (!s->ask.empty()) {
+            glm_asr_set_ask((glm_asr_context*)s->glmasr_ctx, s->ask.c_str());
+        } else {
+            const std::string eff_lang = lang_set ? lang : s->source_language;
+            if (!eff_lang.empty() && eff_lang != "auto") {
+                const std::string instr = "Please transcribe in " + ca_iso_to_english_lang(eff_lang) + ".";
+                glm_asr_set_ask((glm_asr_context*)s->glmasr_ctx, instr.c_str());
+            } else {
+                glm_asr_set_ask((glm_asr_context*)s->glmasr_ctx, nullptr);
+            }
+        }
         glm_asr_result* gr = glm_asr_transcribe_with_probs((glm_asr_context*)s->glmasr_ctx, pcm, n_samples);
         if (!gr || !gr->text) {
             if (gr)
@@ -4670,7 +4743,19 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             // mimo_asr returns null + logs to stderr if the tokenizer companion
             // wasn't set via crispasr_session_set_codec_path. We surface a clean
             // "no transcription" rather than hanging.
-            mimo_asr_set_ask(s->mimo_asr_ctx, s->ask.empty() ? nullptr : s->ask.c_str());
+            // ask > language instruction > default (mirrors crispasr_backend_mimo_asr.cpp).
+            if (!s->ask.empty()) {
+                mimo_asr_set_ask(s->mimo_asr_ctx, s->ask.c_str());
+            } else {
+                const std::string eff_lang = lang_set ? lang : s->source_language;
+                if (!eff_lang.empty() && eff_lang != "auto") {
+                    const std::string instr =
+                        "Please transcribe this audio in " + ca_iso_to_english_lang(eff_lang) + ".";
+                    mimo_asr_set_ask(s->mimo_asr_ctx, instr.c_str());
+                } else {
+                    mimo_asr_set_ask(s->mimo_asr_ctx, nullptr);
+                }
+            }
             mimo_asr_result* mr = mimo_asr_transcribe_with_probs(s->mimo_asr_ctx, pcm, n_samples);
             if (mr && mr->text) {
                 std::vector<ca_token_record> toks;
@@ -4716,7 +4801,18 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
 #endif
 #ifdef CA_HAVE_MOSS_AUDIO
         if (!text && s->moss_audio_ctx) {
-            const char* prompt = s->ask.empty() ? "Transcribe this audio." : s->ask.c_str();
+            // ask > language instruction > default (mirrors crispasr_backend_moss_audio.cpp).
+            std::string prompt_buf;
+            const char* prompt = "Transcribe this audio.";
+            if (!s->ask.empty()) {
+                prompt = s->ask.c_str();
+            } else {
+                const std::string eff_lang = lang_set ? lang : s->source_language;
+                if (!eff_lang.empty() && eff_lang != "auto") {
+                    prompt_buf = "Transcribe this audio in " + ca_iso_to_english_lang(eff_lang) + ".";
+                    prompt = prompt_buf.c_str();
+                }
+            }
             text = moss_audio_process(s->moss_audio_ctx, pcm, n_samples, prompt);
             need_free = true;
         }
