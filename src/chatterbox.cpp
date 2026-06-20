@@ -736,6 +736,17 @@ struct chatterbox_context {
     ggml_tensor* kv_k_cfg = nullptr;
     ggml_tensor* kv_v_cfg = nullptr;
 
+    // Per-call performance counters (populated when CHATTERBOX_BENCH=1)
+    struct {
+        int64_t t_tokenize_us = 0;
+        int64_t t_prefill_build_us = 0;
+        int64_t t_prefill_us = 0;
+        int64_t t_decode_us = 0;
+        int n_text_tokens = 0;
+        int n_prefill_tokens = 0;
+        int n_speech_tokens = 0;
+    } last_perf;
+
     // S3Gen context (lazy-loaded from set_s3gen_path)
     std::string s3gen_path;
     chatterbox_s3gen_context* s3gen_ctx = nullptr;
@@ -2362,6 +2373,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             // residency is the default; this branch is for users who
             // explicitly opt into GPU.
             fprintf(stderr, "chatterbox: T3+s3gen forced to GPU (CRISPASR_CHATTERBOX_FORCE_GPU=1).\n");
+            // Note: T3 GPU on Metal is slower than CPU (kernel-launch overhead).
             if (s3gen_cpu_override) {
                 fprintf(stderr,
                         "chatterbox: s3gen forced to CPU (CRISPASR_CHATTERBOX_S3GEN_CPU=1) — T3 stays on GPU.\n");
@@ -2371,32 +2383,29 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             fprintf(stderr, "chatterbox: T3 → CPU, s3gen → GPU (CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1).\n");
             t3_use_gpu = false;
         } else {
-            // Default split. T3 GPU is a real speedup on CUDA/Vulkan/etc but
-            // on Apple Silicon Metal it is *slower* than CPU: 30 layers × 86
-            // sequential AR tokens × batch=1 ≈ 25k small kernel launches,
-            // and Metal pays µs-class launch overhead per dispatch that the
-            // M1 NEON CPU cache-blasts straight through (benchmark on M1:
-            // 50s full CPU vs 75s T3-GPU + S3Gen-CPU for the JFK sentence).
-            // S3Gen is the same on both routes here — it has to be on CPU
-            // until the compound Metal-precision drift in the UNet1D is
-            // fixed (see handover-prompts/chatterbox-gpu-bug-is-s3gen.md).
-            // Opt back into T3-GPU on Metal with CRISPASR_CHATTERBOX_T3_GPU=1;
-            // it stays on by default for non-Metal GPU backends.
+            // Default split: T3 stays on CPU on Metal (kernel-launch overhead
+            // across 30L × N_speech sequential AR steps is slower than CPU on
+            // Apple Silicon). S3Gen GPU is now the default: the compound
+            // Metal-precision drift in UNet1D CFM (PLAN #83) is fixed by
+            // GGML_PREC_F32 mul_mat hints (mul_mat_hp()) + parallel=true sched.
+            // Opt back into T3-GPU on Metal with CRISPASR_CHATTERBOX_T3_GPU=1.
+            // S3Gen CPU opt-out: CRISPASR_CHATTERBOX_S3GEN_CPU=1.
 #ifdef GGML_USE_METAL
             const bool t3_gpu_default = false;
-            const char* t3_default_reason = "Metal kernel-launch overhead × AR steps is slower than CPU on Apple "
-                                            "Silicon (override: CRISPASR_CHATTERBOX_T3_GPU=1)";
+            const char* t3_default_reason =
+                "Metal kernel-launch overhead × AR steps (override: CRISPASR_CHATTERBOX_T3_GPU=1)";
 #else
             const bool t3_gpu_default = true;
             const char* t3_default_reason = "non-Metal GPU";
 #endif
             t3_use_gpu = t3_gpu_override ? true : t3_gpu_default;
-            s3gen_use_gpu = false;
+            s3gen_use_gpu = !s3gen_cpu_override;
             fprintf(stderr,
-                    "chatterbox: T3 → %s, s3gen → CPU (default; %s). Overrides: "
-                    "CRISPASR_CHATTERBOX_FORCE_GPU=1 (both GPU, broken), "
-                    "CRISPASR_CHATTERBOX_FULL_CPU=1, CRISPASR_CHATTERBOX_T3_GPU=1.\n",
-                    t3_use_gpu ? "GPU" : "CPU", t3_default_reason);
+                    "chatterbox: T3 → %s, s3gen → %s (%s). "
+                    "Overrides: CRISPASR_CHATTERBOX_FORCE_GPU=1, CRISPASR_CHATTERBOX_FULL_CPU=1, "
+                    "CRISPASR_CHATTERBOX_T3_GPU=1, CRISPASR_CHATTERBOX_S3GEN_CPU=1.\n",
+                    t3_use_gpu ? "GPU" : "CPU", s3gen_use_gpu ? "GPU" : "CPU",
+                    s3gen_use_gpu ? "UNet GGML_PREC_F32" : t3_default_reason);
         }
     }
     // Issue #94: flush so consumers see progress on slow-disk loads — the
@@ -2504,6 +2513,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     }
 
     // 1. Normalize and tokenize text
+    int64_t t_tok0 = ggml_time_us();
     std::string norm_text = chatterbox_text_prep::normalize(text, !ctx->language.empty());
 
     std::vector<int32_t> text_tokens;
@@ -2514,6 +2524,8 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         text_tokens = tokenize_text(ctx->tokenizer, norm_text);
     }
     prepend_language_token(ctx, text_tokens);
+    ctx->last_perf.t_tokenize_us = ggml_time_us() - t_tok0;
+    ctx->last_perf.n_text_tokens = (int)text_tokens.size();
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: text \"%s\" → %zu %s tokens\n", norm_text.c_str(), text_tokens.size(),
@@ -2550,6 +2562,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     }
 
     // 4. Build prefill embeddings on CPU
+    int64_t t_preb0 = ggml_time_us();
     std::vector<float> prefill_embeds;
     if (is_gpt2) {
         prefill_embeds = build_prefill_embeds_gpt2(ctx, text_tokens);
@@ -2565,6 +2578,8 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         prefill_embeds.insert(prefill_embeds.end(), bos_extra.begin(), bos_extra.end());
     }
     int prefill_len = (int)(prefill_embeds.size() / ctx->hp.hidden_size);
+    ctx->last_perf.t_prefill_build_us = ggml_time_us() - t_preb0;
+    ctx->last_perf.n_prefill_tokens = prefill_len;
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: prefill %d tokens (max_speech=%d)\n", prefill_len, max_speech);
@@ -2593,6 +2608,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     // 6. Prefill: run the full prefix through the transformer
     int n_past = 0;
     float* logits = nullptr;
+    int64_t t_pre0 = ggml_time_us();
     if (is_gpt2) {
         logits = run_t3_gpt2_kv(ctx, prefill_embeds.data(), prefill_len, n_past);
     } else {
@@ -2610,12 +2626,14 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         n_past_cfg += prefill_len;
     }
     n_past += prefill_len;
+    ctx->last_perf.t_prefill_us = ggml_time_us() - t_pre0;
 
     // 7. AR decode loop with CFG
     std::vector<int32_t> speech_tokens;
     speech_tokens.reserve(max_speech);
     int speech_pos = 1;
 
+    int64_t t_dec0 = ggml_time_us();
     for (int step = 0; step < max_speech; step++) {
         // Blend logits with CFG: logits = cond + cfg * (cond - uncond)
         const int V = (int)ctx->hp.speech_vocab_size;
@@ -2704,6 +2722,8 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         free(logits);
     if (logits_uncond)
         free(logits_uncond);
+    ctx->last_perf.t_decode_us = ggml_time_us() - t_dec0;
+    ctx->last_perf.n_speech_tokens = (int)speech_tokens.size();
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: AR emitted %zu speech tokens\n", speech_tokens.size());
@@ -2833,8 +2853,10 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
     }
 
     // Step 1: T3 → speech tokens
+    int64_t t_t3_0 = ggml_time_us();
     int n_tokens = 0;
     int32_t* speech_tokens = chatterbox_synthesize_tokens(ctx, text, &n_tokens);
+    int64_t t_t3_us = ggml_time_us() - t_t3_0;
     if (!speech_tokens || n_tokens == 0) {
         fprintf(stderr, "chatterbox: T3 produced no speech tokens\n");
         if (speech_tokens)
@@ -2885,11 +2907,48 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
         }
     }
 
+    int64_t t_s3_0 = ggml_time_us();
     float* pcm =
         chatterbox_s3gen_synthesize(ctx->s3gen_ctx, speech_tokens, n_tokens, prompt_tokens, n_prompt, prompt_feat,
                                     prompt_feat_len, spk_emb, ctx->params.cfm_steps, out_n_samples);
+    int64_t t_s3gen_us = ggml_time_us() - t_s3_0;
 
     chatterbox_tokens_free(speech_tokens);
+
+    if (pcm && *out_n_samples > 0) {
+        const char* bench = std::getenv("CHATTERBOX_BENCH");
+        if (bench && bench[0]) {
+            const auto& tp = ctx->last_perf;
+            chatterbox_s3gen_perf sp{};
+            chatterbox_s3gen_get_perf(ctx->s3gen_ctx, &sp);
+            const double audio_s = (double)*out_n_samples / 24000.0;
+            const double total_s = (t_t3_us + t_s3gen_us) / 1e6;
+            fprintf(stderr, "chatterbox: =========== perf report ===========\n");
+            fprintf(stderr, "chatterbox:  audio duration   %7.2f s  (%d samples @ 24 kHz)\n", audio_s, *out_n_samples);
+            fprintf(stderr, "chatterbox:  text tokens      %7d\n", tp.n_text_tokens);
+            fprintf(stderr, "chatterbox:  prefill tokens   %7d\n", tp.n_prefill_tokens);
+            fprintf(stderr, "chatterbox:  speech tokens    %7d\n", tp.n_speech_tokens);
+            fprintf(stderr, "chatterbox:  mel frames       %7d  (%.2f s @ 80 Hz)\n", sp.T_mel, sp.T_mel / 80.0f);
+            fprintf(stderr, "chatterbox: ------- T3 (AR decode) -------------\n");
+            fprintf(stderr, "chatterbox:   tokenize        %7.1f ms\n", tp.t_tokenize_us / 1e3);
+            fprintf(stderr, "chatterbox:   prefill build   %7.1f ms\n", tp.t_prefill_build_us / 1e3);
+            fprintf(stderr, "chatterbox:   prefill compute %7.1f ms\n", tp.t_prefill_us / 1e3);
+            fprintf(stderr, "chatterbox:   decode loop     %7.1f ms  (%d tokens, %.2f ms/tok)\n", tp.t_decode_us / 1e3,
+                    tp.n_speech_tokens, tp.n_speech_tokens > 0 ? tp.t_decode_us / 1e3 / tp.n_speech_tokens : 0.0);
+            fprintf(stderr, "chatterbox:   T3 total        %7.1f ms\n", t_t3_us / 1e3);
+            fprintf(stderr, "chatterbox: ------- S3Gen (CFM + vocoder) ------\n");
+            fprintf(stderr, "chatterbox:   encoder         %7.1f ms\n", sp.t_encoder_us / 1e3);
+            fprintf(stderr, "chatterbox:   CFM euler       %7.1f ms  (%d steps, %.1f ms/step)\n", sp.t_cfm_us / 1e3,
+                    sp.n_cfm_steps, sp.n_cfm_steps > 0 ? sp.t_cfm_us / 1e3 / sp.n_cfm_steps : 0.0);
+            fprintf(stderr, "chatterbox:   HiFT vocoder    %7.1f ms\n", sp.t_vocoder_us / 1e3);
+            fprintf(stderr, "chatterbox:   S3Gen total     %7.1f ms\n", t_s3gen_us / 1e3);
+            fprintf(stderr, "chatterbox: ------- totals ---------------------------\n");
+            fprintf(stderr, "chatterbox:   wall time       %7.1f ms\n", total_s * 1e3);
+            fprintf(stderr, "chatterbox:   RTF             %7.3f  (%.1fx real-time)\n", total_s / audio_s,
+                    audio_s / total_s);
+        }
+    }
+
     return pcm;
 }
 

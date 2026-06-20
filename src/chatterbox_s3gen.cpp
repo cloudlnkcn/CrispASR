@@ -262,13 +262,10 @@ struct chatterbox_s3gen_context {
     // Use CRISPASR_S3GEN_UNET_PIN_CPU_OP=mul_mat to opt in for testing.
     bool unet_pin_mm_cpu = false;
 
-    // True when the UNet weights are GPU-resident (opt-in via
-    // CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1). In that mode the cfm_euler_solve
-    // run_denoiser path also pins `unet_input` to the GPU backend (see the
-    // PLAN #83 r9 follow-up #4 comment there). The ggml-side mutation log
-    // patch in ggml-backend.cpp handles the related src[j] dangling-pointer
-    // issue for any other inputs that cross backends.
+    // True when the UNet weights are GPU-resident (default since we switched to
+    // full GPU + GGML_PREC_F32 mul_mat hints; opt-out via CRISPASR_S3GEN_UNET_CPU=1).
     bool unet_on_gpu = false;
+
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -291,6 +288,15 @@ struct chatterbox_s3gen_context {
     ggml_backend_buffer_t buf_perm = nullptr;
     mt19937_state noise_rng{};
     uint32_t noise_seed = 0;
+
+    // Per-call performance counters (populated when CHATTERBOX_BENCH=1)
+    struct {
+        int64_t t_encoder_us = 0;
+        int64_t t_cfm_us = 0;
+        int64_t t_vocoder_us = 0;
+        int n_cfm_steps = 0;
+        int T_mel = 0;
+    } last_perf;
 
     // S3Tokenizer (module 3 of native voice clone). Bound from the s3.tok.*
     // tensors after weight load. See chatterbox_s3tok.{h,cpp}.
@@ -562,34 +568,28 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     }
     core_gguf::WeightLoad wl;
     bool loaded = false;
-    // PLAN #83 r9 (2026-05-23): two layered fixes for GPU FP16 compound drift
-    // through the 10-step CFM Euler solver (cos_min 0.858 on CUDA P100,
-    // 0.923 on M1 Metal vs 1.000 on CPU — see LEARNINGS Rounds 7 + 8).
-    //
-    //   1. Default: load ConditionalDecoder weights (s3.fd.*) on the CPU
-    //      backend buffer. The ggml scheduler routes ops to the backend
-    //      where weights live, so the UNet runs entirely on CPU
-    //      (genuine F32 dequant + F32 accumulation). Encoder (s3.fe.*),
-    //      flow front-end (s3.flow.*), tokenizer (s3.tok.*), speaker
-    //      encoder (s3.se.*), and HiFT vocoder (s3.v.*) keep GPU residency.
-    //
-    //   2. CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 opts out of #1: all weights
-    //      go on GPU, and the UNet relies instead on the per-op
-    //      GGML_PREC_F32 hints set by mul_mat_hp() (above). Validates
-    //      the kernel-level high-precision path (Metal: _hp kernels;
-    //      CUDA cuBLAS: CUBLAS_COMPUTE_32F).
-    const char* gpu_res_env = std::getenv("CRISPASR_S3GEN_UNET_GPU_RESIDENCY");
-    const bool unet_on_gpu = gpu_res_env && (gpu_res_env[0] == '1' || gpu_res_env[0] == 'y' || gpu_res_env[0] == 'Y');
-    c->unet_on_gpu = unet_on_gpu && (c->backend != c->backend_cpu);
-    if (c->backend != c->backend_cpu && !unet_on_gpu) {
-        auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "s3.fd.", 6) != 0; };
-        loaded = core_gguf::load_weights_split(path, c->backend, c->backend_cpu, is_gpu, nullptr, "s3gen", wl);
-    } else {
-        if (c->backend != c->backend_cpu && verbosity >= 1) {
-            fprintf(stderr, "s3gen: CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 — UNet weights on GPU; "
-                            "relying on GGML_PREC_F32 mul_mat hints\n");
+    // UNet GPU-residency: default ON when GPU is available.
+    // GGML_PREC_F32 hints on all UNet mul_mat ops (mul_mat_hp()) give Metal
+    // the _hp kernel path (F32 accumulation), fixing the FP16 compound drift
+    // that caused cos_min 0.858 in PLAN #83 (see LEARNINGS Rounds 7 + 8).
+    // The parallel=true sched (set below) handles CFG uncond divergence (Bug B).
+    // Opt-out: CRISPASR_S3GEN_UNET_CPU=1 reverts to CPU residency for debugging.
+    {
+        const char* unet_cpu_env = std::getenv("CRISPASR_S3GEN_UNET_CPU");
+        const bool unet_cpu_forced =
+            unet_cpu_env && (unet_cpu_env[0] == '1' || unet_cpu_env[0] == 'y' || unet_cpu_env[0] == 'Y');
+        c->unet_on_gpu = (c->backend != c->backend_cpu) && !unet_cpu_forced;
+        if (c->backend != c->backend_cpu && unet_cpu_forced) {
+            // Hybrid: UNet weights on CPU, rest on GPU (opt-out path).
+            auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "s3.fd.", 6) != 0; };
+            loaded = core_gguf::load_weights_split(path, c->backend, c->backend_cpu, is_gpu, nullptr, "s3gen", wl);
+        } else {
+            if (c->backend != c->backend_cpu && verbosity >= 1) {
+                fprintf(stderr, "s3gen: UNet GPU-resident (GGML_PREC_F32 mul_mat); "
+                                "set CRISPASR_S3GEN_UNET_CPU=1 to revert\n");
+            }
+            loaded = core_gguf::load_weights(path, c->backend, "s3gen", wl);
         }
-        loaded = core_gguf::load_weights(path, c->backend, "s3gen", wl);
     }
     if (!loaded) {
         delete c;
@@ -655,10 +655,10 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         // [cmd_buf_last waitUntilCompleted] which does NOT invalidate the
         // GPU's view of a shared-storage Metal buffer that was overwritten
         // by a CPU memcpy between consecutive command-buffer submissions.
-        // Gated on `c->unet_on_gpu` so CPU residency (production default)
-        // keeps the lower-overhead parallel=false path (Bug B is M1-Metal
-        // specific; CPU residency was never broken).
-        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, c->unet_on_gpu, false);
+        // parallel=true: required for CFG uncond pass correctness on Metal (Bug B).
+        // Now always enabled when a GPU backend is present (UNet is GPU by default).
+        const bool use_parallel = (c->backend != c->backend_cpu);
+        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, use_parallel, false);
         c->compute_meta.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
     }
 
@@ -2054,9 +2054,9 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
     for (int step = 0; step < n_steps; step++) {
         float t_val = t_span[step];
         float r_val = t_span[step + 1];
-
-        // Rebuild the graph each step so Metal re-allocates tensors and reads
-        // the updated time_emb, rather than caching the first step's values.
+        // Rebuild the graph each step — gallocr's alloc state is tied to the
+        // tensor backend_buffer fields and cannot safely survive a reset on
+        // a previously-alloc'd graph (stale pointers confuse the next alloc).
         ggml_cgraph* gf = build_graph_unet1d(c, T_mel);
         float dt = r_val - t_val;
 
@@ -2146,15 +2146,12 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             }
         }
 
-        // Helper: run denoiser with given input, return velocity
+        // Helper: run denoiser with given input, return velocity.
+        // Graph nodes are cached across steps (built once per T_mel above);
+        // reset+alloc are still required by ggml before each graph_compute.
         auto run_denoiser = [&](const std::vector<float>& input) -> std::vector<float> {
             ggml_backend_sched_reset(c->sched);
             s3gen_maybe_pin_graph_to_cpu(c, gf, s3gen_subgraph::unet);
-            // PLAN #83 r9 follow-up #5: Bug B (CFG uncond divergence) is fixed
-            // at the sched level by `parallel=true` in ggml_backend_sched_new
-            // (see the sched_new call near the top of this file). The earlier
-            // workaround of pinning `unet_input` to the GPU backend is no
-            // longer needed and was removed; CRISPASR_NO_INPUT_PIN is gone.
             if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
                 fprintf(stderr, "s3gen: failed to alloc UNet1D graph\n");
                 return {};
@@ -3150,7 +3147,9 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
     bool dump_stages = dump_env && dump_env[0] == '1';
 
     // 1. Conformer encoder: tokens → (80, T_mel)
+    int64_t t_enc0 = ggml_time_us();
     std::vector<float> h = run_conformer_encoder(ctx, speech_tokens, n_speech_tokens, prompt_tokens, n_prompt_tokens);
+    ctx->last_perf.t_encoder_us = ggml_time_us() - t_enc0;
 
     int T_mel_total = (n_prompt_tokens + n_speech_tokens) * 2; // 2x upsample
     int T_mel_prompt = n_prompt_tokens * 2;
@@ -3253,8 +3252,12 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
     if (ctx->verbosity >= 1 && is_meanflow) {
         fprintf(stderr, "s3gen: meanflow mode (%d steps, linear schedule, no CFG)\n", actual_steps);
     }
+    int64_t t_cfm0 = ggml_time_us();
     std::vector<float> mel = cfm_euler_solve(ctx, h, cond, spk_proj, init_noise_cf, T_mel_total, actual_steps, cfg,
                                              is_meanflow, dump_stages);
+    ctx->last_perf.t_cfm_us = ggml_time_us() - t_cfm0;
+    ctx->last_perf.n_cfm_steps = actual_steps;
+    ctx->last_perf.T_mel = T_mel_gen;
 
     // 5. Extract generated portion (skip prompt region)
     std::vector<float> gen_mel(80 * T_mel_gen);
@@ -3358,7 +3361,9 @@ extern "C" float* chatterbox_s3gen_synthesize(struct chatterbox_s3gen_context* c
     const char* dump_env2 = std::getenv("CRISPASR_S3GEN_DUMP");
     bool dump_voc = dump_env2 && dump_env2[0] == '1';
     std::map<std::string, std::vector<float>> voc_dump;
+    int64_t t_voc0 = ggml_time_us();
     std::vector<float> wav = hift_vocoder_cpu(ctx, gen_mel, T_mel_gen, nullptr, 0, dump_voc ? &voc_dump : nullptr);
+    ctx->last_perf.t_vocoder_us = ggml_time_us() - t_voc0;
     if (dump_voc) {
         // Print per-stage RMS for comparison against reference GGUF
         const char* stage_names[] = {"voc_conv_pre", "voc_ups_0", "voc_rb_0", "voc_ups_1",
@@ -3487,6 +3492,18 @@ extern "C" void chatterbox_s3gen_pcm_free(float* pcm) {
 
 extern "C" void chatterbox_s3gen_free(struct chatterbox_s3gen_context* ctx) {
     delete ctx;
+}
+
+extern "C" int chatterbox_s3gen_get_perf(const struct chatterbox_s3gen_context* ctx,
+                                         struct chatterbox_s3gen_perf* out) {
+    if (!ctx || !out)
+        return 0;
+    out->t_encoder_us = ctx->last_perf.t_encoder_us;
+    out->t_cfm_us = ctx->last_perf.t_cfm_us;
+    out->t_vocoder_us = ctx->last_perf.t_vocoder_us;
+    out->n_cfm_steps = ctx->last_perf.n_cfm_steps;
+    out->T_mel = ctx->last_perf.T_mel;
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
