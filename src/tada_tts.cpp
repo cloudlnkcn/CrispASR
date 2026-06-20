@@ -15,6 +15,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -187,6 +188,18 @@ struct tada_context {
     int n_prompt = 0;
 
     uint64_t rng_state = 0;
+
+    // §176b: Lk-bucketed single-step AR graph cache.
+    struct TadaBucket {
+        int lk = 0;
+        ggml_context* ctx = nullptr;
+        std::vector<uint8_t> meta;
+        ggml_cgraph* gf = nullptr;
+    };
+    static constexpr int kBucketN = 4;
+    static constexpr int kBucketLks[kBucketN] = {512, 1024, 2048, 4096};
+    std::array<TadaBucket, kBucketN> ar_buckets{};
+    ggml_backend_sched_t ar_step_sched = nullptr;
 };
 
 // ──────────────────────── metadata loading ─────────────────────────────
@@ -425,8 +438,8 @@ static ggml_cgraph* build_graph_step_embed(tada_context* c) {
 // Llama forward pass (same as orpheus) with KV cache.
 // Input: embeds (d, T), output: hidden_state (d, 1) at last position.
 static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tokens, bool compute_logits,
-                                          ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr) {
-    // Default to positive KV cache
+                                          ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr,
+                                          int fixed_kv_len = 0, ggml_context* arena_ctx = nullptr) {
     if (!use_kv_k)
         use_kv_k = c->kv_k;
     if (!use_kv_v)
@@ -441,12 +454,12 @@ static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tok
     const float theta = hp.rope_theta;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
     const int T = n_tokens;
-    const int Lk = n_past + T;
+    const int Lk = fixed_kv_len > 0 ? fixed_kv_len : (n_past + T);
 
     GGML_ASSERT(use_kv_k && use_kv_v && Lk <= c->kv_max_ctx);
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
@@ -456,7 +469,7 @@ static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tok
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
     ggml_tensor* causal_mask = nullptr;
-    if (T > 1) {
+    if (T > 1 || fixed_kv_len > 0) {
         causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
         ggml_set_name(causal_mask, "causal_mask");
         ggml_set_input(causal_mask);
@@ -466,6 +479,8 @@ static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tok
         n_q, n_kv, hd, n_kv_grp, (int)hp.max_pos, theta, 0.0f, 0.0f, attn_scale, 0.0f, core_attn::GQA_MANUAL_CONT,
     };
 
+    ggml_tensor* eff_kv_indices = fixed_kv_len > 0 ? positions : nullptr;
+
     ggml_tensor* cur = embeds;
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         const auto& b = c->talker.blocks[il];
@@ -474,9 +489,10 @@ static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tok
         ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
         x = ggml_mul(ctx0, x, b.attn_norm_w);
 
-        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
-                                                    nullptr, nullptr, positions, (T == 1) ? nullptr : causal_mask,
-                                                    use_kv_k, use_kv_v, (int)il, n_past, kvp);
+        ggml_tensor* attn = core_attn::kv_self_attn(
+            ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w, nullptr, nullptr, positions,
+            (T == 1 && !fixed_kv_len) ? nullptr : causal_mask, use_kv_k, use_kv_v, (int)il, n_past, kvp,
+            /*qkv_w=*/nullptr, /*fixed_kv_len=*/fixed_kv_len, /*kv_indices=*/eff_kv_indices);
         cur = ggml_add(ctx0, residual, attn);
 
         residual = cur;
@@ -507,7 +523,8 @@ static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tok
         ggml_build_forward_expand(gf, logits);
     }
 
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -697,6 +714,37 @@ static float* build_step_embedding(tada_context* c, int32_t token_id, const floa
     return r;
 }
 
+// §176b: Lk-bucketed single-step AR decode helpers.
+static int tada_pick_bucket(tada_context* c, int needed_lk) {
+    for (int i = 0; i < tada_context::kBucketN; i++)
+        if (tada_context::kBucketLks[i] >= needed_lk && tada_context::kBucketLks[i] <= c->kv_max_ctx)
+            return i;
+    return -1;
+}
+
+static ggml_backend_sched_t tada_step_sched_lazy(tada_context* c) {
+    if (c->ar_step_sched)
+        return c->ar_step_sched;
+    ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
+    int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
+    c->ar_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    return c->ar_step_sched;
+}
+
+static ggml_cgraph* tada_get_or_build_bucket(tada_context* c, int idx) {
+    auto& bk = c->ar_buckets[idx];
+    if (bk.gf)
+        return bk.gf;
+    bk.lk = tada_context::kBucketLks[idx];
+    bk.meta.assign(c->compute_meta.size(), 0);
+    ggml_init_params ip = {bk.meta.size(), bk.meta.data(), true};
+    bk.ctx = ggml_init(ip);
+    if (!bk.ctx)
+        return nullptr;
+    bk.gf = build_graph_talker_kv(c, 0, 1, true, nullptr, nullptr, bk.lk, bk.ctx);
+    return bk.gf;
+}
+
 // Run LLM forward pass. Returns hidden_state (d_model,) and optionally logits.
 // Both are malloc'd. Caller frees.
 struct talker_result {
@@ -704,8 +752,49 @@ struct talker_result {
     float* logits; // (vocab,) or nullptr
 };
 
+static talker_result run_talker_kv_bucket(tada_context* c, const float* embeds, int n_past, bool need_logits) {
+    talker_result res = {nullptr, nullptr};
+    const int idx = tada_pick_bucket(c, n_past + 1);
+    if (idx < 0)
+        return res;
+    ggml_cgraph* gf = tada_get_or_build_bucket(c, idx);
+    if (!gf)
+        return res;
+    ggml_backend_sched_t ss = tada_step_sched_lazy(c);
+    ggml_backend_sched_reset(ss);
+    if (!ggml_backend_sched_alloc_graph(ss, gf))
+        return res;
+    const int d = (int)c->hp.d_model;
+    const int vocab = (int)c->hp.vocab_size;
+    const int Lk = c->ar_buckets[idx].lk;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0, (size_t)d * sizeof(float));
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
+    std::vector<ggml_fp16_t> mask((size_t)Lk);
+    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ni = ggml_fp32_to_fp16(-INFINITY);
+    for (int k = 0; k < Lk; k++)
+        mask[k] = (k <= n_past) ? z : ni;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
+                            mask.size() * sizeof(ggml_fp16_t));
+    if (ggml_backend_sched_graph_compute(ss, gf) != GGML_STATUS_SUCCESS)
+        return res;
+    res.hidden = (float*)malloc((size_t)d * sizeof(float));
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "hidden_state"), res.hidden, 0, (size_t)d * sizeof(float));
+    if (need_logits) {
+        res.logits = (float*)malloc((size_t)vocab * sizeof(float));
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), res.logits, 0, (size_t)vocab * sizeof(float));
+    }
+    return res;
+}
+
 static talker_result run_talker_kv(tada_context* c, const float* embeds, int n_tokens, int n_past, bool need_logits,
                                    ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr) {
+    // §176b: Lk-bucketed fast path for single-step decode on default KV.
+    if (n_tokens == 1 && !use_kv_k && !use_kv_v) {
+        talker_result br = run_talker_kv_bucket(c, embeds, n_past, need_logits);
+        if (br.hidden)
+            return br;
+    }
     talker_result res = {nullptr, nullptr};
     if (n_past + n_tokens > c->kv_max_ctx) {
         fprintf(stderr, "tada: kv overflow (%d+%d > %d)\n", n_past, n_tokens, c->kv_max_ctx);
@@ -1506,6 +1595,11 @@ void tada_pcm_free(float* pcm) {
 void tada_free(struct tada_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->ar_step_sched)
+        ggml_backend_sched_free(ctx->ar_step_sched);
+    for (auto& bk : ctx->ar_buckets)
+        if (bk.ctx)
+            ggml_free(bk.ctx);
     if (ctx->codec_ctx)
         tada_codec_free(ctx->codec_ctx);
     if (ctx->sched)
