@@ -6,6 +6,16 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-20 §183 F5-TTS DiT — fused single ggml graph
+
+Replaced 23 separate ggml sub-graphs per `dit_forward` call (22 DiT blocks +
+final AdaLN/proj) with a single fused `ggml_cgraph` cached in
+`f5_dit_graph_cache`. Used `ggml_gallocr` (direct CPU allocator) instead of
+`ggml_backend_sched` to avoid the "buffer is nil" invalidation pattern.
+Graph rebuilt only when T changes; each ODE step costs one `alloc_graph` +
+two `tensor_set` + one `backend_compute` + one `tensor_get`.
+At 32 steps × 2 CFG passes: 1472 → 64 graph-lifecycle operations per synthesis.
+
 ## 2026-06-20 §182 F5-TTS DiT + Vocos — Accelerate GEMM
 
 Replaced scalar triple-loop matmuls in `src/f5_tts.cpp` with

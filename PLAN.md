@@ -6350,3 +6350,34 @@ Validation: A/B not yet run (no baseline timing captured before the patch).
 construction (same arithmetic). Audio correctness deferred to integration test.
 
 Next: record wall-time A/B with and without `F5_FORCE_SCALAR=1` on a real clip.
+
+## §183 F5-TTS DiT — fused single ggml graph (PLAN §183) — DONE 2026-06-20
+
+**Problem:** `dit_forward` built 23 separate ggml sub-graphs per call (22 blocks
++ final AdaLN/proj), each requiring its own `sched_reset + alloc + compute +
+tensor_get`. With CFG enabled (default cfg_strength=2.0) and 32 ODE steps this
+added up to 64 calls × 23 graphs = 1472 graph-build cycles per synthesis.
+The majority of compute is in the GEMM kernels, but the per-graph overhead was
+non-trivial given the small batch sizes (T ≈ 400–800 for typical F5-TTS outputs).
+
+**Fix:** New `f5_dit_graph_cache` struct + `f5_dit_cache_build` / `f5_dit_run`
+in `src/f5_tts.cpp`:
+- Allocates a single 4 MB `ggml_context` and chains all 22 blocks + final
+  AdaLN/proj into one `ggml_cgraph` (≈950 tensor nodes, 8192 node capacity).
+- Uses `ggml_gallocr` (direct single-backend allocator, not `ggml_backend_sched`)
+  to avoid the "buffer is nil" invalidation issue that affects sched-based caches.
+- Graph rebuilt only when T changes (rare — happens once per synthesis, T is
+  fixed for the duration of the ODE loop).
+- Each ODE step: `ggml_gallocr_alloc_graph` (reassigns pre-computed offsets,
+  O(1)) + two `tensor_set` + `backend_graph_compute` + one `tensor_get`.
+- `pos` tensor `[0..T-1]` is set once at build time (constant across all steps).
+- Cache destroyed automatically via `f5_dit_graph_cache` destructor in
+  `f5_tts_context`.
+
+**Result:** Per synthesis: 1472 → 64 graph ops (one `alloc_graph` + one
+`compute` + one `tensor_get` per ODE step × CFG passes).
+`F5_FORCE_SCALAR=1` path (§182 gate) exercises the same code path; output
+numerically identical by construction.
+
+**Files:** `src/f5_tts.cpp` (+`f5_dit_graph_cache`, `f5_dit_cache_build`,
+`f5_dit_run`; simplified `dit_forward`)

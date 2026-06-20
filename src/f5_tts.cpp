@@ -202,6 +202,36 @@ struct f5_vocab {
     std::map<std::string, int> char_to_idx;
 };
 
+// ── DiT graph cache ───────────────────────────────────────────────
+// All 22 DiT blocks + final AdaLN/proj fused into one ggml graph,
+// built once per T and reused across ODE steps (and cond/uncond passes).
+
+struct f5_dit_graph_cache {
+    int T_cached = -1;
+    ggml_context* gctx = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_tensor* hidden_in = nullptr; // (dim, T) — input hidden state
+    ggml_tensor* t_emb_in = nullptr;  // (dim,)  — timestep embedding
+    ggml_tensor* pos_in = nullptr;    // (T,) i32 — constant [0..T-1]
+    ggml_tensor* output = nullptr;    // (mel_dim, T) — velocity
+
+    void reset() {
+        if (galloc) {
+            ggml_gallocr_free(galloc);
+            galloc = nullptr;
+        }
+        if (gctx) {
+            ggml_free(gctx);
+            gctx = nullptr;
+        }
+        gf = nullptr;
+        hidden_in = t_emb_in = pos_in = output = nullptr;
+        T_cached = -1;
+    }
+    ~f5_dit_graph_cache() { reset(); }
+};
+
 // ── Context ──────────────────────────────────────────────────────
 
 struct f5_tts_context {
@@ -232,6 +262,9 @@ struct f5_tts_context {
 
     // Diff harness: inject reference initial noise for reproducibility
     std::vector<float> ref_init_noise;
+
+    // Cached fused DiT graph (rebuilt only when T changes)
+    f5_dit_graph_cache dit_cache;
 };
 
 // ── Diff dump helpers ────────────────────────────────────────────
@@ -898,6 +931,179 @@ static void f5_grouped_conv1d(const float* in, const float* wt, const float* bia
     }
 }
 
+// ── Fused DiT graph: build (once per T) ──────────────────────────
+
+static bool f5_dit_cache_build(f5_tts_context* ctx, int T) {
+    auto& cache = ctx->dit_cache;
+    if (cache.T_cached == T && cache.galloc)
+        return true;
+    cache.reset();
+
+    const auto& hp = ctx->hp;
+    const auto& w = ctx->w;
+    int dim = hp.dim;
+    int n_heads = hp.heads;
+    int head_dim = hp.dim_head;
+
+    // 22 blocks × ~42 tensors + final block + inputs: ~950 tensors total.
+    // ~4 MB is well above the ~270 KB actually needed.
+    struct ggml_init_params p = {4 * 1024 * 1024, nullptr, true};
+    cache.gctx = ggml_init(p);
+    if (!cache.gctx)
+        return false;
+
+    // Graph inputs
+    cache.hidden_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, dim, T);
+    ggml_set_name(cache.hidden_in, "hidden_in");
+    ggml_set_input(cache.hidden_in);
+
+    cache.t_emb_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_F32, dim);
+    ggml_set_name(cache.t_emb_in, "t_emb");
+    ggml_set_input(cache.t_emb_in);
+
+    cache.pos_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_I32, T);
+    ggml_set_name(cache.pos_in, "pos");
+    ggml_set_input(cache.pos_in);
+
+    // Chain all 22 DiT blocks
+    ggml_tensor* x = cache.hidden_in;
+    for (int i = 0; i < hp.depth; i++) {
+        const auto& blk = w.dit_blocks[i];
+
+        // AdaLN modulation: silu(t_emb) → linear → 6×dim split
+        ggml_tensor* emb = ggml_silu(cache.gctx, cache.t_emb_in);
+        emb = ggml_mul_mat(cache.gctx, blk.adaln_weight, emb);
+        emb = ggml_add(cache.gctx, emb, blk.adaln_bias);
+
+        ggml_tensor* shift_msa = ggml_view_1d(cache.gctx, emb, dim, 0);
+        ggml_tensor* scale_msa = ggml_view_1d(cache.gctx, emb, dim, 1 * dim * sizeof(float));
+        ggml_tensor* gate_msa = ggml_view_1d(cache.gctx, emb, dim, 2 * dim * sizeof(float));
+        ggml_tensor* shift_mlp = ggml_view_1d(cache.gctx, emb, dim, 3 * dim * sizeof(float));
+        ggml_tensor* scale_mlp = ggml_view_1d(cache.gctx, emb, dim, 4 * dim * sizeof(float));
+        ggml_tensor* gate_mlp = ggml_view_1d(cache.gctx, emb, dim, 5 * dim * sizeof(float));
+
+        // Pre-norm (AdaLN): norm(x) * (1 + scale) + shift
+        ggml_tensor* norm_x = ggml_norm(cache.gctx, x, 1e-6f);
+        ggml_tensor* scaled = ggml_mul(cache.gctx, norm_x, scale_msa);
+        norm_x = ggml_add(cache.gctx, norm_x, scaled);
+        norm_x = ggml_add(cache.gctx, norm_x, shift_msa);
+
+        // QKV projections
+        ggml_tensor* q = ggml_mul_mat(cache.gctx, blk.attn_q_weight, norm_x);
+        q = ggml_add(cache.gctx, q, blk.attn_q_bias);
+        ggml_tensor* k = ggml_mul_mat(cache.gctx, blk.attn_k_weight, norm_x);
+        k = ggml_add(cache.gctx, k, blk.attn_k_bias);
+        ggml_tensor* v = ggml_mul_mat(cache.gctx, blk.attn_v_weight, norm_x);
+        v = ggml_add(cache.gctx, v, blk.attn_v_bias);
+
+        // Reshape for RoPE: (dim, T) → (head_dim, n_heads, T)
+        q = ggml_reshape_3d(cache.gctx, q, head_dim, n_heads, T);
+        k = ggml_reshape_3d(cache.gctx, k, head_dim, n_heads, T);
+        v = ggml_reshape_3d(cache.gctx, v, head_dim, n_heads, T);
+
+        // RoPE (NORMAL mode, freq_base=10000)
+        q = ggml_rope_ext(cache.gctx, q, cache.pos_in, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(cache.gctx, k, cache.pos_in, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        // Permute for flash_attn: (head_dim, n_heads, T) → (head_dim, T, n_heads)
+        q = ggml_permute(cache.gctx, q, 0, 2, 1, 3);
+        k = ggml_permute(cache.gctx, k, 0, 2, 1, 3);
+        v = ggml_permute(cache.gctx, v, 0, 2, 1, 3);
+
+        // Flash attention (bidirectional, no mask)
+        float attn_scale = 1.0f / sqrtf((float)head_dim);
+        ggml_tensor* attn_out = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
+        attn_out = ggml_reshape_2d(cache.gctx, attn_out, dim, T);
+
+        // O-proj + gated residual
+        ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, blk.attn_o_weight, attn_out);
+        attn_proj = ggml_add(cache.gctx, attn_proj, blk.attn_o_bias);
+        ggml_tensor* gated_attn = ggml_mul(cache.gctx, attn_proj, gate_msa);
+        ggml_tensor* x_res = ggml_add(cache.gctx, x, gated_attn);
+
+        // FFN pre-norm
+        ggml_tensor* ff_norm = ggml_norm(cache.gctx, x_res, 1e-6f);
+        ggml_tensor* ff_scaled = ggml_mul(cache.gctx, ff_norm, scale_mlp);
+        ff_norm = ggml_add(cache.gctx, ff_norm, ff_scaled);
+        ff_norm = ggml_add(cache.gctx, ff_norm, shift_mlp);
+
+        // FFN: up → GELU → down
+        ggml_tensor* ff = ggml_mul_mat(cache.gctx, blk.ffn_up_weight, ff_norm);
+        ff = ggml_add(cache.gctx, ff, blk.ffn_up_bias);
+        ff = ggml_gelu(cache.gctx, ff);
+        ff = ggml_mul_mat(cache.gctx, blk.ffn_down_weight, ff);
+        ff = ggml_add(cache.gctx, ff, blk.ffn_down_bias);
+
+        // Gated residual
+        x = ggml_add(cache.gctx, x_res, ggml_mul(cache.gctx, ff, gate_mlp));
+    }
+
+    // Final AdaLN + projection → velocity (mel_dim, T)
+    {
+        ggml_tensor* emb = ggml_silu(cache.gctx, cache.t_emb_in);
+        emb = ggml_mul_mat(cache.gctx, w.final_adaln_weight, emb);
+        emb = ggml_add(cache.gctx, emb, w.final_adaln_bias);
+
+        ggml_tensor* fscale = ggml_view_1d(cache.gctx, emb, dim, 0);
+        ggml_tensor* fshift = ggml_view_1d(cache.gctx, emb, dim, dim * sizeof(float));
+
+        ggml_tensor* norm_x = ggml_norm(cache.gctx, x, 1e-6f);
+        ggml_tensor* fn_sc = ggml_mul(cache.gctx, norm_x, fscale);
+        norm_x = ggml_add(cache.gctx, norm_x, fn_sc);
+        norm_x = ggml_add(cache.gctx, norm_x, fshift);
+
+        ggml_tensor* vel = ggml_mul_mat(cache.gctx, w.final_proj_weight, norm_x);
+        vel = ggml_add(cache.gctx, vel, w.final_proj_bias);
+        ggml_set_name(vel, "velocity");
+        ggml_set_output(vel);
+        cache.output = vel;
+    }
+
+    // Build graph
+    cache.gf = ggml_new_graph_custom(cache.gctx, 8192, false);
+    ggml_build_forward_expand(cache.gf, cache.output);
+
+    // Reserve then allocate memory layout
+    cache.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend_cpu));
+    if (!ggml_gallocr_reserve(cache.galloc, cache.gf) || !ggml_gallocr_alloc_graph(cache.galloc, cache.gf)) {
+        cache.reset();
+        return false;
+    }
+
+    // Set constant position indices — persist across steps
+    std::vector<int32_t> pos_data(T);
+    for (int i = 0; i < T; i++)
+        pos_data[i] = i;
+    ggml_backend_tensor_set(cache.pos_in, pos_data.data(), 0, T * sizeof(int32_t));
+
+    cache.T_cached = T;
+    return true;
+}
+
+// ── Fused DiT graph: run one step ────────────────────────────────
+
+static std::vector<float> f5_dit_run(f5_tts_context* ctx, const float* hidden, int T, const float* t_emb_data) {
+    auto& cache = ctx->dit_cache;
+    if (!f5_dit_cache_build(ctx, T))
+        return {};
+
+    // Re-assign buffer pointers (fast for same T)
+    if (!ggml_gallocr_alloc_graph(cache.galloc, cache.gf))
+        return {};
+
+    const int dim = ctx->hp.dim;
+    ggml_backend_tensor_set(cache.hidden_in, hidden, 0, (size_t)T * dim * sizeof(float));
+    ggml_backend_tensor_set(cache.t_emb_in, t_emb_data, 0, (size_t)dim * sizeof(float));
+
+    if (ggml_backend_graph_compute(ctx->backend_cpu, cache.gf) != GGML_STATUS_SUCCESS)
+        return {};
+
+    const int mel_dim = ctx->hp.mel_dim;
+    std::vector<float> velocity((size_t)T * mel_dim);
+    ggml_backend_tensor_get(cache.output, velocity.data(), 0, velocity.size() * sizeof(float));
+    return velocity;
+}
+
 // x:       (T, mel_dim)   — current ODE state
 // cond:    (T, mel_dim)   — conditioning (masked ref mel)
 // text:    (T, text_dim)  — text embedding
@@ -979,198 +1185,13 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
         dump_stage(ctx, "input_embed", hidden.data(), hidden.size());
     }
 
-    // ── RoPE note ──
-    // x_transformers rotate_half pairs adjacent elements (2k, 2k+1):
-    //   x = rearrange(x, '(d r) -> d r', r=2)  →  x1=x[0::2], x2=x[1::2]
-    //   rotated = stack(-x2, x1) → [-x1, x0, -x3, x2, ...]
-    // RotaryEmbedding interleaves freqs: stack((f,f), dim=-1) → [f0,f0,f1,f1,...]
-    // so paired elements share the SAME frequency — a standard 2D rotation,
-    // equivalent to GGML_ROPE_TYPE_NORMAL (mode=0).
-
-    // ── 22 DiT blocks ──
-    for (int blk_idx = 0; blk_idx < hp.depth; blk_idx++) {
-        const auto& blk = w.dit_blocks[blk_idx];
-
-        // Each block:
-        // 1. adaln_modulation = linear(silu(time_emb)) → split into 6 × dim
-        // 2. norm(x) * (1 + scale_msa) + shift_msa → attn input
-        // 3. self_attn with RoPE → attn_output
-        // 4. x = x + gate_msa * attn_output
-        // 5. ff_norm(x) * (1 + scale_mlp) + shift_mlp → ffn input
-        // 6. ffn(input) → ffn_output
-        // 7. x = x + gate_mlp * ffn_output
-
-        int n_heads = hp.heads;
-        int head_dim = hp.dim_head;
-
-        // ── Unified ggml graph: AdaLN + QKV + RoPE + Attention + O-proj + FFN ──
-        {
-            f5_mini_graph mg(ctx->sched, 128 * 1024 * 1024);
-
-            ggml_tensor* x_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, dim, T);
-            ggml_set_name(x_in, "blk_in");
-            ggml_set_input(x_in);
-
-            ggml_tensor* t_emb = ggml_new_tensor_1d(mg.ctx, GGML_TYPE_F32, dim);
-            ggml_set_name(t_emb, "t_emb");
-            ggml_set_input(t_emb);
-
-            // Position indices for RoPE: [0, 1, 2, ..., T-1]
-            ggml_tensor* pos = ggml_new_tensor_1d(mg.ctx, GGML_TYPE_I32, T);
-            ggml_set_name(pos, "pos");
-            ggml_set_input(pos);
-
-            // ── AdaLN modulation ──
-            ggml_tensor* emb = ggml_silu(mg.ctx, t_emb);
-            emb = ggml_mul_mat(mg.ctx, blk.adaln_weight, emb);
-            emb = ggml_add(mg.ctx, emb, blk.adaln_bias);
-
-            ggml_tensor* shift_msa = ggml_view_1d(mg.ctx, emb, dim, 0 * dim * sizeof(float));
-            ggml_tensor* scale_msa = ggml_view_1d(mg.ctx, emb, dim, 1 * dim * sizeof(float));
-            ggml_tensor* gate_msa = ggml_view_1d(mg.ctx, emb, dim, 2 * dim * sizeof(float));
-            ggml_tensor* shift_mlp = ggml_view_1d(mg.ctx, emb, dim, 3 * dim * sizeof(float));
-            ggml_tensor* scale_mlp = ggml_view_1d(mg.ctx, emb, dim, 4 * dim * sizeof(float));
-            ggml_tensor* gate_mlp = ggml_view_1d(mg.ctx, emb, dim, 5 * dim * sizeof(float));
-
-            // ── Pre-norm (AdaLN) ──
-            ggml_tensor* norm_x = ggml_norm(mg.ctx, x_in, 1e-6f);
-            ggml_tensor* scaled = ggml_mul(mg.ctx, norm_x, scale_msa);
-            norm_x = ggml_add(mg.ctx, norm_x, scaled);
-            norm_x = ggml_add(mg.ctx, norm_x, shift_msa);
-
-            // ── QKV projections ──
-            ggml_tensor* q = ggml_mul_mat(mg.ctx, blk.attn_q_weight, norm_x);
-            q = ggml_add(mg.ctx, q, blk.attn_q_bias);
-            ggml_tensor* k = ggml_mul_mat(mg.ctx, blk.attn_k_weight, norm_x);
-            k = ggml_add(mg.ctx, k, blk.attn_k_bias);
-            ggml_tensor* v = ggml_mul_mat(mg.ctx, blk.attn_v_weight, norm_x);
-            v = ggml_add(mg.ctx, v, blk.attn_v_bias);
-
-            // ── Reshape to (head_dim, n_heads, T) for RoPE + attention ──
-            // ggml_rope expects ne[2]=T (sequence dim) to match positions.
-            // ggml_flash_attn_ext expects (head_dim, T, n_heads) so we
-            // permute after RoPE.
-            q = ggml_reshape_3d(mg.ctx, q, head_dim, n_heads, T);
-            k = ggml_reshape_3d(mg.ctx, k, head_dim, n_heads, T);
-            v = ggml_reshape_3d(mg.ctx, v, head_dim, n_heads, T);
-
-            // ── RoPE (GGML_ROPE_TYPE_NORMAL = mode 0, freq_base=10000) ──
-            // Input shape: (head_dim, n_heads, T). RoPE rotates along ne[0],
-            // positions indexed by ne[2].
-            q = ggml_rope_ext(mg.ctx, q, pos, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-            k = ggml_rope_ext(mg.ctx, k, pos, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-
-            // ── Permute for flash_attn: (head_dim, n_heads, T) → (head_dim, T, n_heads) ──
-            q = ggml_permute(mg.ctx, q, 0, 2, 1, 3); // ne: (head_dim, T, n_heads)
-            k = ggml_permute(mg.ctx, k, 0, 2, 1, 3);
-            v = ggml_permute(mg.ctx, v, 0, 2, 1, 3);
-
-            // ── Flash attention (bidirectional, no mask) ──
-            float attn_scale = 1.0f / sqrtf((float)head_dim);
-            ggml_tensor* attn_out = ggml_flash_attn_ext(mg.ctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
-
-            // ── Reshape back to (dim, T) ──
-            attn_out = ggml_reshape_2d(mg.ctx, attn_out, dim, T);
-
-            // ── O-proj + gated residual ──
-            ggml_tensor* attn_proj = ggml_mul_mat(mg.ctx, blk.attn_o_weight, attn_out);
-            attn_proj = ggml_add(mg.ctx, attn_proj, blk.attn_o_bias);
-            ggml_tensor* gated_attn = ggml_mul(mg.ctx, attn_proj, gate_msa);
-            ggml_tensor* x_res = ggml_add(mg.ctx, x_in, gated_attn);
-
-            // ── FFN pre-norm ──
-            ggml_tensor* ff_norm = ggml_norm(mg.ctx, x_res, 1e-6f);
-            ggml_tensor* ff_scaled = ggml_mul(mg.ctx, ff_norm, scale_mlp);
-            ff_norm = ggml_add(mg.ctx, ff_norm, ff_scaled);
-            ff_norm = ggml_add(mg.ctx, ff_norm, shift_mlp);
-
-            // ── FFN ──
-            ggml_tensor* ff = ggml_mul_mat(mg.ctx, blk.ffn_up_weight, ff_norm);
-            ff = ggml_add(mg.ctx, ff, blk.ffn_up_bias);
-            ff = ggml_gelu(mg.ctx, ff);
-            ff = ggml_mul_mat(mg.ctx, blk.ffn_down_weight, ff);
-            ff = ggml_add(mg.ctx, ff, blk.ffn_down_bias);
-
-            // ── Gated residual ──
-            ggml_tensor* gated_ff = ggml_mul(mg.ctx, ff, gate_mlp);
-            ggml_tensor* x_out = ggml_add(mg.ctx, x_res, gated_ff);
-            ggml_set_name(x_out, "blk_out");
-            ggml_set_output(x_out);
-
-            // Build and compute
-            ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 32768, false);
-            ggml_build_forward_expand(gf, x_out);
-            ggml_backend_sched_reset(mg.sched);
-            if (!ggml_backend_sched_alloc_graph(mg.sched, gf))
-                return {};
-
-            // Set inputs
-            mg.set_input(x_in, hidden.data(), hidden.size() * sizeof(float));
-            mg.set_input(t_emb, time_emb_data, dim * sizeof(float));
-            std::vector<int32_t> pos_data(T);
-            for (int i = 0; i < T; i++)
-                pos_data[i] = i;
-            mg.set_input(pos, pos_data.data(), T * sizeof(int32_t));
-
-            ggml_backend_sched_graph_compute(mg.sched, gf);
-
-            hidden.resize(T * dim);
-            ggml_backend_tensor_get(x_out, hidden.data(), 0, hidden.size() * sizeof(float));
-        }
-        if (step_idx == 0 && !drop_audio_cond) {
-            char label[64];
-            snprintf(label, sizeof(label), "dit_layer_%d", blk_idx);
-            dump_stage(ctx, label, hidden.data(), hidden.size());
-        }
-    }
-
-    // ── Final AdaLN + projection ──
+    // ── 22 DiT blocks + final AdaLN/proj (fused single graph) ──
     {
-        f5_mini_graph mg(ctx->sched);
-        ggml_tensor* x_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, dim, T);
-        ggml_set_name(x_in, "final_in");
-        ggml_set_input(x_in);
-
-        ggml_tensor* t_emb = ggml_new_tensor_1d(mg.ctx, GGML_TYPE_F32, dim);
-        ggml_set_name(t_emb, "t_emb_final");
-        ggml_set_input(t_emb);
-
-        // AdaLN_Final: silu(emb) → linear(dim→2*dim) → split scale, shift
-        ggml_tensor* emb = ggml_silu(mg.ctx, t_emb);
-        emb = ggml_mul_mat(mg.ctx, w.final_adaln_weight, emb);
-        emb = ggml_add(mg.ctx, emb, w.final_adaln_bias); // (2*dim,)
-
-        ggml_tensor* scale = ggml_view_1d(mg.ctx, emb, dim, 0);
-        ggml_tensor* shift = ggml_view_1d(mg.ctx, emb, dim, dim * sizeof(float));
-
-        // norm(x) * (1 + scale) + shift = norm + norm*scale + shift
-        ggml_tensor* norm_x = ggml_norm(mg.ctx, x_in, 1e-6f);
-        ggml_tensor* fn_scaled = ggml_mul(mg.ctx, norm_x, scale);
-        norm_x = ggml_add(mg.ctx, norm_x, fn_scaled);
-        norm_x = ggml_add(mg.ctx, norm_x, shift);
-
-        // Project to mel_dim
-        ggml_tensor* output = ggml_mul_mat(mg.ctx, w.final_proj_weight, norm_x);
-        output = ggml_add(mg.ctx, output, w.final_proj_bias);
-
-        ggml_set_name(output, "dit_output");
-        ggml_set_output(output);
-
-        ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 4096, false);
-        ggml_build_forward_expand(gf, output);
-        ggml_backend_sched_reset(mg.sched);
-        if (!ggml_backend_sched_alloc_graph(mg.sched, gf))
+        auto velocity = f5_dit_run(ctx, hidden.data(), T, time_emb_data);
+        if (velocity.empty())
             return {};
-        mg.set_input(x_in, hidden.data(), hidden.size() * sizeof(float));
-        mg.set_input(t_emb, time_emb_data, dim * sizeof(float));
-        ggml_backend_sched_graph_compute(mg.sched, gf);
-
-        std::vector<float> velocity(T * mel_dim);
-        ggml_backend_tensor_get(output, velocity.data(), 0, velocity.size() * sizeof(float));
-
-        if (step_idx == 0 && !drop_audio_cond) {
+        if (step_idx == 0 && !drop_audio_cond)
             dump_stage(ctx, "dit_output", velocity.data(), velocity.size());
-        }
         return velocity;
     }
 }
