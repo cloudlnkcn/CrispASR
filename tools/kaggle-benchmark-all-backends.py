@@ -208,9 +208,14 @@ kh.step("clone.done")
 # stable across restarts by default ("latest"), so re-running the kernel
 # continues where it left off; bump CRISPASR_SWEEP_RUN for a clean run.
 from huggingface_hub import HfApi as _HfApi
+import io as _io
 
-SWEEP_REPO = os.environ.get("CRISPASR_SWEEP_REPO", "cstr/crispasr-backend-sweep")
+# Target the EXISTING progress dataset (same one kaggle_harness streams step
+# progress to), under a sweep-specific prefix so it doesn't collide with the
+# harness's runs/*.jsonl.
+SWEEP_REPO = os.environ.get("CRISPASR_SWEEP_REPO", "cstr/crispasr-kaggle-progress")
 RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "latest")
+SWEEP_PREFIX = f"full-backend-sweep/{RUN_TAG}"
 _hf_token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
              or os.environ.get("HUGGINGFACE_TOKEN"))
 _hf_api = _HfApi(token=_hf_token)
@@ -222,16 +227,30 @@ def _sweep_key(category, backend):
     return f"{category}__{backend}".replace("/", "-")
 
 
+# Up-front WRITE test: actually push a heartbeat file. whoami() / create_repo
+# don't reliably exercise write perms on an existing repo, so do a real upload —
+# a bad/expired token then fails LOUDLY here, not silently after the ~78-min
+# sweep (the 2026-06-20 run wasted a full pass because the attached token 401'd).
 try:
-    _hf_api.create_repo(SWEEP_REPO, repo_type="dataset", private=True, exist_ok=True)
+    if not _hf_token:
+        raise RuntimeError("no HF token in env (HF_TOKEN) — resolve_hf_token must run first")
+    _who = _hf_api.whoami().get("name", "?")
+    _hf_api.upload_file(path_or_fileobj=_io.BytesIO(b"alive\n"),
+                        path_in_repo=f"{SWEEP_PREFIX}/_heartbeat.txt",
+                        repo_type="dataset", repo_id=SWEEP_REPO,
+                        commit_message="sweep heartbeat (token write-test)")
     for f in _hf_api.list_repo_files(SWEEP_REPO, repo_type="dataset"):
-        if f.startswith(f"{RUN_TAG}/results/") and f.endswith(".json"):
+        if f.startswith(f"{SWEEP_PREFIX}/results/") and f.endswith(".json"):
             _done_keys.add(f.split("/")[-1][:-5])
     _sweep_ok = True
-    print(f"[sweep] HF dataset {SWEEP_REPO} run='{RUN_TAG}': "
-          f"{len(_done_keys)} backend(s) already done — will resume/skip those")
+    print(f"[sweep] HF streaming OK → {SWEEP_REPO}/{SWEEP_PREFIX} (token user={_who}); "
+          f"{len(_done_keys)} backend(s) already done — resume/skip")
 except Exception as e:
-    print(f"[sweep] HF streaming DISABLED ({e!r}); results stay local only")
+    print("=" * 72)
+    print(f"[sweep] !! HF STREAMING DISABLED — token WRITE-TEST FAILED: {e!r}")
+    print(f"[sweep] !! results will stay LOCAL ONLY this run. Fix the HF token in the")
+    print(f"[sweep] !! attached dataset: hf_token.txt needs WRITE access to {SWEEP_REPO}.")
+    print("=" * 72)
 
 
 def sweep_done(category, backend):
@@ -243,7 +262,6 @@ def sweep_publish(category, result):
     """Upload one backend's result JSON to the HF dataset (interim, resumable)."""
     if not _sweep_ok or not result:
         return
-    import io as _io
     key = _sweep_key(category, result.get("backend", "unknown"))
     payload = dict(result)
     payload["_category"] = category
@@ -251,11 +269,11 @@ def sweep_publish(category, result):
     data = json.dumps(payload, indent=2, default=str).encode()
     try:
         _hf_api.upload_file(path_or_fileobj=_io.BytesIO(data),
-                            path_in_repo=f"{RUN_TAG}/results/{key}.json",
+                            path_in_repo=f"{SWEEP_PREFIX}/results/{key}.json",
                             repo_type="dataset", repo_id=SWEEP_REPO,
                             commit_message=f"sweep {RUN_TAG}: {key}")
         _done_keys.add(key)
-        print(f"  [sweep] ↑ streamed → {SWEEP_REPO}/{RUN_TAG}/results/{key}.json")
+        print(f"  [sweep] ↑ streamed → {SWEEP_REPO}/{SWEEP_PREFIX}/results/{key}.json")
     except Exception as e:
         print(f"  [sweep] ! upload failed for {key}: {e!r}")
 
@@ -725,9 +743,9 @@ if _sweep_ok:
                "counts": {"asr": len(results), "tts": len(tts_results), "mt": len(mt_results)}}
     try:
         _hf_api.upload_file(path_or_fileobj=_io.BytesIO(json.dumps(summary, indent=2, default=str).encode()),
-                            path_in_repo=f"{RUN_TAG}/summary.json", repo_type="dataset",
+                            path_in_repo=f"{SWEEP_PREFIX}/summary.json", repo_type="dataset",
                             repo_id=SWEEP_REPO, commit_message=f"sweep {RUN_TAG}: summary")
-        print(f"[sweep] ↑ combined summary → {SWEEP_REPO}/{RUN_TAG}/summary.json")
+        print(f"[sweep] ↑ combined summary → {SWEEP_REPO}/{SWEEP_PREFIX}/summary.json")
     except Exception as e:
         print(f"[sweep] ! summary upload failed: {e!r}")
 
