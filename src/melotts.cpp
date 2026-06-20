@@ -39,6 +39,16 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+static bool melotts_use_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (getenv("MELOTTS_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+#endif
+
 // ===========================================================================
 // Bench instrumentation — `MELOTTS_BENCH=1` for per-stage timings.
 // ===========================================================================
@@ -1046,18 +1056,40 @@ static void cpu_multihead_attention_relpos(const std::vector<float>& x, // (C, T
     }
 
     std::vector<float> Q(C * T), K(C * T), V(C * T);
-    for (int t = 0; t < T; t++) {
-        for (int co = 0; co < C; co++) {
-            float sq = bq[co], sk = bk[co], sv = bv[co];
-            for (int ci = 0; ci < C; ci++) {
-                float xv = x_in[t * C + ci];
-                sq += xv * wq[ci + co * C];
-                sk += xv * wk[ci + co * C];
-                sv += xv * wv[ci + co * C];
+#if defined(HAVE_ACCELERATE)
+    if (!melotts_use_scalar()) {
+        // Q/K/V[T,C] = x_in[T,C] @ w^T[C,C] + bias[C]
+        // Weight layout: w[ci + co*C] = column-major [C_in × C_out].
+        // CblasTrans on B makes BLAS read w as row-major [C_out × C_in]^T = [C_in × C_out].
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x_in.data(), C, wq.data(), C, 0.0f,
+                    Q.data(), C);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x_in.data(), C, wk.data(), C, 0.0f,
+                    K.data(), C);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x_in.data(), C, wv.data(), C, 0.0f,
+                    V.data(), C);
+        for (int t = 0; t < T; t++) {
+            for (int c = 0; c < C; c++) {
+                Q[t * C + c] += bq[c];
+                K[t * C + c] += bk[c];
+                V[t * C + c] += bv[c];
             }
-            Q[t * C + co] = sq;
-            K[t * C + co] = sk;
-            V[t * C + co] = sv;
+        }
+    } else
+#endif
+    {
+        for (int t = 0; t < T; t++) {
+            for (int co = 0; co < C; co++) {
+                float sq = bq[co], sk = bk[co], sv = bv[co];
+                for (int ci = 0; ci < C; ci++) {
+                    float xv = x_in[t * C + ci];
+                    sq += xv * wq[ci + co * C];
+                    sk += xv * wk[ci + co * C];
+                    sv += xv * wv[ci + co * C];
+                }
+                Q[t * C + co] = sq;
+                K[t * C + co] = sk;
+                V[t * C + co] = sv;
+            }
         }
     }
 
@@ -1074,22 +1106,34 @@ static void cpu_multihead_attention_relpos(const std::vector<float>& x, // (C, T
         int ch_off = h * D;
 
         std::vector<float> scores(T * T);
+#if defined(HAVE_ACCELERATE)
+        if (!melotts_use_scalar()) {
+            // scores[T,T] = inv_sqrt_d * Q_h[T,D] @ K_h[T,D]^T
+            // Q_h has non-contiguous rows (stride C instead of D); lda=C handles this.
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, T, D, inv_sqrt_d, Q.data() + ch_off, C,
+                        K.data() + ch_off, C, 0.0f, scores.data(), T);
+        } else
+#endif
+        {
+            for (int i = 0; i < T; i++) {
+                for (int j = 0; j < T; j++) {
+                    float s = 0;
+                    for (int d = 0; d < D; d++)
+                        s += Q[i * C + ch_off + d] * K[j * C + ch_off + d];
+                    scores[i * T + j] = s * inv_sqrt_d;
+                }
+            }
+        }
+
+        // Relative key bias — only 2W+1 positions, O(T*2W*D) << O(T²*D)
         for (int i = 0; i < T; i++) {
-            for (int j = 0; j < T; j++) {
-                float s = 0;
-                for (int d = 0; d < D; d++) {
-                    s += Q[i * C + ch_off + d] * K[j * C + ch_off + d];
-                }
-                s *= inv_sqrt_d;
+            int j0 = std::max(0, i - W), j1 = std::min(T, i + W + 1);
+            for (int j = j0; j < j1; j++) {
                 int r = j - i + W;
-                if (r >= 0 && r < n_rel) {
-                    float rel_s = 0;
-                    for (int d = 0; d < D; d++) {
-                        rel_s += Q[i * C + ch_off + d] * rel_k[d + r * D];
-                    }
-                    s += rel_s * inv_sqrt_d;
-                }
-                scores[i * T + j] = s;
+                float rel_s = 0;
+                for (int d = 0; d < D; d++)
+                    rel_s += Q[i * C + ch_off + d] * rel_k[d + r * D];
+                scores[i * T + j] += rel_s * inv_sqrt_d;
             }
         }
 
@@ -1108,19 +1152,39 @@ static void cpu_multihead_attention_relpos(const std::vector<float>& x, // (C, T
                 scores[i * T + j] /= sum_e;
         }
 
-        // Weighted sum with relative value bias
-        for (int i = 0; i < T; i++) {
-            for (int d = 0; d < D; d++) {
-                float s = 0;
-                for (int j = 0; j < T; j++) {
-                    float w_ij = scores[i * T + j];
-                    s += w_ij * V[j * C + ch_off + d];
+        // V accumulation: out_h[T,D] = scores[T,T] @ V_h[T,D] + rel_val_bias
+#if defined(HAVE_ACCELERATE)
+        if (!melotts_use_scalar()) {
+            std::vector<float> tmp(T * D, 0.0f);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, D, T, 1.0f, scores.data(), T, V.data() + ch_off,
+                        C, 0.0f, tmp.data(), D);
+            // Relative value bias — same 2W+1 window
+            for (int i = 0; i < T; i++) {
+                int j0 = std::max(0, i - W), j1 = std::min(T, i + W + 1);
+                for (int j = j0; j < j1; j++) {
                     int r = j - i + W;
-                    if (r >= 0 && r < n_rel) {
-                        s += w_ij * rel_v[d + r * D];
-                    }
+                    float w_ij = scores[i * T + j];
+                    for (int d = 0; d < D; d++)
+                        tmp[i * D + d] += w_ij * rel_v[d + r * D];
                 }
-                out[i * C + ch_off + d] = s;
+            }
+            for (int t = 0; t < T; t++)
+                std::memcpy(out.data() + t * C + ch_off, tmp.data() + t * D, D * sizeof(float));
+        } else
+#endif
+        {
+            for (int i = 0; i < T; i++) {
+                for (int d = 0; d < D; d++) {
+                    float s = 0;
+                    for (int j = 0; j < T; j++) {
+                        float w_ij = scores[i * T + j];
+                        s += w_ij * V[j * C + ch_off + d];
+                        int r = j - i + W;
+                        if (r >= 0 && r < n_rel)
+                            s += w_ij * rel_v[d + r * D];
+                    }
+                    out[i * C + ch_off + d] = s;
+                }
             }
         }
     }

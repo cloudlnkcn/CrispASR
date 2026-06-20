@@ -1376,6 +1376,14 @@ target_link_libraries     (melotts PUBLIC crispasr-core ggml ggml-base ggml-cpu 
 if(NOT MSVC)
     target_compile_options(melotts PRIVATE -O3)
 endif()
+if(APPLE)
+    # §176d Accelerate cblas_sgemm for QKV projections + per-head attention matmuls.
+    if(NOT ACCELERATE_LIB)
+        find_library(ACCELERATE_LIB Accelerate REQUIRED)
+    endif()
+    target_link_libraries(melotts PUBLIC ${ACCELERATE_LIB})
+    target_compile_definitions(melotts PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
+endif()
 
 # openvoice2 — myshell-ai/OpenVoice V2 Tone Color Converter (voice cloning)
 # ---------------------------------------------------------------------------

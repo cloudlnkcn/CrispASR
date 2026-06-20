@@ -9231,3 +9231,25 @@ optimization commits across the session:
 **Other**:
 - §176m: Nemotron streaming KV cache memmove (`6e416c85`)
 - §176s: SenseVoice encoder graph caching by T_lfr (`1c82bd0d`)
+
+## 2026-06-20 §198 MeloTTS — Accelerate GEMM for multi-head relative-position attention
+
+**Problem:** `cpu_multihead_attention_relpos` — the text encoder and flow
+decoder's shared 6-layer relative-position self-attention — ran as pure
+scalar nested loops. Complexity: O(C²×T) for QKV projections + O(H×T²×D)
+per head for attention scores and V accumulation.
+
+**Fix:** Three `cblas_sgemm` paths under `HAVE_ACCELERATE`:
+1. QKV projections: 3× `CblasNoTrans/CblasTrans` calls (T×C × C×C^T).
+   Weight layout is column-major [C_in × C_out]; `CblasTrans` on B
+   makes BLAS read the row-major [C_out × C_in] view correctly.
+2. Per-head attention scores: `CblasNoTrans/CblasTrans` with `lda=C`
+   (non-contiguous head stride handled by BLAS leading-dimension param).
+3. Per-head V accumulation: `CblasNoTrans/CblasNoTrans` with `ldb=C`,
+   output into contiguous tmp[T×D] then memcpy to interleaved out[T×C].
+
+Relative key and value biases (9-position window, O(T×2W×D)≪O(T²×D))
+stay scalar — not worth BLAS overhead at W=4.
+
+`MELOTTS_FORCE_SCALAR=1` bypasses the BLAS path for debugging.
+Scalar fallback unchanged on non-Apple. All 4 melotts unit tests pass.
