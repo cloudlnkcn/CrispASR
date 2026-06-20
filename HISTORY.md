@@ -6,6 +6,14 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-20 §188 Chatterbox T3 embedding table cache
+
+Pre-cache all five embedding tables (speech_emb, speech_pos_emb, text_emb,
+text_pos_emb, wpe) as F32 vectors at model load. Eliminates ~48 GB of
+tensor_get_f32 data movement per 1000-token synthesis (~48 MB per step).
+All 10 call sites in build_speech_token_embed, build_speech_token_embed_gpt2,
+prefill builders, and CFG uncond setup now use direct array indexing.
+
 ## 2026-06-20 §187 Embed fast path — 4 more LLM-ASR backends
 
 Extended the funasr single-token embed fast path (§180) to glm_asr,

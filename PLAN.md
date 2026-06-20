@@ -6488,6 +6488,35 @@ expected >10% wall-clock reduction on CPU and Metal for long utterances.
 
 ---
 
+## §188 Chatterbox T3 embedding table cache — DONE 2026-06-20
+
+**Problem:** `build_speech_token_embed` (called every AR decode step) and
+`build_speech_token_embed_gpt2` (Kartoffelbox path) each read the full
+`speech_emb_w` (~32 MB, 8194×1024 F32) and `speech_pos_emb_w` / `wpe_w`
+(~16 MB) tables via `tensor_get_f32` on every single token. Prefill builders
+also read `text_emb_w`, `text_pos_emb_w`, and the WPE table one-time per
+synthesis. For Q4_K models these calls dequantize the full table; for
+device-resident weights they incur a GPU→CPU transfer per step.
+
+For a 1000-token synthesis (≈10 s speech): ~48 MB × 1000 steps = **~48 GB** of
+data movement just for embedding lookups.
+
+**Fix:** Added five `std::vector<float>` cache fields to `chatterbox_context`
+(`speech_emb_cache`, `speech_pos_emb_cache`, `text_emb_cache`,
+`text_pos_emb_cache`, `wpe_cache`). Populated once at the end of
+`chatterbox_init_from_file`. All 10 call sites replaced with const-ref
+array indexing — zero `tensor_get_f32` calls at synthesis time.
+
+**Cost:** ~96 MB resident (32 MB speech_emb + 16 MB speech_pos + 3 MB text_emb
++ 8 MB text_pos + 33 MB wpe) for a full Kartoffelbox model. Llama-T3 path
+has no WPE, so ~60 MB.
+
+**Files:** `src/chatterbox.cpp` (5 cache fields in `chatterbox_context`;
+init population; `build_speech_token_embed`, `build_speech_token_embed_gpt2`,
+`build_prefill_embeds`, `build_prefill_embeds_kartoffelbox`, CFG uncond setup)
+
+---
+
 ## §176 Runtime optimization pass — 2026-06-20 audit
 
 Full code-read survey of every runtime. Detailed findings in
@@ -6510,13 +6539,12 @@ context_params structs. Wire the flag through and default it ON.
 
 #### §176b Lk-bucketed graph caching for AR decode steps
 
-**Status:** OPEN
+**Status:** PARTIAL — Chatterbox T3 DONE (§186 2026-06-20)
 **Effort:** Medium (template from qwen3-tts)
-**Backends:** All 30+ backends that rebuild their decode graph per step.
-Highest-value targets: Chatterbox (1000 tokens), Orpheus/OuteTTS (long
+**Backends done:** Chatterbox T3 (§186). **Remaining:** Orpheus/OuteTTS (long
 codec sequences), Parler (9 codebooks), SpeechT5, Dia, Pocket-TTS,
-Zonos, TADA, CosyVoice3, VoxCPM2, VibeVoice (pred head), F5-TTS
-(22 blocks × 32 steps × 2 CFG), LFM2 (VAE), KugelAudio (VAE + pred)
+Zonos, TADA, CosyVoice3, VoxCPM2, VibeVoice (pred head), LFM2 (VAE), KugelAudio
+(VAE + pred). F5-TTS DiT done differently (§183 single graph, 32-step CFG loop).
 **Approach:** Qwen3-TTS demonstrates with 5 pre-built graphs at fixed Lk
 sizes. MIMO has a simpler single-bucket `step_t1_gf`. FunASR has the
 infrastructure but disabled due to full-window attend; needs Lk-bucketing
@@ -6559,11 +6587,10 @@ runtimes and currently run as unvectorized nested loops.
 
 #### §176e Context caching for support runtimes
 
-**Status:** OPEN
+**Status:** PARTIAL — WhisperEncDec + MarbleNet VAD DONE (commit `ccdd3af6` 2026-06-20)
 **Effort:** Small per backend (template: Silero VAD static cache)
-**Backends:** WhisperEncDec VAD, MarbleNet VAD, FireRed VAD, Pyannote,
-ECAPA-TDNN LID, RNNoise enhancement, CTC aligner, FireRedPunc (graph
-ctx)
+**Backends done:** WhisperEncDec VAD, MarbleNet VAD. **Remaining:** FireRed VAD,
+Pyannote, ECAPA-TDNN LID, RNNoise enhancement, CTC aligner, FireRedPunc (graph ctx)
 **Approach:** The Silero VAD `g_silero_cache_mtx` + static context
 pattern prevents 70× init/free regression. Replicate for each backend:
 static or per-pipeline cached context, mutex-guarded.
@@ -6587,10 +6614,10 @@ STFT; BLAS gives SIMD + threading for free on mel projection.
 
 #### §176g CPU embedding cache for AR TTS backends
 
-**Status:** OPEN
+**Status:** PARTIAL — Chatterbox DONE (§188 2026-06-20)
 **Effort:** Small per backend (template: qwen3-tts `CpuEmbdCache`)
-**Backends:** Orpheus, OuteTTS, Chatterbox, Zonos, CosyVoice3, TADA,
-VibeVoice, Pocket-TTS
+**Backends done:** Chatterbox (§188). **Remaining:** Orpheus, OuteTTS, Zonos,
+CosyVoice3, TADA, VibeVoice, Pocket-TTS
 **Approach:** Copy raw quantized embedding bytes from GPU buffer to CPU
 at init; `get_row_into` dequantizes via `ggml_get_type_traits(type)->
 to_float`. Eliminates ~17 Metal command-buffer round-trips per AR frame
@@ -6598,16 +6625,14 @@ to_float`. Eliminates ~17 Metal command-buffer round-trips per AR frame
 
 #### §176h F5-TTS: collapse 22 mini-graphs + batch CFG
 
-**Status:** OPEN
+**Status:** PARTIAL — single fused graph DONE (§183 2026-06-20)
 **Effort:** Medium
 **File:** `src/f5_tts.cpp`
-**Approach:**
-1. Build all 22 DiT blocks in a single ggml graph (currently 22 separate
-   alloc+compute+get cycles per ODE step, 1408 total round-trips)
-2. Batch CFG as B=2 in the same graph (currently two serial passes)
-3. Port Vocos ConvNeXt + text encoder from scalar C++ to ggml
-**Impact:** ~2× from CFG batching + ~22× fewer graph round-trips per ODE
-step. Vocos ggml port enables GPU dispatch for the vocoder.
+**Done:** §183 fused all 22 DiT blocks into a single ggml graph (eliminated 1408
+alloc+compute round-trips per synthesis). **Remaining:** batch CFG as B=2 in the
+same graph pass (currently two serial passes); Vocos ConvNeXt ggml port (currently
+CPU scalar C++, blocks GPU dispatch). Weight pre-cache (§184/§185) already avoids
+all dequantization in the hot path.
 
 #### §176i Cross-KV in F16 (not F32)
 
