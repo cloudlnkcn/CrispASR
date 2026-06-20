@@ -6552,7 +6552,7 @@ tracks the TODO items.
 
 #### §176a Wire `ggml_flash_attn_ext` in remaining AR decoders
 
-**Status:** OPEN
+**Status:** MOSTLY DONE — all backends using `core_attn::kv_self_attn` already use `ggml_flash_attn_ext` unconditionally. MOSS encoder DONE (`294bedff`).
 **Effort:** Small per backend (flag passthrough)
 **Backends:** Orpheus, OuteTTS, Chatterbox (PLAN #86 stub), Parler
 (decoder SA), SpeechT5, Dia, Zonos, TADA, Pocket-TTS, CSM (backbone +
