@@ -229,6 +229,12 @@ struct canary_context {
 
     int n_threads = 4;
 
+    // §176s: cached encoder graph — reused when T_mel matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_mel = 0;
+
     // Sticky decode-time sampling controls. temperature == 0 keeps the
     // bit-identical greedy path; > 0 switches to numerically-stable
     // softmax sampling. Set via canary_set_temperature().
@@ -558,7 +564,7 @@ static std::vector<float> canary_compute_mel_impl(canary_context* ctx, const flo
 
 static const float kLayerNormEps = 1e-5f;
 
-static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
+static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel, ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int n_mels = (int)hp.n_mels;
@@ -568,7 +574,7 @@ static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
         /*mem_buffer=*/ctx->compute_meta.data(),
         /*no_alloc=*/true,
     };
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // ----- Inputs -----
@@ -595,7 +601,8 @@ static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
 
     ggml_set_name(cur, "enc_out");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -669,7 +676,23 @@ static std::vector<float> canary_encode_mel(canary_context* ctx, const float* me
         ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
-    ggml_cgraph* gf = canary_build_graph_encoder(ctx, T_mel);
+    // §176s: reuse cached encoder graph when T_mel matches.
+    ggml_cgraph* gf;
+    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
+        gf = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(aip);
+        gf = canary_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_mel = T_mel;
+    }
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1344,6 +1367,8 @@ extern "C" struct canary_context* canary_init_from_file(const char* path_model, 
 extern "C" void canary_free(struct canary_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->cross_buf)
         ggml_backend_buffer_free(ctx->cross_buf);
     if (ctx->cross_ctx)
