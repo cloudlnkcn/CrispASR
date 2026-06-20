@@ -87,7 +87,8 @@ SLOW_BACKENDS = [
     ("moss-audio",        "MOSS Audio",              300, "Q4_K, Whisper enc + Qwen3 LLM"),
     ("lfm2-audio",        "LFM2-Audio 1.5B",         240, "Q5_K, hybrid conv+attn backbone"),
     ("mini-omni2",        "Mini-Omni2",              300, "Q4_K, multi-stream speech+chat"),
-    ("vibevoice-1.5b",    "VibeVoice-ASR 1.5B",      240, "Q4_K, smaller VibeVoice ASR variant"),
+    # NOTE: vibevoice-1.5b is a TTS model (vibevoice-1.5b-tts-q4_k.gguf), not ASR
+    # — moved to TTS_BACKENDS below (running it as ASR produced an empty transcript).
 ]
 
 # TTS backends suitable for Kaggle time limits (small/fast models first,
@@ -118,7 +119,8 @@ TTS_BACKENDS = [
     ("outetts",           "OuteTTS",                 180, "Q8_0, Llama + WavTokenizer"),
     ("tada",              "TADA 3B",                 300, "Q4_K, multilingual AR TTS"),
     ("voxcpm2-tts",       "VoxCPM2 TTS",             300, "F16, VAE encoder + LLM"),
-    ("kugelaudio",        "KugelAudio",              180, "Q8_0, German TTS"),
+    ("vibevoice-1.5b",    "VibeVoice 1.5B TTS",      300, "Q4_K ~1.6GB; was mis-listed as ASR"),
+    ("kugelaudio",        "KugelAudio",              420, "Q4_K ~5.7GB (F16 ~14GB) — large, slow; bumped timeout"),
 ]
 
 # Text MT backends (translate a sentence; not ASR/TTS but part of the backend
@@ -216,6 +218,13 @@ import io as _io
 SWEEP_REPO = os.environ.get("CRISPASR_SWEEP_REPO", "cstr/crispasr-kaggle-progress")
 RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "latest")
 SWEEP_PREFIX = f"full-backend-sweep/{RUN_TAG}"
+# Optional subset filter: CRISPASR_SWEEP_ONLY="f5-tts,chatterbox,..." runs ONLY
+# those backends (skips all others) — for targeted re-tests of a fixed subset.
+SWEEP_ONLY = {x.strip() for x in os.environ.get("CRISPASR_SWEEP_ONLY", "").split(",") if x.strip()}
+
+
+def sweep_skip_only(backend):
+    return bool(SWEEP_ONLY) and backend not in SWEEP_ONLY
 _hf_token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
              or os.environ.get("HUGGINGFACE_TOKEN"))
 _hf_api = _HfApi(token=_hf_token)
@@ -615,6 +624,8 @@ def benchmark_backend(backend, display_name, timeout, notes):
 
 # Run all fast backends
 for backend, name, timeout, notes in BACKENDS:
+    if sweep_skip_only(backend):
+        continue
     if sweep_done("asr", backend):
         print(f"⏭ {name} ({backend}): already streamed for run '{RUN_TAG}' — resume skip")
         continue
@@ -627,6 +638,8 @@ for backend, name, timeout, notes in BACKENDS:
 BENCHMARK_SLOW = os.environ.get("BENCHMARK_SLOW", "1")  # ON by default on Kaggle
 if BENCHMARK_SLOW == "1":
     for backend, name, timeout, notes in SLOW_BACKENDS:
+        if sweep_skip_only(backend):
+            continue
         if sweep_done("asr", backend):
             print(f"⏭ {name} ({backend}): already streamed for run '{RUN_TAG}' — resume skip")
             continue
@@ -649,6 +662,8 @@ if BENCHMARK_TTS == "1":
     TTS_PHRASE = "The quick brown fox jumps over the lazy dog."
 
     for backend, name, timeout, notes in TTS_BACKENDS:
+        if sweep_skip_only(backend):
+            continue
         if sweep_done("tts", backend):
             print(f"⏭ TTS {name} ({backend}): already streamed for run '{RUN_TAG}' — resume skip")
             continue
@@ -659,12 +674,32 @@ if BENCHMARK_TTS == "1":
         cmd = [CRISPASR, "--backend", backend, "-m", "auto", "--auto-download",
                "--tts-output", outfile, "--no-prints"]
 
-        # Per-backend phrase and voice overrides
+        # Per-backend voice/speaker overrides. Several TTS backends REQUIRE a
+        # reference voice or speaker and produce 0-byte output without one — the
+        # earlier sweep's bare `--tts` made them look like failures when the cause
+        # was just missing args. Provide the right voice per backend:
+        #   - voice-CLONING (f5/chatterbox/cosyvoice3/vibevoice): a reference wav
+        #     (jfk.wav, always cloned with the repo) + the --i-have-rights consent
+        #     flag the CLI requires for .wav cloning; cosyvoice3 also needs --ref-text.
+        #   - fastpitch: a speaker index (multi-speaker, 5 speakers) via --voice 0.
+        #   - orpheus: a built-in voice name.
+        REF_WAV = f"{CRISPASR_DIR}/samples/jfk.wav"
+        JFK_RT = ("And so my fellow Americans, ask not what your country can do for you, "
+                  "ask what you can do for your country.")
+        voice_args = {
+            "f5-tts":         ["--voice", REF_WAV, "--i-have-rights"],
+            "chatterbox":     ["--voice", REF_WAV, "--i-have-rights"],
+            "cosyvoice3":     ["--voice", REF_WAV, "--ref-text", JFK_RT, "--i-have-rights"],
+            "vibevoice-tts":  ["--voice", REF_WAV, "--i-have-rights"],
+            "vibevoice-1.5b": ["--voice", REF_WAV, "--i-have-rights"],
+            "fastpitch":      ["--voice", "0"],
+            "orpheus":        ["--voice", "tara"],
+        }
+        cmd += voice_args.get(backend, [])
+
         phrase = TTS_PHRASE
         if backend == "dia":
             phrase = "[S1] The quick brown fox jumps over the lazy dog. This is a longer prompt for Dia which needs over one hundred characters to produce good output quality."
-        elif backend == "orpheus":
-            cmd += ["--voice", "tara"]
 
         cmd += ["--tts", phrase]
 
@@ -710,6 +745,8 @@ mt_results = []
 if BENCHMARK_MT == "1":
     MT_TEXT = "The quick brown fox jumps over the lazy dog."
     for backend, name, timeout, notes in MT_BACKENDS:
+        if sweep_skip_only(backend):
+            continue
         if sweep_done("mt", backend):
             print(f"⏭ MT {name} ({backend}): already streamed for run '{RUN_TAG}' — resume skip")
             continue
