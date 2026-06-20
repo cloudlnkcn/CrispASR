@@ -6591,17 +6591,17 @@ backends at long output sequences.
 
 #### §176d BLAS/ggml for scalar CPU matmul hotpaths
 
-**Status:** PARTIAL — TitaNet ASP DONE (HAVE_ACCELERATE, prior), Silero LID DONE (§ e1a0725e 2026-06-20), FireRed VAD DONE (§193 2026-06-20)
+**Status:** PARTIAL — TitaNet ASP DONE (HAVE_ACCELERATE, prior), Silero LID DONE (§ e1a0725e 2026-06-20), FireRed VAD DONE (§193 2026-06-20), Parakeet DONE (§194 2026-06-20)
 **Effort:** Medium-Large (per-backend refactor)
 **Targets (ordered by compute dominance):**
 - TitaNet ASP TDNN: DONE — cblas_sgemm under HAVE_ACCELERATE (prior)
 - Silero LID: DONE — cblas_sgemm (§ e1a0725e 2026-06-20, 4.5×)
 - FireRed VAD: DONE — cblas_sgemm for all DFSMN cpu_linear calls (§193 2026-06-20)
+- Parakeet LSTM+joint: DONE — cblas_sgemv for lstm_step_layer + joint_proj_enc + joint_step (§194 2026-06-20)
 - MeloTTS/Piper: `cpu_multihead_attention_relpos` O(H×T²×D) × 6 layers
   → ggml with flash_attn
 - OpenVoice2 WaveNet: 16 layers × T × K=5 × C=192 → ggml_conv_1d
 - Granite Speech `cpu_linear`: naive dequant matmul → ggml or OMP
-- Parakeet LSTM predictor: H=640 per-step matmul → BLAS sgemm
 - Nemotron LSTM/joint: same pattern as Parakeet
 - F5-TTS Vocos + text encoder: ConvNeXt matmuls → ggml
 **Impact:** These are the dominant compute paths in their respective

@@ -48,6 +48,16 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+static bool parakeet_use_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (getenv("PARAKEET_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -866,20 +876,30 @@ static void lstm_step_layer(const float* x, // [in_dim]
     for (int i = 0; i < H4; i++)
         gates[i] = b_ih[i] + b_hh[i];
 
-    for (int i = 0; i < H4; i++) {
-        const float* row = w_ih + (size_t)i * in_dim;
-        float s = 0.0f;
-        for (int k = 0; k < in_dim; k++)
-            s += row[k] * x[k];
-        gates[i] += s;
+#if defined(HAVE_ACCELERATE)
+    if (!parakeet_use_scalar()) {
+        // w_ih[4H, in_dim] @ x[in_dim] and w_hh[4H, H] @ h[H], adding into gates
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, H4, in_dim, 1.0f, w_ih, in_dim, x, 1, 1.0f, gates.data(), 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, H4, H, 1.0f, w_hh, H, h, 1, 1.0f, gates.data(), 1);
+    } else {
+#endif
+        for (int i = 0; i < H4; i++) {
+            const float* row = w_ih + (size_t)i * in_dim;
+            float s = 0.0f;
+            for (int k = 0; k < in_dim; k++)
+                s += row[k] * x[k];
+            gates[i] += s;
+        }
+        for (int i = 0; i < H4; i++) {
+            const float* row = w_hh + (size_t)i * H;
+            float s = 0.0f;
+            for (int k = 0; k < H; k++)
+                s += row[k] * h[k];
+            gates[i] += s;
+        }
+#if defined(HAVE_ACCELERATE)
     }
-    for (int i = 0; i < H4; i++) {
-        const float* row = w_hh + (size_t)i * H;
-        float s = 0.0f;
-        for (int k = 0; k < H; k++)
-            s += row[k] * h[k];
-        gates[i] += s;
-    }
+#endif
 
     auto sig = [](float x) { return 1.0f / (1.0f + expf(-x)); };
 
@@ -929,9 +949,17 @@ static void predictor_step(const parakeet_predictor_weights& W, int token_id, pa
 // Pre-compute proj_e once per encoder frame so we don't redo it inside the
 // inner predictor loop.
 static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, std::vector<float>& out) {
-    out.assign(J.joint_hidden, 0.0f);
+    out.assign(J.enc_b.begin(), J.enc_b.end());
+#if defined(HAVE_ACCELERATE)
+    if (!parakeet_use_scalar()) {
+        // enc_w[joint_hidden, d_model] @ enc_t[d_model], adding into out (which holds enc_b)
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.joint_hidden, J.d_model, 1.0f, J.enc_w.data(), J.d_model, enc_t, 1,
+                    1.0f, out.data(), 1);
+        return;
+    }
+#endif
     for (int i = 0; i < J.joint_hidden; i++) {
-        float s = J.enc_b[i];
+        float s = out[i]; // already has enc_b[i]
         const float* row = J.enc_w.data() + (size_t)i * J.d_model;
         for (int k = 0; k < J.d_model; k++)
             s += row[k] * enc_t[k];
@@ -944,25 +972,44 @@ static void joint_step(const parakeet_joint_weights& J,
                        const float* pred_u,   // [pred_hidden]
                        std::vector<float>& logits) {
     std::vector<float> mid(J.joint_hidden);
-    for (int i = 0; i < J.joint_hidden; i++) {
-        float s = J.pred_b[i];
-        const float* row = J.pred_w.data() + (size_t)i * J.pred_hidden;
-        for (int k = 0; k < J.pred_hidden; k++)
-            s += row[k] * pred_u[k];
-        // NeMo RNNTJoint uses ReLU (not tanh) — see jointnet.activation in
-        // model_config.yaml.
-        float v = proj_enc[i] + s;
-        mid[i] = v > 0.0f ? v : 0.0f;
-    }
+#if defined(HAVE_ACCELERATE)
+    if (!parakeet_use_scalar()) {
+        // pred_w[joint_hidden, pred_hidden] @ pred_u + pred_b → mid, then relu(proj_enc + mid)
+        mid.assign(J.pred_b.begin(), J.pred_b.end());
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.joint_hidden, J.pred_hidden, 1.0f, J.pred_w.data(), J.pred_hidden,
+                    pred_u, 1, 1.0f, mid.data(), 1);
+        for (int i = 0; i < J.joint_hidden; i++) {
+            float v = proj_enc[i] + mid[i];
+            mid[i] = v > 0.0f ? v : 0.0f;
+        }
+        // out_w[vocab_total, joint_hidden] @ mid + out_b → logits
+        logits.assign(J.out_b.begin(), J.out_b.end());
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.vocab_total, J.joint_hidden, 1.0f, J.out_w.data(), J.joint_hidden,
+                    mid.data(), 1, 1.0f, logits.data(), 1);
+    } else {
+#endif
+        for (int i = 0; i < J.joint_hidden; i++) {
+            float s = J.pred_b[i];
+            const float* row = J.pred_w.data() + (size_t)i * J.pred_hidden;
+            for (int k = 0; k < J.pred_hidden; k++)
+                s += row[k] * pred_u[k];
+            // NeMo RNNTJoint uses ReLU (not tanh) — see jointnet.activation in
+            // model_config.yaml.
+            float v = proj_enc[i] + s;
+            mid[i] = v > 0.0f ? v : 0.0f;
+        }
 
-    logits.assign(J.vocab_total, 0.0f);
-    for (int v = 0; v < J.vocab_total; v++) {
-        float s = J.out_b[v];
-        const float* row = J.out_w.data() + (size_t)v * J.joint_hidden;
-        for (int k = 0; k < J.joint_hidden; k++)
-            s += row[k] * mid[k];
-        logits[v] = s;
+        logits.assign(J.vocab_total, 0.0f);
+        for (int v = 0; v < J.vocab_total; v++) {
+            float s = J.out_b[v];
+            const float* row = J.out_w.data() + (size_t)v * J.joint_hidden;
+            for (int k = 0; k < J.joint_hidden; k++)
+                s += row[k] * mid[k];
+            logits[v] = s;
+        }
+#if defined(HAVE_ACCELERATE)
     }
+#endif
 }
 
 // ===========================================================================

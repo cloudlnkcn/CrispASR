@@ -6,6 +6,18 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-20 §194 Parakeet: Accelerate GEMV for LSTM predictor + joint head (§176d)
+
+Replaced scalar matrix-vector loops in three CPU hotpaths of `parakeet.cpp`
+with `cblas_sgemv` (Accelerate, Apple only; scalar fallback via
+`PARAKEET_FORCE_SCALAR=1`):
+- `lstm_step_layer`: `w_ih[4H,in_dim] @ x` and `w_hh[4H,H] @ h`
+  (H=640 → 2×2560-row GEMV per AR token step, two LSTM layers)
+- `joint_proj_enc`: `enc_w[640,1024] @ enc_t` (once per encoder frame)
+- `joint_step`: `pred_w[640,640] @ pred_u` + `out_w[8198,640] @ mid`
+  (8198-row GEMV is the main logit computation per decoder step)
+699 unit tests pass.
+
 ## 2026-06-20 §193 FireRed VAD: Accelerate GEMM for DFSMN linear layers (§176d)
 
 Replaced the naive O(T·K·N) triple-loop `cpu_linear` in `firered_vad.cpp` with

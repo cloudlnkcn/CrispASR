@@ -596,6 +596,14 @@ if(GGML_CUDA)
     target_compile_definitions(parakeet PRIVATE GGML_USE_CUDA)
     target_link_libraries(parakeet PUBLIC ggml-cuda)
 endif()
+if(APPLE)
+    # §194 Accelerate cblas_sgemv for LSTM predictor + joint head (§176d).
+    if(NOT ACCELERATE_LIB)
+        find_library(ACCELERATE_LIB Accelerate REQUIRED)
+    endif()
+    target_link_libraries(parakeet PUBLIC ${ACCELERATE_LIB})
+    target_compile_definitions(parakeet PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
+endif()
 
 # ---------------------------------------------------------------------------
 # Qwen3-ASR — Qwen/Qwen3-ASR-0.6B (Whisper-style audio encoder + Qwen3 LLM)
