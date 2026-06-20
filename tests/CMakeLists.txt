@@ -870,6 +870,91 @@ catch_discover_tests(test-speecht5-params
     PROPERTIES LABELS "unit;speecht5"
 )
 
+# ─── test-dia-params — Catch2 unit tests for dia_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-dia-params
+    test-dia-params.cpp
+)
+target_include_directories(test-dia-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-dia-params PRIVATE
+    Catch2::Catch2WithMain
+    dia-tts
+)
+catch_discover_tests(test-dia-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;dia"
+)
+
+# ─── test-melotts-params — Catch2 unit tests for melotts_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-melotts-params
+    test-melotts-params.cpp
+)
+target_include_directories(test-melotts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-melotts-params PRIVATE
+    Catch2::Catch2WithMain
+    melotts
+)
+catch_discover_tests(test-melotts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;melotts"
+)
+
+# ─── test-mimoasr-params — Catch2 unit tests for mimo_asr_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-mimoasr-params
+    test-mimoasr-params.cpp
+)
+target_include_directories(test-mimoasr-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-mimoasr-params PRIVATE
+    Catch2::Catch2WithMain
+    mimo_asr
+)
+catch_discover_tests(test-mimoasr-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;mimo_asr"
+)
+
+# ─── test-nemotron-params — Catch2 unit tests for nemotron_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-nemotron-params
+    test-nemotron-params.cpp
+)
+target_include_directories(test-nemotron-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-nemotron-params PRIVATE
+    Catch2::Catch2WithMain
+    nemotron
+)
+catch_discover_tests(test-nemotron-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;nemotron"
+)
+
+# ─── test-omniasr-params — Catch2 unit tests for omniasr_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-omniasr-params
+    test-omniasr-params.cpp
+)
+target_include_directories(test-omniasr-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-omniasr-params PRIVATE
+    Catch2::Catch2WithMain
+    omniasr
+)
+catch_discover_tests(test-omniasr-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;omniasr"
+)
+
 # ─── test-qwen3-tts-cv-style — Catch2 unit tests for qwen3_tts_set_cv_style_instruct
 # (issue #91: --instruct silently ignored for CustomVoice models).
 # Exercises null-ctx guards and default-params sanity — no GGUF needed. ─────
