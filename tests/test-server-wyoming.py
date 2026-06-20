@@ -277,6 +277,39 @@ def main():
             print(f"  ✗ exception: {exc}")
             failed += 1
 
+        # ── Test 6: width=4 (float32) audio-chunk → transcript (H1) ──────────
+        # HA's `wyoming` lib can stream float32 PCM (width=4); the server must
+        # accept it (average channels → int16) instead of dropping it. Exercises
+        # the H1 path end-to-end with the same jfk audio as int16-normalized f32.
+        print("\n[6] float32 (width=4) ASR round-trip")
+        try:
+            import struct as _struct
+            pcm_raw, pcm_rate, pcm_ch = load_pcm_s16(sample)
+            n = len(pcm_raw) // 2
+            int16s = _struct.unpack("<%dh" % n, pcm_raw)
+            f32_bytes = _struct.pack("<%df" % n, *[v / 32768.0 for v in int16s])
+            s = socket.create_connection(("127.0.0.1", wyoming_port), timeout=5)
+            s.settimeout(120)
+            wyoming_send(s, "transcribe", {"name": "whisper", "language": "en"})
+            wyoming_send(s, "audio-start", {"rate": pcm_rate, "width": 4, "channels": pcm_ch})
+            chunk_sz = 4096 * 4 * pcm_ch
+            for i in range(0, len(f32_bytes), chunk_sz):
+                wyoming_send(s, "audio-chunk",
+                             {"rate": pcm_rate, "width": 4, "channels": pcm_ch},
+                             f32_bytes[i:i + chunk_sz])
+            wyoming_send(s, "audio-stop", {})
+            msg_type, data, _ = wyoming_recv(s, timeout=120.0)
+            s.close()
+            if msg_type == "transcript" and isinstance(data.get("text"), str) and data["text"].strip():
+                print(f"  ✓ float32 transcript: {data['text'].strip()[:80]!r}")
+                passed += 1
+            else:
+                print(f"  ✗ got type={msg_type!r} text={data.get('text')!r}")
+                failed += 1
+        except Exception as exc:
+            print(f"  ✗ exception: {exc}")
+            failed += 1
+
         print(f"\nRESULT: {passed} passed, {failed} failed")
         return 0 if failed == 0 else 1
 

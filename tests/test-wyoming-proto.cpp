@@ -57,6 +57,28 @@ static std::vector<float> s16_to_f32(const int16_t* src, int n) {
     return out;
 }
 
+// Mirror of wyoming.cpp's width=4 (float32) audio-chunk path (H1): average the
+// `ch` interleaved float channels per frame, clamp to [-1,1], scale to int16.
+static std::vector<int16_t> f32_multichannel_to_s16_mono(const float* src, int n_f32, int ch) {
+    if (ch < 1)
+        ch = 1;
+    const int frames = n_f32 / ch;
+    std::vector<int16_t> out;
+    out.reserve((size_t)frames);
+    for (int i = 0; i < frames; i++) {
+        float acc = 0.0f;
+        for (int c = 0; c < ch; c++)
+            acc += src[i * ch + c];
+        acc /= (float)ch;
+        if (acc > 1.0f)
+            acc = 1.0f;
+        if (acc < -1.0f)
+            acc = -1.0f;
+        out.push_back((int16_t)(acc * 32767.0f));
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // f32 ↔ s16 conversion
 // ---------------------------------------------------------------------------
@@ -95,6 +117,46 @@ TEST_CASE("Wyoming s16→f32 sign preserved", "[unit][wyoming]") {
     // Magnitude should be ~0.5
     REQUIRE(f32[0] == Catch::Approx(0.5f).epsilon(0.01));
     REQUIRE(f32[1] == Catch::Approx(-0.5f).epsilon(0.01));
+}
+
+// ---------------------------------------------------------------------------
+// float32 (width=4) audio-chunk path — H1 (#176)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Wyoming float32 mono passthrough → int16", "[unit][wyoming]") {
+    float mono[3] = {0.5f, -0.5f, 0.0f};
+    auto s16 = f32_multichannel_to_s16_mono(mono, 3, /*ch=*/1);
+    REQUIRE(s16.size() == 3);
+    REQUIRE(s16[0] == (int16_t)(0.5f * 32767.0f));
+    REQUIRE(s16[1] == (int16_t)(-0.5f * 32767.0f));
+    REQUIRE(s16[2] == 0);
+}
+
+TEST_CASE("Wyoming float32 clamps out-of-range", "[unit][wyoming]") {
+    float over[4] = {2.0f, 1.0f, -1.0f, -2.0f};
+    auto s16 = f32_multichannel_to_s16_mono(over, 4, /*ch=*/1);
+    REQUIRE(s16[0] == 32767);
+    REQUIRE(s16[1] == 32767);
+    REQUIRE(s16[2] == -32767);
+    REQUIRE(s16[3] == -32767);
+}
+
+TEST_CASE("Wyoming float32 stereo is averaged to mono", "[unit][wyoming]") {
+    // 2 frames, 2 channels interleaved: frame0=(1.0,0.0)->0.5, frame1=(-1.0,-1.0)->-1.0
+    float stereo[4] = {1.0f, 0.0f, -1.0f, -1.0f};
+    auto s16 = f32_multichannel_to_s16_mono(stereo, 4, /*ch=*/2);
+    REQUIRE(s16.size() == 2);
+    REQUIRE(s16[0] == (int16_t)(0.5f * 32767.0f));
+    REQUIRE(s16[1] == -32767);
+}
+
+TEST_CASE("Wyoming float32 drops a trailing partial frame", "[unit][wyoming]") {
+    // 5 floats, 2 channels → 2 full frames; the dangling 5th float is ignored.
+    float buf[5] = {0.2f, 0.2f, 0.4f, 0.4f, 0.9f};
+    auto s16 = f32_multichannel_to_s16_mono(buf, 5, /*ch=*/2);
+    REQUIRE(s16.size() == 2);
+    REQUIRE(s16[0] == (int16_t)(0.2f * 32767.0f));
+    REQUIRE(s16[1] == (int16_t)(0.4f * 32767.0f));
 }
 
 // ---------------------------------------------------------------------------
