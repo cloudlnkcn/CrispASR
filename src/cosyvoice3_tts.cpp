@@ -403,6 +403,10 @@ struct cosyvoice3_tts_context {
     ggml_cgraph* step_t1_gf = nullptr;
     int step_t1_fixed_kv_len = 0;
 
+    // §192 CPU embed cache: all speech_embd rows dequantized to F32 at
+    // init. Avoids a GPU round-trip + graph-cache invalidation per AR step.
+    std::vector<float> speech_embd_cache; // [speech_vocab * d_model]
+
     // RAS sampler RNG. Seeded once at init from params.seed (or 42);
     // re-seedable via cosyvoice3_tts_set_seed. Advances through every
     // RAS sample so repeated generate() calls don't replay.
@@ -1043,6 +1047,25 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
                 ctx->tensors.size(), hp.n_layers, hp.d_model, hp.n_heads, hp.n_kv_heads, hp.head_dim, hp.ff_dim,
                 hp.text_vocab, hp.speech_vocab, hp.speech_codebook);
     }
+
+    // §192 Pre-dequantize speech embedding table to CPU F32. The table is
+    // [d_model, speech_vocab] = 896×6761 ≈ 24 MB in F32; negligible RAM
+    // cost but saves a GPU round-trip + graph-cache invalidation per AR step.
+    {
+        ggml_tensor* w = ctx->lm.speech_embd_w;
+        const int d = (int)hp.d_model;
+        const int v = (int)hp.speech_vocab;
+        ctx->speech_embd_cache.resize((size_t)v * d);
+        if (w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(w, ctx->speech_embd_cache.data(), 0, (size_t)v * d * sizeof(float));
+        } else {
+            const size_t nbytes = ggml_nbytes(w);
+            std::vector<uint8_t> raw(nbytes);
+            ggml_backend_tensor_get(w, raw.data(), 0, nbytes);
+            ggml_get_type_traits(w->type)->to_float(raw.data(), ctx->speech_embd_cache.data(), (size_t)v * d);
+        }
+    }
+
     return ctx;
 }
 
@@ -1230,10 +1253,18 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
         return nullptr;
     }
 
-    // Step 1: look up speech_embd[speech_id] as a [d_model, 1] F32 buffer.
-    float* embed = cv3_run_embed(ctx, ctx->lm.speech_embd_w, &speech_id, 1);
-    if (!embed)
-        return nullptr;
+    // Step 1: look up speech_embd[speech_id]. §192: use the CPU F32 cache
+    // when available — avoids a GPU round-trip and preserves step_t1_gf.
+    float* embed_alloc = nullptr;
+    const float* embed;
+    if (!ctx->speech_embd_cache.empty()) {
+        embed = ctx->speech_embd_cache.data() + (size_t)speech_id * d;
+    } else {
+        embed_alloc = cv3_run_embed(ctx, ctx->lm.speech_embd_w, &speech_id, 1);
+        if (!embed_alloc)
+            return nullptr;
+        embed = embed_alloc;
+    }
 
     // Step 2: run the LM forward with that embedding. Use the cached
     // T=1 graph when possible to amortise the build cost across steps.
@@ -1246,13 +1277,13 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
     } else {
         gf = cv3_build_lm_graph(ctx, /*n_tokens*/ 1, /*n_past*/ 0, /*fixed_kv_len*/ fixed_kv);
         if (!gf) {
-            free(embed);
+            free(embed_alloc);
             return nullptr;
         }
         ggml_backend_sched_reset(ctx->sched);
         if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
             fprintf(stderr, "cosyvoice3_tts: step alloc_graph failed\n");
-            free(embed);
+            free(embed_alloc);
             return nullptr;
         }
         ctx->step_t1_gf = gf;
@@ -1268,10 +1299,10 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
     };
 
     if (!set_t("inputs_embeds", embed, (size_t)d * sizeof(float))) {
-        free(embed);
+        free(embed_alloc);
         return nullptr;
     }
-    free(embed);
+    free(embed_alloc);
 
     int32_t pos = n_past;
     if (!set_t("lm_positions", &pos, sizeof(pos)))

@@ -6662,10 +6662,10 @@ loaded dev box).
 
 #### §176g CPU embedding cache for AR TTS backends
 
-**Status:** PARTIAL — Chatterbox DONE (§188 2026-06-20), Zonos DONE (§191 2026-06-20)
+**Status:** PARTIAL — Chatterbox DONE (§188 2026-06-20), Zonos DONE (§191 2026-06-20), CosyVoice3 DONE (§192 2026-06-20)
 **Effort:** Small per backend (template: qwen3-tts `CpuEmbdCache`)
-**Backends done:** Chatterbox (§188), Zonos (§191). **Remaining:** Orpheus, OuteTTS,
-CosyVoice3, TADA, VibeVoice, Pocket-TTS
+**Backends done:** Chatterbox (§188), Zonos (§191), CosyVoice3 (§192). **Remaining:** Orpheus (vocab 156938 → ~1.7 GB F32, skip), OuteTTS,
+TADA, VibeVoice, Pocket-TTS
 **Approach:** Copy raw quantized embedding bytes from GPU buffer to CPU
 at init; `get_row_into` dequantizes via `ggml_get_type_traits(type)->
 to_float`. Eliminates ~17 Metal command-buffer round-trips per AR frame

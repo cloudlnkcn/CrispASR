@@ -6,6 +6,16 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-20 §192 CosyVoice3 CPU speech embed cache (§176g)
+
+Pre-dequantize `speech_embd_w` (6761×896 ≈ 24 MB F32) at init.
+`cosyvoice3_tts_step_speech` now reads from `speech_embd_cache` directly
+instead of calling `cv3_run_embed` → avoids a GPU round-trip AND stops
+invalidating `step_t1_gf` on every AR step (the previous `cv3_run_embed`
+always set `step_t1_gf = nullptr`). Net effect: first AR step still builds
+the graph, all subsequent steps reuse it without any sched_reset. 653 unit
+tests pass.
+
 ## 2026-06-20 §191 Zonos CPU codebook embed cache (§176g)
 
 Fixed `tensor_get_row_f32` for quantized types: was calling
