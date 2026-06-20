@@ -6,6 +6,44 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-20 §176b+c handover prompts — remaining AR decode graph cache targets
+
+Surveyed all remaining §176b (Lk-bucketed AR decode graph caching) and §176c
+(device-resident KV) targets and wrote self-contained handover prompts in
+`docs/prompts/` (gitignored):
+
+- **`176b-parler-tts.md`** — Parler TTS: self-attn KV is host-side; cross-attn
+  pre-computed but host-side. Need Lk-buckets (7: 64/128/256/512/1024/2048/4096)
+  + device-resident cross-attn KV (§202 pattern from SpeechT5). Dedicated
+  `dec_step_sched` to avoid colliding with T5 encoder scheduler.
+
+- **`176b-dia-tts.md`** — Dia TTS: self-attn KV rebuilt per step from host
+  local vectors (NOT using the allocated `ctx->kv.k_l` device tensors). Cross-attn
+  pre-computed but also host-side + re-uploaded each step. Two phases:
+  (1) move cross-attn into `ctx->kv.cross_k_l` device tensors, (2) Lk-bucket
+  self-attn. Note: correctness bug (logits_dense 9-channel) is separate; this
+  prompt covers perf only.
+
+- **`176b-pocket-tts.md`** — Pocket-TTS: two KV caches (`backbone_kv`,
+  `dec_xfmr_kv`) as host `std::vector<float>`. Past KV shape `(HD, pos, NH)`
+  baked per step. Standard Lk-bucket + device-resident conversion.
+
+- **`176b-lfm2-kugelaudio.md`** — LFM2 + KugelAudio: BOTH already have
+  device-resident KV; bottleneck is only graph-rebuild overhead. For T_in=1
+  (LFM2) and n_tokens=1 (KugelAudio) decode, causal mask is nullptr → graph
+  topology is FIXED → single cached graph (simpler than Lk-bucketing). Also
+  covers KugelAudio pred head + VAE decoder (already fixed-shape).
+
+- **`176bc-speecht5-self-attn-kv.md`** — SpeechT5: cross-attn is done (§202).
+  Self-attn KV is host `decoder_kv_cache` with append per step. Need:
+  (1) device tensors `sa_kv_k[l]` / `sa_kv_v[l]` of shape `(hidden_size, max_steps)`,
+  (2) Lk-buckets (32/64/128/256), (3) remove `self_kv_cache` struct entirely.
+
+Also added `docs/prompts/` to `.gitignore` (previously only `/handover-prompts/`
+was listed).
+
+---
+
 ## 2026-06-20 §176s Encoder graph caching — 6 more backends
 
 Applied the metadata-swap encoder graph caching pattern to 6 backends

@@ -5467,7 +5467,13 @@ context_params structs. Wire the flag through and default it ON.
 **Backends done:** Chatterbox T3 (§186), Orpheus (§190), OuteTTS, Zonos, TADA, CosyVoice3 (step_t1_gf), VibeVoice TTS LM (§201 2026-06-20).
 **Note:** VoxCPM2 TSLM already has Lk-buckets (`get_or_build_tslm_step_graph`). VibeVoice pred head already cached by n_frames (`get_pred_head_graph`). Both can be removed from remaining.
 **Remaining:** Parler (9 codebooks), SpeechT5 (self-attn only; §202 handled cross-attn), Dia, Pocket-TTS,
-LFM2 (VAE), KugelAudio (VAE + pred).
+LFM2 (T=1 decode graph fixed-topology), KugelAudio (LM T=1 + pred head + VAE decoder).
+**Handover prompts:** `docs/prompts/176b-parler-tts.md`, `docs/prompts/176b-dia-tts.md`,
+`docs/prompts/176b-pocket-tts.md`, `docs/prompts/176b-lfm2-kugelaudio.md`,
+`docs/prompts/176bc-speecht5-self-attn-kv.md`.
+**Note on LFM2/KugelAudio:** device-resident KV already present — only graph-cache
+overhead remains. For T=1 decode, graph topology is FIXED (no mask); can cache a
+single graph, simpler than Lk-bucketing.
 **Approach:** Qwen3-TTS demonstrates with 5 pre-built graphs at fixed Lk
 sizes. MIMO has a simpler single-bucket `step_t1_gf`. FunASR has the
 infrastructure but disabled due to full-window attend; needs Lk-bucketing
@@ -5479,8 +5485,9 @@ steps. Largest single latency win project-wide.
 
 **Status:** OPEN
 **Effort:** Medium per backend
-**Backends:** SpeechT5 (cross-attn KV DONE §202; self-attn KV still host-side), Dia, Parler, Pocket-TTS, VoxCPM2 (all use
-`std::vector<float>` KV that grows and re-uploads every step)
+**Backends:** SpeechT5 (cross-attn KV DONE §202; self-attn KV still host-side), Dia, Parler,
+Pocket-TTS, VoxCPM2 (all use `std::vector<float>` KV that grows and re-uploads every step).
+LFM2 and KugelAudio already have device-resident KV (no §176c work needed there).
 **Approach:** Follow IndexTTS/CSM pattern: 4D on-device tensor
 `[head_dim, max_ctx, n_heads, n_layers]` with `ggml_view_4d` +
 `ggml_cpy` writes. Eliminates O(step × layers × hidden) host↔device
