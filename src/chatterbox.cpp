@@ -763,6 +763,22 @@ struct chatterbox_context {
     ggml_tensor* kv_k_cfg = nullptr;
     ggml_tensor* kv_v_cfg = nullptr;
 
+    // §186 Lk-bucketed T3 AR step graphs (PLAN §186). Pre-built graphs at
+    // fixed Lk sizes eliminate per-step sched reset + graph rebuild + alloc
+    // for T=1 cond-pass decode steps. Gated: only when no debug dump env vars
+    // are active and use_kv_k == nullptr (cond pass). kv_max_ctx-bounded.
+    struct T3Bucket {
+        int lk = 0;
+        ggml_context* ctx = nullptr;
+        std::vector<uint8_t> meta;
+        ggml_cgraph* gf = nullptr;
+    };
+    static constexpr int kT3NBuckets = 4;
+    static constexpr int kT3BucketLks[kT3NBuckets] = {512, 1024, 2048, 4096};
+    std::array<T3Bucket, kT3NBuckets> t3_buckets{};
+    ggml_backend_sched_t t3_step_sched = nullptr;
+    int t3_active_bucket = -1;
+
     // Per-call performance counters (populated when CHATTERBOX_BENCH=1)
     struct {
         int64_t t_tokenize_us = 0;
@@ -786,6 +802,11 @@ struct chatterbox_context {
     ~chatterbox_context() {
         if (s3gen_ctx)
             chatterbox_s3gen_free(s3gen_ctx);
+        if (t3_step_sched)
+            ggml_backend_sched_free(t3_step_sched);
+        for (auto& bk : t3_buckets)
+            if (bk.ctx)
+                ggml_free(bk.ctx);
         if (sched)
             ggml_backend_sched_free(sched);
         if (kv_cfg_buf)
@@ -1185,8 +1206,14 @@ static bool kv_alloc(chatterbox_context* c, int max_ctx) {
 
 // Llama-520M transformer: inputs_embeds (D, T) → speech logits (speech_vocab,)
 // Uses core_attn::kv_self_attn for each layer, matching orpheus pattern.
+// fixed_kv_len > 0: pin Lk to a constant (bucket mode). Graph topology is
+// then invariant across calls with different n_past; kv_indices=positions
+// redirects K/V writes to the correct cache row at runtime. arena_ctx
+// provides the ggml_context for the long-lived bucket graph (caller owns it
+// and must NOT pass it to ggml_free; omit for per-call dynamic graphs).
 static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_tokens, ggml_tensor* use_kv_k = nullptr,
-                                      ggml_tensor* use_kv_v = nullptr) {
+                                      ggml_tensor* use_kv_v = nullptr, int fixed_kv_len = 0,
+                                      ggml_context* arena_ctx = nullptr) {
     // Use provided KV tensors or default to c->kv_k/kv_v
     if (!use_kv_k)
         use_kv_k = c->kv_k;
@@ -1201,12 +1228,12 @@ static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_t
     const float eps = hp.rms_norm_eps;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
     const int T = n_tokens;
-    const int Lk = n_past + T;
+    const int Lk = fixed_kv_len > 0 ? fixed_kv_len : (n_past + T);
 
     GGML_ASSERT(c->kv_k && c->kv_v && Lk <= c->kv_max_ctx);
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T);
@@ -1221,8 +1248,9 @@ static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_t
         ggml_set_name(rope_freq_factors, "rope_freq_factors");
         ggml_set_input(rope_freq_factors);
     }
+    // Bucket mode always needs a mask: un-written tail slots must be -inf.
     ggml_tensor* causal_mask = nullptr;
-    if (T > 1) {
+    if (T > 1 || fixed_kv_len > 0) {
         causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
         ggml_set_name(causal_mask, "causal_mask");
         ggml_set_input(causal_mask);
@@ -1309,10 +1337,12 @@ static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_t
             }
         }
 
-        ggml_tensor* attn =
-            core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
-                                    /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions,
-                                    (T == 1) ? nullptr : causal_mask, use_kv_k, use_kv_v, (int)il, n_past, kvp);
+        ggml_tensor* eff_kv_indices = fixed_kv_len > 0 ? positions : nullptr;
+        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
+                                                    /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, causal_mask,
+                                                    use_kv_k, use_kv_v, (int)il, n_past, kvp,
+                                                    /*qkv_w=*/nullptr, /*fixed_kv_len=*/fixed_kv_len,
+                                                    /*kv_indices=*/eff_kv_indices);
         if (std::getenv("CRISPASR_CHATTERBOX_DUMP_ATTN_AT")) {
             const char* lyr_env = std::getenv("CRISPASR_CHATTERBOX_DUMP_LAYER");
             const int dbg_layer = lyr_env ? (int)std::strtol(lyr_env, nullptr, 10) : 0;
@@ -1367,13 +1397,132 @@ static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_t
         }
     }
 
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
+}
+
+// §186: returns true if any debug-dump env vars are set (those change graph topology).
+static bool t3_debug_active() {
+    return std::getenv("CRISPASR_CHATTERBOX_DUMP_LOGITS_AT") || std::getenv("CRISPASR_CHATTERBOX_DUMP_NORM_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_DUMP_KPROJ_AT") || std::getenv("CRISPASR_CHATTERBOX_DUMP_KROPE_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_DUMP_QPROJ_AT") || std::getenv("CRISPASR_CHATTERBOX_DUMP_VPROJ_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_DUMP_ATTN_AT") || std::getenv("CRISPASR_CHATTERBOX_DUMP_FFN_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_DUMP_WK") || std::getenv("CRISPASR_CHATTERBOX_DUMP_KV_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_NAIVE_ATTN");
+}
+
+// §186: pick smallest bucket whose Lk >= needed_lk and fits in the KV cache.
+static int t3_pick_bucket(chatterbox_context* c, int needed_lk) {
+    for (int i = 0; i < chatterbox_context::kT3NBuckets; i++) {
+        const int bk_lk = chatterbox_context::kT3BucketLks[i];
+        if (bk_lk >= needed_lk && bk_lk <= c->kv_max_ctx)
+            return i;
+    }
+    return -1;
+}
+
+// §186: lazily create the dedicated step scheduler (separate from c->sched so
+// bucket allocations survive sched resets during synthesis).
+static ggml_backend_sched_t t3_step_sched_lazy(chatterbox_context* c) {
+    if (c->t3_step_sched)
+        return c->t3_step_sched;
+    ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
+    int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
+    c->t3_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    return c->t3_step_sched;
+}
+
+// §186: get or build the pre-allocated graph for bucket[idx].
+static ggml_cgraph* t3_get_or_build_bucket(chatterbox_context* c, int idx) {
+    auto& bk = c->t3_buckets[idx];
+    if (bk.gf)
+        return bk.gf;
+    bk.lk = chatterbox_context::kT3BucketLks[idx];
+    bk.meta.assign(c->compute_meta.size(), 0);
+    ggml_init_params ip = {bk.meta.size(), bk.meta.data(), true};
+    bk.ctx = ggml_init(ip);
+    if (!bk.ctx) {
+        fprintf(stderr, "chatterbox: t3_bucket[%d] arena init failed\n", idx);
+        return nullptr;
+    }
+    bk.gf = build_graph_t3_kv(c, /*n_past=*/0, /*n_tokens=*/1,
+                              /*use_kv_k=*/nullptr, /*use_kv_v=*/nullptr,
+                              /*fixed_kv_len=*/bk.lk, /*arena_ctx=*/bk.ctx);
+    if (!bk.gf) {
+        ggml_free(bk.ctx);
+        bk.ctx = nullptr;
+        return nullptr;
+    }
+    return bk.gf;
+}
+
+// §186: fast Lk-bucketed single-step T3 decode (cond-pass only, no debug dumps).
+static float* run_t3_kv_bucket(chatterbox_context* c, const float* embeds, int n_past) {
+    const int idx = t3_pick_bucket(c, n_past + 1);
+    if (idx < 0)
+        return nullptr;
+
+    ggml_cgraph* gf = t3_get_or_build_bucket(c, idx);
+    if (!gf)
+        return nullptr;
+
+    const auto& bk = c->t3_buckets[idx];
+    const int D = (int)c->hp.hidden_size;
+    const int Lk = bk.lk;
+    const int vocab = (int)c->hp.speech_vocab_size;
+
+    ggml_backend_sched_t step_sched = t3_step_sched_lazy(c);
+    if (!step_sched)
+        return nullptr;
+
+    if (c->t3_active_bucket != idx) {
+        ggml_backend_sched_reset(step_sched);
+        if (!ggml_backend_sched_alloc_graph(step_sched, gf)) {
+            fprintf(stderr, "chatterbox: t3_bucket[%d] alloc failed\n", idx);
+            return nullptr;
+        }
+        c->t3_active_bucket = idx;
+    }
+
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0, (size_t)D * sizeof(float));
+    if (!c->rope_freq_factors.empty())
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "rope_freq_factors"), c->rope_freq_factors.data(), 0,
+                                c->rope_freq_factors.size() * sizeof(float));
+
+    // Fill causal mask: positions [0..n_past] visible, [n_past+1..Lk-1] = -inf.
+    {
+        std::vector<ggml_fp16_t> mask(Lk, ggml_fp32_to_fp16(0.0f));
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int k = n_past + 1; k < Lk; k++)
+            mask[k] = neg_inf;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
+                                (size_t)Lk * sizeof(ggml_fp16_t));
+    }
+
+    if (ggml_backend_sched_graph_compute(step_sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "chatterbox: t3_bucket compute failed\n");
+        return nullptr;
+    }
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
+    float* r = (float*)malloc((size_t)vocab * sizeof(float));
+    ggml_backend_tensor_get(out, r, 0, (size_t)vocab * sizeof(float));
+    return r;
 }
 
 // Run the T3 transformer on pre-built embeddings. Returns logits (speech_vocab,).
 static float* run_t3_kv(chatterbox_context* c, const float* embeds, int n_tokens, int n_past,
                         ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr) {
+    // §186: Lk-bucketed fast path for T=1 cond-pass decode (no debug dumps, no custom KV).
+    if (n_tokens == 1 && !use_kv_k && !t3_debug_active()) {
+        if (float* r = run_t3_kv_bucket(c, embeds, n_past))
+            return r;
+        // Fall through if no bucket fits (n_past+1 > max bucket or > kv_max_ctx).
+    }
+
     if (n_past + n_tokens > c->kv_max_ctx) {
         fprintf(stderr, "chatterbox: kv overflow (%d+%d > %d)\n", n_past, n_tokens, c->kv_max_ctx);
         return nullptr;

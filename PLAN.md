@@ -6426,6 +6426,39 @@ references into the cached vectors — zero `read_tensor_f32` calls at synthesis
 
 ---
 
+## §186 Chatterbox T3 Lk-bucketed graph caching — DONE 2026-06-20
+
+**Problem:** `run_t3_kv` rebuilt the T3 attention graph on every AR decode step via
+`build_graph_t3_kv` → `ggml_backend_sched_reset` → `ggml_backend_sched_alloc_graph`.
+For a 500-token synthesis (≈10 s speech) this means 500 graph builds + allocations,
+each O(n_layers × n_nodes).
+
+**Fix:** Pre-build one graph per KV-bucket size {512, 1024, 2048, 4096} at the first
+step that hits it. The key enablers:
+- `build_graph_t3_kv` extended with `fixed_kv_len` (pins Lk in graph topology) and
+  `arena_ctx` (owns the compute-meta allocation so the bucket's memory is stable).
+- `causal_mask` tensor now always created when `fixed_kv_len > 0` (T=1 step needs
+  the mask to hide un-written tail slots; previously guarded by `T > 1`).
+- `core_attn::kv_self_attn` called with `fixed_kv_len` + `kv_indices=positions`
+  (scatter K/V writes to cache row `n_past` via `ggml_set_rows`).
+- Dedicated `t3_step_sched` separate from `c->sched` so sched resets during synthesis
+  don't invalidate pre-allocated bucket graphs.
+- `t3_debug_active()` guard: any debug-dump env var bypasses the bucket path (dumps
+  add nodes that change graph topology).
+- CFG uncond pass uses `use_kv_k != nullptr` → automatically falls through to the
+  dynamic path (bucket graphs reference `c->kv_k`, not `c->kv_k_cfg`).
+
+**Expected gain:** Eliminates ~500 graph rebuild + alloc calls per synthesis,
+expected >10% wall-clock reduction on CPU and Metal for long utterances.
+
+**Files:** `src/chatterbox.cpp` (`T3Bucket` struct; `t3_buckets`, `t3_step_sched`,
+`t3_active_bucket` fields in `chatterbox_context`; destructor cleanup;
+`build_graph_t3_kv` extensions; `t3_debug_active`, `t3_pick_bucket`,
+`t3_step_sched_lazy`, `t3_get_or_build_bucket`, `run_t3_kv_bucket` helpers;
+`run_t3_kv` dispatch)
+
+---
+
 ## §176 Runtime optimization pass — 2026-06-20 audit
 
 Full code-read survey of every runtime. Detailed findings in

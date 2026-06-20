@@ -6,6 +6,13 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-20 §186 Chatterbox T3 Lk-bucketed graph caching
+
+Pre-build T3 AR-decode graphs once per KV-bucket {512,1024,2048,4096} and reuse
+across all steps. Eliminates ≈500 graph-rebuild + sched-alloc calls per synthesis.
+Dedicated `t3_step_sched` keeps bucket allocations stable across main-sched resets.
+CFG uncond pass and debug-dump paths fall through to the existing dynamic path.
+
 ## 2026-06-20 §185 F5-TTS text + Vocos weight pre-cache
 
 Pre-dequantize all text ConvNeXtV2 and Vocos ConvNeXt weights once at model load.
