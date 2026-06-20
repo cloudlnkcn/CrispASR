@@ -6566,9 +6566,9 @@ context_params structs. Wire the flag through and default it ON.
 
 **Status:** PARTIAL — Chatterbox T3 DONE (§186), Orpheus DONE (§190), OuteTTS DONE, Zonos DONE, TADA DONE. F5-TTS DiT done differently (§183).
 **Effort:** Medium (template from qwen3-tts)
-**Backends done:** Chatterbox T3 (§186), Orpheus (§190), OuteTTS, Zonos, TADA.
+**Backends done:** Chatterbox T3 (§186), Orpheus (§190), OuteTTS, Zonos, TADA, CosyVoice3 (step_t1_gf).
 **Remaining:** Parler (9 codebooks), SpeechT5, Dia, Pocket-TTS,
-CosyVoice3, VoxCPM2, VibeVoice (pred head), LFM2 (VAE), KugelAudio (VAE + pred).
+VoxCPM2, VibeVoice (pred head), LFM2 (VAE), KugelAudio (VAE + pred).
 **Approach:** Qwen3-TTS demonstrates with 5 pre-built graphs at fixed Lk
 sizes. MIMO has a simpler single-bucket `step_t1_gf`. FunASR has the
 infrastructure but disabled due to full-window attend; needs Lk-bucketing
@@ -6611,10 +6611,10 @@ runtimes and currently run as unvectorized nested loops.
 
 #### §176e Context caching for support runtimes
 
-**Status:** PARTIAL — WhisperEncDec + MarbleNet VAD DONE (commit `ccdd3af6` 2026-06-20)
+**Status:** PARTIAL — WhisperEncDec + MarbleNet VAD DONE (`ccdd3af6`), Pyannote DONE (`afb651bf`)
 **Effort:** Small per backend (template: Silero VAD static cache)
-**Backends done:** WhisperEncDec VAD, MarbleNet VAD. **Remaining:** FireRed VAD,
-Pyannote, ECAPA-TDNN LID, RNNoise enhancement, CTC aligner, FireRedPunc (graph ctx)
+**Backends done:** WhisperEncDec VAD, MarbleNet VAD, Pyannote segmentation.
+**Remaining:** FireRed VAD, ECAPA-TDNN LID, RNNoise enhancement, CTC aligner, FireRedPunc (graph ctx)
 **Approach:** The Silero VAD `g_silero_cache_mtx` + static context
 pattern prevents 70× init/free regression. Replicate for each backend:
 static or per-pipeline cached context, mutex-guarded.
