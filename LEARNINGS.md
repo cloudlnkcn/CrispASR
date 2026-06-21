@@ -8963,6 +8963,46 @@ tokens via `FASTPITCH_FORCE_TOKENS=<file>`, (3) dump C++ per-stage via
 `FASTPITCH_DUMP_DIR=<dir>`, (4) compare with numpy cosine similarity. First
 divergent stage is the bug. Debug hooks: `FASTPITCH_DUMP_DIR`, `FASTPITCH_FORCE_TOKENS`.
 
+### GPU/CUDA crash — two Metal-masked bugs (§204, 2026-06-21)
+
+FastPitch synthesised correctly on M1 Metal but aborted on the Kaggle CUDA
+sweep. The give-away "passes on Metal, dies on CUDA" almost always means a
+backend bug that **unified memory hides** — on Apple silicon the CPU backend can
+read GPU buffers, so device-pointer mistakes are silent. Two distinct bugs:
+
+**Bug A — `sched_alloc_graph` then compute on the raw CPU backend.** When the
+GPU upgrade (§140) wired `ggml_backend_sched` into fastpitch, only the encoder
+and pitch-embed graphs were switched to `ggml_backend_sched_graph_compute`; the
+decoder and vocoder graphs were left calling
+`ggml_backend_graph_compute(ctx->backend_cpu, gf)` after a
+`ggml_backend_sched_alloc_graph`. With `use_gpu` the weights are in a GPU buffer,
+so the CPU backend dereferences device pointers — harmless on Metal, an illegal
+access on CUDA. **Rule:** a graph allocated via the scheduler must be computed
+via the scheduler. Grep any GPU-enabled backend for
+`ggml_backend_graph_compute(.*backend_cpu` following a `sched_alloc_graph`.
+
+**Bug B — `core_hifigan` ConvTranspose layout (channel-major vs time-first).**
+The whole `core_hifigan::forward()` pipeline is **time-major** `(T, C)` — every
+`ggml_conv_1d` there produces `ne0=time, ne1=channel`. But the col2im decomposed
+transpose-conv path (the `w_perm` branch, added in `a862f2de`) called
+`core_convt::convt1d_decomp`, which is **channel-major**: its first op is
+`mul_mat(w_perm[IC, K*OC], x)` and therefore needs `x->ne0 = IC`. Fed a
+time-major `x` (`ne0 = T`), it aborts on `ggml_can_mul_mat` — on **both** CPU and
+GPU. The fix is to use the time-first sibling `convt1d_decomp_tf` (transposes
+in, runs the channel-major decomp, transposes out). This is a *shared-header*
+bug: every `ups_w_perm` user is affected, and both FastPitch and SpeechT5 feed
+`mel_in = (T_mel, n_mel)`, so the one-line `hifigan.h` change repairs both.
+
+**Lesson:** when a `mul_mat`/conv asserts deep inside a shared vocoder, the wrong
+suspect is the model weights; the right one is which axis of the *input* is
+contiguous. `convt1d_decomp` (channel-major) and `convt1d_decomp_tf` (time-first)
+look interchangeable but assume opposite `ne0` conventions — pick by what the
+caller's pipeline actually produces (here, `ggml_conv_1d` ⇒ time-major).
+
+Validated: cstr/fastpitch-en-GGUF q8_0, GPU and CPU outputs byte-identical,
+verbatim ASR roundtrip. See `core/hifigan.h::conv_transpose_1d`,
+`fastpitch_tts.cpp` decoder/vocoder compute, HISTORY §204.
+
 ## SpeechT5 TTS decoder — what ACTUALLY fixed it (2026-06-02)
 
 The encoder was validated at cos > 0.999 in the earlier round (§8115). The

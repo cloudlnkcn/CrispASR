@@ -721,10 +721,18 @@ mistakes, not bugs**, leaving **7 genuine failures** (+1 pending):
 
 **GENUINE bugs — fail on CUDA even with correct args (TODO):**
 - [ ] **lfm2-audio** (ASR) — CRASHes mid-run (~9.8 s). Hybrid conv+attn backbone.
-- [ ] **speecht5** (TTS) — 0-byte (~2.2 s) even with the built-in default
-  zero-speaker embedding, so not a missing-voice issue. Enc-dec + HiFi-GAN.
-- [ ] **fastpitch** (TTS) — 0-byte (~4 s) with an explicit `--voice 0` speaker
-  index; the speaker fix did not help → real bug.
+- [x] **speecht5** (TTS) — FIXED (shared `core_hifigan` fix, commit `69dc1789`,
+  §204). Same latent HiFi-GAN ConvTranspose layout bug as fastpitch below — both
+  pass `ups_w_perm` and feed time-major `mel_in=(T_mel, n_mel)`, so the code path
+  is identical to the fastpitch fix. CUDA re-test still pending (local
+  `speecht5-tts-f16.gguf` is truncated → load-time mmap-bounds failure blocked
+  the M1 e2e re-test).
+- [x] **fastpitch** (TTS) — FIXED (commit `69dc1789`, §204). Two Metal-masked
+  bugs: (1) decoder+vocoder graphs were `sched_alloc`'d then computed on
+  `backend_cpu` → GPU device-ptr deref (CUDA-only crash); (2) `core_hifigan`
+  ConvTranspose used channel-major `convt1d_decomp` on a time-major input →
+  `ggml_can_mul_mat` abort on *all* backends. Validated on M1 Metal: GPU/CPU
+  byte-identical + verbatim ASR roundtrip.
 - [ ] **orpheus** (TTS) — 0-byte (~17 s) with `--voice tara`. Llama-3.2 + SNAC.
 - [ ] **chatterbox** (TTS) — 0-byte (~14 s) with `--voice <wav> --i-have-rights`;
   the #83 S3Gen GPU fix was Metal-validated — re-check the CUDA S3Gen path.
@@ -4796,8 +4804,8 @@ passed via `g_open_use_gpu_tls` from the C API.
 
 | Backend | GPU status | Notes |
 |---|---|---|
-| **fastpitch** | **DONE** | sched + init_best + core_gguf::load_weights |
-| **speecht5** | **DONE** | sched + init_best (use_gpu default=true) |
+| **fastpitch** | **DONE** | sched + init_best + core_gguf::load_weights. CUDA fix §204 (`69dc1789`): decoder+vocoder graphs must `sched_graph_compute`, not `backend_cpu` compute (see step 6) |
+| **speecht5** | **DONE** | sched + init_best (use_gpu default=true). Shared `core_hifigan` CUDA fix §204 (`69dc1789`) |
 | **piper** | **DONE** | sched + init_best (use_gpu default=false in params, overridden by C API) |
 | **parler-tts** | **DONE** | sched + init_best (use_gpu default=false in params, overridden by C API) |
 | **outetts** | **DONE** | sched + init_best (use_gpu default=false in params, overridden by C API) |
@@ -4811,6 +4819,12 @@ passed via `g_open_use_gpu_tls` from the C API.
 4. Init: `backend = params.use_gpu ? ggml_backend_init_best() : backend_cpu`
 5. Create sched: `ggml_backend_sched_new(backends, nullptr, n_be, graph_size, false, false)`
 6. Each sub-graph: `sched_reset` → `sched_alloc_graph` → set inputs → `sched_graph_compute`
+   **Gotcha (§204):** once a graph is `sched_alloc_graph`'d it MUST be run with
+   `ggml_backend_sched_graph_compute(sched, gf)`, never
+   `ggml_backend_graph_compute(backend_cpu, gf)`. The latter dereferences
+   GPU-resident weights on the CPU backend — a no-op on unified-memory Metal but
+   an illegal access on CUDA. fastpitch shipped with this mistake on its
+   decoder+vocoder graphs (the encoder/pitch graphs were correct).
 7. Free: `sched_free` → `buffer_free` → `backend_free` (GPU before CPU)
 8. Wire `p.use_gpu = g_open_use_gpu_tls` in crispasr_c_api.cpp open dispatch
 

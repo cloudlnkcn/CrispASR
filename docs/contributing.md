@@ -386,6 +386,28 @@ PyTorch model loading OOMs easily on this machine. Patterns:
 - Use `--stages mel_spectrogram,encoder_output` to skip LLM loading
   entirely when only testing the audio pipeline
 
+### GPU / CUDA correctness (it works on Metal ≠ it works on CUDA)
+
+Apple-silicon Metal uses unified memory, so the CPU backend can read GPU
+buffers. That hides two whole classes of bug that abort on CUDA — always
+sanity-check a GPU-enabled backend on a real discrete GPU (Kaggle T4/P100),
+not just M1.
+
+- **Compute a `sched`-allocated graph with the `sched`, never a raw backend.**
+  If you allocate with `ggml_backend_sched_alloc_graph(sched, gf)`, you MUST run
+  it with `ggml_backend_sched_graph_compute(sched, gf)`. Calling
+  `ggml_backend_graph_compute(backend_cpu, gf)` instead dereferences
+  GPU-resident weights on the CPU backend — a silent no-op on Metal, an illegal
+  access on CUDA. (FastPitch shipped this on its decoder + vocoder graphs while
+  the encoder graph was correct — §204.)
+- **`core_convt::convt1d_decomp` is channel-major; `convt1d_decomp_tf` is
+  time-first.** The decomposed ConvTranspose1d's first op is
+  `mul_mat(w_perm[IC, K*OC], x)`, which needs `x->ne0 = IC`. `core_hifigan` (and
+  any pipeline built from `ggml_conv_1d`) is **time-major** `(T, C)` — `ne0 = T`,
+  not `IC` — so it must use the `_tf` variant. The wrong one aborts on
+  `ggml_can_mul_mat` on *all* backends. When a `mul_mat`/conv asserts inside a
+  shared vocoder, suspect the input's contiguous axis, not the weights (§204).
+
 ## Watermarking tests
 
 All TTS output is automatically watermarked. When changing TTS output

@@ -9458,3 +9458,38 @@ and was not isolated after ~45 experiments. Reverted all changes (`f5_tts.cpp`,
 `ggml-alloc.c`); working tree clean. The §183 single-graph fusion already captured
 F5's main win; B=2 adds only ~1.2× and is not worth more investment. `repro_batch.cpp`
 + diagnostic logs preserved in the worktree for any future attempt.
+
+## 2026-06-21 §204 FastPitch (+SpeechT5) — GPU/CUDA crash fixed (sched dispatch + HiFi-GAN convT layout)
+
+The §201 CUDA sweep flagged fastpitch as a "0-byte (~4 s) genuine bug" that
+nonetheless synthesised fine on M1 Metal. Classic unified-memory masking: two
+backend-correctness bugs, both invisible on Metal (where the CPU backend can
+read GPU buffers) but fatal on CUDA. Commit `69dc1789`.
+
+**Bug 1 — sched-alloc then raw-CPU compute (the CUDA crash).** The §140 GPU
+upgrade (`194f1bd8`) converted fastpitch's four sub-graphs to
+`ggml_backend_sched`, but only the encoder + pitch-embed graphs were switched to
+`ggml_backend_sched_graph_compute`. The **decoder (`gf3`)** and **vocoder
+(`gf4`)** graphs were still `sched_alloc_graph`'d and then computed with
+`ggml_backend_graph_compute(ctx->backend_cpu, gf)`. With `use_gpu` the weights
+live in a GPU buffer, so the CPU backend dereferences device pointers — a no-op
+on Metal, an illegal access on CUDA. Fix: route both through the scheduler.
+
+**Bug 2 — HiFi-GAN ConvTranspose layout (latent, all backends).** Surfaced once
+bug 1's vocoder graph ran through the scheduler. `core_hifigan::forward()` is
+uniformly **time-major** `(T, C)` (every `ggml_conv_1d` outputs `ne0=time`), but
+`conv_transpose_1d`'s col2im decomp path — wired in by `a862f2de` — called the
+**channel-major** `core_convt::convt1d_decomp`, whose `mul_mat(w_perm[IC,K*OC], x)`
+needs `x->ne0 = IC` and instead got `ne0 = T`, aborting on `ggml_can_mul_mat`.
+This crashed on **both CPU and GPU**. Fix: use the time-first variant
+`convt1d_decomp_tf`. This is a shared bug affecting every `ups_w_perm` user —
+both **fastpitch and speecht5** feed `mel_in=(T_mel, n_mel)`, so the one-line
+header fix repairs both. (SpeechT5 was the sweep's other "0-byte ~2.2 s" TTS
+crash.)
+
+**Validation.** cstr/fastpitch-en-GGUF q8_0 on M1 Metal: GPU and CPU outputs are
+byte-identical and ASR-roundtrip verbatim ("The quick brown fox jumps over the
+lazy dog."). SpeechT5 shares the fixed code path; its M1 e2e re-test was blocked
+by a truncated local `speecht5-tts-f16.gguf` (load-time mmap-bounds failure,
+unrelated) — CUDA re-test of speecht5 still pending. Worktree:
+`/Volumes/backups/code/fastpitch-cuda-stash`.
