@@ -5519,16 +5519,28 @@ context_params structs. Wire the flag through and default it ON.
 
 **Status:** PARTIAL — Chatterbox T3 DONE (§186), Orpheus DONE (§190), OuteTTS DONE, Zonos DONE, TADA DONE. F5-TTS DiT done differently (§183).
 **Effort:** Medium (template from qwen3-tts)
-**Backends done:** Chatterbox T3 (§186), Orpheus (§190), OuteTTS, Zonos, TADA, CosyVoice3 (step_t1_gf), VibeVoice TTS LM (§201 2026-06-20).
+**Backends done:** Chatterbox T3 (§186), Orpheus (§190), OuteTTS, Zonos, TADA, CosyVoice3 (step_t1_gf), VibeVoice TTS LM (§201 2026-06-20), Parler (§176b+c 2026-06-21, opt-in).
 **Note:** VoxCPM2 TSLM already has Lk-buckets (`get_or_build_tslm_step_graph`). VibeVoice pred head already cached by n_frames (`get_pred_head_graph`). Both can be removed from remaining.
-**Remaining:** Parler (9 codebooks), SpeechT5 (self-attn only; §202 handled cross-attn), Dia, Pocket-TTS,
+**Remaining:** SpeechT5 (self-attn only; §202 handled cross-attn), Dia, Pocket-TTS,
 LFM2 (T=1 decode graph fixed-topology), KugelAudio (LM T=1 + pred head + VAE decoder).
-**Handover prompts:** `docs/prompts/176b-parler-tts.md`, `docs/prompts/176b-dia-tts.md`,
+**Handover prompts:** `docs/prompts/176b-dia-tts.md`,
 `docs/prompts/176b-pocket-tts.md`, `docs/prompts/176b-lfm2-kugelaudio.md`,
 `docs/prompts/176bc-speecht5-self-attn-kv.md`.
 **Note on LFM2/KugelAudio:** device-resident KV already present — only graph-cache
 overhead remains. For T=1 decode, graph topology is FIXED (no mask); can cache a
 single graph, simpler than Lk-bucketing.
+**Parler note (§176b+c 2026-06-21, opt-in `CRISPASR_PARLER_BUCKET=1`, default OFF):** Implemented
+device-resident self-attn + cross-attn KV (`ggml_set_rows` write, fixed-Lk read) and
+7 cached bucket graphs on a dedicated `dec_step_sched`. Numerically equivalent to the
+legacy host-KV path but NOT bit-exact — the fixed-Lk padded reduction shifts FP rounding
+(step-1 bit-identical, later steps ~1e-4), so greedy decoding produces a different *valid*
+generation. Gotchas found: (1) read from the `set_rows` *result*, not the bare KV tensor,
+or Metal races the in-place write; (2) reset+alloc the sched each step — reusing a sched
+allocation across `graph_compute` faults on Metal; (3) rebuild bucket graphs per utterance
+or repeated synthesize calls fault on stale tensor→buffer pointers. Perf is backend-
+dependent: a win where host↔device KV transfer is costly (discrete GPU / CUDA), but
+neutral-to-negative on M1 unified memory (transfer ≈ memcpy; fixed-Lk over-read makes long
+utterances slower) — hence opt-in, not default. Validate + flip default on CUDA.
 **Approach:** Qwen3-TTS demonstrates with 5 pre-built graphs at fixed Lk
 sizes. MIMO has a simpler single-bucket `step_t1_gf`. FunASR has the
 infrastructure but disabled due to full-window attend; needs Lk-bucketing
@@ -5540,8 +5552,9 @@ steps. Largest single latency win project-wide.
 
 **Status:** OPEN
 **Effort:** Medium per backend
-**Backends:** SpeechT5 (cross-attn KV DONE §202; self-attn KV still host-side), Dia, Parler,
+**Backends:** SpeechT5 (cross-attn KV DONE §202; self-attn KV still host-side), Dia,
 Pocket-TTS, VoxCPM2 (all use `std::vector<float>` KV that grows and re-uploads every step).
+Parler DONE (§176b+c 2026-06-21, opt-in — see §176b note).
 LFM2 and KugelAudio already have device-resident KV (no §176c work needed there).
 **Approach:** Follow IndexTTS/CSM pattern: 4D on-device tensor
 `[head_dim, max_ctx, n_heads, n_layers]` with `ggml_view_4d` +

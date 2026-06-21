@@ -70,6 +70,43 @@ produces finite, reference-matching audio (`conv_pre rms≈3.4`).
 Open: confirm on a Kaggle CUDA re-run that q8 chatterbox (the sweep default)
 produces good audio there with the FFT fix (the Metal CFM route is M1-only).
 
+---
+
+## 2026-06-21 §203 Parler — device-resident KV + Lk-bucketed AR decode (§176b+c, opt-in)
+
+Added an opt-in (`CRISPASR_PARLER_BUCKET=1`, default OFF) fast path to
+`parler_tts.cpp`: device-resident self-attn KV (written in place via
+`ggml_set_rows`, read as a fixed-Lk window), device-resident cross-attn
+KV (uploaded once per utterance), and 7 cached fixed-Lk decode-step
+graphs on a dedicated `dec_step_sched`. The graph topology is built once
+per bucket and reused across steps (skips the 6–14 ms/step rebuild and
+the per-step KV host re-upload).
+
+Numerically equivalent to the legacy host-KV path but NOT bit-exact: the
+fixed-Lk padded reduction shifts FP rounding (step-1 bit-identical, later
+steps ~1e-4), so greedy decoding yields a different *valid* generation.
+
+Three Metal gotchas, each cost a debugging round (see LEARNINGS):
+1. Read the KV window from the `set_rows` *result*, not the bare KV
+   tensor — Metal runs independent nodes concurrently and races the
+   in-place write otherwise.
+2. Reset+alloc the sched each step. Reusing a sched allocation across
+   `graph_compute` (no reset) faults on Metal for graphs that write
+   external buffers. A *dedicated* small sched keeps reset+alloc cheap
+   (the large `ctx->sched` re-plans the whole model graph → slower).
+3. Rebuild the bucket graphs per utterance. Reusing call-N's cached
+   graphs on call N+1 leaves dangling tensor→buffer pointers (the next
+   `ggml_backend_tensor_set` memmoves into freed memory → crash).
+
+Perf is backend-dependent and the reason it's opt-in: a win where
+host↔device KV transfer is costly (discrete GPU / CUDA), but neutral-to-
+negative on M1 unified memory (transfer ≈ memcpy; the fixed-Lk over-read
+makes long utterances slower). Validate + flip to default on CUDA.
+Validated bit-identical-to-legacy *when greedy doesn't flip an argmax*
+and crash-free across repeated synthesize calls on M1 Metal (Q4_K).
+
+---
+
 ## 2026-06-20 §176b+c handover prompts — remaining AR decode graph cache targets
 
 Surveyed all remaining §176b (Lk-bucketed AR decode graph caching) and §176c

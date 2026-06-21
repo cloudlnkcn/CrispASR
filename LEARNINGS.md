@@ -90,6 +90,45 @@ not the graph. Corollaries:
   cause. (Not done for F5; ~1.2× payoff didn't justify it. See HISTORY §203,
   `repro_batch.cpp`.)
 
+## In-place device-KV decode graphs on Metal: three hazards (§176b+c, §203)
+
+Porting the Lk-bucketed device-resident KV decode (write KV in place via
+`ggml_set_rows`, read a fixed-Lk window, reuse a cached graph per bucket)
+to Parler surfaced three Metal-specific hazards. All three "compile and
+sometimes pass," which makes them nasty — they each cost a debugging round.
+
+1. **Write→read ordering needs an explicit edge.** Reading the KV window
+   from the bare cache tensor (`ggml_cont(ggml_view_2d(c->kv, …))`) has *no*
+   data-dependency on the `ggml_set_rows` that just wrote the current row.
+   Metal runs independent graph nodes concurrently, so the read races the
+   write — build-dependent garbage (looked deterministic within a build,
+   flipped 0↔1280 token mismatches across rebuilds). Fix: read from the
+   `set_rows` **result** tensor (`set_rows` records the dest as `src[2]`, so
+   viewing its result creates the edge). CPU never showed this (serial).
+
+2. **Don't reuse a sched allocation across `graph_compute`.** The vibevoice
+   §201 pattern (alloc once on a dedicated sched, skip realloc on the same
+   bucket) faults on Metal here (`setBuffer_impl` on a freed AGXBuffer) for
+   graphs that write external buffers. The portable idiom (kyutai §176s) is
+   reset+`alloc_graph` every step, reusing only the *built graph topology*.
+   Use a **dedicated** small sched for the step graph: reset+alloc on it is
+   cheap, whereas re-planning the large `ctx->sched` (full model graph) each
+   step is slower than the legacy path.
+
+3. **Rebuild cached step graphs per utterance.** Reusing call-N's cached
+   bucket graphs on call N+1 leaves the graph's compute tensors pointing at
+   the previous call's freed sched allocation; the next
+   `ggml_backend_tensor_set` memmoves into freed memory → SIGSEGV on the
+   *second* synthesize. Invalidate (free + rebuild) at the start of each
+   call; within a call the per-step reuse is preserved.
+
+Also: fixed-Lk bucketing is **not bit-exact** vs a dynamic-length path —
+the padded reduction shifts FP rounding, so greedy decoding diverges into a
+different *valid* sequence. Gate such opts on ASR-roundtrip quality, not
+token equality. And on **unified memory (M1)** the device-KV migration wins
+nothing (host↔device is a memcpy) while the over-read costs — the payoff is
+a discrete-GPU/CUDA phenomenon. Ship opt-in until CUDA-validated.
+
 ## Backend-name guards must match the *registered* name, by prefix when aliased (#171, #174)
 
 A backend's CLI factory alias and the string `name()` returns are not the
