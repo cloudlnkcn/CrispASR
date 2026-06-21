@@ -768,14 +768,25 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
     // [n_past..n_past+T) by construction for RoPE — exactly the row
     // ids set_rows needs).
     const bool quant_kv = ggml_is_quantized(kv_k->type);
+    // When the write goes through ggml_set_rows we keep the result tensors so
+    // the read view below can be based on them (see the read path) — that gives
+    // the scheduler an explicit write→read dependency edge. Without it the read
+    // views the bare cache and the set_rows nodes become graph dead-ends, so on
+    // Metal the KV read races the in-place set_rows write and reads stale/garbage
+    // (the Lk-bucket single-step decode in orpheus/parler hits this). Mirrors
+    // parler_tts's bucket read path.
+    ggml_tensor* sr_k = nullptr;
+    ggml_tensor* sr_v = nullptr;
     if (kv_indices || quant_kv) {
         ggml_tensor* eff_idx = kv_indices ? kv_indices : positions;
         ggml_tensor* k_layer =
             ggml_view_3d(ctx0, kv_k, hd, kv_k->ne[1], n_kv, kv_k->nb[1], kv_k->nb[2], (size_t)il * kv_k->nb[3]);
         ggml_tensor* v_layer =
             ggml_view_3d(ctx0, kv_v, hd, kv_v->ne[1], n_kv, kv_v->nb[1], kv_v->nb[2], (size_t)il * kv_v->nb[3]);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_layer, K_new_perm, eff_idx));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_layer, V_new_perm, eff_idx));
+        sr_k = ggml_set_rows(ctx0, k_layer, K_new_perm, eff_idx);
+        sr_v = ggml_set_rows(ctx0, v_layer, V_new_perm, eff_idx);
+        ggml_build_forward_expand(gf, sr_k);
+        ggml_build_forward_expand(gf, sr_v);
     } else {
         ggml_tensor* k_view = ggml_view_4d(ctx0, kv_k, hd, T, n_kv, 1, kv_k->nb[1], kv_k->nb[2], kv_k->nb[3],
                                            (size_t)il * kv_k->nb[3] + (size_t)n_past * kv_k->nb[1]);
@@ -800,10 +811,15 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
     // Flash-attn-ext on Metal accepts F32 K/V natively (and F16 / quant
     // too) but mixing types across K and V isn't supported, so both
     // sides cast to the same dtype.
-    ggml_tensor* k_layer_view =
-        ggml_view_3d(ctx0, kv_k, hd, Lk, n_kv, kv_k->nb[1], kv_k->nb[2], (size_t)il * kv_k->nb[3]);
-    ggml_tensor* v_layer_view =
-        ggml_view_3d(ctx0, kv_v, hd, Lk, n_kv, kv_v->nb[1], kv_v->nb[2], (size_t)il * kv_v->nb[3]);
+    // Read from the set_rows RESULT when we wrote via set_rows (sr_k/sr_v are
+    // in-place views of the layer slice, so offset 0 == this layer's data);
+    // otherwise read the bare cache at the per-layer offset (ggml_cpy path).
+    ggml_tensor* k_read_src = sr_k ? sr_k : kv_k;
+    ggml_tensor* v_read_src = sr_v ? sr_v : kv_v;
+    const size_t k_read_off = sr_k ? 0 : (size_t)il * kv_k->nb[3];
+    const size_t v_read_off = sr_v ? 0 : (size_t)il * kv_v->nb[3];
+    ggml_tensor* k_layer_view = ggml_view_3d(ctx0, k_read_src, hd, Lk, n_kv, kv_k->nb[1], kv_k->nb[2], k_read_off);
+    ggml_tensor* v_layer_view = ggml_view_3d(ctx0, v_read_src, hd, Lk, n_kv, kv_v->nb[1], kv_v->nb[2], v_read_off);
     // CRISPASR_KV_READ_F32=1 forces the cache read to dequantise (or
     // upcast F16) to F32 before flash_attn. Useful when F16 attention
     // accumulator drift on Metal sends the sampler off the rails for

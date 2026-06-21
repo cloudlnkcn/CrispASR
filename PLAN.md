@@ -844,16 +844,19 @@ mistakes, not bugs**, leaving **7 genuine failures** (+1 pending). Of those 7,
   "Hello there.".
 
 **GENUINE bugs — fail on CUDA even with correct args (TODO):**
-- [ ] **orpheus** (TTS) — 0-byte (~17 s) with `--voice tara`. Llama-3.2 + SNAC.
-  **§213 (2026-06-21):** built a talker-level diff (`crispasr-diff orpheus-talker`,
-  ref at `cstr/orpheus-3b-0.1-ft-GGUF/diff-harness-ref/`) and ran it on a Kaggle
-  P100 alongside the SNAC diff. Both components work on CUDA: the talker AR decode
-  **emits codes, GPU byte-identical to CPU** (the diff "FAIL" is bf16-vs-ref
-  precision only, 47.6%), and **SNAC vocoder PASSES on GPU 8/8**. So the 0-byte is
-  in neither component — it's the full `orpheus_synthesize` glue (undelay →
-  codes→SNAC, or the full-length *sampled* generation the 48-step greedy diff
-  doesn't exercise) **or already fixed** since §201. Next: one end-to-end
-  `orpheus_synthesize` on CUDA to confirm.
+- [x] **orpheus** (TTS) — **FIXED (§215, HISTORY).** The 0-byte/SIGSEGV was the
+  §176b Lk-bucket decode's dedicated step-sched: a fresh `ggml_backend_sched`'s
+  first `alloc_graph` left the cross-backend input copies unbacked on GPU, so the
+  first decode step bound a garbage device buffer (crash in `ggml_metal_op_norm`
+  on node #0, before any set_rows). §213 was right that neither the talker AR
+  decode nor SNAC was the culprit — it was the bucket's separate sched. Fix:
+  run the cached bucket graph on the already-warm prefill sched `c->sched`
+  (drop `ar_step_sched`) + read the KV from the `ggml_set_rows` result for the
+  Metal write→read edge. GPU + CPU bucket both ASR-roundtrip verbatim on M1.
+  Stays opt-in (`CRISPASR_ORPHEUS_BUCKET=1`): correct now, but ~30 % slower than
+  the non-bucket path on M1 unified memory (over-read); may still win on CUDA.
+  **CUDA cross-check still pending** (Kaggle `chr1str/crispasr-orpheus-talker-cuda`
+  end-to-end `orpheus_synthesize`).
 - [ ] **chatterbox** (TTS) — 0-byte (~14 s) with `--voice <wav> --i-have-rights`;
   the #83 S3Gen GPU fix was Metal-validated — re-check the CUDA S3Gen path.
 - [ ] **cosyvoice3** (TTS) — **dies in 0.1 s** even with a reference voice; passes

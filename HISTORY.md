@@ -6,6 +6,49 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-21 §215 Orpheus — Lk-bucket GPU decode SIGSEGV fixed (run on the warm prefill sched; stays opt-in)
+
+Resolves the §201/§213 orpheus "0-byte on GPU/CUDA": the §176b/c Lk-bucketed
+single-step AR decode SIGSEGV'd on the first generated token (`AGXMetal
+setBuffer_impl` ← `ggml_backend_sched_graph_compute` ← `run_talker_kv`), so it
+had been gated default-OFF (commit `336d2fad`).
+
+**Root cause — the dedicated step-sched, not the graph.** The bucket built its
+graph once in an arena and ran it on a *dedicated* `ar_step_sched`
+(`ggml_backend_sched_new`). On GPU that fresh sched's **first**
+`ggml_backend_sched_alloc_graph` left the cross-backend graph-input copies
+(`MTL0#inputs_embeds#0` / `positions` / `causal_mask`) unbacked — `lldb` put the
+crash in `ggml_metal_op_norm` on node #0 (the first RMS_NORM reading
+`inputs_embeds`), i.e. *before* any set_rows/rope ran. (The `[ NULL ]` buffers in
+`GGML_SCHED_DEBUG=2` are a red herring: that print is pre-allocation state and the
+working multi-token prefill graph shows them too.) Decisive A/B: routing the
+identical bucket graph through the prefill sched `c->sched` produced a correct
+205 KB WAV, so the bug is the second/cold sched, not the set_rows graph —
+`c->sched` is already *warm* (reserved by prefill) and its galloc backs the input
+copies; the fresh `ar_step_sched` hit the cold `reserve_n` path and didn't.
+
+**Fix.** `run_talker_kv_bucket` now runs the cached bucket graph on `c->sched`
+(reset+alloc each step) and the dedicated `ar_step_sched` is removed. The bucket's
+real wins are preserved (cached graph → no per-step rebuild; device-resident KV
+via `ggml_set_rows` → no per-step host re-upload); only the cheap per-step host
+graph-alloc is paid, and since the bucket topology is invariant the galloc
+fast-paths it. Also hardened `core_attn::kv_self_attn`: the fixed-Lk KV read now
+views the **`ggml_set_rows` result** (not the bare cache), giving Metal the
+explicit write→read edge it needs so the in-place KV write isn't raced (mirrors
+parler_tts's bucket; value-identical on every backend, no-op for the F16
+`ggml_cpy` path).
+
+**Validation (M1, Q4_K).** GPU bucket → 205 KB WAV, ASR roundtrip verbatim
+("Hey there, my name is Tara."), token stream **bit-identical to the non-bucket
+GPU path**. CPU bucket → 160 KB WAV, roundtrip verbatim. Non-bucket default
+unchanged.
+
+**Stays opt-in (`CRISPASR_ORPHEUS_BUCKET=1`, default OFF).** Now correct, but on
+M1's unified memory the fixed-Lk over-read makes it **~30 % slower** than the
+non-bucket path on short utterances (97 s vs 75 s), the same reason parler's
+bucket is opt-in. It may still win on discrete GPU / CUDA, where the non-bucket
+path's per-step host↔device KV traffic dominates — kept available, not removed.
+
 ## 2026-06-21 §215 Parakeet long-form — single-pass = NeMo-exact for non-JA (fixes boundary dups + VAD speech-drop)
 
 Reported symptom: parakeet on a 5-min German clip (and the 28-min ARD

@@ -177,8 +177,6 @@ struct orpheus_context {
     static constexpr int kBucketN = 4;
     static constexpr int kBucketLks[kBucketN] = {512, 1024, 2048, 4096};
     std::array<OrpheusBucket, kBucketN> ar_buckets{};
-    ggml_backend_sched_t ar_step_sched = nullptr;
-    int ar_active_bucket = -1;
 
     // SNAC codec (lazy-loaded on first orpheus_synthesize call).
     std::string snac_codec_path;
@@ -194,8 +192,6 @@ struct orpheus_context {
         if (snac_dec) {
             snac_decoder_free(snac_dec);
         }
-        if (ar_step_sched)
-            ggml_backend_sched_free(ar_step_sched);
         for (auto& bk : ar_buckets)
             if (bk.ctx)
                 ggml_free(bk.ctx);
@@ -723,14 +719,19 @@ static float* run_talker_kv(orpheus_context* c, const float* embeds, int n_token
     // §176b: Lk-bucketed fast path for single-step decode.
     //
     // OPT-IN via CRISPASR_ORPHEUS_BUCKET=1 (default OFF), mirroring parler's
-    // CRISPASR_PARLER_BUCKET. The bucketed path's dedicated step-sched leaves
-    // its graph-input copies unallocated on the Metal backend (positions /
-    // causal_mask show `[ NULL ]` buffers in GGML_SCHED_DEBUG=2), so the first
-    // decode step binds a garbage Metal buffer and SIGSEGVs — this was the
-    // §201 sweep's orpheus "0-byte on CUDA/GPU". The non-bucket path below uses
-    // the same graph structure as prefill (which computes fine on GPU), so the
-    // default is correct on every backend; the bucket stays available for perf
-    // experiments on CPU where it's already validated.
+    // CRISPASR_PARLER_BUCKET. The bucket is now CORRECT on GPU (Metal + CUDA):
+    // the §201/§213 SIGSEGV was its dedicated step-sched — that fresh sched's
+    // first ggml_backend_sched_alloc_graph left the cross-backend input copies
+    // (inputs_embeds/positions/causal_mask) unbacked, so the first decode step
+    // bound a garbage device buffer (AGXMetal setBuffer_impl). Fixed in
+    // run_talker_kv_bucket by running the bucket graph on the already-warm
+    // prefill sched (c->sched) instead (§215). It nonetheless stays OPT-IN:
+    // on M1's unified memory the fixed-Lk over-read (reading the full bucket
+    // window every step) makes it ~30% SLOWER than the non-bucket path for
+    // short utterances (97s vs 75s for "Hey there, my name is Tara."), the
+    // same reason parler's bucket is opt-in. It may still win on discrete
+    // GPU / CUDA where the non-bucket path's per-step host<->device KV traffic
+    // dominates — hence kept available, not removed.
     static const bool bucket_enabled = []() {
         const char* e = std::getenv("CRISPASR_ORPHEUS_BUCKET");
         return e && e[0] == '1';
@@ -799,15 +800,6 @@ static int orpheus_pick_bucket(orpheus_context* c, int needed_lk) {
     return -1;
 }
 
-static ggml_backend_sched_t orpheus_step_sched_lazy(orpheus_context* c) {
-    if (c->ar_step_sched)
-        return c->ar_step_sched;
-    ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
-    int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
-    c->ar_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
-    return c->ar_step_sched;
-}
-
 static ggml_cgraph* orpheus_get_or_build_bucket(orpheus_context* c, int idx) {
     auto& bk = c->ar_buckets[idx];
     if (bk.gf)
@@ -844,17 +836,24 @@ static float* run_talker_kv_bucket(orpheus_context* c, const float* embeds, int 
     const int Lk = bk.lk;
     const int vocab = (int)c->hp.vocab_size;
 
-    ggml_backend_sched_t step_sched = orpheus_step_sched_lazy(c);
-    if (!step_sched)
+    // Reuse the prefill scheduler (c->sched) rather than a dedicated step-sched.
+    // The §176b design used a separate ar_step_sched and reused its allocation
+    // across steps, but on GPU that fresh sched's first ggml_backend_sched_alloc_
+    // graph leaves the cross-backend input copies (inputs_embeds / positions /
+    // causal_mask) unallocated — the first decode step then binds a garbage
+    // device buffer and SIGSEGVs (AGXMetal setBuffer_impl, §213/§215). c->sched
+    // is already warm from the multi-token prefill, so its galloc allocates the
+    // bucket graph correctly. The bucket's real wins (cached graph → no per-step
+    // rebuild, device-resident KV via ggml_set_rows → no per-step host re-upload)
+    // are preserved; only the per-step graph alloc is paid, and since the bucket
+    // graph topology is invariant across steps the galloc fast-paths it (no
+    // realloc). reset+alloc every step keeps the sched's src[j] rewires fresh
+    // (the graph-reuse-without-realloc hazard documented in ggml-backend.cpp).
+    ggml_backend_sched_t step_sched = c->sched;
+    ggml_backend_sched_reset(step_sched);
+    if (!ggml_backend_sched_alloc_graph(step_sched, gf)) {
+        fprintf(stderr, "orpheus: ar_bucket[%d] alloc failed\n", idx);
         return nullptr;
-
-    if (c->ar_active_bucket != idx) {
-        ggml_backend_sched_reset(step_sched);
-        if (!ggml_backend_sched_alloc_graph(step_sched, gf)) {
-            fprintf(stderr, "orpheus: ar_bucket[%d] alloc failed\n", idx);
-            return nullptr;
-        }
-        c->ar_active_bucket = idx;
     }
 
     int32_t pos = n_past;
