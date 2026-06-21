@@ -3398,6 +3398,10 @@ int main(int argc, char** argv) {
         cp.verbosity = 0;
         cp.temperature = 0.0f; // greedy for deterministic comparison
         cp.seed = 42;
+        // Default CPU (parity baseline); ORPHEUS_DIFF_GPU=1 runs the talker AR
+        // loop on the GPU — used to reproduce/localize the CUDA 0-byte failure
+        // (compare GPU vs CPU vs the PyTorch ground truth).
+        cp.use_gpu = std::getenv("ORPHEUS_DIFF_GPU") != nullptr;
         // gen_codes covers the first frames only; cap the AR loop so we don't
         // run the full ~8192-step default (override via ORPHEUS_DIFF_MAXGEN).
         {
