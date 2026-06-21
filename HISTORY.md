@@ -6,6 +6,49 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-21 Chatterbox CUDA crash — non-power-of-two FFT heap overflow (fix/chatterbox-cuda)
+
+Kaggle full-backend-sweep (Tesla P100, sm_60) crashed chatterbox TTS with
+`free(): corrupted unsorted chunks` immediately after the `[CONSENT]` line
+(voice cloning from `samples/jfk.wav`), 0 bytes out. Reproduced locally on M1
+under AddressSanitizer: **heap-buffer-overflow** in
+`core_fft::fft_radix2_wrapper` (`src/core/fft.h`) ← `core_mel::compute`
+← `chatterbox_ve::compute_mel` ← `compute_speaker_emb` ←
+`chatterbox_set_voice_from_wav`.
+
+**Root cause.** `fft_radix2_inplace` is a power-of-two-only radix-2 FFT, but
+the VoiceEncoder (`n_fft=400`), S3Tokenizer (`400`), CAMPPlus (`1920`) and
+CosyVoice3 (`400`) mels all pass non-power-of-two `N`. For `N=400` the
+`len=256` butterfly stage writes `re[400..511]` — 112 floats (448 B) past the
+`N`-element thread-local scratch → heap corruption. macOS's allocator
+tolerates the small overrun (so M1 "worked", with a subtly-wrong /
+non-deterministic speaker embedding from the paired OOB reads); glibc traps it
+→ the Kaggle crash. The FFT is CPU-side, so this is independent of the T3
+GPU/CPU split (the non-Metal T3-GPU default was incidental to the repro).
+
+**Fix (`src/core/fft.h`).** Keep the exact radix-2 path for power-of-two `N`
+(granite 512, indextts 1024, lfm2 512 stay **bit-identical** — zero
+regression), and route non-power-of-two `N` through a new mixed-radix real FFT
+(`fft_mixed_radix_r2c`: radix-2 DIT split down to an odd-`N` naive DFT base
+case, modeled on `voxtral_fft`) that computes the true `N`-point transform the
+mel filterbanks were built for. Also repairs the same latent overflow in
+S3Tokenizer / CAMPPlus / CosyVoice3 mels.
+
+**Validation.**
+- Standalone test: max-abs err vs a double-precision reference DFT ~1e-4 for
+  `N ∈ {160, 201, 400, 512, 1024, 1920}`.
+- ASan rerun of the failing command: **0 heap-buffer-overflows**, runs past
+  the VE crash site.
+- Default-config synth (T3 CPU, **F16** s3gen) produces finite audio
+  (`conv_pre rms=3.53` vs ref 5.50); moonshine ASR roundtrip → "the quick
+  brown fox jumps over the lazy dog" (recognizable).
+
+**Separate pre-existing issue (NOT this fix).** The **q8** s3gen vocoder
+NaNs on M1 Metal (`conv_pre rms=nan`, `STFT range [1e30,0]`) — present in the
+unfixed baseline too, and absent with F16 s3gen. May be Metal-specific; a
+Kaggle re-run with this fix is needed to confirm chatterbox q8 (the sweep
+default) produces good audio on CUDA. Tracked separately.
+
 ## 2026-06-20 §176b+c handover prompts — remaining AR decode graph cache targets
 
 Surveyed all remaining §176b (Lk-bucketed AR decode graph caching) and §176c
