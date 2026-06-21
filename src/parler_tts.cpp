@@ -1999,18 +1999,21 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
                     bk.gf = build_decoder_step_graph(ctx, 1, 0, T_enc, bk.Lk, bk.arena);
                 }
                 if (bk.gf) {
-                    // Reset + alloc the dedicated sched each step (the prebuilt bucket
-                    // graph topology is reused — that's the costly part we skip — but
-                    // the sched allocation is re-planned each step; reusing a sched
-                    // allocation across computes faults on Metal). The dedicated sched
-                    // only ever sees this small graph, so reset+alloc is cheap (unlike
-                    // re-planning on the large ctx->sched).
-                    ggml_backend_sched_reset(ctx->dec_step_sched);
-                    if (!ggml_backend_sched_alloc_graph(ctx->dec_step_sched, bk.gf)) {
-                        fprintf(stderr, "parler_tts: bucket %d alloc failed at step %d\n", bidx, gen_step);
-                        return nullptr; // device-only KV: legacy fallback would read stale host KV
+                    // Reuse the dedicated sched's allocation across steps: only
+                    // reset + alloc on a bucket switch, otherwise just update inputs
+                    // and recompute the cached graph. The device KV persists across
+                    // computes (set_rows writes in place), so nothing needs realloc
+                    // between steps. (Reuse is safe because reads come from the
+                    // set_rows result, giving an explicit write→read edge, and the
+                    // bucket graphs are rebuilt per utterance — see the setup above.)
+                    if (ctx->dec_active_bucket != bidx) {
+                        ggml_backend_sched_reset(ctx->dec_step_sched);
+                        if (!ggml_backend_sched_alloc_graph(ctx->dec_step_sched, bk.gf)) {
+                            fprintf(stderr, "parler_tts: bucket %d alloc failed at step %d\n", bidx, gen_step);
+                            return nullptr; // device-only KV: legacy fallback would read stale host KV
+                        }
+                        ctx->dec_active_bucket = bidx;
                     }
-                    ctx->dec_active_bucket = bidx;
                     safe_set(bk.gf, "inp_hidden", inp_embed.data(), D * sizeof(float));
                     int32_t pos_i = past_len;
                     safe_set(bk.gf, "kv_pos", &pos_i, sizeof(int32_t));
