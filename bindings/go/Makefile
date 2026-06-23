@@ -34,7 +34,9 @@ whisper: mkdir
 		-DCMAKE_BUILD_TYPE=Release \
 		-DBUILD_SHARED_LIBS=OFF \
 		-DCRISPASR_WITH_ESPEAK_NG=OFF \
-		-DCRISPASR_MEL_BLAS=OFF
+		-DCRISPASR_MEL_BLAS=OFF \
+		-DCRISPASR_OPUS=OFF \
+		-DCRISPASR_AMR=OFF
 	cmake --build ../../${BUILD_DIR} --target crispasr-lib
 
 test: model-small whisper modtidy
