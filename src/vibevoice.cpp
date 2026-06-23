@@ -4053,8 +4053,13 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                            int kv_sel = 0) -> bool {
         auto t_build0 = std::chrono::high_resolution_clock::now();
 
-        // §201: Lk-bucketed fast path for single-token decode (no debug env vars).
-        if (n_tokens == 1 && (!dump_dir || !dump_dir[0])) {
+        // §201: Lk-bucketed fast path for single-token decode.
+        // Disabled by default — the bucket graph's ggml_set_rows + cached
+        // KV views crash on CUDA (P100) and Vulkan (RDNA4) with illegal
+        // memory access (issue #184). Enable with CRISPASR_VIBEVOICE_LM_BUCKETS=1
+        // for CPU-only inference where the cache speedup (~30%) applies.
+        const bool use_buckets = std::getenv("CRISPASR_VIBEVOICE_LM_BUCKETS") != nullptr;
+        if (use_buckets && n_tokens == 1 && (!dump_dir || !dump_dir[0])) {
             const int idx = lm_pick_bucket(n_past + 1);
             if (idx >= 0) {
                 ggml_cgraph* gf = lm_get_or_build_bucket(kv_sel, idx);
