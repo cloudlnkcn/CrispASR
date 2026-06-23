@@ -335,18 +335,113 @@ if (CRISPASR_AMR)
     endif()
 
     if (NOT _crispasr_amr_ok)
-        # FetchContent static build requires a patched opencore-amr with complete
-        # OSCL shim headers. The upstream feuvan/opencore-amr-iOS repo is missing
-        # oscl_dll.h et al. so standalone compilation fails. AMR support requires
-        # system packages (apt install libopencore-amrnb-dev libopencore-amrwb-dev).
-        message(STATUS "CrispASR: AMR disabled (system libopencore-amr not found; "
-                       "install libopencore-amrnb-dev libopencore-amrwb-dev for AMR support)")
+        # Static fallback: build opencore-amr from source with minimal OSCL
+        # shim headers. The upstream Android/AOSP opencore-amr depends on a
+        # full OSCL library; we generate trivial stubs so the decoder compiles
+        # standalone. The source is Brian Aker's CMake-enabled fork.
+        include(FetchContent)
+        if (NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+            set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+        endif()
+        FetchContent_Declare(crispasr_opencore_amr
+            GIT_REPOSITORY https://github.com/ArtifexSoftware/opencore-amr.git
+            GIT_TAG v0.1.6
+            GIT_SHALLOW TRUE)
+        FetchContent_GetProperties(crispasr_opencore_amr)
+        if (NOT crispasr_opencore_amr_POPULATED)
+            FetchContent_Populate(crispasr_opencore_amr)
+        endif()
+
+        # Generate minimal OSCL shim headers so the opencore-amr C++ sources
+        # compile without the full PacketVideo OSCL library.
+        set(_oscl_shim_dir "${CMAKE_CURRENT_BINARY_DIR}/oscl_shim")
+        file(MAKE_DIRECTORY "${_oscl_shim_dir}/oscl")
+        file(WRITE "${_oscl_shim_dir}/oscl/oscl_types.h"
+            "#ifndef OSCL_TYPES_H\n#define OSCL_TYPES_H\n"
+            "#include <stdint.h>\n"
+            "typedef int32_t  oscl_int32;\ntypedef uint32_t oscl_uint32;\n"
+            "typedef int16_t  oscl_int16;\ntypedef uint16_t oscl_uint16;\n"
+            "typedef int8_t   oscl_int8;\ntypedef uint8_t  oscl_uint8;\n"
+            "typedef char     oscl_char;\ntypedef float    oscl_float;\n"
+            "typedef double   oscl_double;\ntypedef int      oscl_int;\n"
+            "typedef unsigned oscl_uint;\ntypedef bool     oscl_bool;\n"
+            "#define oscl_wchar wchar_t\n"
+            "#define OSCL_UNUSED_ARG(x) (void)(x)\n"
+            "#endif\n")
+        file(WRITE "${_oscl_shim_dir}/oscl/oscl_mem.h"
+            "#ifndef OSCL_MEM_H\n#define OSCL_MEM_H\n"
+            "#include <stdlib.h>\n#include <string.h>\n"
+            "#define oscl_malloc(sz) malloc(sz)\n"
+            "#define oscl_free(p)    free(p)\n"
+            "#define oscl_memset     memset\n"
+            "#define oscl_memmove    memmove\n"
+            "#define oscl_memcpy     memcpy\n"
+            "#define OSCL_ARRAY_NEW(T,n) new T[n]\n"
+            "#define OSCL_ARRAY_DELETE(p) delete[] p\n"
+            "#define OSCL_NEW(T,args) new T args\n"
+            "#define OSCL_DELETE(p) delete p\n"
+            "#endif\n")
+        file(WRITE "${_oscl_shim_dir}/oscl/oscl_dll.h"
+            "#ifndef OSCL_DLL_H\n#define OSCL_DLL_H\n"
+            "#define OSCL_DLL_ENTRY_POINT()\n"
+            "#define OSCL_DLL_ENTRY_POINT_DEFAULT()\n"
+            "#endif\n")
+        file(WRITE "${_oscl_shim_dir}/oscl/osclconfig.h"
+            "#ifndef OSCLCONFIG_H\n#define OSCLCONFIG_H\n"
+            "#include \"oscl_types.h\"\n"
+            "#endif\n")
+        file(WRITE "${_oscl_shim_dir}/oscl/osclconfig_compiler_warnings.h"
+            "#ifndef OSCLCONFIG_COMPILER_WARNINGS_H\n#define OSCLCONFIG_COMPILER_WARNINGS_H\n"
+            "#endif\n")
+
+        # Check if this is the CMake-enabled fork (has CMakeLists.txt)
+        # or the raw AOSP source (autotools only).
+        set(_amr_src "${crispasr_opencore_amr_SOURCE_DIR}")
+        if (EXISTS "${_amr_src}/CMakeLists.txt")
+            # Use the fork's own CMake build
+            add_subdirectory("${_amr_src}" "${crispasr_opencore_amr_BINARY_DIR}" EXCLUDE_FROM_ALL)
+            if (TARGET opencore-amrnb)
+                target_include_directories(opencore-amrnb SYSTEM PUBLIC "${_oscl_shim_dir}")
+                target_include_directories(opencore-amrwb SYSTEM PUBLIC "${_oscl_shim_dir}")
+                target_link_libraries(crispasr-lib PRIVATE opencore-amrnb opencore-amrwb)
+                set(_crispasr_amr_ok ON)
+                message(STATUS "CrispASR: AMR via FetchContent static opencore-amr (CMake fork)")
+            endif()
+        endif()
+
+        if (NOT _crispasr_amr_ok)
+            # Manual compilation of the decoder-only sources
+            file(GLOB _amrnb_srcs "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_nb/dec/src/*.cpp"
+                                  "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_nb/dec/src/*.c")
+            file(GLOB _amrwb_srcs "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_wb/dec/src/*.cpp"
+                                  "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_wb/dec/src/*.c")
+            if (_amrnb_srcs AND _amrwb_srcs)
+                add_library(crispasr_amrnb STATIC ${_amrnb_srcs})
+                target_include_directories(crispasr_amrnb SYSTEM PUBLIC
+                    "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_nb/dec/include"
+                    "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_nb/common/include"
+                    "${_oscl_shim_dir}")
+                set_target_properties(crispasr_amrnb PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+                add_library(crispasr_amrwb STATIC ${_amrwb_srcs})
+                target_include_directories(crispasr_amrwb SYSTEM PUBLIC
+                    "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_wb/dec/include"
+                    "${_oscl_shim_dir}")
+                set_target_properties(crispasr_amrwb PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+                target_link_libraries(crispasr-lib PRIVATE crispasr_amrnb crispasr_amrwb)
+                set(_crispasr_amr_ok ON)
+                message(STATUS "CrispASR: AMR via FetchContent static opencore-amr (manual build)")
+            else()
+                message(STATUS "CrispASR: AMR disabled (FetchContent: opencore-amr source layout not recognized)")
+            endif()
+        endif()
     endif()
 
     if (_crispasr_amr_ok)
         target_compile_definitions(crispasr-lib PRIVATE CRISPASR_HAVE_AMR=1)
-    elseif (NOT CRISPASR_AMR_FETCH)
-        message(STATUS "CrispASR: AMR disabled — opencore-amr not found (set -DCRISPASR_AMR_FETCH=ON to build it)")
+    else()
+        message(STATUS "CrispASR: AMR disabled — opencore-amr not found (install libopencore-amrnb-dev libopencore-amrwb-dev, or set -DCRISPASR_AMR_FETCH=ON)")
     endif()
 endif()
 
