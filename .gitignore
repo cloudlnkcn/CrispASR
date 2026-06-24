@@ -40,6 +40,9 @@ ggml/ggml-version.cmake
 .swiftpm
 *.metallib
 
+# local benchmark models + profiling artifacts
+.bench-models/
+
 ggml-metal-embed.metal
 ggml-metal-embed.metal.tmp
 

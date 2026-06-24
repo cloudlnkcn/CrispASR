@@ -115,7 +115,12 @@ if (NOT GGML_LLAMAFILE_DEFAULT)
 endif()
 
 if (NOT GGML_CUDA_GRAPHS_DEFAULT)
-    set(GGML_CUDA_GRAPHS_DEFAULT OFF)
+    # CrispASR: enable CUDA graphs by default. Capture is arch-gated to
+    # sm_80+ inside ggml-cuda (graph_check_compute_cap), so older GPUs are
+    # unaffected. Eliminates per-launch dispatch overhead for launch-bound
+    # decode loops (e.g. granite-speech LLM decode, see PERFORMANCE.md).
+    # Runtime escape hatch: GGML_CUDA_DISABLE_GRAPHS=1.
+    set(GGML_CUDA_GRAPHS_DEFAULT ON)
 endif()
 
 # general

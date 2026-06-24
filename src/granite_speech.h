@@ -67,6 +67,15 @@ void granite_speech_kv_reset(struct granite_speech_context* ctx);
 float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, const float* inputs_embeds, int n_tokens,
                                  int n_past, int* out_n_tokens, int* out_vocab_size);
 
+// Enable the CUDA-graph-capture-friendly bucketed decode path. When bucket_len
+// > 0, subsequent single-token run_llm_kv calls reuse a cached shape-stable
+// graph pinned to a fixed KV read extent (bucket_len) instead of rebuilding the
+// 40-layer graph each step. Call after prefill with bucket_len >= n_past +
+// max_new_tokens. Set bucket_len = 0 to revert to the legacy per-step path.
+// Ignored on CPU backends / multi-token prefill (those always use run_llm_kv's
+// rebuild path). Requires the KV cache initialised to >= bucket_len.
+void granite_speech_set_decode_bucket(struct granite_speech_context* ctx, int bucket_len);
+
 // Embed token IDs. Returns malloc'd (n_tokens, d_model) F32.
 float* granite_speech_embed_tokens(struct granite_speech_context* ctx, const int32_t* input_ids, int n_tokens);
 

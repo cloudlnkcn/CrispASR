@@ -71,6 +71,7 @@ public:
         cp.n_threads = p.n_threads;
         cp.verbosity = p.no_prints ? 0 : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
+        use_gpu_ = cp.use_gpu;
 
         ctx_ = granite_speech_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {
@@ -380,6 +381,18 @@ public:
         dec_cfg.temperature = params.temperature;
         dec_cfg.frequency_penalty = params.frequency_penalty;
         dec_cfg.seed = params.seed;
+
+        // Enable the CUDA-graph-capture-friendly bucketed decode (Phase 1).
+        // The bucket covers [total_prompt .. total_prompt + max_new] so no
+        // re-capture mid-decode; capped to the 4096 KV cache. Single-token
+        // forward calls then reuse one cached shape-stable graph. Only on GPU
+        // (capture is meaningless on CPU) and only when the decode will fit
+        // the bucket — beam search keeps its legacy per-step path.
+        const bool use_bucket = use_gpu_;
+        if (use_bucket) {
+            const int bucket = std::min(total_prompt + max_new + 1, 4096);
+            granite_speech_set_decode_bucket(ctx_, bucket);
+        }
 
         const int n_runs = (params.temperature > 0.0f && params.best_of > 1) ? params.best_of : 1;
         core_greedy_decode::Result best_dec;
@@ -699,6 +712,12 @@ public:
         std::string accumulated;
         bool leading_space_trimmed = false;
 
+        // Enable bucketed CUDA-graph-capture decode for the streaming loop too.
+        if (use_gpu_) {
+            const int bucket = std::min(total_prompt + dec_cfg.max_new_tokens + 1, 4096);
+            granite_speech_set_decode_bucket(ctx_, bucket);
+        }
+
         auto token_cb = [&](int32_t id, float /*prob*/) {
             if (id == eos_tok)
                 return;
@@ -734,6 +753,7 @@ public:
 
 private:
     granite_speech_context* ctx_ = nullptr;
+    bool use_gpu_ = false;
 };
 
 } // namespace
