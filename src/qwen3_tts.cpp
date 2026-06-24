@@ -6243,7 +6243,8 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
     const auto& hp = ctx->hp;
     const int d = (int)hp.d_model;
     const int n_groups = (int)hp.n_code_groups; // 16
-    int max_frames = ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps : 1500;
+    int max_frames = ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps
+                                                     : (ctx->kv_max_ctx > 0 ? ctx->kv_max_ctx : 1500);
     if (const char* mf = getenv("QWEN3_TTS_MAX_FRAMES")) {
         const int v = std::atoi(mf);
         if (v > 0)

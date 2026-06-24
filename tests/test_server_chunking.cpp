@@ -153,8 +153,18 @@ TEST_CASE("server TTS policy keeps ALL vibevoice* TTS variants single-shot", "[u
     }
 }
 
-TEST_CASE("server TTS policy chunks non-VibeVoice backends", "[unit][chunking]") {
-    auto out = crispasr_tts_plan_chunks_for_backend("First sentence. Second sentence.", "qwen3-tts");
+TEST_CASE("server TTS policy keeps qwen3-tts variants single-shot", "[unit][chunking]") {
+    const char* text = "First sentence. Second sentence. Third sentence.";
+    for (const char* name : {"qwen3-tts", "qwen3-tts-1.7b-base", "qwen3-tts-customvoice", "qwen3-tts-voicedesign"}) {
+        CAPTURE(name);
+        auto out = crispasr_tts_plan_chunks_for_backend(text, name);
+        REQUIRE(out.size() == 1);
+        REQUIRE(out[0] == text);
+    }
+}
+
+TEST_CASE("server TTS policy chunks sentence-safe backends", "[unit][chunking]") {
+    auto out = crispasr_tts_plan_chunks_for_backend("First sentence. Second sentence.", "kokoro");
     REQUIRE(out.size() == 2);
     REQUIRE(out[0] == "First sentence.");
     REQUIRE(out[1] == "Second sentence.");
