@@ -595,6 +595,18 @@ constexpr Entry k_registry[] = {
     {"canary-ctc-aligner", "canary-ctc-aligner-q4_k.gguf",
      "https://huggingface.co/cstr/canary-ctc-aligner-GGUF/resolve/main/canary-ctc-aligner-q4_k.gguf",
      "~442 MB", nullptr, nullptr},
+    // Qwen3-ForcedAligner-0.6B — same architecture as qwen3-asr-0.6B but
+    // with a 5000-class timestamp head instead of a vocabulary head.
+    // Identified at load time by the lm_head output dimension; crispasr_aligner
+    // dispatches to the qwen3 path when the filename contains
+    // "forced-aligner", "qwen3-fa", or "qwen3-forced". Q4_K (~500 MB)
+    // is the recommended quant; Q5_0 / Q8_0 / F16 also available on the repo.
+    {"qwen3-forced-aligner", "qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF/resolve/main/qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "~500 MB", nullptr, nullptr},
+    {"qwen3-fa", "qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF/resolve/main/qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "~500 MB", nullptr, nullptr},
     // M2M-100 (facebook/m2m100_418M, MIT) — multilingual text-to-text
     // translation. 100 source/target languages via SentencePiece + lang
     // codes prefix. Encoder-decoder transformer with cross-attention
