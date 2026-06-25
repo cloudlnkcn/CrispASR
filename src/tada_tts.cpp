@@ -1483,21 +1483,23 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     float ac_std = hp.acoustic_std;
     float ac_mean = hp.acoustic_mean;
 
-    // Skip prompt + prefix + transition frames to match Python's:
-    //   num_prompt_tokens = prefix_len + (n_prompt - transition)   [after pad + trim]
-    //   skip = num_prompt_tokens + transition - 1
-    //        = prefix_len + n_prompt - 1
-    int skip_frames = 0;
-    if (ctx->n_prompt > 0) {
-        int num_transition_steps = 5;
-        skip_frames = prefix_len + ctx->n_prompt - 1;
-        if (skip_frames >= (int)acoustic_features.size()) {
-            skip_frames = std::max(0, (int)acoustic_features.size() - 1);
-        }
-        if (ctx->params.verbosity >= 1) {
-            fprintf(stderr, "tada: skipping %d prompt+transition frames, decoding %d\n", skip_frames,
-                    (int)acoustic_features.size() - skip_frames);
-        }
+    // Skip all prompt-phase acoustic frames (steps shift..num_prompt-1).
+    // The C++ loop collects acoustic features starting at step=shift — these include
+    // FM outputs computed during prompt prefilling (prefix zeros, audio prompt, synth
+    // text, EOT shift tokens).  Only the frames generated AFTER the full prompt is
+    // consumed (step >= num_prompt) are meaningful.  The Python model prefills the
+    // prompt in one shot and never computes acoustic features during that phase, so
+    // Python's generated-features array == C++'s generated-features array.
+    //
+    // Correct skip: num_prompt - shift  (= number of steps in prompt phase after shift)
+    int skip_frames = num_prompt - (int)shift;
+    if (skip_frames < 0)
+        skip_frames = 0;
+    if (skip_frames >= (int)acoustic_features.size())
+        skip_frames = std::max(0, (int)acoustic_features.size() - 1);
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "tada: skipping %d prompt-phase frames, decoding %d (num_prompt=%d shift=%d n_prompt=%d)\n",
+                skip_frames, (int)acoustic_features.size() - skip_frames, num_prompt, (int)shift, ctx->n_prompt);
     }
 
     // Expand with time_before durations (same as model._decode_wav)
@@ -1563,6 +1565,24 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
             }
         }
         fprintf(stderr, "tada: %zu features → %d expanded frames\n", acoustic_features.size(), n_expanded);
+    }
+
+    // Optional feature dump for diff harness (TADA_DUMP_FEATURES=/path/to/file).
+    // Python side: tools/reference_backends/tada_codec_diff.py --features <path>
+    {
+        const char* dump_path = getenv("TADA_DUMP_FEATURES");
+        if (dump_path && n_expanded > 0) {
+            FILE* df = fopen(dump_path, "wb");
+            if (df) {
+                uint32_t hdr[2] = {(uint32_t)n_expanded, (uint32_t)ad};
+                fwrite(hdr, sizeof(hdr), 1, df);
+                fwrite(expanded.data(), sizeof(float), (size_t)n_expanded * ad, df);
+                fclose(df);
+                fprintf(stderr, "tada: dumped %d×%d expanded features → %s\n", n_expanded, ad, dump_path);
+            } else {
+                fprintf(stderr, "tada: WARN: could not open TADA_DUMP_FEATURES=%s\n", dump_path);
+            }
+        }
     }
 
     // ── Codec decode ──
