@@ -1812,7 +1812,6 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     const int prompt_used_len = std::max(0, prompt_padded_len - transition_steps);
     const int prefill_len = prompt_used_len > 0 ? std::min(num_prompt, transition_steps + prompt_used_len - 1) : 0;
 
-    // ── AR + FM generation loop ──
     std::vector<std::vector<float>> acoustic_features;
     std::vector<int> time_before_list;
 
@@ -1852,8 +1851,118 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     // Extend model_ids as we generate
     std::vector<int32_t> all_ids = model_ids;
 
+    // ── Batched prefill ──
+    // During prefill (steps 0..prefill_len-1) the FM is never needed and
+    // pos/neg token embeddings are identical (all tokens are structural or
+    // pad-masked content), so we can:
+    //   1. Pre-build all prefill embeddings without running Llama,
+    //   2. Run a single batched Llama forward (T = prefill_len),
+    //   3. memcpy pos KV → neg KV instead of a second Llama pass.
+    // This replaces 2×prefill_len separate T=1 graph calls with 1 T=N call.
+    // Disable with CRISPASR_TADA_BATCH_PREFILL=0.
+    static const bool s_batch_prefill_env = []() {
+        const char* e = std::getenv("CRISPASR_TADA_BATCH_PREFILL");
+        return !(e && *e == '0');
+    }();
+    const bool do_batch_prefill = (prefill_len > 1) && s_batch_prefill_env;
+
+    if (do_batch_prefill) {
+        tada_bench_stage _bs_pf("prefill_batch");
+        const int d = (int)hp.d_model;
+
+        // Pre-build all prefill embeddings and collect acoustic features.
+        // State advances through prompt data exactly as the main loop would,
+        // but no FM is called (need_fm=false for all steps 0..prefill_len-1).
+        std::vector<float> prefill_embs((size_t)d * prefill_len, 0.0f);
+        {
+            std::vector<float> pf_acoustic(ad, 0.0f);
+            int32_t pf_mask = 0, pf_t_before = 0, pf_t_after = 0;
+
+            for (int s = 0; s < prefill_len; s++) {
+                float* emb =
+                    build_step_embedding(ctx, all_ids[s], pf_acoustic.data(), pf_mask, pf_t_before, pf_t_after);
+                if (!emb) {
+                    fprintf(stderr, "tada: batched prefill embed failed at step %d\n", s);
+                    return nullptr;
+                }
+                memcpy(prefill_embs.data() + (size_t)s * d, emb, (size_t)d * sizeof(float));
+                free(emb);
+
+                // Mirror the state update from the main loop (identical logic,
+                // but without pred_t_before from FM — unused in prefill range).
+                if (s < shift) {
+                    std::fill(pf_acoustic.begin(), pf_acoustic.end(), 0.0f);
+                    pf_mask = 0;
+                    pf_t_before = 0;
+                    pf_t_after = 0;
+                } else {
+                    int fi = s - shift;
+                    bool fi_in_prefix = (fi < prefix_len && fi < prompt_used_len);
+                    if (fi_in_prefix) {
+                        std::vector<float> feat(ad, 0.0f);
+                        acoustic_features.push_back(feat);
+                        time_before_list.push_back(0);
+                        pf_acoustic = feat;
+                        pf_mask = 0;
+                        pf_t_before = 0;
+                        pf_t_after = 0;
+                    } else {
+                        int pfidx = fi - prefix_len;
+                        bool fi_in_prompt =
+                            (fi < prompt_used_len && ctx->n_prompt > 0 && pfidx >= 0 && pfidx < ctx->n_prompt);
+                        if (fi_in_prompt) {
+                            std::vector<float> feat(ctx->prompt_values.begin() + (size_t)pfidx * ad,
+                                                    ctx->prompt_values.begin() + (size_t)(pfidx + 1) * ad);
+                            acoustic_features.push_back(feat);
+                            bool use_prompted_time =
+                                (fi < prompt_used_len - 1) && (pfidx + 1 < (int)ctx->prompt_time_before.size());
+                            int tb = use_prompted_time ? ctx->prompt_time_before[pfidx + 1] : 0;
+                            int ta = use_prompted_time ? (pfidx + 1 < (int)ctx->prompt_time_after.size()
+                                                              ? ctx->prompt_time_after[pfidx + 1]
+                                                              : 0)
+                                                       : 0;
+                            time_before_list.push_back(tb);
+                            pf_acoustic = feat;
+                            pf_mask = 1;
+                            pf_t_before = tb;
+                            pf_t_after = ta;
+                        }
+                    }
+                }
+            }
+
+            // Hand the final state to the main loop (used by step prefill_len).
+            cur_acoustic = pf_acoustic;
+            cur_mask = pf_mask;
+            cur_t_before = pf_t_before;
+            cur_t_after = pf_t_after;
+        }
+
+        // Single batched Llama forward for all prefill tokens.
+        {
+            talker_result pf_tr = run_talker_kv(ctx, prefill_embs.data(), prefill_len, 0, false);
+            free(pf_tr.hidden);
+            free(pf_tr.logits);
+        }
+        n_past = prefill_len;
+
+        // Copy pos KV → neg KV: embeddings are identical during prefill
+        // (all tokens are structural or pad), so the KV caches match.
+        if (ctx->kv_neg_k) {
+            ggml_backend_tensor_copy(ctx->kv_k, ctx->kv_neg_k);
+            ggml_backend_tensor_copy(ctx->kv_v, ctx->kv_neg_v);
+        }
+
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "tada: batched prefill %d tokens, neg KV copied\n", prefill_len);
+    }
+
+    // ── AR + FM generation loop ──
+    // Starts at prefill_len when batched prefill ran, otherwise at 0.
+    const int loop_start = do_batch_prefill ? prefill_len : 0;
+
     (void)max_tokens;
-    for (int step = 0; step < num_prompt; step++) {
+    for (int step = loop_start; step < num_prompt; step++) {
         if (step >= (int)all_ids.size())
             break;
 
