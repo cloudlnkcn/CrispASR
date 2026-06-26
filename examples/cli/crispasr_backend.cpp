@@ -132,7 +132,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "kartoffelbox_turbo" || name == "lahgtna" || name == "lahgtna-chatterbox" ||
         name == "lahgtna-chatterbox-v1")
         return crispasr_make_chatterbox_backend();
-    if (name == "tada" || name == "tada-tts" || name == "tada-3b" || name == "tada-3b-ml")
+    if (name == "tada" || name == "tada-tts" || name == "tada-1b" || name == "tada-tts-1b" || name == "tada-3b" ||
+        name == "tada-3b-ml")
         return crispasr_make_tada_backend();
     if (name == "indextts" || name == "indextts-1.5" || name == "indextts1.5" || name == "index-tts")
         return crispasr_make_indextts_backend();
@@ -241,6 +242,10 @@ std::vector<std::string> crispasr_list_backends() {
         "chatterbox-turbo",
         "kartoffelbox-turbo",
         "lahgtna-chatterbox",
+        "tada",
+        "tada-1b",
+        "tada-tts-1b",
+        "tada-3b-ml",
         "indextts",
         "f5-tts",
         "pocket-tts",
@@ -637,7 +642,7 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "f5-tts";
             else if (a == "chatterbox" || a == "chatterbox_turbo" || a == "kartoffelbox")
                 result = "chatterbox";
-            else if (a == "tada" || a == "tada-tts" || a == "tada-3b-ml")
+            else if (a == "tada" || a == "tada-tts" || a == "tada-1b" || a == "tada-tts-1b" || a == "tada-3b-ml")
                 result = "tada";
             else if (a == "m2m100" || a == "m2m_100")
                 result = "m2m100";

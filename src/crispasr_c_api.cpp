@@ -1268,6 +1268,9 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "m2m100";
     else if (strcmp(arch, "parler-tts") == 0 || strcmp(arch, "parler_tts") == 0 || strcmp(arch, "parlertts") == 0)
         backend = "parler-tts";
+    else if (strcmp(arch, "tada") == 0 || strcmp(arch, "tada-tts") == 0 || strcmp(arch, "tada-1b") == 0 ||
+             strcmp(arch, "tada-tts-1b") == 0 || strcmp(arch, "tada-3b-ml") == 0)
+        backend = "tada";
     else if (strcmp(arch, "t5") == 0)
         backend = "madlad";
     else if (strcmp(arch, "moss_audio") == 0 || strcmp(arch, "moss-audio") == 0)
@@ -2234,7 +2237,8 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     }
 #endif
 #ifdef CA_HAVE_TADA
-    if (s->backend == "tada" || s->backend == "tada-tts" || s->backend == "tada-3b" || s->backend == "tada-3b-ml") {
+    if (s->backend == "tada" || s->backend == "tada-tts" || s->backend == "tada-1b" || s->backend == "tada-tts-1b" ||
+        s->backend == "tada-3b" || s->backend == "tada-3b-ml") {
         s->backend = "tada";
         tada_context_params p = tada_context_default_params();
         p.n_threads = s->n_threads;
@@ -2902,7 +2906,7 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     list += ",chatterbox";
 #endif
 #ifdef CA_HAVE_TADA
-    list += ",tada";
+    list += ",tada,tada-1b,tada-tts-1b,tada-3b-ml";
 #endif
 #ifdef CA_HAVE_OUTETTS
     list += ",outetts";

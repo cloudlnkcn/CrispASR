@@ -447,6 +447,27 @@ constexpr Entry k_registry[] = {
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
      "~80 MB"},
+    // TADA TTS 1B: Llama-3.2-1B + flow matching + TADA codec.
+    // Q4_K is the canonical CLI auto-download target; F16 is also listed so
+    // explicit filename resolution can find the matching HF URL.
+    {"tada-1b", "tada-tts-1b-q4_k.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-q4_k.gguf",
+     "~1.7 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~1 GB"},
+    {"tada-tts-1b", "tada-tts-1b-q4_k.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-q4_k.gguf",
+     "~1.7 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~1 GB"},
+    {"tada-1b", "tada-tts-1b-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-f16.gguf",
+     "~3.1 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~1 GB"},
     // TADA-3B-ML (HumeAI/tada-3b-ml): Llama-3.2-3B + flow matching + TADA codec.
     {"tada", "tada-tts-3b-ml-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-tts-3b-ml-f16.gguf",
