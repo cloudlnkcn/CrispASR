@@ -71,11 +71,15 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     print(f"  loading Encoder from {codec_dir or 'HumeAI/tada-codec'}")
     from tada.modules.encoder import Encoder
 
-    # Patch for transformers >= 5.x: all_tied_weights_keys was renamed
+    # Patch for transformers >= 5.x: all_tied_weights_keys was renamed/removed
     import transformers
     if not hasattr(transformers.PreTrainedModel, 'all_tied_weights_keys'):
-        transformers.PreTrainedModel.all_tied_weights_keys = property(
-            lambda self: getattr(self, '_tied_weights_keys', None) or {})
+        def _get_tied(self):
+            return getattr(self, '_all_tied_weights_keys_store', None) or \
+                   getattr(self, '_tied_weights_keys', None) or {}
+        def _set_tied(self, val):
+            self._all_tied_weights_keys_store = val
+        transformers.PreTrainedModel.all_tied_weights_keys = property(_get_tied, _set_tied)
 
     # Patch tokenizer for gated Llama — redirect to unsloth mirror
     from transformers import AutoTokenizer
@@ -94,7 +98,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         codec_dir or "HumeAI/tada-codec",
         subfolder="encoder",
         language=language,
-    ).to(device)
+    ).float().to(device)
     encoder.eval()
 
     # ── Process audio ──
