@@ -50,36 +50,29 @@ if str(REPO / "tools" / "kaggle") not in sys.path:
 import kaggle_harness as kh
 kh.init_progress()
 
-# ── HF auth — MUST be first after harness init ──────────────────────────
-# Resolves: env HF_TOKEN → Kaggle Secret → mounted dataset file
-# Also sets HF_HUB_ENABLE_HF_TRANSFER=1 and exports to subprocess env.
-token = kh.resolve_hf_token()
+# ── HF auth — first thing after harness init ────────────────────────
+token = kh.resolve_hf_token()   # env → Secret (retry) → dataset file
 
 # %% [code]  remove tensorflow to prevent protobuf clash
 kh.step("pip-remove-tf")
-subprocess.check_call(
-    [sys.executable, "-m", "pip", "uninstall", "-y", "tensorflow", "tf-keras"],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-)
+kh.sh(f"{sys.executable} -m pip uninstall -y tensorflow tf-keras",
+      check=False)
 
 # %% [code]  install deps
-# NOTE: do NOT install torch/torchaudio — Kaggle pre-installs them (gotcha #11)
+# NOTE: do NOT reinstall torch/torchaudio — Kaggle pre-installs them
 kh.step("pip-install")
-subprocess.check_call([
-    sys.executable, "-m", "pip", "install", "--quiet",
-    "gguf", "datasets", "soundfile", "scipy",
-    "hume-tada",   # PyPI package; not git URL
-])
+kh.sh(f"{sys.executable} -m pip install --quiet "
+      "gguf datasets soundfile scipy hume-tada hf_transfer")
 
-# %% [code]  generate (subprocess inherits HF_TOKEN env set by resolve_hf_token)
+# %% [code]  generate
+# subprocess env already has HF_TOKEN from kh.resolve_hf_token()
 kh.step("gen.begin")
-result = subprocess.run(
-    [sys.executable, str(REPO / "tools" / "gen_tada_lang_refs.py"),
-     "--output-dir", str(OUT),
-     "--skip-existing"],
+rc = kh.sh(
+    f"{sys.executable} {REPO}/tools/gen_tada_lang_refs.py "
+    f"--output-dir {OUT} --skip-existing",
     check=False,
 )
-kh.step("gen.done", returncode=result.returncode)
+kh.step("gen.done", returncode=rc)
 
 # %% [code]  report
 files = sorted(OUT.glob("*.gguf"))
