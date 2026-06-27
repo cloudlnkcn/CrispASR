@@ -237,6 +237,17 @@ struct tada_context {
     ggml_context* fm_b2_ctx_f16 = nullptr;
     ggml_backend_buffer_t fm_b2_buf_f16 = nullptr;
     tada_fm_head fm_b2_f16{};
+
+    // General batched FM graph cache (arbitrary batch B), used by candidate
+    // ranking (num_acoustic_candidates>1): all candidates × CFG are solved in a
+    // single forward of batch B per ODE step instead of looping B=2 forwards.
+    // Cached graph+sched are reused across ODE steps and AR steps; rebuilt only
+    // when B changes. Mirrors Python _solve_flow_matching_ranked's batched solve.
+    ggml_context* fm_batch_ctx = nullptr;
+    std::vector<uint8_t> fm_batch_meta;
+    ggml_cgraph* fm_batch_gf = nullptr;
+    ggml_backend_sched_t fm_batch_sched = nullptr;
+    int fm_batch_B = 0;
 };
 
 // ──────────────────────── metadata loading ─────────────────────────────
@@ -760,6 +771,136 @@ static ggml_cgraph* build_graph_fm_step_b2(tada_context* c, ggml_context* arena_
     if (!arena_ctx)
         ggml_free(ctx0);
     return gf;
+}
+
+static void sinusoidal_embedding(float t, int dim, float* out); // defined below
+
+// General batched FM-head graph: identical math to build_graph_fm_step_b2 but
+// with an arbitrary batch dimension B and a per-column noisy state (the b2
+// graph shares a single noisy_z across its 2 CFG columns; here every column has
+// its own state, so candidate solving and reconstruction scoring can batch
+// many independent (noise, cond) pairs into one forward). The timestep is
+// shared across the batch (all columns evaluated at the same t).
+static ggml_cgraph* build_graph_fm_step_batch(tada_context* c, int B, ggml_context* arena_ctx) {
+    const auto& hp = c->hp;
+    const tada_fm_head& fm = c->fm_b2_f16.layers.empty() ? c->fm : c->fm_b2_f16;
+    const int hid = (int)hp.fm_hidden;
+    const int lat = (int)hp.fm_latent;
+    const float eps = hp.rms_norm_eps;
+
+    ggml_context* ctx0 = arena_ctx;
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    // Per-column inputs: noisy_z (lat, B), cond (hid, B); shared t (256).
+    ggml_tensor* noisy_b = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, lat, B);
+    ggml_set_name(noisy_b, "noisy_b");
+    ggml_set_input(noisy_b);
+
+    ggml_tensor* t_emb_sin = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 256);
+    ggml_set_name(t_emb_sin, "t_emb_sin");
+    ggml_set_input(t_emb_sin);
+
+    ggml_tensor* cond_b = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hid, B);
+    ggml_set_name(cond_b, "cond_b");
+    ggml_set_input(cond_b);
+
+    // x = noisy_proj(noisy_b) → (hid, B). No repeat: each column is independent.
+    ggml_tensor* x_b = ggml_mul_mat(ctx0, fm.noisy_proj_w, noisy_b);
+
+    // Shared timestep MLP → (hid,), broadcast across the B columns.
+    ggml_tensor* t_shared = ggml_mul_mat(ctx0, fm.t_emb_mlp0_w, t_emb_sin);
+    t_shared = ggml_silu(ctx0, t_shared);
+    t_shared = ggml_mul_mat(ctx0, fm.t_emb_mlp1_w, t_shared);
+    ggml_tensor* t_b = ggml_repeat(ctx0, t_shared, cond_b);
+
+    ggml_tensor* c_emb = ggml_add(ctx0, ggml_mul_mat(ctx0, fm.cond_proj_w, cond_b), t_b);
+
+    for (uint32_t i = 0; i < hp.head_layers; i++) {
+        const auto& l = fm.layers[i];
+
+        ggml_tensor* mod = ggml_silu(ctx0, c_emb);
+        mod = ggml_mul_mat(ctx0, l.adaln_w, mod); // (3*hid, B)
+
+        size_t col_stride = (size_t)3 * hid * sizeof(float);
+        ggml_tensor* shift = ggml_cont(ctx0, ggml_view_2d(ctx0, mod, hid, B, col_stride, 0));
+        ggml_tensor* scale = ggml_cont(ctx0, ggml_view_2d(ctx0, mod, hid, B, col_stride, (size_t)hid * sizeof(float)));
+        ggml_tensor* gate =
+            ggml_cont(ctx0, ggml_view_2d(ctx0, mod, hid, B, col_stride, (size_t)2 * hid * sizeof(float)));
+
+        ggml_tensor* h = ggml_rms_norm(ctx0, x_b, eps);
+        h = ggml_mul(ctx0, h, ggml_repeat(ctx0, l.norm_w, x_b));
+        h = ggml_add(ctx0, ggml_add(ctx0, h, ggml_mul(ctx0, h, scale)), shift);
+
+        ggml_tensor* ffn_out = core_ffn::swiglu(ctx0, h, l.ffn_gate_w, l.ffn_up_w, l.ffn_down_w);
+        x_b = ggml_add(ctx0, x_b, ggml_mul(ctx0, gate, ffn_out));
+    }
+
+    {
+        ggml_tensor* mod = ggml_silu(ctx0, c_emb);
+        mod = ggml_mul_mat(ctx0, fm.final_adaln_w, mod); // (2*hid, B)
+        size_t col_stride = (size_t)2 * hid * sizeof(float);
+        ggml_tensor* shift = ggml_cont(ctx0, ggml_view_2d(ctx0, mod, hid, B, col_stride, 0));
+        ggml_tensor* scale = ggml_cont(ctx0, ggml_view_2d(ctx0, mod, hid, B, col_stride, (size_t)hid * sizeof(float)));
+
+        ggml_tensor* h = ggml_rms_norm(ctx0, x_b, eps);
+        if (fm.final_norm_w)
+            h = ggml_mul(ctx0, h, ggml_repeat(ctx0, fm.final_norm_w, x_b));
+        h = ggml_add(ctx0, ggml_add(ctx0, h, ggml_mul(ctx0, h, scale)), shift);
+        h = ggml_mul_mat(ctx0, fm.final_proj_w, h); // (lat, B)
+        ggml_set_name(h, "velocity_b");
+        ggml_build_forward_expand(gf, h);
+    }
+
+    return gf;
+}
+
+// Run one batched FM step: B independent (noisy, cond) columns at a shared
+// timestep, one forward. Reuses a cached graph+sched keyed by B (rebuilt only
+// when B changes), so the per-ODE-step host build cost is paid once per run.
+static bool run_fm_step_batch(tada_context* c, const float* noisy_b, float timestep, const float* cond_b,
+                              float* vel_b_out, int B) {
+    const int lat = (int)c->hp.fm_latent;
+    const int hid = (int)c->hp.fm_hidden;
+
+    float t_emb[256];
+    sinusoidal_embedding(timestep, 256, t_emb);
+
+    if (c->fm_batch_B != B) {
+        // (Re)build the graph + sched for this batch size.
+        if (c->fm_batch_ctx) {
+            ggml_free(c->fm_batch_ctx);
+            c->fm_batch_ctx = nullptr;
+        }
+        if (c->fm_batch_sched) {
+            ggml_backend_sched_free(c->fm_batch_sched);
+            c->fm_batch_sched = nullptr;
+        }
+        c->fm_batch_meta.assign(c->compute_meta.size() * 2, 0);
+        ggml_init_params ip = {c->fm_batch_meta.size(), c->fm_batch_meta.data(), true};
+        c->fm_batch_ctx = ggml_init(ip);
+        if (!c->fm_batch_ctx)
+            return false;
+        c->fm_batch_gf = build_graph_fm_step_batch(c, B, c->fm_batch_ctx);
+        ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
+        int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
+        c->fm_batch_sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+        c->fm_batch_B = B;
+    }
+    ggml_cgraph* gf = c->fm_batch_gf;
+    ggml_backend_sched_t sched = c->fm_batch_sched;
+    ggml_backend_sched_reset(sched);
+    if (!ggml_backend_sched_alloc_graph(sched, gf))
+        return false;
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_b"), noisy_b, 0, (size_t)lat * B * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_b"), cond_b, 0, (size_t)hid * B * sizeof(float));
+
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS)
+        return false;
+
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "velocity_b"), vel_b_out, 0, (size_t)lat * B * sizeof(float));
+    return true;
 }
 
 // ──────────────────────── runtime helpers ─────────────────────────────
@@ -1449,6 +1590,111 @@ static float fm_score_reconstruction(tada_context* c, const float* sample, const
         total_err += err / ad;
     }
     return (float)(-total_err / 3.0);
+}
+
+// Batched candidate ranking — same result as N sequential (fm_euler_solve +
+// fm_score_reconstruction) calls, but all N candidates × CFG are solved in one
+// batch-2N forward per ODE step and scored in 3 batch-N forwards. This is the
+// fast path for num_acoustic_candidates>1: it turns ~13N small FM forwards per
+// AR step into 10+3 batched forwards (mirrors Python's batched ranked solve).
+// `all_noise` holds N pre-drawn, pre-scaled noise vectors (N*lat). On success
+// the best candidate (by reconstruction score) is written to `best_out` (lat).
+static bool fm_solve_rank_candidates(tada_context* c, const float* all_noise, int N, const float* cond_pos,
+                                     const float* cond_neg, int num_steps, float cfg_scale, float* best_out) {
+    const int lat = (int)c->hp.fm_latent;
+    const int ad = (int)c->hp.acoustic_dim;
+    const int hid = (int)c->hp.fm_hidden;
+    if (N < 1)
+        return false;
+
+    std::vector<float> zero_cond(hid, 0.0f);
+    const float* neg = cond_neg ? cond_neg : zero_cond.data();
+
+    std::vector<float> t_span;
+    build_logsnr_schedule(t_span, num_steps);
+
+    // States for all candidates (start from the noise), contiguous N*lat.
+    std::vector<float> states((size_t)N * lat);
+    std::copy(all_noise, all_noise + (size_t)N * lat, states.begin());
+
+    // Solve: batch = 2N. Columns [0,N)=pos path, [N,2N)=neg path; both use the
+    // same per-candidate state, paired with cond_pos / cond_neg respectively.
+    const int Bsolve = 2 * N;
+    std::vector<float> noisy_b((size_t)lat * Bsolve);
+    std::vector<float> cond_b((size_t)hid * Bsolve);
+    std::vector<float> vel_b((size_t)lat * Bsolve);
+    // cond columns are constant across ODE steps — fill once.
+    for (int cnd = 0; cnd < N; cnd++) {
+        std::copy(cond_pos, cond_pos + hid, cond_b.begin() + (size_t)cnd * hid);
+        std::copy(neg, neg + hid, cond_b.begin() + (size_t)(N + cnd) * hid);
+    }
+
+    for (int i = 0; i < num_steps; i++) {
+        const float dt = t_span[i + 1] - t_span[i];
+        const float t_val = t_span[i];
+        const float a_cfg = scheduled_cfg(cfg_scale, t_val, "cosine");
+
+        for (int cnd = 0; cnd < N; cnd++) {
+            const float* s = states.data() + (size_t)cnd * lat;
+            std::copy(s, s + lat, noisy_b.begin() + (size_t)cnd * lat);       // pos col
+            std::copy(s, s + lat, noisy_b.begin() + (size_t)(N + cnd) * lat); // neg col
+        }
+        if (!run_fm_step_batch(c, noisy_b.data(), t_val, cond_b.data(), vel_b.data(), Bsolve))
+            return false;
+
+        for (int cnd = 0; cnd < N; cnd++) {
+            float* s = states.data() + (size_t)cnd * lat;
+            const float* vp = vel_b.data() + (size_t)cnd * lat;
+            const float* vn = vel_b.data() + (size_t)(N + cnd) * lat;
+            for (int j = 0; j < ad; j++) // acoustic dims: acoustic CFG
+                s[j] += dt * (vn[j] + a_cfg * (vp[j] - vn[j]));
+            for (int j = ad; j < lat; j++) // time dims: duration CFG = 1.0
+                s[j] += dt * vp[j];
+        }
+    }
+
+    // Score: for each of 3 eval timesteps, one batch-N forward (cond=cond_pos).
+    static const float t_pts[3] = {0.3f, 0.6f, 0.9f};
+    std::vector<double> err(N, 0.0);
+    std::vector<float> sc_noisy((size_t)lat * N);
+    std::vector<float> sc_cond((size_t)hid * N);
+    std::vector<float> sc_vel((size_t)lat * N);
+    for (int cnd = 0; cnd < N; cnd++)
+        std::copy(cond_pos, cond_pos + hid, sc_cond.begin() + (size_t)cnd * hid);
+    for (int p = 0; p < 3; p++) {
+        const float t = t_pts[p];
+        for (int cnd = 0; cnd < N; cnd++) {
+            const float* nz = all_noise + (size_t)cnd * lat;
+            const float* sm = states.data() + (size_t)cnd * lat;
+            float* xt = sc_noisy.data() + (size_t)cnd * lat;
+            for (int j = 0; j < lat; j++)
+                xt[j] = (1.0f - t) * nz[j] + t * sm[j];
+        }
+        if (!run_fm_step_batch(c, sc_noisy.data(), t, sc_cond.data(), sc_vel.data(), N))
+            return false;
+        for (int cnd = 0; cnd < N; cnd++) {
+            const float* nz = all_noise + (size_t)cnd * lat;
+            const float* sm = states.data() + (size_t)cnd * lat;
+            const float* pv = sc_vel.data() + (size_t)cnd * lat;
+            double e = 0.0;
+            for (int j = 0; j < ad; j++) {
+                const float d = pv[j] - (sm[j] - nz[j]);
+                e += (double)d * d;
+            }
+            err[cnd] += e / ad;
+        }
+    }
+
+    int best = 0;
+    double best_err = err[0];
+    for (int cnd = 1; cnd < N; cnd++) {
+        if (err[cnd] < best_err) {
+            best_err = err[cnd];
+            best = cnd;
+        }
+    }
+    std::copy(states.data() + (size_t)best * lat, states.data() + (size_t)(best + 1) * lat, best_out);
+    return true;
 }
 
 // Simple argmax
@@ -2278,26 +2524,33 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
             tada_scale_noise_like_python(speech.data(), lat, noise_temp);
         } else if (need_fm) {
             // num_acoustic_candidates>1: draw N noises in one block (matches
-            // torch.randn(N*lat)), solve each FM candidate with CFG, and keep the
-            // one with the best reconstruction score (Python _solve_flow_matching_ranked,
-            // scorer="likelihood"). This makes timing/acoustics robust to the noise
-            // lottery — a single bad noise sample can otherwise collapse durations.
+            // torch.randn(N*lat)), solve all N candidates × CFG in batched FM
+            // forwards, and keep the best by reconstruction score (Python
+            // _solve_flow_matching_ranked, scorer="likelihood"). This makes
+            // timing/acoustics robust to the noise lottery — a single bad noise
+            // sample can otherwise collapse durations.
             std::vector<float> all_noise((size_t)n_cand * lat);
             mt19937_randn(&ctx->mt_rng, all_noise.data(), n_cand * lat);
             tada_scale_noise_like_python(all_noise.data(), n_cand * lat, noise_temp);
-            float best_score = -3.4e38f;
-            std::vector<float> cand(lat);
-            for (int ci = 0; ci < n_cand; ci++) {
-                const float* noise_c = all_noise.data() + (size_t)ci * lat;
-                std::copy(noise_c, noise_c + lat, cand.begin());
-                fm_euler_solve(ctx, cand.data(), tr.hidden, num_fm_steps, cfg_scale, neg_hidden, false);
-                const float sc = fm_score_reconstruction(ctx, cand.data(), noise_c, tr.hidden);
-                if (sc > best_score) {
-                    best_score = sc;
-                    speech = cand;
+            if (fm_solve_rank_candidates(ctx, all_noise.data(), n_cand, tr.hidden, neg_hidden, num_fm_steps, cfg_scale,
+                                         speech.data())) {
+                cand_already_solved = true;
+            } else {
+                // Fallback: sequential solve+score if the batched path fails.
+                float best_score = -3.4e38f;
+                std::vector<float> cand(lat);
+                for (int ci = 0; ci < n_cand; ci++) {
+                    const float* noise_c = all_noise.data() + (size_t)ci * lat;
+                    std::copy(noise_c, noise_c + lat, cand.begin());
+                    fm_euler_solve(ctx, cand.data(), tr.hidden, num_fm_steps, cfg_scale, neg_hidden, false);
+                    const float sc = fm_score_reconstruction(ctx, cand.data(), noise_c, tr.hidden);
+                    if (sc > best_score) {
+                        best_score = sc;
+                        speech = cand;
+                    }
                 }
+                cand_already_solved = true;
             }
-            cand_already_solved = true;
         }
 
         tada_fm_dump_record fm_rec;
@@ -2684,6 +2937,10 @@ void tada_free(struct tada_context* ctx) {
         ggml_backend_buffer_free(ctx->fm_b2_buf_f16);
     if (ctx->fm_b2_ctx_f16)
         ggml_free(ctx->fm_b2_ctx_f16);
+    if (ctx->fm_batch_sched)
+        ggml_backend_sched_free(ctx->fm_batch_sched);
+    if (ctx->fm_batch_ctx)
+        ggml_free(ctx->fm_batch_ctx);
     if (ctx->fm_step_sched)
         ggml_backend_sched_free(ctx->fm_step_sched);
     if (ctx->fm_step_ctx)
