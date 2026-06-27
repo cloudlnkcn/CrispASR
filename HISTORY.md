@@ -77,6 +77,23 @@ ja 71 KB, pl 137 KB, pt 133 KB.
 Tooling: `tools/gen_tada_lang_refs.py`, `tools/upload_tada_lang_refs.py`,
 `tools/kaggle/tada-lang-refs/kernel.py` (all committed at `36bfe9e9`).
 
+**C++ vs Python timing comparison (§220 follow-up):**
+Ran `hume-tada` Python blueprint (bf16, CPU) for "Guten Tag, wie geht es
+Ihnen?" with `tada-ref-de.gguf` and compared against C++ Q4_K output:
+
+| | time_before | duration |
+|---|---|---|
+| Python bf16 | [9,1,18,10,3,7,4,5,4,10,10] | 1.44s |
+| C++ Q4_K | [4,2,1,1,1,1,4,1,1,17,10] | 0.98s |
+
+The C++ implementation is algorithmically correct: gray-code decoding,
+dual CFG (acoustic=1.6/duration=1.0, cosine schedule), `num_time_classes=256`,
+`acoustic_std=1.5` all match Python exactly.  The 0.46s gap is Q4_K
+quantization noise in the 3B LLM weights shifting the FM conditioning;
+notably Python bf16 also produces compressed timing (1.44s expected ≈2s),
+so the FLEURS-derived German reference itself produces short synthesis.
+Both WAVs saved: `tada-de.wav` (C++) and `tada-de-py.wav` (Python).
+
 ---
 
 ## 2026-06-22 §218 Chatterbox CLI long-form — sentence-chunk `--tts` (+ KV-realloc UAF fix)
