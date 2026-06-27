@@ -10956,3 +10956,34 @@ The remaining default-quality bottleneck is the 10-step DiT-CFM flow. Reducing
 `COSYVOICE3_FLOW_STEPS` trades quality for nearly linear speed. Do not silently
 change its default, and do not treat cold reads from an external SSD as
 inference time; use a resident server when measuring repeated synthesis.
+
+### CosyVoice3: batch CFG exactly as upstream, and lazy-load cloning encoders
+
+Upstream CFM stacks the conditional and unconditional branches into batch
+size 2 and evaluates the 22-layer DiT once per Euler step. The first C++ port
+ran two B=1 forwards, doubling graph launches and weight reads. A batch-aware
+DiT path must preserve the batch dimension through Q/K/V as
+`[head_dim, heads, time, batch]`; flattening batch into time would allow
+cross-branch attention unless a block-diagonal mask is added.
+
+The position-convolution input pipeline is still built once per branch, then
+the two `[dim,time,1]` results are concatenated on the batch dimension. The DiT
+stack, final AdaLN, and output projection run at B=2. On an M1 this reduced the
+10-step flow from roughly 4.6 s to 1.9–2.3 s. Both a short 10-step synthesis
+and longer bucket-crossing tests produced byte-identical WAVs versus separate
+CFG forwards. Keep `COSYVOICE3_CFG_BATCH=0` as a backend compatibility bisect.
+
+KV allocation and active attention length are separate concerns. Allocate
+storage for the full generation cap so K/V never has to be copied while
+growing, but build the cached T=1 graph against 256-token active buckets.
+Crossing a bucket rebuilds the topology against the same persistent storage.
+This cut the same short LM decode to about 0.5 s; a 319-token test crossed a
+bucket and remained byte-identical. `COSYVOICE3_KV_BUCKET=0` restores the full
+allocation shape for debugging.
+
+Finally, baked voices never use speech_tokenizer_v3 or CAMPPlus. Eagerly
+loading them added about 475 MiB and substantial external-SSD startup time.
+The CLI backend now discovers their paths at initialization but loads both
+under a mutex only when a `.wav` cloning request arrives. This must be lazy,
+not permanently disabled: a resident server can receive baked-voice requests
+first and a WAV-cloning request later.

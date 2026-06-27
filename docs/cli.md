@@ -1123,6 +1123,11 @@ reuse, etc.) see [`tts.md`](tts.md):
   model default `10`). Lower values reduce flow latency approximately
   linearly at a possible quality cost; `5` is a practical fast mode.
 - `COSYVOICE3_BENCH=1` — print CosyVoice3 per-stage timings.
+- `COSYVOICE3_CFG_BATCH=0` — compatibility fallback to two separate flow
+  forwards per Euler step. The default batch-2 path matches upstream and is
+  faster while producing identical output on validated CPU and Metal runs.
+- `COSYVOICE3_KV_BUCKET=0` — compatibility fallback that exposes the full KV
+  allocation to every AR step instead of the default 256-token active buckets.
 - `VIBEVOICE_VAE_BACKEND={auto,cpu,gpu}` — VAE decoder placement
 - `VIBEVOICE_TTS_FLASH_ATTN={1,0}` — TTS LM attention: `1` (default)
   uses fused `ggml_flash_attn_ext`; `0` uses an explicit
@@ -1145,9 +1150,14 @@ CosyVoice3 performance notes:
 - An external model directory affects cold startup, not steady-state
   synthesis. For repeated requests, use server mode so the ~1.2 GB model set
   remains resident.
+- Baked voices do not load the S3 tokenizer or CAMPPlus encoder. Those
+  companions add roughly 475 MiB and are loaded lazily on the first `.wav`
+  cloning request, including a later request to a resident server.
 - On an Apple M1 test using the Q4_K LLM and Q8_0 flow, request-sized KV
-  caching reduced a 17-token LM decode from about 6.8 s to 1.4 s while
-  producing a byte-identical WAV. Hardware and prompt length change results.
+  caching plus active KV buckets reduced a 17-token LM decode from about
+  6.8 s to 0.5 s. Batched CFG reduced the 10-step flow from about 4.6 s to
+  1.9–2.3 s. The final WAV remained byte-identical. Hardware and prompt length
+  change results.
 
 ### Comparison with llama.cpp
 

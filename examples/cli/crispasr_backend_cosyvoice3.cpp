@@ -17,8 +17,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <sys/stat.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -125,16 +127,7 @@ public:
                                                            "cosyvoice3-campplus.gguf",
                                                        });
         }
-        if (campplus_path.empty()) {
-            fprintf(stderr, "crispasr[cosyvoice3-tts]: no CAMPPlus GGUF found. Place "
-                            "cosyvoice3-campplus-f16.gguf next to the LLM, or set "
-                            "COSYVOICE3_CAMPPLUS_PATH.\n");
-            return false;
-        }
-        if (cosyvoice3_tts_init_campplus_from_file(ctx_, campplus_path.c_str()) != 0) {
-            fprintf(stderr, "crispasr[cosyvoice3-tts]: failed to load CAMPPlus '%s'\n", campplus_path.c_str());
-            return false;
-        }
+        campplus_path_ = std::move(campplus_path);
 
         // ---- HiFT ----
         std::string hift_path;
@@ -159,19 +152,10 @@ public:
         }
 
         // ---- speech_tokenizer_v3 ----
-        std::string s3tok_path = discover_sibling(base_dir, {
-                                                                "cosyvoice3-s3tok-f16.gguf",
-                                                                "cosyvoice3-s3tok.gguf",
-                                                            });
-        if (!s3tok_path.empty()) {
-            if (cosyvoice3_tts_init_s3tok_from_file(ctx_, s3tok_path.c_str()) != 0) {
-                fprintf(stderr, "crispasr[cosyvoice3-tts]: failed to load s3tok '%s'\n", s3tok_path.c_str());
-                return false;
-            }
-        } else if (!p.no_prints) {
-            fprintf(stderr, "crispasr[cosyvoice3-tts]: no s3tok GGUF found. Runtime WAV cloning will fall back to the "
-                            "Python voice-bake bridge until cosyvoice3-s3tok-f16.gguf is present.\n");
-        }
+        s3tok_path_ = discover_sibling(base_dir, {
+                                                     "cosyvoice3-s3tok-f16.gguf",
+                                                     "cosyvoice3-s3tok.gguf",
+                                                 });
 
         // ---- Voices ----
         std::string voices_path;
@@ -218,6 +202,8 @@ public:
                 fprintf(stderr, "crispasr[cosyvoice3-tts]: --voice is a WAV but --ref-text was not set.\n");
                 return {};
             }
+            if (!ensure_cloning_models())
+                return {};
             pcm = cosyvoice3_tts_synth_from_wav(ctx_, text.c_str(), params.tts_voice.c_str(),
                                                 params.tts_ref_text.c_str(), &n);
         } else {
@@ -242,7 +228,33 @@ public:
     }
 
 private:
+    bool ensure_cloning_models() {
+        std::lock_guard<std::mutex> lock(cloning_models_mutex_);
+        if (cloning_models_loaded_)
+            return true;
+        if (campplus_path_.empty() || s3tok_path_.empty()) {
+            fprintf(stderr,
+                    "crispasr[cosyvoice3-tts]: WAV cloning requires cosyvoice3-campplus-f16.gguf and "
+                    "cosyvoice3-s3tok-f16.gguf beside the LLM (or COSYVOICE3_CAMPPLUS_PATH).\n");
+            return false;
+        }
+        if (cosyvoice3_tts_init_campplus_from_file(ctx_, campplus_path_.c_str()) != 0) {
+            fprintf(stderr, "crispasr[cosyvoice3-tts]: failed to load CAMPPlus '%s'\n", campplus_path_.c_str());
+            return false;
+        }
+        if (cosyvoice3_tts_init_s3tok_from_file(ctx_, s3tok_path_.c_str()) != 0) {
+            fprintf(stderr, "crispasr[cosyvoice3-tts]: failed to load s3tok '%s'\n", s3tok_path_.c_str());
+            return false;
+        }
+        cloning_models_loaded_ = true;
+        return true;
+    }
+
     struct cosyvoice3_tts_context* ctx_ = nullptr;
+    std::string campplus_path_;
+    std::string s3tok_path_;
+    bool cloning_models_loaded_ = false;
+    std::mutex cloning_models_mutex_;
 };
 
 } // namespace

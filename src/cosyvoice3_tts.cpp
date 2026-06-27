@@ -1295,7 +1295,14 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
     // encoding the first normalization op (issue #194). This mirrors the
     // VibeVoice bucket-cache fix: graph construction stays amortized while
     // the inexpensive scheduler split/allocation pass is refreshed.
-    const int fixed_kv = ctx->kv_max_ctx;
+    // Keep storage sized to the full generation budget, but expose only a
+    // 256-token bucket to the T=1 attention graph. The graph is rebuilt when
+    // generation crosses a bucket boundary; short requests avoid attending
+    // over the entire (normally 512-token) CLI budget on every step.
+    const char* kv_bucket_env = std::getenv("COSYVOICE3_KV_BUCKET");
+    const bool use_kv_bucket = !kv_bucket_env || strcmp(kv_bucket_env, "0") != 0;
+    const int kv_bucket = ((n_past + 1 + 255) / 256) * 256;
+    const int fixed_kv = use_kv_bucket ? std::min(ctx->kv_max_ctx, kv_bucket) : ctx->kv_max_ctx;
     const bool can_skip = (ctx->step_t1_gf != nullptr && ctx->step_t1_fixed_kv_len == fixed_kv);
 
     ggml_cgraph* gf;
@@ -2912,6 +2919,60 @@ ggml_tensor* cv3_dit_block_apply(ggml_context* ctx0, ggml_tensor* x, ggml_tensor
     return ggml_add(ctx0, x_after_attn, ggml_mul(ctx0, ff, gate_mlp));
 }
 
+// Batch-aware variant used by the CFM classifier-free-guidance path. x is
+// [d,T,B]; modulation is shared across the batch because both CFG branches
+// use the same Euler timestep.
+ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* t_silu,
+                                         ggml_tensor* positions, const cv3_dit_block& b, int d, int n_h, int hd,
+                                         float rope_theta) {
+    const float ln_eps = 1e-6f;
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int T = (int)x->ne[1];
+    const int B = (int)x->ne[2];
+
+    ggml_tensor* mod = ggml_add(ctx0, ggml_mul_mat(ctx0, b.adaln_w, t_silu), b.adaln_b);
+    const size_t fs = sizeof(float);
+    auto chunk = [&](int idx) { return ggml_view_1d(ctx0, mod, d, (size_t)(idx * d) * fs); };
+    ggml_tensor* shift_msa = chunk(0);
+    ggml_tensor* scale_msa = chunk(1);
+    ggml_tensor* gate_msa = chunk(2);
+    ggml_tensor* shift_mlp = chunk(3);
+    ggml_tensor* scale_mlp = chunk(4);
+    ggml_tensor* gate_mlp = chunk(5);
+
+    ggml_tensor* lnx_a = ggml_norm(ctx0, x, ln_eps);
+    ggml_tensor* h_a = ggml_add(ctx0, lnx_a, ggml_mul(ctx0, lnx_a, scale_msa));
+    h_a = ggml_add(ctx0, h_a, shift_msa);
+
+    ggml_tensor* Q = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_q_w, h_a), b.attn_q_b);
+    ggml_tensor* K = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_k_w, h_a), b.attn_k_b);
+    ggml_tensor* V = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_v_w, h_a), b.attn_v_b);
+    Q = ggml_reshape_4d(ctx0, Q, d, 1, T, B);
+    K = ggml_reshape_4d(ctx0, K, d, 1, T, B);
+    Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f,
+                      0.0f, 0.0f);
+    K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f,
+                      0.0f, 0.0f);
+    Q = ggml_reshape_4d(ctx0, Q, hd, n_h, T, B);
+    K = ggml_reshape_4d(ctx0, K, hd, n_h, T, B);
+    V = ggml_reshape_4d(ctx0, V, hd, n_h, T, B);
+    Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+    K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+    V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+    ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, attn_scale, 0.0f, 0.0f);
+    attn = ggml_reshape_3d(ctx0, attn, d, T, B);
+    attn = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_o_w, attn), b.attn_o_b);
+    ggml_tensor* x_after_attn = ggml_add(ctx0, x, ggml_mul(ctx0, attn, gate_msa));
+
+    ggml_tensor* lnx_f = ggml_norm(ctx0, x_after_attn, ln_eps);
+    ggml_tensor* h_f = ggml_add(ctx0, lnx_f, ggml_mul(ctx0, lnx_f, scale_mlp));
+    h_f = ggml_add(ctx0, h_f, shift_mlp);
+    ggml_tensor* ff = ggml_add(ctx0, ggml_mul_mat(ctx0, b.ffn_l1_w, h_f), b.ffn_l1_b);
+    ff = ggml_gelu(ctx0, ff);
+    ff = ggml_add(ctx0, ggml_mul_mat(ctx0, b.ffn_l2_w, ff), b.ffn_l2_b);
+    return ggml_add(ctx0, x_after_attn, ggml_mul(ctx0, ff, gate_mlp));
+}
+
 ggml_cgraph* cv3_build_dit_full_graph(cosyvoice3_tts_context* ctx, int T_mel) {
     const auto& fh = ctx->flow.hp;
     const auto& f = ctx->flow;
@@ -3190,6 +3251,130 @@ ggml_cgraph* cv3_build_estimator_full_graph(cosyvoice3_tts_context* ctx, int T_m
     return gf;
 }
 
+// Build the upstream-style B=2 CFG estimator. The expensive DiT stack runs
+// once for [conditional, unconditional]; the causal position-convolution
+// inputs are built independently before the two branches are stacked.
+ggml_cgraph* cv3_build_estimator_cfg_graph(cosyvoice3_tts_context* ctx, int T_mel) {
+    const auto& fh = ctx->flow.hp;
+    const auto& f = ctx->flow;
+    const int mel = (int)fh.mel_dim;
+    const int spk_out = (int)fh.spk_dim_out;
+    const int dit_dim = (int)fh.dit_dim;
+    const int n_h = (int)fh.dit_heads;
+    const int hd = (int)fh.dit_head_dim;
+    const int L = (int)fh.n_dit_layers;
+    const float ln_eps = 1e-6f;
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 12288, false);
+
+    auto input_2d = [&](const char* name) {
+        ggml_tensor* t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, mel, T_mel);
+        ggml_set_input(t);
+        ggml_set_name(t, name);
+        return t;
+    };
+    auto input_spk = [&](const char* name) {
+        ggml_tensor* t = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, spk_out);
+        ggml_set_input(t);
+        ggml_set_name(t, name);
+        return t;
+    };
+    ggml_tensor* x = input_2d("cfg_x_in");
+    ggml_tensor* mu_c = input_2d("cfg_mu_cond");
+    ggml_tensor* cond_c = input_2d("cfg_cond_cond");
+    ggml_tensor* spk_c = input_spk("cfg_spk_cond");
+    ggml_tensor* mu_u = input_2d("cfg_mu_uncond");
+    ggml_tensor* cond_u = input_2d("cfg_cond_uncond");
+    ggml_tensor* spk_u = input_spk("cfg_spk_uncond");
+    ggml_tensor* sin_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 256);
+    ggml_set_input(sin_emb);
+    ggml_set_name(sin_emb, "cfg_sin_emb");
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_mel);
+    ggml_set_input(positions);
+    ggml_set_name(positions, "cfg_positions");
+
+    ggml_tensor* t_emb = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_time_mlp_0_w, sin_emb), f.dit_time_mlp_0_b);
+    t_emb = ggml_silu(ctx0, t_emb);
+    t_emb = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_time_mlp_2_w, t_emb), f.dit_time_mlp_2_b);
+    ggml_tensor* t_silu = ggml_silu(ctx0, t_emb);
+
+    auto input_branch = [&](ggml_tensor* mu, ggml_tensor* spk, ggml_tensor* cond) {
+        ggml_tensor* spk_template = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, spk_out, T_mel);
+        ggml_tensor* spk_bc = ggml_repeat(ctx0, spk, spk_template);
+        ggml_tensor* catted = ggml_concat(ctx0, ggml_concat(ctx0, ggml_concat(ctx0, x, cond, 0), mu, 0), spk_bc, 0);
+        ggml_tensor* h = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_in_proj_w, catted), f.dit_in_proj_b);
+        ggml_tensor* pos = cv3_causal_grouped_conv1d(ctx0, h, f.dit_conv_pos_c1_w, f.dit_conv_pos_c1_b);
+        pos = cv3_mish(ctx0, pos);
+        pos = cv3_causal_grouped_conv1d(ctx0, pos, f.dit_conv_pos_c2_w, f.dit_conv_pos_c2_b);
+        pos = cv3_mish(ctx0, pos);
+        return ggml_add(ctx0, pos, h);
+    };
+
+    ggml_tensor* h_c = ggml_reshape_3d(ctx0, input_branch(mu_c, spk_c, cond_c), dit_dim, T_mel, 1);
+    ggml_tensor* h_u = ggml_reshape_3d(ctx0, input_branch(mu_u, spk_u, cond_u), dit_dim, T_mel, 1);
+    ggml_tensor* h = ggml_concat(ctx0, h_c, h_u, 2);
+    for (int il = 0; il < L; il++)
+        h = cv3_dit_block_apply_batched(ctx0, h, t_silu, positions, f.blocks[il], dit_dim, n_h, hd, fh.rope_theta);
+
+    ggml_tensor* nmod = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_norm_out_w, t_silu), f.dit_norm_out_b);
+    const size_t fs = sizeof(float);
+    ggml_tensor* nscale = ggml_view_1d(ctx0, nmod, dit_dim, 0);
+    ggml_tensor* nshift = ggml_view_1d(ctx0, nmod, dit_dim, (size_t)dit_dim * fs);
+    ggml_tensor* lnx = ggml_norm(ctx0, h, ln_eps);
+    ggml_tensor* normed = ggml_add(ctx0, lnx, ggml_mul(ctx0, lnx, nscale));
+    normed = ggml_add(ctx0, normed, nshift);
+    ggml_tensor* dphi = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_proj_out_w, normed), f.dit_proj_out_b);
+    ggml_set_name(dphi, "cfg_dphi");
+    ggml_set_output(dphi);
+    ggml_build_forward_expand(gf, dphi);
+    ggml_free(ctx0);
+    return gf;
+}
+
+float* cv3_run_estimator_cfg(cosyvoice3_tts_context* ctx, const float* x, int T_mel, const float* mu,
+                             const float* spks, const float* cond, const float* mu_zero, const float* spks_zero,
+                             const float* cond_zero, const float* sin_emb_t) {
+    const int mel = (int)ctx->flow.hp.mel_dim;
+    const int spk_out = (int)ctx->flow.hp.spk_dim_out;
+    ggml_cgraph* gf = cv3_build_estimator_cfg_graph(ctx, T_mel);
+    if (!gf)
+        return nullptr;
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+        return nullptr;
+    auto set_t = [&](const char* name, const void* data, size_t bytes) {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+        if (!t)
+            return false;
+        ggml_backend_tensor_set(t, data, 0, bytes);
+        return true;
+    };
+    const size_t mel_bytes = (size_t)mel * T_mel * sizeof(float);
+    if (!set_t("cfg_x_in", x, mel_bytes) || !set_t("cfg_mu_cond", mu, mel_bytes) ||
+        !set_t("cfg_cond_cond", cond, mel_bytes) || !set_t("cfg_spk_cond", spks, (size_t)spk_out * sizeof(float)) ||
+        !set_t("cfg_mu_uncond", mu_zero, mel_bytes) || !set_t("cfg_cond_uncond", cond_zero, mel_bytes) ||
+        !set_t("cfg_spk_uncond", spks_zero, (size_t)spk_out * sizeof(float)) ||
+        !set_t("cfg_sin_emb", sin_emb_t, 256 * sizeof(float)))
+        return nullptr;
+    std::vector<int32_t> pos((size_t)T_mel);
+    for (int i = 0; i < T_mel; i++)
+        pos[(size_t)i] = i;
+    if (!set_t("cfg_positions", pos.data(), pos.size() * sizeof(int32_t)))
+        return nullptr;
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "cosyvoice3_tts: batched CFG estimator compute failed\n");
+        return nullptr;
+    }
+    ggml_tensor* out_t = ggml_graph_get_tensor(gf, "cfg_dphi");
+    const size_t n = out_t ? (size_t)ggml_nelements(out_t) : 0;
+    float* out = n ? (float*)malloc(n * sizeof(float)) : nullptr;
+    if (out)
+        ggml_backend_tensor_get(out_t, out, 0, n * sizeof(float));
+    return out;
+}
+
 // Run the full-estimator graph once. Returns a malloc'd float[T_mel*mel_dim]
 // buffer (caller frees).
 float* cv3_run_estimator_full(cosyvoice3_tts_context* ctx, const float* x, int T_mel, const float* mu,
@@ -3282,29 +3467,52 @@ float* cv3_run_solve_euler(cosyvoice3_tts_context* ctx, const float* mu, int T_m
     std::vector<float> mu_zero(mel_n, 0.0f);
     std::vector<float> cond_zero(mel_n, 0.0f);
     std::vector<float> spks_zero((size_t)spk_out, 0.0f);
+    const char* cfg_batch_env = std::getenv("COSYVOICE3_CFG_BATCH");
+    bool use_cfg_batch = !cfg_batch_env || strcmp(cfg_batch_env, "0") != 0;
 
     double t = t_span[0];
     double dt = t_span[1] - t_span[0];
     for (int step = 1; step <= n_steps; step++) {
         std::vector<float> sin_emb = cv3_compute_sin_emb((float)t, 256);
 
-        float* dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
-        if (!dphi_cond)
-            return nullptr;
-        float* dphi_unc = cv3_run_estimator_full(ctx, x.data(), T_mel, mu_zero.data(), spks_zero.data(),
-                                                 cond_zero.data(), sin_emb.data());
-        if (!dphi_unc) {
-            free(dphi_cond);
-            return nullptr;
-        }
-
-        // CFG combine: dphi = (1 + cfg) * dphi_cond - cfg * dphi_unc.
         const float w_cond = 1.0f + cfg_rate;
         const float w_unc = cfg_rate;
-        for (size_t i = 0; i < mel_n; i++) {
-            dphi_cond[i] = w_cond * dphi_cond[i] - w_unc * dphi_unc[i];
+        float* dphi_cond = nullptr;
+        if (cfg_rate == 0.0f) {
+            dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
+            if (!dphi_cond)
+                return nullptr;
+        } else if (use_cfg_batch) {
+            float* cfg_pair = cv3_run_estimator_cfg(ctx, x.data(), T_mel, mu, spks_proj, cond, mu_zero.data(),
+                                                    spks_zero.data(), cond_zero.data(), sin_emb.data());
+            if (cfg_pair) {
+                dphi_cond = (float*)malloc(mel_n * sizeof(float));
+                if (!dphi_cond) {
+                    free(cfg_pair);
+                    return nullptr;
+                }
+                for (size_t i = 0; i < mel_n; i++)
+                    dphi_cond[i] = w_cond * cfg_pair[i] - w_unc * cfg_pair[mel_n + i];
+                free(cfg_pair);
+            } else {
+                fprintf(stderr, "cosyvoice3_tts: batched CFG unavailable; falling back to separate forwards\n");
+                use_cfg_batch = false;
+            }
         }
-        free(dphi_unc);
+        if (!dphi_cond) {
+            dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
+            if (!dphi_cond)
+                return nullptr;
+            float* dphi_unc = cv3_run_estimator_full(ctx, x.data(), T_mel, mu_zero.data(), spks_zero.data(),
+                                                     cond_zero.data(), sin_emb.data());
+            if (!dphi_unc) {
+                free(dphi_cond);
+                return nullptr;
+            }
+            for (size_t i = 0; i < mel_n; i++)
+                dphi_cond[i] = w_cond * dphi_cond[i] - w_unc * dphi_unc[i];
+            free(dphi_unc);
+        }
 
         if (step == 1 && dphi_step0_out) {
             std::memcpy(dphi_step0_out, dphi_cond, mel_n * sizeof(float));

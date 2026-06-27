@@ -653,6 +653,11 @@ curl http://localhost:8080/v1/audio/speech \
   -d '{"input":"Hello world","voice":"vivian"}' -o out.wav
 ```
 
+CosyVoice3 uses batched classifier-free guidance and request-sized KV
+caching by default. Baked voices load only the LLM, flow, HiFT, and voice
+bank; the larger S3 tokenizer and CAMPPlus companions load lazily when a
+`.wav` cloning voice is first requested.
+
 ---
 
 ## CLI reference
