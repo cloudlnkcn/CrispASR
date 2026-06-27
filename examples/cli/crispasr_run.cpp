@@ -1458,6 +1458,17 @@ int crispasr_run_backend(const whisper_params& params_in) {
         return 0;
     }
 
+    // ---- make-ref mode: create TADA voice reference GGUF ----
+    if (params.make_ref) {
+        fprintf(stderr, "crispasr[make-ref]: --make-ref mode\n");
+        fprintf(stderr, "crispasr[make-ref]: C++ tokenization not yet implemented.\n"
+                        "  Use the Python converter instead:\n"
+                        "    python models/convert-tada-ref-to-gguf.py \\\n"
+                        "      --audio <voice.wav> --transcript \"text\" --output ref.gguf\n"
+                        "  Or use the C++ diff harness with pre-computed positions for parity testing.\n");
+        return 20;
+    }
+
     // ---- TTS mode: synthesize speech from text ----
     if (!params.tts_text.empty()) {
         if (!(backend->capabilities() & CAP_TTS)) {

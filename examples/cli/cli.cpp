@@ -541,6 +541,14 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_ref_text = ARGV_NEXT;
     } else if (arg == "--ref-asr") {
         params.tts_ref_asr = ARGV_NEXT;
+    } else if (arg == "--make-ref") {
+        params.make_ref = true;
+    } else if (arg == "--make-ref-output") {
+        params.make_ref_output = ARGV_NEXT;
+    } else if (arg == "--make-ref-aligner") {
+        params.make_ref_aligner = ARGV_NEXT;
+    } else if (arg == "--make-ref-encoder") {
+        params.make_ref_encoder = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
@@ -1084,6 +1092,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_ref_asr.empty() ? "whisper" : params.tts_ref_asr.c_str());
     fprintf(stderr, "             --instruct \"TEXT\"        natural-language voice/style description "
                     "(qwen3-tts: VoiceDesign = voice description; CustomVoice = style control)\n");
+    fprintf(stderr,
+            "             --make-ref                create a TADA voice reference GGUF (with --voice <audio.wav>\n"
+            "                                                 --ref-text \"transcript\" [--make-ref-output path.gguf])\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",

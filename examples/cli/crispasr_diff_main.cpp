@@ -71,6 +71,7 @@
 #include "mini_omni2.h"
 #include "nemotron.h"
 #include "tada_codec.h"
+#include "tada_encoder.h"
 #include "tada_tts.h"
 #if __has_include("kugelaudio.h")
 #include "kugelaudio.h"
@@ -1016,7 +1017,7 @@ int main(int argc, char** argv) {
             stderr,
             "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
             "\n"
-            "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, tada-tts, kokoro, granite, "
+            "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, tada-tts, tada-encoder, kokoro, granite, "
             "granite-4.1, "
             "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
             "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
@@ -2699,6 +2700,98 @@ int main(int argc, char** argv) {
             free(our_data);
         }
         tada_codec_free(ctx);
+
+    } else if (backend_name == "tada-encoder") {
+        // TADA encoder: WavEncoder + LocalAttentionEncoder for voice reference creation.
+        // model_path = tada-encoder.gguf, ref_path = reference GGUF from dump_reference.py.
+        // Audio is the reference audio (loaded as 16kHz by the harness, we need 24kHz).
+        tada_encoder_params ep = tada_encoder_default_params();
+        ep.n_threads = 4;
+        ep.verbosity = 1;
+        tada_encoder_context* ectx = tada_encoder_init(model_path.c_str(), ep);
+        if (!ectx) {
+            fprintf(stderr, "tada-encoder: failed to load encoder model '%s'\n", model_path.c_str());
+            return 4;
+        }
+
+        // The audio from the harness is 16kHz. Resample to 24kHz for the encoder.
+        int n_16k = (int)samples.size();
+        int n_24k = (int)((int64_t)n_16k * 24000 / 16000);
+        std::vector<float> audio_24k(n_24k);
+        for (int i = 0; i < n_24k; i++) {
+            float src = (float)i * 16000.0f / 24000.0f;
+            int idx = (int)src;
+            float frac = src - idx;
+            if (idx + 1 < n_16k)
+                audio_24k[i] = samples[idx] * (1.0f - frac) + samples[idx + 1] * frac;
+            else if (idx < n_16k)
+                audio_24k[i] = samples[idx];
+        }
+
+        // Get token_masks from reference if available
+        auto masks_pair = ref.get_f32("aligner_token_masks");
+        int n_masks = 0;
+        std::vector<int32_t> token_masks;
+        if (masks_pair.first && masks_pair.second > 0) {
+            n_masks = (int)masks_pair.second;
+            token_masks.resize(n_masks);
+            for (int i = 0; i < n_masks; i++)
+                token_masks[i] = (int32_t)masks_pair.first[i];
+        }
+
+        // Compare encoder stages
+        static const char* enc_stages[] = {
+            "encoder_wav_out", "encoder_attn_out", "encoder_hidden",
+        };
+        for (const char* stage : enc_stages) {
+            if (!ref.has(stage)) {
+                printf("[SKIP] %-22s (not in reference archive)\n", stage);
+                n_skip++;
+                continue;
+            }
+            int n_stage = 0;
+            float* our_data = tada_encoder_extract_stage(
+                ectx, audio_24k.data(), n_24k,
+                token_masks.data(), n_masks, stage, &n_stage);
+            if (!our_data || n_stage <= 0) {
+                printf("[ERR ] %-22s  extract returned null\n", stage);
+                n_fail++;
+                if (our_data) free(our_data);
+                continue;
+            }
+            auto rep = ref.compare(stage, our_data, (size_t)n_stage, crispasr_diff::Ref::COS_LAST_DIM);
+            print_row(stage, rep, COS_THRESHOLD);
+            record(rep);
+            free(our_data);
+        }
+
+        // Compare token_values if positions are available
+        auto pos_pair = ref.get_f32("aligner_positions");
+        if (pos_pair.first && pos_pair.second > 0 && ref.has("encoder_token_values")) {
+            int n_tokens = (int)pos_pair.second;
+            std::vector<int32_t> positions(n_tokens);
+            for (int i = 0; i < n_tokens; i++)
+                positions[i] = (int32_t)pos_pair.first[i];
+
+            tada_encoder_result result;
+            int rc = tada_encoder_encode_with_positions(
+                ectx, audio_24k.data(), n_24k,
+                token_masks.data(), n_masks,
+                positions.data(), n_tokens, result);
+            if (rc == 0 && !result.token_values.empty()) {
+                auto rep = ref.compare("encoder_token_values",
+                                       result.token_values.data(),
+                                       result.token_values.size(),
+                                       crispasr_diff::Ref::COS_LAST_DIM);
+                print_row("encoder_token_values", rep, COS_THRESHOLD);
+                record(rep);
+            } else {
+                printf("[ERR ] %-22s  encode_with_positions failed (rc=%d)\n", "encoder_token_values", rc);
+                n_fail++;
+            }
+        }
+
+        tada_encoder_free(ectx);
 
     } else if (backend_name == "lid-glotlid" || backend_name == "lid-fasttext176") {
         // Text-input LID (GlotLID + Facebook LID-176 share this backend).

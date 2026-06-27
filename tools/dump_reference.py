@@ -249,6 +249,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
     # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
     "tada-tts":   "reference_backends.tada_tts",
+    # TADA encoder: Aligner + WavEncoder + LocalAttentionEncoder → voice reference.
+    # model_dir = HumeAI/tada-codec or local path. Audio arg is the reference audio.
+    # Text from TADA_ENCODER_TEXT, language from TADA_ENCODER_LANG env vars.
+    "tada-encoder": "reference_backends.tada_encoder",
     # Zyphra/Zonos-v0.1-transformer: GPT-style AR TTS with 9-codebook DAC.
     # model_dir = Zyphra/Zonos-v0.1-transformer HF id or local snapshot.
     # Audio arg is unused (text-driven). Text + seed from env vars:

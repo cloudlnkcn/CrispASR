@@ -188,6 +188,7 @@ target_link_libraries(crispasr-diff PRIVATE
     kokoro
     chatterbox
     tada-tts
+    tada-encoder
     indextts
     m2m100
     gemma4_e2b
@@ -280,6 +281,7 @@ target_link_libraries(${TARGET} PRIVATE
     orpheus
     chatterbox
     tada-tts
+    tada-encoder
     indextts
     kokoro
     piper-tts
