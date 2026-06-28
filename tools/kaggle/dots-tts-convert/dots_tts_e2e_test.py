@@ -78,21 +78,24 @@ try:
     if r.returncode != 0:
         log(f"stderr: {r.stderr[-800:]}")
 
-    # Build CLI
-    log(f"Building with {n_jobs} jobs...")
+    # Build just the shared library (not the full CLI — that takes 20+ min)
+    log(f"Building crispasr-lib + dots-tts with {n_jobs} jobs...")
     with kh.build_heartbeat("dots-tts CUDA build"):
         r2 = subprocess.run(
-            ["cmake", "--build", str(build_dir), "--target", "crispasr-cli", f"-j{n_jobs}"],
-            capture_output=True, text=True, env=cmake_env, cwd=str(_CRISPASR_DIR), timeout=1200)
+            ["cmake", "--build", str(build_dir), "--target", "crispasr-lib", f"-j{n_jobs}"],
+            capture_output=True, text=True, env=cmake_env, cwd=str(_CRISPASR_DIR), timeout=1800)
     log(f"Build rc={r2.returncode}")
     if r2.returncode != 0:
-        log(f"Build stderr (last 500): {r2.stderr[-500:]}")
+        log(f"Build stderr (last 800): {r2.stderr[-800:]}")
 
-    cli_bin = build_dir / "bin" / "crispasr"
-    if not cli_bin.exists():
-        log(f"ERROR: CLI not found at {cli_bin}")
+    # Check that the shared library exists
+    import glob
+    libs = glob.glob(str(build_dir / "src" / "libcrispasr*"))
+    log(f"Built libs: {libs}")
+    if not libs:
+        log("ERROR: libcrispasr not found")
         sys.exit(1)
-    log("CLI built OK")
+    log("Library built OK")
 
     # ── Download GGUFs ──
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"])
@@ -117,80 +120,75 @@ try:
     log("GPU check:")
     os.system("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null")
 
-    # ── Run synthesis ──
-    core_model = model_dir / "dots-tts-soar-q4_k.gguf"
-    output_wav = WORK / "dots_tts_output.wav"
+    # ── Run synthesis via Python ctypes (no CLI needed) ──
+    core_model = str(model_dir / "dots-tts-soar-q4_k.gguf")
+    voc_model = str(model_dir / "dots-tts-soar-vocoder-f16.gguf")
 
-    test_texts = [
-        "Hello world, this is a test.",
-        "The quick brown fox jumps over the lazy dog.",
-    ]
+    log("\n=== Synthesis via ctypes ===")
+    try:
+        import ctypes
+        lib_path = glob.glob(str(build_dir / "src" / "libcrispasr.so*"))[0]
+        log(f"Loading {lib_path}")
+        lib = ctypes.CDLL(lib_path)
 
-    for i, text in enumerate(test_texts):
-        log(f"\n=== Test {i+1}: '{text}' ===")
+        # Use session API
+        lib.crispasr_session_open.restype = ctypes.c_void_p
+        lib.crispasr_session_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        lib.crispasr_session_synthesize.restype = ctypes.POINTER(ctypes.c_float)
+        lib.crispasr_session_synthesize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+        lib.crispasr_session_free.argtypes = [ctypes.c_void_p]
+        lib.crispasr_pcm_free.argtypes = [ctypes.POINTER(ctypes.c_float)]
+
+        os.environ["DOTS_TTS_BENCH"] = "1"
+        os.environ["CRISPASR_DOTS_TTS_DEBUG"] = "1"
+
+        log(f"Opening session: {core_model}")
         t0 = time.time()
-
-        cmd = [
-            str(cli_bin),
-            "--backend", "dots-tts",
-            "-m", str(core_model),
-            "--tts", text,
-            "--tts-output", str(output_wav),
-            "--seed", "42",
-            "-t", "4",
-        ]
-        log(f"CMD: {' '.join(cmd)}")
-
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                          env={**os.environ, "DOTS_TTS_BENCH": "1", "CRISPASR_DOTS_TTS_DEBUG": "1"})
-
-        elapsed = time.time() - t0
-        log(f"Exit code: {r.returncode} ({elapsed:.1f}s)")
-        log(f"stdout: {r.stdout[-500:]}")
-        if r.stderr:
-            log(f"stderr:\n{r.stderr[-2000:]}")
-
-        if output_wav.exists():
-            sz = output_wav.stat().st_size
-            log(f"Output WAV: {sz} bytes ({sz/1024:.1f} KB)")
-
-            # Check if WAV has actual audio content
-            if sz > 44:  # WAV header is 44 bytes
-                log("WAV file produced with audio content!")
-
-                # Quick audio stats
-                try:
-                    import struct
-                    with open(output_wav, "rb") as wf:
-                        wf.seek(40)
-                        data_size = struct.unpack("<I", wf.read(4))[0]
-                        n_samples = data_size // 4  # float32
-                        wf.seek(24)
-                        sample_rate = struct.unpack("<I", wf.read(4))[0]
-                        duration = n_samples / sample_rate if sample_rate > 0 else 0
-                        log(f"  Samples: {n_samples}, Rate: {sample_rate} Hz, Duration: {duration:.2f}s")
-
-                        # Read a few samples to check they're not all zero
-                        wf.seek(44)
-                        raw = wf.read(min(4000, data_size))
-                        samples = struct.unpack(f"<{len(raw)//4}f", raw)
-                        max_val = max(abs(s) for s in samples)
-                        log(f"  Max amplitude (first 1000 samples): {max_val:.6f}")
-                        if max_val > 0.001:
-                            log("  ✓ Audio has non-trivial content")
-                        else:
-                            log("  ✗ Audio appears silent (all near-zero)")
-                except Exception as e:
-                    log(f"  WAV analysis failed: {e}")
-            else:
-                log("WAV file is too small (empty)")
+        sess = lib.crispasr_session_open(core_model.encode(), b"dots-tts")
+        if not sess:
+            log("ERROR: session open failed")
         else:
-            log("No output WAV produced")
+            log(f"Session opened in {time.time()-t0:.1f}s")
 
-        # Break after first test if it took too long
-        if elapsed > 120:
-            log("Skipping remaining tests (too slow)")
-            break
+            text = "Hello world."
+            log(f"Synthesizing: '{text}'")
+            t0 = time.time()
+            n_samples = ctypes.c_int(0)
+            pcm = lib.crispasr_session_synthesize(sess, text.encode(), ctypes.byref(n_samples))
+            elapsed = time.time() - t0
+
+            if pcm and n_samples.value > 0:
+                log(f"Synthesis done: {n_samples.value} samples ({elapsed:.1f}s)")
+                # Read first few samples
+                samples = [pcm[i] for i in range(min(1000, n_samples.value))]
+                max_val = max(abs(s) for s in samples)
+                log(f"  Max amplitude (first 1000): {max_val:.6f}")
+                if max_val > 0.001:
+                    log("  ✓ Audio has non-trivial content")
+                else:
+                    log("  ✗ Audio appears silent")
+
+                # Save as WAV
+                import struct, wave
+                output_wav = WORK / "dots_tts_output.wav"
+                all_samples = [pcm[i] for i in range(n_samples.value)]
+                with wave.open(str(output_wav), 'w') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)  # 16-bit
+                    wf.setframerate(48000)
+                    pcm_i16 = b''.join(struct.pack('<h', max(-32768, min(32767, int(s * 32767)))) for s in all_samples)
+                    wf.writeframes(pcm_i16)
+                log(f"  Saved WAV: {output_wav} ({output_wav.stat().st_size / 1024:.1f} KB)")
+
+                lib.crispasr_pcm_free(pcm)
+            else:
+                log(f"Synthesis returned null/empty ({elapsed:.1f}s)")
+
+            lib.crispasr_session_free(sess)
+    except Exception as e:
+        log(f"Synthesis test failed: {e}")
+        import traceback
+        log(traceback.format_exc())
 
     # ══════════════════════════════════════════════════════════════════
     # Phase 2: Python reference dump (dots.tts upstream)
