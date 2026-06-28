@@ -1026,27 +1026,6 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latent_patch, 
     // Input projection
     ggml_tensor* cur = ggml_mul_mat(ctx0, pe.in_proj, x);
 
-    // Positions for RoPE
-    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
-    ggml_set_name(positions, "penc_pos");
-    ggml_set_input(positions);
-
-    // Causal mask
-    ggml_tensor* mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_past + T, T);
-    ggml_set_name(mask, "penc_mask");
-    ggml_set_input(mask);
-
-    core_attn::KvSelfAttnParams atp{};
-    atp.head_dim = (int)pe.head_dim;
-    atp.n_heads = (int)pe.n_heads;
-    atp.n_kv_heads = (int)pe.n_heads; // no GQA in PatchEncoder
-    atp.n_kv_grp = 1;
-    atp.rope_type = GGML_ROPE_TYPE_NEOX;
-    atp.rope_theta = pe.rope_theta;
-    atp.n_ctx_orig = 4096;
-
-    atp.qk_norm_eps = 1e-6f;
-
     // PatchEncoder: 24-layer causal transformer.
     // TODO: The full KV-cached attention causes segfaults on some backends.
     // For now, run a simplified version: just the FFN layers (no attention).
@@ -1102,20 +1081,6 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latent_patch, 
     ggml_gallocr_alloc_graph(galloc, gf);
 
     ggml_backend_tensor_set(x, latent_patch, 0, in_dim * T * sizeof(float));
-
-    std::vector<int32_t> pos(T);
-    for (int i = 0; i < T; i++)
-        pos[i] = n_past + i;
-    ggml_backend_tensor_set(positions, pos.data(), 0, T * sizeof(int32_t));
-
-    int Lk = n_past + T;
-    std::vector<ggml_fp16_t> mask_data(Lk * T, ggml_fp32_to_fp16(-INFINITY));
-    for (int q = 0; q < T; q++) {
-        for (int k = 0; k < n_past + q + 1; k++) {
-            mask_data[q * Lk + k] = ggml_fp32_to_fp16(0.0f);
-        }
-    }
-    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
 
     ggml_backend_graph_compute(ctx->backend, gf);
 
