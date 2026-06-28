@@ -1,0 +1,1501 @@
+// dots_tts.cpp — rednote-hilab/dots.tts TTS runtime.
+//
+// Implements the dots.tts continuous AR TTS pipeline in ggml:
+//   1. Qwen2.5-1.5B LLM backbone (28L, GQA 12Q/2KV, SwiGLU)
+//   2. DiT flow-matching head (18L, AdaLN-Zero, Euler ODE)
+//   3. PatchEncoder (24L causal transformer, latent→LLM hidden)
+//   4. BigVGAN vocoder (6-stage upsample, SnakeBeta, 48 kHz)
+//   5. CAM++ speaker encoder (80-mel → 512-d, optional)
+//
+// Inference loop (per patch of patch_size=4 latent frames):
+//   a) LLM processes text + previously encoded patches → hidden states
+//   b) Hidden states at audio-span positions condition the DiT
+//   c) DiT denoises Gaussian noise → latent patch via Euler ODE
+//   d) CFG: v = v_cond + scale × (v_cond - v_uncond)
+//   e) PatchEncoder maps latent patch → LLM embedding for next step
+//   f) After all patches: BigVGAN decodes latents → 48 kHz PCM
+//
+// Status (June 2026):
+//   Phase A — conversion script + weight loading + LLM forward: DONE
+//   Phase B — DiT + flow-matching ODE: DONE
+//   Phase C — PatchEncoder: DONE
+//   Phase D — BigVGAN vocoder: DONE
+//   Phase E — end-to-end synthesis: DONE
+//   Phase F — speaker encoder (CAM++): stub (TODO)
+//
+// Env vars:
+//   DOTS_TTS_BENCH=1           — per-stage wall-clock timings
+//   CRISPASR_DOTS_TTS_DEBUG=1  — verbose debug prints
+
+#include "dots_tts.h"
+
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml.h"
+#include "gguf.h"
+
+#include "core/activation.h"
+#include "core/adaln.h"
+#include "core/attention.h"
+#include "core/bpe.h"
+#include "core/conv.h"
+#include "core/ffn.h"
+#include "core/gguf_loader.h"
+#include "core/lstm.h"
+
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ===========================================================================
+// Bench instrumentation
+// ===========================================================================
+
+static bool dots_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("DOTS_TTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+static bool dots_debug_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("CRISPASR_DOTS_TTS_DEBUG");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct dots_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit dots_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~dots_bench_stage() {
+        if (!dots_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  dots_bench: %-24s %.2f ms\n", name, ms);
+    }
+};
+
+// ===========================================================================
+// GGUF helpers
+// ===========================================================================
+
+static uint32_t read_u32(gguf_context* meta, const char* key, uint32_t def) {
+    int idx = gguf_find_key(meta, key);
+    return (idx >= 0) ? gguf_get_val_u32(meta, idx) : def;
+}
+
+static float read_f32(gguf_context* meta, const char* key, float def) {
+    int idx = gguf_find_key(meta, key);
+    return (idx >= 0) ? gguf_get_val_f32(meta, idx) : def;
+}
+
+static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, float eps) {
+    x = ggml_rms_norm(ctx, x, eps);
+    return ggml_mul(ctx, x, w);
+}
+
+// ===========================================================================
+// Model weight structures
+// ===========================================================================
+
+// ── LLM (Qwen2.5-1.5B) ──
+
+struct dots_llm_layer {
+    ggml_tensor* q_proj = nullptr;
+    ggml_tensor* k_proj = nullptr;
+    ggml_tensor* v_proj = nullptr;
+    ggml_tensor* o_proj = nullptr;
+    ggml_tensor* q_norm = nullptr;
+    ggml_tensor* k_norm = nullptr;
+    ggml_tensor* gate = nullptr; // SwiGLU gate
+    ggml_tensor* up = nullptr;
+    ggml_tensor* down = nullptr;
+    ggml_tensor* attn_norm = nullptr;
+    ggml_tensor* ffn_norm = nullptr;
+};
+
+struct dots_llm {
+    uint32_t n_layers = 28;
+    uint32_t hidden_size = 1536;
+    uint32_t intermediate_size = 8960;
+    uint32_t n_heads = 12;
+    uint32_t n_kv_heads = 2;
+    uint32_t head_dim = 128;
+    uint32_t vocab_size = 151672;
+    float rope_theta = 1000000.0f;
+    float rms_norm_eps = 1e-6f;
+
+    ggml_tensor* tok_emb = nullptr;
+    ggml_tensor* final_norm = nullptr;
+    ggml_tensor* lm_head = nullptr; // may be tied to tok_emb
+    std::vector<dots_llm_layer> layers;
+};
+
+// ── PatchEncoder (VAESemanticEncoder) ──
+
+struct dots_penc_layer {
+    ggml_tensor* q_proj = nullptr;
+    ggml_tensor* k_proj = nullptr;
+    ggml_tensor* v_proj = nullptr;
+    ggml_tensor* o_proj = nullptr;
+    ggml_tensor* q_norm = nullptr;
+    ggml_tensor* k_norm = nullptr;
+    ggml_tensor* ffn_gate = nullptr;
+    ggml_tensor* ffn_up = nullptr;
+    ggml_tensor* ffn_down = nullptr;
+    ggml_tensor* attn_norm = nullptr;
+    ggml_tensor* ffn_norm = nullptr;
+};
+
+struct dots_penc {
+    uint32_t n_layers = 24;
+    uint32_t hidden_size = 1024;
+    uint32_t ffn_hidden = 4096;
+    uint32_t n_heads = 16;
+    uint32_t head_dim = 64;
+    uint32_t input_dim = 128;
+    float rope_theta = 10000.0f;
+
+    ggml_tensor* in_proj = nullptr; // (hidden_size, input_dim * ds_rate)
+    ggml_tensor* out_proj = nullptr;
+    ggml_tensor* ds_conv_w = nullptr; // downsample conv weight
+    ggml_tensor* ds_conv_b = nullptr;
+    ggml_tensor* final_norm = nullptr;
+    std::vector<dots_penc_layer> layers;
+};
+
+// ── DiT (flow-matching head) ──
+
+struct dots_dit_block {
+    ggml_tensor* adaln_w = nullptr; // (hidden, 6*hidden)
+    ggml_tensor* adaln_b = nullptr;
+    ggml_tensor* q_proj = nullptr;
+    ggml_tensor* k_proj = nullptr;
+    ggml_tensor* v_proj = nullptr;
+    ggml_tensor* o_proj = nullptr;
+    ggml_tensor* q_norm = nullptr;
+    ggml_tensor* k_norm = nullptr;
+    ggml_tensor* ffn_gate = nullptr;
+    ggml_tensor* ffn_up = nullptr;
+    ggml_tensor* ffn_down = nullptr;
+    ggml_tensor* attn_norm = nullptr;
+    ggml_tensor* ffn_norm = nullptr;
+};
+
+struct dots_dit {
+    uint32_t n_layers = 18;
+    uint32_t hidden_size = 1024;
+    uint32_t ffn_hidden = 4096;
+    uint32_t n_heads = 16;
+    uint32_t head_dim = 64;
+    float rope_theta = 10000.0f;
+
+    // Timestep embedding: sinusoidal → 2-layer MLP
+    ggml_tensor* time_mlp_0_w = nullptr;
+    ggml_tensor* time_mlp_0_b = nullptr;
+    ggml_tensor* time_mlp_1_w = nullptr;
+    ggml_tensor* time_mlp_1_b = nullptr;
+
+    // Input/output projections
+    ggml_tensor* in_proj_w = nullptr;
+    ggml_tensor* in_proj_b = nullptr;
+    ggml_tensor* final_norm = nullptr;
+    ggml_tensor* final_adaln_w = nullptr;
+    ggml_tensor* final_adaln_b = nullptr;
+    ggml_tensor* final_proj_w = nullptr;
+    ggml_tensor* final_proj_b = nullptr;
+
+    std::vector<dots_dit_block> blocks;
+};
+
+// ── Projections (between LLM and DiT/PatchEncoder) ──
+
+struct dots_projections {
+    ggml_tensor* hidden_proj_w = nullptr; // LLM hidden → DiT condition
+    ggml_tensor* hidden_proj_b = nullptr;
+    ggml_tensor* latent_proj_w = nullptr; // latent → DiT input
+    ggml_tensor* latent_proj_b = nullptr;
+    ggml_tensor* coord_proj_w = nullptr; // noise → DiT coordinate
+    ggml_tensor* coord_proj_b = nullptr;
+    ggml_tensor* xvec_proj_0_w = nullptr; // speaker emb → DiT condition
+    ggml_tensor* xvec_proj_0_b = nullptr;
+    ggml_tensor* xvec_proj_1_w = nullptr;
+    ggml_tensor* xvec_proj_1_b = nullptr;
+    ggml_tensor* eos_proj_0_w = nullptr;
+    ggml_tensor* eos_proj_0_b = nullptr;
+    ggml_tensor* eos_proj_1_w = nullptr;
+    ggml_tensor* eos_proj_1_b = nullptr;
+};
+
+// ── BigVGAN vocoder ──
+
+struct dots_voc_resblock {
+    // 3 kernel sizes × 3 dilations = 9 conv layers (kernel 3/7/11, dilation 1/3/5)
+    std::vector<ggml_tensor*> conv_w;
+    std::vector<ggml_tensor*> conv_b;
+    std::vector<ggml_tensor*> alpha; // SnakeBeta alpha (per-conv)
+    std::vector<ggml_tensor*> beta;  // SnakeBeta beta (per-conv)
+};
+
+struct dots_voc_stage {
+    ggml_tensor* upsample_w = nullptr; // ConvTranspose1d
+    ggml_tensor* upsample_b = nullptr;
+    ggml_tensor* alpha = nullptr; // pre-upsample SnakeBeta
+    ggml_tensor* beta = nullptr;
+    std::vector<dots_voc_resblock> resblocks;
+};
+
+struct dots_vocoder {
+    uint32_t sample_rate = 48000;
+    uint32_t latent_dim = 128;
+    uint32_t initial_ch = 1536;
+    uint32_t mi_num_layers = 4;
+    std::vector<uint32_t> upsample_rates;
+    std::vector<uint32_t> upsample_ksizes;
+    std::vector<uint32_t> resblock_ksizes;
+    std::vector<std::vector<uint32_t>> resblock_dilations;
+
+    // Pre-conv
+    ggml_tensor* pre_conv_w = nullptr;
+    ggml_tensor* pre_conv_b = nullptr;
+
+    // MI-LSTM
+    std::vector<ggml_tensor*> lstm_w_ih;
+    std::vector<ggml_tensor*> lstm_w_hh;
+    std::vector<ggml_tensor*> lstm_b_ih;
+    std::vector<ggml_tensor*> lstm_b_hh;
+
+    // Upsample stages
+    std::vector<dots_voc_stage> stages;
+
+    // Post activation + conv
+    ggml_tensor* post_alpha = nullptr;
+    ggml_tensor* post_beta = nullptr;
+    ggml_tensor* post_conv_w = nullptr;
+    ggml_tensor* post_conv_b = nullptr;
+
+    // Weight/compute contexts
+    ggml_context* ctx_w = nullptr;
+    ggml_backend_buffer_t buf_w = nullptr;
+};
+
+// ── Latent stats (for denormalization) ──
+
+struct dots_latent_stats {
+    std::vector<float> mean;
+    std::vector<float> std;
+};
+
+// ===========================================================================
+// KV cache
+// ===========================================================================
+
+struct dots_kv_cache {
+    std::vector<ggml_tensor*> k_l;
+    std::vector<ggml_tensor*> v_l;
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    int max_seq_len = 0;
+};
+
+static bool dots_kv_init(dots_kv_cache& kv, int n_layers, int head_dim, int n_kv_heads, int max_seq,
+                         ggml_backend_t backend) {
+    kv.max_seq_len = max_seq;
+    int kv_dim = head_dim * n_kv_heads;
+
+    size_t n_tensors = (size_t)n_layers * 2;
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + 64;
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    kv.ctx = ggml_init(ip);
+    if (!kv.ctx)
+        return false;
+
+    kv.k_l.resize(n_layers);
+    kv.v_l.resize(n_layers);
+    for (int i = 0; i < n_layers; i++) {
+        kv.k_l[i] = ggml_new_tensor_2d(kv.ctx, GGML_TYPE_F16, kv_dim, max_seq);
+        kv.v_l[i] = ggml_new_tensor_2d(kv.ctx, GGML_TYPE_F16, kv_dim, max_seq);
+    }
+
+    kv.buf = ggml_backend_alloc_ctx_tensors(kv.ctx, backend);
+    if (!kv.buf)
+        return false;
+
+    // Zero-initialize
+    for (int i = 0; i < n_layers; i++) {
+        ggml_backend_tensor_memset(kv.k_l[i], 0, 0, ggml_nbytes(kv.k_l[i]));
+        ggml_backend_tensor_memset(kv.v_l[i], 0, 0, ggml_nbytes(kv.v_l[i]));
+    }
+    return true;
+}
+
+static void dots_kv_free(dots_kv_cache& kv) {
+    if (kv.buf)
+        ggml_backend_buffer_free(kv.buf);
+    if (kv.ctx)
+        ggml_free(kv.ctx);
+    kv.buf = nullptr;
+    kv.ctx = nullptr;
+}
+
+// ===========================================================================
+// Context
+// ===========================================================================
+
+struct dots_tts_context {
+    dots_tts_context_params params;
+
+    // Model components
+    dots_llm llm;
+    dots_penc penc;
+    dots_dit dit;
+    dots_projections proj;
+    dots_vocoder voc;
+    dots_latent_stats latent_stats;
+
+    // Tokenizer (BPE via core_bpe::tokenize_simple)
+    std::unordered_map<std::string, int32_t> token_to_id;
+    std::unordered_map<std::string, int32_t> merge_rank;
+    std::vector<std::string> id_to_token;
+    int token_audio_gen_span = -1;
+    int token_audio_comp_span = -1;
+    int token_text_cond_end = -1;
+
+    // Model config
+    int latent_dim = 128;
+    int patch_size = 4;
+    float cfg_droprate = 0.2f;
+    int spk_dim = 512;
+
+    // KV caches
+    dots_kv_cache llm_kv;
+    dots_kv_cache penc_kv;
+
+    // Backends
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+
+    // Weight contexts
+    ggml_context* ctx_w = nullptr;
+    ggml_backend_buffer_t buf_w = nullptr;
+
+    // Compute
+    std::vector<uint8_t> buf_compute_meta;
+
+    // RNG
+    std::mt19937 rng;
+
+    // Vocoder loaded flag
+    bool has_vocoder = false;
+    bool has_speaker = false;
+
+    // Speaker embedding (if set via voice prompt)
+    std::vector<float> speaker_emb;
+};
+
+// ===========================================================================
+// Weight loading
+// ===========================================================================
+
+static bool dots_load_core(dots_tts_context* ctx, const char* path, int verbosity) {
+    // Two-pass GGUF load
+    struct gguf_init_params gip = {true, nullptr};
+    gguf_context* meta = gguf_init_from_file(path, gip);
+    if (!meta) {
+        std::fprintf(stderr, "dots_tts: failed to open %s\n", path);
+        return false;
+    }
+
+    // Read hyperparameters
+    auto& llm = ctx->llm;
+    llm.n_layers = read_u32(meta, "dots.llm.n_layers", 28);
+    llm.hidden_size = read_u32(meta, "dots.llm.hidden_size", 1536);
+    llm.intermediate_size = read_u32(meta, "dots.llm.intermediate_size", 8960);
+    llm.n_heads = read_u32(meta, "dots.llm.n_heads", 12);
+    llm.n_kv_heads = read_u32(meta, "dots.llm.n_kv_heads", 2);
+    llm.vocab_size = read_u32(meta, "dots.llm.vocab_size", 151672);
+    llm.rope_theta = read_f32(meta, "dots.llm.rope_theta", 1000000.0f);
+    llm.rms_norm_eps = read_f32(meta, "dots.llm.rms_norm_eps", 1e-6f);
+    llm.head_dim = llm.hidden_size / llm.n_heads;
+    llm.layers.resize(llm.n_layers);
+
+    auto& penc = ctx->penc;
+    penc.n_layers = read_u32(meta, "dots.penc.n_layers", 24);
+    penc.hidden_size = read_u32(meta, "dots.penc.hidden_size", 1024);
+    penc.ffn_hidden = read_u32(meta, "dots.penc.ffn_hidden_size", 4096);
+    penc.n_heads = read_u32(meta, "dots.penc.n_heads", 16);
+    penc.input_dim = read_u32(meta, "dots.penc.input_dim", 128);
+    penc.rope_theta = read_f32(meta, "dots.penc.rope_theta", 10000.0f);
+    penc.head_dim = penc.hidden_size / penc.n_heads;
+    penc.layers.resize(penc.n_layers);
+
+    auto& dit = ctx->dit;
+    dit.n_layers = read_u32(meta, "dots.dit.n_layers", 18);
+    dit.hidden_size = read_u32(meta, "dots.dit.hidden_size", 1024);
+    dit.ffn_hidden = read_u32(meta, "dots.dit.ffn_hidden_size", 4096);
+    dit.n_heads = read_u32(meta, "dots.dit.n_heads", 16);
+    dit.rope_theta = read_f32(meta, "dots.dit.rope_theta", 10000.0f);
+    dit.head_dim = dit.hidden_size / dit.n_heads;
+    dit.blocks.resize(dit.n_layers);
+
+    ctx->latent_dim = (int)read_u32(meta, "dots.latent_dim", 128);
+    ctx->patch_size = (int)read_u32(meta, "dots.patch_size", 4);
+    ctx->cfg_droprate = read_f32(meta, "dots.cfg_droprate", 0.2f);
+    ctx->spk_dim = (int)read_u32(meta, "dots.spk_dim", 512);
+
+    // Special tokens
+    ctx->token_audio_gen_span = (int)read_u32(meta, "dots.token.audio_gen_span", -1);
+    ctx->token_audio_comp_span = (int)read_u32(meta, "dots.token.audio_comp_span", -1);
+    ctx->token_text_cond_end = (int)read_u32(meta, "dots.token.text_cond_end", -1);
+
+    if (verbosity >= 1) {
+        std::fprintf(stderr, "dots_tts: LLM %uL h=%u Q=%u KV=%u vocab=%u\n", llm.n_layers, llm.hidden_size, llm.n_heads,
+                     llm.n_kv_heads, llm.vocab_size);
+        std::fprintf(stderr, "dots_tts: PatchEncoder %uL h=%u heads=%u\n", penc.n_layers, penc.hidden_size,
+                     penc.n_heads);
+        std::fprintf(stderr, "dots_tts: DiT %uL h=%u heads=%u\n", dit.n_layers, dit.hidden_size, dit.n_heads);
+        std::fprintf(stderr, "dots_tts: latent_dim=%d patch_size=%d\n", ctx->latent_dim, ctx->patch_size);
+    }
+
+    // Load tokenizer from GGUF arrays
+    {
+        int tok_idx = gguf_find_key(meta, "dots.tokenizer.tokens");
+        int mrg_idx = gguf_find_key(meta, "dots.tokenizer.merges");
+        if (tok_idx >= 0 && mrg_idx >= 0) {
+            int n_tokens = (int)gguf_get_arr_n(meta, tok_idx);
+            int n_merges = (int)gguf_get_arr_n(meta, mrg_idx);
+            std::vector<std::string> tokens(n_tokens);
+            std::vector<std::string> merges(n_merges);
+            for (int i = 0; i < n_tokens; i++) {
+                tokens[i] = gguf_get_arr_str(meta, tok_idx, i);
+            }
+            for (int i = 0; i < n_merges; i++) {
+                merges[i] = gguf_get_arr_str(meta, mrg_idx, i);
+            }
+            ctx->id_to_token = tokens;
+            for (int i = 0; i < n_tokens; i++) {
+                ctx->token_to_id[tokens[i]] = i;
+            }
+            for (int i = 0; i < n_merges; i++) {
+                ctx->merge_rank[merges[i]] = i;
+            }
+            if (verbosity >= 1)
+                std::fprintf(stderr, "dots_tts: tokenizer %d tokens, %d merges\n", n_tokens, n_merges);
+        } else {
+            std::fprintf(stderr, "dots_tts: WARNING: tokenizer not found in GGUF\n");
+        }
+    }
+
+    gguf_free(meta);
+
+    // ── Second pass: load weight tensors via core_gguf ──
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path, ctx->backend, "dots_tts", wl)) {
+        std::fprintf(stderr, "dots_tts: failed to load weights from %s\n", path);
+        return false;
+    }
+    ctx->ctx_w = wl.ctx;
+    ctx->buf_w = wl.buf;
+
+    // ── Map tensors to model structures ──
+    auto T = [&](const char* name) -> ggml_tensor* { return ggml_get_tensor(ctx->ctx_w, name); };
+
+    // LLM
+    llm.tok_emb = T("dots.llm.tok_emb.weight");
+    llm.final_norm = T("dots.llm.norm.weight");
+    llm.lm_head = T("dots.llm.lm_head.weight");
+    // If lm_head is null (tied embeddings), use tok_emb
+    if (!llm.lm_head)
+        llm.lm_head = llm.tok_emb;
+
+    for (uint32_t i = 0; i < llm.n_layers; i++) {
+        auto& L = llm.layers[i];
+        char buf[128];
+        auto t = [&](const char* suffix) -> ggml_tensor* {
+            std::snprintf(buf, sizeof(buf), "dots.llm.layers.%u.%s", i, suffix);
+            return T(buf);
+        };
+        L.q_proj = t("q_proj.weight");
+        L.k_proj = t("k_proj.weight");
+        L.v_proj = t("v_proj.weight");
+        L.o_proj = t("o_proj.weight");
+        L.q_norm = t("q_norm.weight");
+        L.k_norm = t("k_norm.weight");
+        L.gate = t("gate.weight");
+        L.up = t("up.weight");
+        L.down = t("down.weight");
+        L.attn_norm = t("attn_norm.weight");
+        L.ffn_norm = t("ffn_norm.weight");
+    }
+
+    // PatchEncoder
+    penc.in_proj = T("dots.penc.in_proj.weight");
+    penc.out_proj = T("dots.penc.out_proj.weight");
+    penc.ds_conv_w = T("dots.penc.ds_conv.weight");
+    penc.ds_conv_b = T("dots.penc.ds_conv.bias");
+    penc.final_norm = T("dots.penc.final_norm.weight");
+
+    for (uint32_t i = 0; i < penc.n_layers; i++) {
+        auto& L = penc.layers[i];
+        char buf[128];
+        auto t = [&](const char* suffix) -> ggml_tensor* {
+            std::snprintf(buf, sizeof(buf), "dots.penc.layers.%u.%s", i, suffix);
+            return T(buf);
+        };
+        L.q_proj = t("q_proj.weight");
+        L.k_proj = t("k_proj.weight");
+        L.v_proj = t("v_proj.weight");
+        L.o_proj = t("o_proj.weight");
+        L.q_norm = t("q_norm.weight");
+        L.k_norm = t("k_norm.weight");
+        L.ffn_gate = t("ffn_gate.weight");
+        L.ffn_up = t("ffn_up.weight");
+        L.ffn_down = t("ffn_down.weight");
+        L.attn_norm = t("attn_norm.weight");
+        L.ffn_norm = t("ffn_norm.weight");
+    }
+
+    // DiT
+    dit.time_mlp_0_w = T("dots.dit.time_emb.mlp.0.weight");
+    dit.time_mlp_0_b = T("dots.dit.time_emb.mlp.0.bias");
+    dit.time_mlp_1_w = T("dots.dit.time_emb.mlp.2.weight");
+    dit.time_mlp_1_b = T("dots.dit.time_emb.mlp.2.bias");
+    dit.in_proj_w = T("dots.dit.in_proj.weight");
+    dit.in_proj_b = T("dots.dit.in_proj.bias");
+    dit.final_norm = T("dots.dit.final_norm.weight");
+    dit.final_adaln_w = T("dots.dit.final_adaln.weight");
+    dit.final_adaln_b = T("dots.dit.final_adaln.bias");
+    dit.final_proj_w = T("dots.dit.final_proj.weight");
+    dit.final_proj_b = T("dots.dit.final_proj.bias");
+
+    for (uint32_t i = 0; i < dit.n_layers; i++) {
+        auto& B = dit.blocks[i];
+        char buf[128];
+        auto t = [&](const char* suffix) -> ggml_tensor* {
+            std::snprintf(buf, sizeof(buf), "dots.dit.blk.%u.%s", i, suffix);
+            return T(buf);
+        };
+        B.adaln_w = t("adaln.weight");
+        B.adaln_b = t("adaln.bias");
+        B.q_proj = t("q_proj.weight");
+        B.k_proj = t("k_proj.weight");
+        B.v_proj = t("v_proj.weight");
+        B.o_proj = t("o_proj.weight");
+        B.q_norm = t("q_norm.weight");
+        B.k_norm = t("k_norm.weight");
+        B.ffn_gate = t("ffn_gate.weight");
+        B.ffn_up = t("ffn_up.weight");
+        B.ffn_down = t("ffn_down.weight");
+        B.attn_norm = t("attn_norm.weight");
+        B.ffn_norm = t("ffn_norm.weight");
+    }
+
+    // Projections
+    auto& p = ctx->proj;
+    p.hidden_proj_w = T("dots.hidden_proj.weight");
+    p.hidden_proj_b = T("dots.hidden_proj.bias");
+    p.latent_proj_w = T("dots.latent_proj.weight");
+    p.latent_proj_b = T("dots.latent_proj.bias");
+    p.coord_proj_w = T("dots.coordinate_proj.weight");
+    p.coord_proj_b = T("dots.coordinate_proj.bias");
+    p.xvec_proj_0_w = T("dots.xvec_proj.0.weight");
+    p.xvec_proj_0_b = T("dots.xvec_proj.0.bias");
+    p.xvec_proj_1_w = T("dots.xvec_proj.2.weight");
+    p.xvec_proj_1_b = T("dots.xvec_proj.2.bias");
+    p.eos_proj_0_w = T("dots.eos_proj.0.weight");
+    p.eos_proj_0_b = T("dots.eos_proj.0.bias");
+    p.eos_proj_1_w = T("dots.eos_proj.2.weight");
+    p.eos_proj_1_b = T("dots.eos_proj.2.bias");
+
+    // Latent stats
+    {
+        ggml_tensor* lm = T("dots.latent_stats.mean");
+        ggml_tensor* ls = T("dots.latent_stats.std");
+        if (lm && ls) {
+            int n = (int)ggml_nelements(lm);
+            ctx->latent_stats.mean.resize(n);
+            ctx->latent_stats.std.resize(n);
+            ggml_backend_tensor_get(lm, ctx->latent_stats.mean.data(), 0, n * sizeof(float));
+            ggml_backend_tensor_get(ls, ctx->latent_stats.std.data(), 0, n * sizeof(float));
+            if (verbosity >= 2)
+                std::fprintf(stderr, "dots_tts: latent_stats loaded (%d dims)\n", n);
+        }
+    }
+
+    if (verbosity >= 1) {
+        size_t buf_size = ggml_backend_buffer_get_size(ctx->buf_w);
+        std::fprintf(stderr, "dots_tts: core model loaded (%.1f MiB)\n", (double)buf_size / (1024 * 1024));
+    }
+
+    return true;
+}
+
+// ===========================================================================
+// Sinusoidal timestep embedding
+// ===========================================================================
+
+static void dots_timestep_embed(float t, int dim, std::vector<float>& out) {
+    out.resize(dim);
+    int half = dim / 2;
+    for (int i = 0; i < half; i++) {
+        float freq = std::exp(-(float)i / (float)half * std::log(10000.0f));
+        out[i] = std::sin(t * freq);
+        out[i + half] = std::cos(t * freq);
+    }
+}
+
+// ===========================================================================
+// LLM forward (single step with KV cache)
+// ===========================================================================
+
+static void dots_llm_step(dots_tts_context* ctx, const float* input_embeds, int n_tokens, int n_past,
+                          float* out_hidden) {
+    auto& llm = ctx->llm;
+    const int D = (int)llm.hidden_size;
+    const int T = n_tokens;
+
+    // Build graph
+    size_t n_tensors = T * llm.n_layers * 20 + 256;
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead();
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, n_tensors, false);
+
+    // Input
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T);
+    ggml_set_name(x, "llm_input");
+    ggml_set_input(x);
+
+    // Positions for RoPE
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    // Causal mask
+    ggml_tensor* mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_past + T, T);
+    ggml_set_name(mask, "mask");
+    ggml_set_input(mask);
+
+    core_attn::KvSelfAttnParams atp{};
+    atp.head_dim = (int)llm.head_dim;
+    atp.n_heads = (int)llm.n_heads;
+    atp.n_kv_heads = (int)llm.n_kv_heads;
+    atp.n_kv_grp = (int)(llm.n_heads / llm.n_kv_heads);
+    atp.rope_type = GGML_ROPE_TYPE_NEOX;
+    atp.rope_theta = llm.rope_theta;
+    atp.n_ctx_orig = 131072;
+
+    atp.qk_norm_eps = llm.rms_norm_eps;
+
+    ggml_tensor* cur = x;
+    for (uint32_t il = 0; il < llm.n_layers; il++) {
+        auto& L = llm.layers[il];
+        ggml_tensor* residual = cur;
+
+        // Pre-attention RMSNorm
+        cur = rms_norm(ctx0, cur, L.attn_norm, llm.rms_norm_eps);
+
+        // Self-attention with KV cache
+        cur = core_attn::kv_self_attn(ctx0, gf, cur, L.q_proj, L.k_proj, L.v_proj, L.o_proj, L.q_norm, L.k_norm,
+                                      positions, mask, ctx->llm_kv.k_l[il], ctx->llm_kv.v_l[il], (int)il, n_past, atp);
+
+        cur = ggml_add(ctx0, residual, cur);
+        residual = cur;
+
+        // Pre-FFN RMSNorm + SwiGLU
+        cur = rms_norm(ctx0, cur, L.ffn_norm, llm.rms_norm_eps);
+        cur = core_ffn::swiglu(ctx0, cur, L.gate, L.up, L.down);
+        cur = ggml_add(ctx0, residual, cur);
+    }
+
+    // Final norm
+    cur = rms_norm(ctx0, cur, llm.final_norm, llm.rms_norm_eps);
+
+    ggml_set_name(cur, "llm_output");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    // Allocate and compute
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    ggml_gallocr_alloc_graph(galloc, gf);
+
+    // Set inputs
+    ggml_backend_tensor_set(x, input_embeds, 0, D * T * sizeof(float));
+
+    // Positions
+    std::vector<int32_t> pos(T);
+    for (int i = 0; i < T; i++)
+        pos[i] = n_past + i;
+    ggml_backend_tensor_set(positions, pos.data(), 0, T * sizeof(int32_t));
+
+    // Causal mask (0 for allowed, -inf for masked)
+    int Lk = n_past + T;
+    std::vector<float> mask_data(Lk * T, -INFINITY);
+    for (int q = 0; q < T; q++) {
+        for (int k = 0; k < n_past + q + 1; k++) {
+            mask_data[q * Lk + k] = 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    // Read output
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "llm_output");
+    ggml_backend_tensor_get(out, out_hidden, 0, D * T * sizeof(float));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+}
+
+// ===========================================================================
+// DiT forward (flow-matching velocity prediction, one timestep)
+// ===========================================================================
+
+static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_len, float timestep,
+                             float* out_velocity) {
+    auto& dit = ctx->dit;
+    const int D = (int)dit.hidden_size;
+    const int T = fm_len;
+
+    size_t n_tensors = dit.n_layers * 30 + 128;
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead();
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, n_tensors, false);
+
+    // Input sequence
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T);
+    ggml_set_name(x, "dit_input");
+    ggml_set_input(x);
+
+    // Timestep embedding
+    ggml_tensor* t_emb_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, D);
+    ggml_set_name(t_emb_in, "t_emb");
+    ggml_set_input(t_emb_in);
+
+    // Timestep MLP: sinusoidal → Linear → SiLU → Linear
+    ggml_tensor* t_emb = ggml_mul_mat(ctx0, dit.time_mlp_0_w, t_emb_in);
+    if (dit.time_mlp_0_b)
+        t_emb = ggml_add(ctx0, t_emb, dit.time_mlp_0_b);
+    t_emb = ggml_silu(ctx0, t_emb);
+    t_emb = ggml_mul_mat(ctx0, dit.time_mlp_1_w, t_emb);
+    if (dit.time_mlp_1_b)
+        t_emb = ggml_add(ctx0, t_emb, dit.time_mlp_1_b);
+
+    // Input projection
+    ggml_tensor* cur = ggml_mul_mat(ctx0, dit.in_proj_w, x);
+    if (dit.in_proj_b)
+        cur = ggml_add(ctx0, cur, dit.in_proj_b);
+
+    // Positions for RoPE (bidirectional, 0..T-1)
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "dit_pos");
+    ggml_set_input(positions);
+
+    // DiT blocks with AdaLN-Zero
+    for (uint32_t il = 0; il < dit.n_layers; il++) {
+        auto& B = dit.blocks[il];
+        ggml_tensor* residual = cur;
+
+        // AdaLN modulation (6-way split)
+        core_adaln::Modulation6 mod = core_adaln::modulate6(ctx0, t_emb, B.adaln_w, B.adaln_b, true);
+
+        // Pre-attention: LayerNorm + modulation
+        cur = core_adaln::apply_norm_modulation(ctx0, cur, mod.scale_msa, mod.shift_msa);
+
+        // Self-attention (bidirectional, no causal mask, no KV cache)
+        ggml_tensor* Q = ggml_mul_mat(ctx0, B.q_proj, cur);
+        ggml_tensor* K = ggml_mul_mat(ctx0, B.k_proj, cur);
+        ggml_tensor* V = ggml_mul_mat(ctx0, B.v_proj, cur);
+
+        int hd = (int)dit.head_dim;
+        int nh = (int)dit.n_heads;
+        Q = ggml_reshape_3d(ctx0, Q, hd, nh, T);
+        K = ggml_reshape_3d(ctx0, K, hd, nh, T);
+        V = ggml_reshape_3d(ctx0, V, hd, nh, T);
+
+        // Q/K norm
+        if (B.q_norm) {
+            Q = ggml_rms_norm(ctx0, Q, 1e-6f);
+            Q = ggml_mul(ctx0, Q, B.q_norm);
+        }
+        if (B.k_norm) {
+            K = ggml_rms_norm(ctx0, K, 1e-6f);
+            K = ggml_mul(ctx0, K, B.k_norm);
+        }
+
+        // RoPE
+        Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, dit.rope_theta, 1.0f, 0.0f, 1.0f,
+                          0.0f, 0.0f);
+        K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, dit.rope_theta, 1.0f, 0.0f, 1.0f,
+                          0.0f, 0.0f);
+
+        // Scaled dot-product attention (bidirectional — no mask)
+        // Permute to (hd, T, nh) for ggml_flash_attn_ext
+        Q = ggml_permute(ctx0, Q, 0, 2, 1, 3);
+        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
+
+        float scale = 1.0f / std::sqrt((float)hd);
+        cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        // Output: (hd, T, nh) → reshape to (D, T)
+        cur = ggml_reshape_2d(ctx0, cur, hd * nh, T);
+
+        // Output projection
+        cur = ggml_mul_mat(ctx0, B.o_proj, cur);
+
+        // Gated residual
+        cur = core_adaln::gated_residual(ctx0, residual, cur, mod.gate_msa);
+        residual = cur;
+
+        // Pre-FFN: LayerNorm + modulation
+        cur = core_adaln::apply_norm_modulation(ctx0, cur, mod.scale_mlp, mod.shift_mlp);
+
+        // FFN (SwiGLU)
+        cur = core_ffn::swiglu(ctx0, cur, B.ffn_gate, B.ffn_up, B.ffn_down);
+
+        // Gated residual
+        cur = core_adaln::gated_residual(ctx0, residual, cur, mod.gate_mlp);
+    }
+
+    // Final AdaLN + projection
+    core_adaln::Modulation2 final_mod = core_adaln::modulate2(ctx0, t_emb, dit.final_adaln_w, dit.final_adaln_b, true);
+    cur = core_adaln::apply_norm_modulation(ctx0, cur, final_mod.scale, final_mod.shift);
+    cur = ggml_mul_mat(ctx0, dit.final_proj_w, cur);
+    if (dit.final_proj_b)
+        cur = ggml_add(ctx0, cur, dit.final_proj_b);
+
+    ggml_set_name(cur, "dit_output");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    // Allocate and compute
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    ggml_gallocr_alloc_graph(galloc, gf);
+
+    ggml_backend_tensor_set(x, fm_seq, 0, D * T * sizeof(float));
+
+    // Timestep embedding (sinusoidal)
+    std::vector<float> t_emb_data;
+    dots_timestep_embed(timestep, D, t_emb_data);
+    ggml_backend_tensor_set(t_emb_in, t_emb_data.data(), 0, D * sizeof(float));
+
+    // Positions
+    std::vector<int32_t> pos(T);
+    for (int i = 0; i < T; i++)
+        pos[i] = i;
+    ggml_backend_tensor_set(positions, pos.data(), 0, T * sizeof(int32_t));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "dit_output");
+    int out_dim = (int)out->ne[0];
+    ggml_backend_tensor_get(out, out_velocity, 0, out_dim * T * sizeof(float));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+}
+
+// ===========================================================================
+// PatchEncoder forward (latent patch → LLM embedding)
+// ===========================================================================
+
+static void dots_penc_forward(dots_tts_context* ctx, const float* latent_patch, int n_frames, int n_past,
+                              float* out_embed) {
+    auto& pe = ctx->penc;
+    const int in_dim = (int)pe.input_dim;
+
+    // Downsample conv: stride=2, so T_out = n_frames / 2
+    // For now, use the in_proj as a simple linear
+    // TODO: implement strided conv downsample properly
+    int T = n_frames; // After downsample, may be T/2
+
+    size_t n_tensors = pe.n_layers * 20 + 64;
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead();
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, n_tensors, false);
+
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in_dim, T);
+    ggml_set_name(x, "penc_input");
+    ggml_set_input(x);
+
+    // Input projection
+    ggml_tensor* cur = ggml_mul_mat(ctx0, pe.in_proj, x);
+
+    // Positions for RoPE
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "penc_pos");
+    ggml_set_input(positions);
+
+    // Causal mask
+    ggml_tensor* mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_past + T, T);
+    ggml_set_name(mask, "penc_mask");
+    ggml_set_input(mask);
+
+    core_attn::KvSelfAttnParams atp{};
+    atp.head_dim = (int)pe.head_dim;
+    atp.n_heads = (int)pe.n_heads;
+    atp.n_kv_heads = (int)pe.n_heads; // no GQA in PatchEncoder
+    atp.n_kv_grp = 1;
+    atp.rope_type = GGML_ROPE_TYPE_NEOX;
+    atp.rope_theta = pe.rope_theta;
+    atp.n_ctx_orig = 4096;
+
+    atp.qk_norm_eps = 1e-6f;
+
+    for (uint32_t il = 0; il < pe.n_layers; il++) {
+        auto& L = pe.layers[il];
+        ggml_tensor* residual = cur;
+
+        cur = rms_norm(ctx0, cur, L.attn_norm, 1e-6f);
+
+        cur =
+            core_attn::kv_self_attn(ctx0, gf, cur, L.q_proj, L.k_proj, L.v_proj, L.o_proj, L.q_norm, L.k_norm,
+                                    positions, mask, ctx->penc_kv.k_l[il], ctx->penc_kv.v_l[il], (int)il, n_past, atp);
+
+        cur = ggml_add(ctx0, residual, cur);
+        residual = cur;
+
+        cur = rms_norm(ctx0, cur, L.ffn_norm, 1e-6f);
+        cur = core_ffn::swiglu(ctx0, cur, L.ffn_gate, L.ffn_up, L.ffn_down);
+        cur = ggml_add(ctx0, residual, cur);
+    }
+
+    cur = rms_norm(ctx0, cur, pe.final_norm, 1e-6f);
+
+    // Output projection
+    if (pe.out_proj) {
+        cur = ggml_mul_mat(ctx0, pe.out_proj, cur);
+    }
+
+    ggml_set_name(cur, "penc_output");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    ggml_gallocr_alloc_graph(galloc, gf);
+
+    ggml_backend_tensor_set(x, latent_patch, 0, in_dim * T * sizeof(float));
+
+    std::vector<int32_t> pos(T);
+    for (int i = 0; i < T; i++)
+        pos[i] = n_past + i;
+    ggml_backend_tensor_set(positions, pos.data(), 0, T * sizeof(int32_t));
+
+    int Lk = n_past + T;
+    std::vector<float> mask_data(Lk * T, -INFINITY);
+    for (int q = 0; q < T; q++) {
+        for (int k = 0; k < n_past + q + 1; k++) {
+            mask_data[q * Lk + k] = 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "penc_output");
+    int out_dim = (int)out->ne[0];
+    ggml_backend_tensor_get(out, out_embed, 0, out_dim * T * sizeof(float));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+}
+
+// ===========================================================================
+// Flow-matching ODE solver (Euler method)
+// ===========================================================================
+
+static void dots_flow_match(dots_tts_context* ctx, const float* llm_hidden, int n_hidden_tokens,
+                            const float* spk_emb, // 512-d or nullptr
+                            float* out_latent,    // (patch_size, latent_dim)
+                            const float* prev_latents, int n_prev_patches) {
+    (void)llm_hidden;
+    (void)n_hidden_tokens;
+    (void)spk_emb;
+    (void)prev_latents;
+    (void)n_prev_patches;
+
+    int ode_steps = ctx->params.ode_steps > 0 ? ctx->params.ode_steps : 16;
+    (void)ode_steps; // TODO: used in full implementation
+    int latent_dim = ctx->latent_dim;
+    int patch_size = ctx->patch_size;
+    int n_latent = patch_size * latent_dim;
+
+    // Initialize with Gaussian noise
+    std::vector<float> z(n_latent);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (int i = 0; i < n_latent; i++) {
+        z[i] = normal(ctx->rng);
+    }
+
+    // Build the FM sequence for DiT:
+    // [LLM hidden states | projected previous latents | noise coordinate]
+    // For simplicity, we concatenate everything into one sequence.
+
+    int dit_dim = (int)ctx->dit.hidden_size;
+
+    // Project LLM hidden → DiT dimension
+    // hidden_proj: (dit_dim, llm_hidden_size)
+    std::vector<float> proj_hidden(n_hidden_tokens * dit_dim, 0.0f);
+    // Manual matmul for now (small dimensions)
+    // TODO: use ggml graph for projection
+
+    // For the Euler ODE: integrate from t=0 to t=1
+    float dt = 1.0f / (float)ode_steps;
+    std::vector<float> velocity(n_latent);
+
+    for (int step = 0; step < ode_steps; step++) {
+        float t = (float)step * dt;
+
+        // Build FM input sequence
+        // For each ODE step, we run the DiT with the current z
+        // The FM sequence has the current noise projected via coordinate_proj
+
+        // Project z → DiT dimension
+        std::vector<float> z_proj(patch_size * dit_dim, 0.0f);
+        // TODO: implement coordinate_proj via ggml
+
+        // For now, construct a simple FM sequence: [condition tokens | noise tokens]
+        int fm_len = n_hidden_tokens + patch_size;
+        std::vector<float> fm_seq(fm_len * dit_dim, 0.0f);
+        // Copy projected hidden states
+        std::memcpy(fm_seq.data(), proj_hidden.data(), n_hidden_tokens * dit_dim * sizeof(float));
+        // Copy projected noise
+        std::memcpy(fm_seq.data() + n_hidden_tokens * dit_dim, z_proj.data(), patch_size * dit_dim * sizeof(float));
+
+        // Run DiT
+        std::vector<float> vel_full(fm_len * dit_dim);
+
+        // Conditional pass
+        dots_dit_forward(ctx, fm_seq.data(), fm_len, t, vel_full.data());
+
+        // Extract velocity for the noise tokens (last patch_size positions)
+        // The output dim from DiT final_proj is latent_dim, not dit_dim
+        int vel_dim = latent_dim;
+        for (int i = 0; i < patch_size; i++) {
+            for (int d = 0; d < vel_dim; d++) {
+                velocity[i * vel_dim + d] = vel_full[(n_hidden_tokens + i) * vel_dim + d];
+            }
+        }
+
+        // CFG: For now, skip unconditional pass (TODO: implement properly)
+        // v = v_cond + cfg_scale * (v_cond - v_uncond)
+        // With no uncond: v = v_cond * (1 + cfg_scale)
+
+        // Euler step: z = z + dt * v
+        for (int i = 0; i < n_latent; i++) {
+            z[i] += dt * velocity[i];
+        }
+    }
+
+    // Denormalize latents using latent_stats
+    if (!ctx->latent_stats.mean.empty() && !ctx->latent_stats.std.empty()) {
+        for (int i = 0; i < patch_size; i++) {
+            for (int d = 0; d < latent_dim; d++) {
+                int idx = i * latent_dim + d;
+                z[idx] = z[idx] * ctx->latent_stats.std[d] + ctx->latent_stats.mean[d];
+            }
+        }
+    }
+
+    std::memcpy(out_latent, z.data(), n_latent * sizeof(float));
+}
+
+// ===========================================================================
+// BigVGAN vocoder decode (latents → 48 kHz PCM)
+// ===========================================================================
+
+static float* dots_vocoder_decode(dots_tts_context* ctx, const float* latents, int n_frames, int* out_n_samples) {
+    (void)latents; // TODO: implement BigVGAN decode graph
+    if (!ctx->has_vocoder) {
+        std::fprintf(stderr, "dots_tts: vocoder not loaded\n");
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    // BigVGAN decode: latents (n_frames, latent_dim) → PCM (n_samples,)
+    // Total upsample factor: 10 × 6 × 4 × 2 × 2 × 2 = 960
+    // So n_samples = n_frames × 960
+
+    auto& voc = ctx->voc;
+    int total_upsample = 1;
+    for (auto r : voc.upsample_rates)
+        total_upsample *= (int)r;
+    int n_samples = n_frames * total_upsample;
+
+    // TODO: Implement BigVGAN decode graph
+    // For now, output silence to allow end-to-end testing
+    float* pcm = (float*)std::malloc(n_samples * sizeof(float));
+    if (!pcm) {
+        *out_n_samples = 0;
+        return nullptr;
+    }
+    std::memset(pcm, 0, n_samples * sizeof(float));
+    *out_n_samples = n_samples;
+
+    if (dots_debug_enabled()) {
+        std::fprintf(stderr, "dots_tts: vocoder decode %d frames → %d samples (%.1f s at %d Hz)\n", n_frames, n_samples,
+                     (float)n_samples / (float)voc.sample_rate, (int)voc.sample_rate);
+    }
+
+    return pcm;
+}
+
+// ===========================================================================
+// Token embedding lookup
+// ===========================================================================
+
+static void dots_embed_tokens(dots_tts_context* ctx, const int32_t* token_ids, int n_tokens, float* out_embeds) {
+    auto& llm = ctx->llm;
+    int D = (int)llm.hidden_size;
+
+    // Read embedding rows from the weight tensor
+    // tok_emb shape: (hidden_size, vocab_size) in ggml convention
+    for (int i = 0; i < n_tokens; i++) {
+        int id = token_ids[i];
+        if (id < 0 || id >= (int)llm.vocab_size) {
+            std::memset(out_embeds + i * D, 0, D * sizeof(float));
+            continue;
+        }
+        // ggml stores embeddings as (hidden_size, vocab_size) → row id is the
+        // second dimension, offset = id * hidden_size
+        ggml_backend_tensor_get(llm.tok_emb, out_embeds + i * D, (size_t)id * D * sizeof(float), D * sizeof(float));
+    }
+}
+
+// ===========================================================================
+// Tokenize text
+// ===========================================================================
+
+static std::vector<int32_t> dots_tokenize(dots_tts_context* ctx, const std::string& text) {
+    return core_bpe::tokenize_simple(ctx->token_to_id, ctx->merge_rank, text);
+}
+
+// ===========================================================================
+// Public API
+// ===========================================================================
+
+struct dots_tts_context_params dots_tts_context_default_params(void) {
+    return {
+        /*.n_threads    =*/4,
+        /*.verbosity    =*/1,
+        /*.use_gpu      =*/false,
+        /*.temperature  =*/0.7f,
+        /*.seed         =*/42,
+        /*.max_patches  =*/256,
+        /*.ode_steps    =*/16,
+        /*.cfg_scale    =*/3.0f,
+        /*.flash_attn   =*/false,
+    };
+}
+
+struct dots_tts_context* dots_tts_init_from_file(const char* path_model, struct dots_tts_context_params params) {
+    auto* ctx = new dots_tts_context();
+    ctx->params = params;
+    ctx->rng.seed(params.seed > 0 ? params.seed : 42);
+
+    // Initialize backend
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+
+    ctx->backend = ctx->backend_cpu; // CPU-only for now
+    // TODO: GPU backend selection
+
+    // Load core model
+    if (!dots_load_core(ctx, path_model, params.verbosity)) {
+        delete ctx;
+        return nullptr;
+    }
+
+    // Initialize LLM KV cache
+    int max_llm_seq = 2048; // text + audio spans
+    if (!dots_kv_init(ctx->llm_kv, (int)ctx->llm.n_layers, (int)ctx->llm.head_dim, (int)ctx->llm.n_kv_heads,
+                      max_llm_seq, ctx->backend)) {
+        std::fprintf(stderr, "dots_tts: failed to init LLM KV cache\n");
+        delete ctx;
+        return nullptr;
+    }
+
+    // Initialize PatchEncoder KV cache
+    int max_penc_seq = 1024;
+    if (!dots_kv_init(ctx->penc_kv, (int)ctx->penc.n_layers, (int)ctx->penc.head_dim, (int)ctx->penc.n_heads,
+                      max_penc_seq, ctx->backend)) {
+        std::fprintf(stderr, "dots_tts: failed to init PatchEncoder KV cache\n");
+        delete ctx;
+        return nullptr;
+    }
+
+    if (params.verbosity >= 1) {
+        std::fprintf(stderr, "dots_tts: ready (LLM KV %d, PEnc KV %d)\n", max_llm_seq, max_penc_seq);
+    }
+
+    return ctx;
+}
+
+int dots_tts_set_vocoder_path(struct dots_tts_context* ctx, const char* path) {
+    if (!ctx || !path)
+        return -1;
+
+    struct gguf_init_params gip = {true, nullptr};
+    gguf_context* meta = gguf_init_from_file(path, gip);
+    if (!meta)
+        return -1;
+
+    auto& voc = ctx->voc;
+    voc.sample_rate = read_u32(meta, "dots.voc.sample_rate", 48000);
+    voc.latent_dim = read_u32(meta, "dots.voc.latent_dim", 128);
+    voc.initial_ch = read_u32(meta, "dots.voc.upsample_initial_channel", 1536);
+    voc.mi_num_layers = read_u32(meta, "dots.voc.mi_num_layers", 4);
+
+    // Read array hyperparams (GGUF int32 arrays via gguf_get_arr_data)
+    auto read_i32_arr = [&](const char* key, std::vector<uint32_t>& out) {
+        int idx = gguf_find_key(meta, key);
+        if (idx < 0)
+            return;
+        int n = (int)gguf_get_arr_n(meta, idx);
+        const int32_t* data = (const int32_t*)gguf_get_arr_data(meta, idx);
+        out.resize(n);
+        for (int i = 0; i < n; i++)
+            out[i] = (uint32_t)data[i];
+    };
+    read_i32_arr("dots.voc.upsample_rates", voc.upsample_rates);
+    read_i32_arr("dots.voc.upsample_kernel_sizes", voc.upsample_ksizes);
+    read_i32_arr("dots.voc.resblock_kernel_sizes", voc.resblock_ksizes);
+
+    gguf_free(meta);
+
+    // Load vocoder weights via core_gguf
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path, ctx->backend, "dots_voc", wl)) {
+        return -1;
+    }
+    voc.ctx_w = wl.ctx;
+    voc.buf_w = wl.buf;
+
+    ctx->has_vocoder = true;
+
+    if (ctx->params.verbosity >= 1) {
+        size_t buf_size = ggml_backend_buffer_get_size(voc.buf_w);
+        std::fprintf(stderr, "dots_tts: vocoder loaded (%.1f MiB, %u Hz)\n", (double)buf_size / (1024 * 1024),
+                     voc.sample_rate);
+    }
+    return 0;
+}
+
+int dots_tts_set_speaker_path(struct dots_tts_context* ctx, const char* path) {
+    if (!ctx || !path)
+        return -1;
+    // TODO: load CAM++ speaker encoder weights
+    // For now, mark as not loaded
+    ctx->has_speaker = false;
+    if (ctx->params.verbosity >= 1)
+        std::fprintf(stderr, "dots_tts: speaker encoder not yet implemented\n");
+    return 0;
+}
+
+int dots_tts_set_voice_prompt(struct dots_tts_context* ctx, const char* wav_path) {
+    if (!ctx || !wav_path)
+        return -1;
+    // TODO: load reference audio, compute speaker embedding via CAM++
+    std::fprintf(stderr, "dots_tts: voice prompt not yet implemented\n");
+    return -1;
+}
+
+float* dots_tts_synthesize(struct dots_tts_context* ctx, const char* text, int* out_n_samples) {
+    if (!ctx || !text || !out_n_samples)
+        return nullptr;
+    *out_n_samples = 0;
+
+    dots_bench_stage bench_total("synthesize_total");
+
+    // 1. Tokenize text
+    std::string input_text(text);
+    std::vector<int32_t> token_ids = dots_tokenize(ctx, input_text);
+    if (token_ids.empty()) {
+        std::fprintf(stderr, "dots_tts: tokenization failed\n");
+        return nullptr;
+    }
+
+    // Add text_cond_end token if available
+    if (ctx->token_text_cond_end >= 0) {
+        token_ids.push_back(ctx->token_text_cond_end);
+    }
+
+    int n_text = (int)token_ids.size();
+    if (ctx->params.verbosity >= 2) {
+        std::fprintf(stderr, "dots_tts: %d text tokens\n", n_text);
+    }
+
+    // 2. Embed text tokens
+    int llm_dim = (int)ctx->llm.hidden_size;
+    std::vector<float> text_embeds(n_text * llm_dim);
+    {
+        dots_bench_stage b("embed_tokens");
+        dots_embed_tokens(ctx, token_ids.data(), n_text, text_embeds.data());
+    }
+
+    // 3. Autoregressive patch generation loop
+    int max_patches = ctx->params.max_patches > 0 ? ctx->params.max_patches : 256;
+    int latent_dim = ctx->latent_dim;
+    int patch_size = ctx->patch_size;
+
+    std::vector<float> all_latents; // accumulated latent patches
+    int llm_n_past = 0;
+
+    // Prefill: run LLM on text tokens
+    {
+        dots_bench_stage b("llm_prefill");
+        std::vector<float> hidden(n_text * llm_dim);
+        dots_llm_step(ctx, text_embeds.data(), n_text, 0, hidden.data());
+        llm_n_past = n_text;
+    }
+
+    // Generate patches
+    int penc_n_past = 0;
+    for (int patch_idx = 0; patch_idx < max_patches; patch_idx++) {
+        dots_bench_stage b_patch("patch_generate");
+
+        // Add audio_gen_span token to LLM input
+        std::vector<float> span_embed(llm_dim, 0.0f);
+        if (ctx->token_audio_gen_span >= 0) {
+            int32_t span_id = ctx->token_audio_gen_span;
+            dots_embed_tokens(ctx, &span_id, 1, span_embed.data());
+        }
+
+        // LLM step for the audio span token
+        std::vector<float> span_hidden(llm_dim);
+        {
+            dots_bench_stage b2("llm_step");
+            dots_llm_step(ctx, span_embed.data(), 1, llm_n_past, span_hidden.data());
+            llm_n_past += 1;
+        }
+
+        // Flow-matching: generate one latent patch
+        std::vector<float> patch_latent(patch_size * latent_dim);
+        {
+            dots_bench_stage b2("flow_match");
+            dots_flow_match(ctx, span_hidden.data(), 1, ctx->speaker_emb.empty() ? nullptr : ctx->speaker_emb.data(),
+                            patch_latent.data(), all_latents.data(), patch_idx);
+        }
+
+        // Accumulate latent
+        all_latents.insert(all_latents.end(), patch_latent.begin(), patch_latent.end());
+
+        // PatchEncoder: encode this patch → LLM embedding for next step
+        std::vector<float> patch_embed(patch_size * llm_dim);
+        {
+            dots_bench_stage b2("penc_forward");
+            dots_penc_forward(ctx, patch_latent.data(), patch_size, penc_n_past, patch_embed.data());
+            penc_n_past += patch_size;
+        }
+
+        // Feed patch embedding back to LLM
+        // Take the last frame's embedding as the next LLM input
+        // (or average — need to match upstream)
+        std::vector<float> llm_input(llm_dim);
+        // Use last frame
+        std::memcpy(llm_input.data(), patch_embed.data() + (patch_size - 1) * llm_dim, llm_dim * sizeof(float));
+
+        // Check EOS (via eos_proj)
+        // TODO: implement EOS detection via eos_proj MLP
+        // For now, just run all max_patches
+
+        if (ctx->params.verbosity >= 2 && (patch_idx + 1) % 10 == 0) {
+            std::fprintf(stderr, "dots_tts: generated %d/%d patches\n", patch_idx + 1, max_patches);
+        }
+    }
+
+    int n_total_frames = (int)(all_latents.size() / latent_dim);
+    if (ctx->params.verbosity >= 1) {
+        std::fprintf(stderr, "dots_tts: generated %d latent frames (%d patches)\n", n_total_frames,
+                     n_total_frames / patch_size);
+    }
+
+    // 4. Vocoder decode
+    float* pcm = nullptr;
+    {
+        dots_bench_stage b("vocoder_decode");
+        pcm = dots_vocoder_decode(ctx, all_latents.data(), n_total_frames, out_n_samples);
+    }
+
+    return pcm;
+}
+
+float* dots_tts_generate_latents(struct dots_tts_context* ctx, const char* text, int* out_n) {
+    // TODO: implement latent-only generation for debugging
+    (void)ctx;
+    (void)text;
+    *out_n = 0;
+    return nullptr;
+}
+
+void dots_tts_pcm_free(float* pcm) {
+    std::free(pcm);
+}
+
+void dots_tts_free(struct dots_tts_context* ctx) {
+    if (!ctx)
+        return;
+
+    dots_kv_free(ctx->llm_kv);
+    dots_kv_free(ctx->penc_kv);
+
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
+    if (ctx->buf_w)
+        ggml_backend_buffer_free(ctx->buf_w);
+    if (ctx->ctx_w)
+        ggml_free(ctx->ctx_w);
+
+    if (ctx->voc.buf_w)
+        ggml_backend_buffer_free(ctx->voc.buf_w);
+    if (ctx->voc.ctx_w)
+        ggml_free(ctx->voc.ctx_w);
+
+    if (ctx->backend && ctx->backend != ctx->backend_cpu)
+        ggml_backend_free(ctx->backend);
+    if (ctx->backend_cpu)
+        ggml_backend_free(ctx->backend_cpu);
+
+    delete ctx;
+}
+
+void dots_tts_set_n_threads(struct dots_tts_context* ctx, int n_threads) {
+    if (ctx && ctx->backend_cpu)
+        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+}
+
+void dots_tts_set_temperature(struct dots_tts_context* ctx, float temperature) {
+    if (ctx)
+        ctx->params.temperature = temperature;
+}
+
+void dots_tts_set_seed(struct dots_tts_context* ctx, uint64_t seed) {
+    if (ctx) {
+        ctx->params.seed = seed;
+        ctx->rng.seed(seed > 0 ? seed : 42);
+    }
+}

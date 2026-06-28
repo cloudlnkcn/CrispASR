@@ -1633,6 +1633,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# dots-tts — rednote-hilab/dots.tts 2B continuous AR TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(dots-tts STATIC dots_tts.h dots_tts.cpp)
+set_target_properties(dots-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(dots-tts PUBLIC .)
+target_compile_features   (dots-tts PUBLIC cxx_std_17)
+target_link_libraries     (dots-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(dots-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # fastpitch-tts — NVIDIA FastPitch parallel TTS (native ggml runtime)
 # ---------------------------------------------------------------------------
 add_library(fastpitch-tts STATIC fastpitch_tts.h fastpitch_tts.cpp)
@@ -2152,6 +2164,9 @@ if (TARGET bark-tts)
 endif()
 if (TARGET dia-tts)
     target_link_libraries(crispasr-lib PUBLIC dia-tts)
+endif()
+if (TARGET dots-tts)
+    target_link_libraries(crispasr-lib PUBLIC dots-tts)
 endif()
 if (TARGET fastpitch-tts)
     target_link_libraries(crispasr-lib PUBLIC fastpitch-tts)

@@ -1,0 +1,78 @@
+#pragma once
+
+// dots_tts.h — public C ABI for rednote-hilab/dots.tts TTS backend.
+//
+// dots.tts is a 2B-parameter continuous AR text-to-speech system:
+//   - Qwen2.5-1.5B LLM backbone (28L, 12Q/2KV heads, hidden=1536)
+//   - PatchEncoder: 24L causal transformer (VAESemanticEncoder, in=128→1024)
+//   - DiT: 18L AdaLN flow-matching head (hidden=1024)
+//   - BigVGAN vocoder: 6-stage upsample (960x) with SnakeBeta, 48 kHz
+//   - CAM++ speaker encoder: 80-mel → 512-d embedding
+//
+// The inference loop generates audio patch-by-patch:
+//   1. Text tokens → LLM → hidden states at audio-span positions
+//   2. LLM hidden → DiT conditions; noise → Euler ODE → denoised latent
+//   3. Latent → PatchEncoder → embedding → feed back to LLM
+//   4. All latents → BigVGAN decoder → 48 kHz PCM
+//
+// Three GGUF files:
+//   - Core (LLM + DiT + PatchEncoder + tokenizer): dots-tts-soar-f16.gguf
+//   - Vocoder (BigVGAN): dots-tts-soar-vocoder-f16.gguf
+//   - Speaker (CAM++): dots-tts-soar-spk-f16.gguf (optional, for voice cloning)
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct dots_tts_context;
+
+struct dots_tts_context_params {
+    int n_threads;
+    int verbosity; // 0=silent, 1=normal, 2=verbose
+    bool use_gpu;
+    float temperature; // sampling temperature for LLM decode (0 = greedy)
+    uint64_t seed;     // RNG seed (0 = default 42)
+    int max_patches;   // max audio patches to generate; 0 = default (256 ≈ 40s)
+    int ode_steps;     // flow-matching ODE steps; 0 = default (16)
+    float cfg_scale;   // classifier-free guidance scale; 0 = default (3.0)
+    bool flash_attn;   // flash attention for LLM/PatchEncoder
+};
+
+struct dots_tts_context_params dots_tts_context_default_params(void);
+
+// Load core model (LLM + DiT + PatchEncoder + tokenizer).
+struct dots_tts_context* dots_tts_init_from_file(const char* path_model, struct dots_tts_context_params params);
+
+// Load vocoder GGUF (required before synthesis). Returns 0 on success.
+int dots_tts_set_vocoder_path(struct dots_tts_context* ctx, const char* path);
+
+// Load speaker encoder GGUF (optional, for voice cloning). Returns 0 on success.
+int dots_tts_set_speaker_path(struct dots_tts_context* ctx, const char* path);
+
+// Set reference audio for voice cloning (requires speaker encoder).
+// wav_path must be a mono WAV file. Returns 0 on success.
+int dots_tts_set_voice_prompt(struct dots_tts_context* ctx, const char* wav_path);
+
+// Synthesize text to 48 kHz mono float32 PCM.
+// Returns malloc'd float[*out_n_samples]. Caller frees with dots_tts_pcm_free().
+// Returns nullptr on failure.
+float* dots_tts_synthesize(struct dots_tts_context* ctx, const char* text, int* out_n_samples);
+
+// Generate latents only (no vocoder decode). For debugging.
+// Returns malloc'd float[*out_n] in (n_patches * patch_size, latent_dim) layout.
+float* dots_tts_generate_latents(struct dots_tts_context* ctx, const char* text, int* out_n);
+
+void dots_tts_pcm_free(float* pcm);
+void dots_tts_free(struct dots_tts_context* ctx);
+
+// Runtime parameter setters
+void dots_tts_set_n_threads(struct dots_tts_context* ctx, int n_threads);
+void dots_tts_set_temperature(struct dots_tts_context* ctx, float temperature);
+void dots_tts_set_seed(struct dots_tts_context* ctx, uint64_t seed);
+
+#ifdef __cplusplus
+}
+#endif

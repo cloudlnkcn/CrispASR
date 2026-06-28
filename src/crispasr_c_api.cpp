@@ -156,6 +156,10 @@
 #include "dia_tts.h"
 #define CA_HAVE_DIA 1
 #endif
+#if __has_include("dots_tts.h")
+#include "dots_tts.h"
+#define CA_HAVE_DOTS_TTS 1
+#endif
 #if __has_include("pocket_tts.h")
 #include "pocket_tts.h"
 #define CA_HAVE_POCKET 1
@@ -1281,6 +1285,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "kugelaudio";
     else if (strcmp(arch, "zonos") == 0 || strcmp(arch, "zonos-tts") == 0)
         backend = "zonos";
+    else if (strcmp(arch, "dots-tts") == 0 || strcmp(arch, "dots_tts") == 0 || strcmp(arch, "dots.tts") == 0)
+        backend = "dots-tts";
 
     std::strncpy(out_name, backend, out_cap - 1);
     out_name[out_cap - 1] = '\0';
@@ -1573,6 +1579,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_DIA
     dia_tts_context* dia_tts_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    dots_tts_context* dots_tts_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_POCKET
     pocket_tts_context* pocket_tts_ctx = nullptr;
@@ -2363,6 +2372,40 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
                 if (f) {
                     fclose(f);
                     dia_tts_set_codec_path(s->dia_tts_ctx, cp.c_str());
+                    break;
+                }
+            }
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->backend == "dots" || s->backend == "dots-tts" || s->backend == "dots_tts" || s->backend == "dots.tts") {
+        s->backend = "dots-tts";
+        dots_tts_context_params p = dots_tts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.temperature = (g_open_temperature_tls > 0.0f) ? g_open_temperature_tls : 0.7f;
+        p.seed = g_open_seed_tls;
+        s->dots_tts_ctx = dots_tts_init_from_file(model_path, p);
+        if (!s->dots_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Auto-resolve vocoder GGUF next to the model
+        {
+            std::string mp = model_path ? model_path : "";
+            auto sep = mp.find_last_of("/\\");
+            std::string dir = (sep == std::string::npos) ? std::string(".") : mp.substr(0, sep);
+            for (const char* name : {"dots-tts-soar-vocoder-f16.gguf",
+                                     "dots-tts-vocoder-f16.gguf",
+                                     "dots-tts-vocoder.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    dots_tts_set_vocoder_path(s->dots_tts_ctx, cp.c_str());
                     break;
                 }
             }
@@ -5989,6 +6032,11 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         return dia_tts_synthesize(s->dia_tts_ctx, text, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->dots_tts_ctx) {
+        return dots_tts_synthesize(s->dots_tts_ctx, text, out_n_samples);
+    }
+#endif
 #ifdef CA_HAVE_POCKET
     if (s->pocket_tts_ctx) {
         return pocket_tts_synthesize(s->pocket_tts_ctx, text, out_n_samples);
@@ -6591,6 +6639,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_DIA
     if (s->dia_tts_ctx)
         dia_tts_free(s->dia_tts_ctx);
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->dots_tts_ctx)
+        dots_tts_free(s->dots_tts_ctx);
 #endif
 #ifdef CA_HAVE_POCKET
     if (s->pocket_tts_ctx)
