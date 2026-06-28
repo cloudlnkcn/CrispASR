@@ -1036,6 +1036,26 @@ if(GGML_CUDA)
     target_link_libraries(voxtral4b PUBLIC ggml-cuda)
 endif()
 
+add_library(higgs_stt STATIC
+            higgs_stt.h
+            higgs_stt.cpp
+            )
+target_include_directories(higgs_stt PUBLIC . ../include)
+target_compile_features   (higgs_stt PUBLIC cxx_std_17)
+set_target_properties(higgs_stt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (higgs_stt PUBLIC ggml ggml-base Threads::Threads crispasr-core crisp_audio)
+if(NOT MSVC)
+    target_compile_options(higgs_stt PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(higgs_stt PRIVATE GGML_USE_METAL)
+    target_link_libraries(higgs_stt PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(higgs_stt PRIVATE GGML_USE_CUDA)
+    target_link_libraries(higgs_stt PUBLIC ggml-cuda)
+endif()
+
 add_library(granite_speech STATIC
             granite_speech.h
             granite_speech.cpp
@@ -2048,6 +2068,9 @@ if (TARGET canary_ctc)
 endif()
 if (TARGET voxtral)
     target_link_libraries(crispasr-lib PUBLIC voxtral)
+endif()
+if (TARGET higgs_stt)
+    target_link_libraries(crispasr-lib PUBLIC higgs_stt)
 endif()
 if (TARGET voxtral4b)
     target_link_libraries(crispasr-lib PUBLIC voxtral4b)

@@ -25,6 +25,7 @@ add_executable(${TARGET}
     crispasr_backend_granite_nle.cpp
     crispasr_backend_voxtral.cpp
     crispasr_backend_voxtral4b.cpp
+    crispasr_backend_higgs_stt.cpp
     crispasr_backend_qwen3.cpp
     crispasr_backend_fastconformer_ctc.cpp
     crispasr_backend_wav2vec2.cpp
@@ -184,6 +185,7 @@ target_link_libraries(crispasr-diff PRIVATE
     granite_nle
     voxtral
     voxtral4b
+    higgs_stt
     qwen3_asr
     qwen3_tts
     orpheus
@@ -280,6 +282,7 @@ target_link_libraries(${TARGET} PRIVATE
     granite_nle
     voxtral
     voxtral4b
+    higgs_stt
     qwen3_asr
     qwen3_tts
     orpheus

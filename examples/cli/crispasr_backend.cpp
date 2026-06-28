@@ -17,6 +17,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_granite_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_granite_nle_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral4b_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_higgs_stt_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastconformer_ctc_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_wav2vec2_backend();
@@ -102,6 +103,9 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_voxtral_backend();
     if (name == "voxtral4b")
         return crispasr_make_voxtral4b_backend();
+    if (name == "higgs-stt" || name == "higgs_stt" || name == "higgs-audio-v3-stt" || name == "higgs-audio-stt" ||
+        name == "higgsaudiostt")
+        return crispasr_make_higgs_stt_backend();
     if (name == "qwen3" || name == "qwen3-1.7b" || name == "qwen3_1.7b" || name == "qwen3_17b" || name == "mega-asr" ||
         name == "mega_asr" || name == "megaasr")
         return crispasr_make_qwen3_backend();
@@ -479,6 +483,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "voxtral4b";
     if (contains_ci("voxtral"))
         return "voxtral";
+    if (contains_ci("higgs") && (contains_ci("stt") || contains_ci("audio")))
+        return "higgs-stt";
     // Distinguish parakeet-CTC standalones (parakeet-ctc-0.6b /
     // parakeet-ctc-1.1b — same FastConformer encoder + CTC head as the
     // stt_en_fastconformer_ctc family) from parakeet-TDT (transducer)
@@ -663,6 +669,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "m2m100";
             else if (a == "voxtral")
                 result = "voxtral";
+            else if (a == "higgs-stt" || a == "higgs_stt" || a == "higgs-audio-v3-stt")
+                result = "higgs-stt";
             else if (a == "voxtral4b" || a == "voxtral-4b" || a == "voxtral_4b")
                 result = "voxtral4b";
             else if (a == "granite-speech" || a == "granite_speech" || a == "granitespeech")
