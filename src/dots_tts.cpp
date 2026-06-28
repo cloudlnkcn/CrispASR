@@ -124,6 +124,9 @@ struct dots_llm_layer {
     ggml_tensor* k_proj = nullptr;
     ggml_tensor* v_proj = nullptr;
     ggml_tensor* o_proj = nullptr;
+    ggml_tensor* q_proj_b = nullptr; // Qwen2.5 has QKV biases
+    ggml_tensor* k_proj_b = nullptr;
+    ggml_tensor* v_proj_b = nullptr;
     ggml_tensor* q_norm = nullptr;
     ggml_tensor* k_norm = nullptr;
     ggml_tensor* gate = nullptr; // SwiGLU gate
@@ -157,6 +160,7 @@ struct dots_penc_layer {
     ggml_tensor* k_proj = nullptr;
     ggml_tensor* v_proj = nullptr;
     ggml_tensor* o_proj = nullptr;
+    ggml_tensor* o_proj_b = nullptr;
     ggml_tensor* q_norm = nullptr;
     ggml_tensor* k_norm = nullptr;
     // 2-layer MLP (NOT SwiGLU): fc1 (hidden→ffn) + SiLU + fc2 (ffn→hidden)
@@ -194,6 +198,7 @@ struct dots_dit_block {
     ggml_tensor* k_proj = nullptr;
     ggml_tensor* v_proj = nullptr;
     ggml_tensor* o_proj = nullptr;
+    ggml_tensor* o_proj_b = nullptr;
     ggml_tensor* q_norm = nullptr;
     ggml_tensor* k_norm = nullptr;
     // 2-layer MLP (NOT SwiGLU): fc1 → SiLU → fc2
@@ -565,6 +570,9 @@ static bool dots_load_core(dots_tts_context* ctx, const char* path, int verbosit
         L.k_proj = t("k_proj.weight");
         L.v_proj = t("v_proj.weight");
         L.o_proj = t("o_proj.weight");
+        L.q_proj_b = t("q_proj.bias");
+        L.k_proj_b = t("k_proj.bias");
+        L.v_proj_b = t("v_proj.bias");
         L.q_norm = t("q_norm.weight");
         L.k_norm = t("k_norm.weight");
         L.gate = t("gate.weight");
@@ -592,6 +600,7 @@ static bool dots_load_core(dots_tts_context* ctx, const char* path, int verbosit
         L.k_proj = t("k_proj.weight");
         L.v_proj = t("v_proj.weight");
         L.o_proj = t("o_proj.weight");
+        L.o_proj_b = t("o_proj.bias");
         L.q_norm = t("q_norm.weight");
         L.k_norm = t("k_norm.weight");
         L.ffn_up = t("ffn_up.weight"); // fc1
@@ -628,6 +637,7 @@ static bool dots_load_core(dots_tts_context* ctx, const char* path, int verbosit
         B.k_proj = t("k_proj.weight");
         B.v_proj = t("v_proj.weight");
         B.o_proj = t("o_proj.weight");
+        B.o_proj_b = t("o_proj.bias");
         B.q_norm = t("q_norm.weight");
         B.k_norm = t("k_norm.weight");
         B.ffn_up = t("ffn_up.weight"); // fc1
@@ -746,7 +756,9 @@ static void dots_llm_step(dots_tts_context* ctx, const float* input_embeds, int 
 
         // Self-attention with KV cache
         cur = core_attn::kv_self_attn(ctx0, gf, cur, L.q_proj, L.k_proj, L.v_proj, L.o_proj, L.q_norm, L.k_norm,
-                                      positions, mask, ctx->llm_kv.k_l[il], ctx->llm_kv.v_l[il], (int)il, n_past, atp);
+                                      positions, mask, ctx->llm_kv.k_l[il], ctx->llm_kv.v_l[il], (int)il, n_past, atp,
+                                      /*qkv_w=*/nullptr, /*fixed_kv_len=*/0, /*kv_indices=*/nullptr, L.q_proj_b,
+                                      L.k_proj_b, L.v_proj_b);
 
         cur = ggml_add(ctx0, residual, cur);
         residual = cur;
@@ -893,6 +905,8 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
 
         // Output projection
         cur = ggml_mul_mat(ctx0, B.o_proj, cur);
+        if (B.o_proj_b)
+            cur = ggml_add(ctx0, cur, B.o_proj_b);
 
         // Gated residual
         cur = core_adaln::gated_residual(ctx0, residual, cur, mod.gate_msa);
@@ -1006,9 +1020,10 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latent_patch, 
 
         cur = rms_norm(ctx0, cur, L.attn_norm, 1e-6f);
 
-        cur =
-            core_attn::kv_self_attn(ctx0, gf, cur, L.q_proj, L.k_proj, L.v_proj, L.o_proj, L.q_norm, L.k_norm,
-                                    positions, mask, ctx->penc_kv.k_l[il], ctx->penc_kv.v_l[il], (int)il, n_past, atp);
+        cur = core_attn::kv_self_attn(ctx0, gf, cur, L.q_proj, L.k_proj, L.v_proj, L.o_proj, L.q_norm, L.k_norm,
+                                      positions, mask, ctx->penc_kv.k_l[il], ctx->penc_kv.v_l[il], (int)il, n_past, atp,
+                                      /*qkv_w=*/nullptr, /*fixed_kv_len=*/0, /*kv_indices=*/nullptr,
+                                      /*q_b=*/nullptr, /*k_b=*/nullptr, /*v_b=*/nullptr, L.o_proj_b);
 
         cur = ggml_add(ctx0, residual, cur);
         residual = cur;
@@ -1273,10 +1288,26 @@ static float* dots_vocoder_decode(dots_tts_context* ctx, const float* latents, i
     ggml_set_name(x, "voc_input");
     ggml_set_input(x);
 
-    // Step 1: MI layer (skip for now — it processes latents but the graph
-    // is CPU-side LSTM which needs special handling. TODO: implement via
-    // core_lstm or CPU-side loop.)
-    // For now, pass latents directly to conv_pre.
+    // Step 1: MI layer — Linear(128→512) → 4-layer LSTM(512) → Linear(512→128)
+    // The MI layer processes latents through a mutual information bottleneck.
+    if (voc.mi_in_w && voc.lstm_w_ih[0]) {
+        // Linear in: (latent_dim, T) → (512, T)
+        x = ggml_mul_mat(ctx0, voc.mi_in_w, x);
+        if (voc.mi_in_b)
+            x = ggml_add(ctx0, x, voc.mi_in_b);
+        // 4-layer stacked LSTM (forward only, hidden=512)
+        const int lstm_h = 512;
+        for (int li = 0; li < 4; li++) {
+            if (!voc.lstm_w_ih[li])
+                break;
+            x = core_lstm::lstm_unidir(ctx0, gf, x, voc.lstm_w_ih[li], voc.lstm_w_hh[li], voc.lstm_b_ih[li],
+                                       voc.lstm_b_hh[li], lstm_h, /*reverse=*/false);
+        }
+        // Linear out: (512, T) → (128, T)
+        x = ggml_mul_mat(ctx0, voc.mi_out_w, x);
+        if (voc.mi_out_b)
+            x = ggml_add(ctx0, x, voc.mi_out_b);
+    }
 
     // Step 2: conv_pre — Conv1d(128, 1536, k=5)
     x = dots_conv1d(ctx0, x, voc.conv_pre_w, voc.conv_pre_b);

@@ -361,9 +361,15 @@ def main():
             w.add_string("dots.tokenizer.tokens", "\n".join(token_strings))
             w.add_int32("dots.tokenizer.n_tokens", len(token_strings))
             print(f"  Tokenizer: {len(token_strings)} tokens")
-        # Extract merges
-        merges = tok_data.get("model", {}).get("merges", [])
-        if merges:
+        # Extract merges — may be list of strings or list of [str, str] pairs
+        merges_raw = tok_data.get("model", {}).get("merges", [])
+        if merges_raw:
+            merges = []
+            for m in merges_raw:
+                if isinstance(m, list):
+                    merges.append(" ".join(m))  # ["Ġ", "t"] → "Ġ t"
+                else:
+                    merges.append(str(m))
             w.add_string("dots.tokenizer.merges", "\n".join(merges))
             w.add_int32("dots.tokenizer.n_merges", len(merges))
             print(f"  Merges: {len(merges)}")
