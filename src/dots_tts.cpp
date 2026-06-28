@@ -705,12 +705,15 @@ static bool dots_load_core(dots_tts_context* ctx, const char* path, int verbosit
 // ===========================================================================
 
 static void dots_timestep_embed(float t, int dim, std::vector<float>& out) {
+    // Reference (dit.py TimestepEmbedder.timestep_embedding):
+    //   freqs = exp(-log(10000) * arange(half)/half); args = t*freqs
+    //   embedding = cat([cos(args), sin(args)])   -- COS first, then SIN.
     out.resize(dim);
     int half = dim / 2;
     for (int i = 0; i < half; i++) {
         float freq = std::exp(-(float)i / (float)half * std::log(10000.0f));
-        out[i] = std::sin(t * freq);
-        out[i + half] = std::cos(t * freq);
+        out[i] = std::cos(t * freq);
+        out[i + half] = std::sin(t * freq);
     }
 }
 
@@ -840,8 +843,10 @@ static void dots_llm_step(dots_tts_context* ctx, const float* input_embeds, int 
 // DiT forward (flow-matching velocity prediction, one timestep)
 // ===========================================================================
 
+// g_cond: optional (D,) global conditioning added to the timestep embedding
+// to form the AdaLN condition c (reference: c = time_embedder(t) + g_cond).
 static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_len, float timestep,
-                             float* out_velocity) {
+                             const float* g_cond, float* out_velocity) {
     auto& dit = ctx->dit;
     const int D = (int)dit.hidden_size;
     const int T = fm_len;
@@ -881,10 +886,24 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
     if (dit.time_mlp_1_b)
         t_emb = ggml_add(ctx0, t_emb, dit.time_mlp_1_b);
 
+    // AdaLN condition c = t_emb (+ g_cond). All block/final modulation uses c.
+    ggml_tensor* c = t_emb;
+    ggml_tensor* g_cond_in = nullptr;
+    if (g_cond) {
+        g_cond_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, D);
+        ggml_set_name(g_cond_in, "dit_gcond");
+        ggml_set_input(g_cond_in);
+        c = ggml_add(ctx0, t_emb, g_cond_in);
+    }
+
+    const bool dit_dbg = std::getenv("CRISPASR_DOTS_DIT_DEBUG") != nullptr;
+
     // Input projection
     ggml_tensor* cur = ggml_mul_mat(ctx0, dit.in_proj_w, x);
     if (dit.in_proj_b)
         cur = ggml_add(ctx0, cur, dit.in_proj_b);
+    ggml_tensor* dbg_x0 = cur;
+    ggml_tensor* dbg_b0 = nullptr;
 
     // Positions for RoPE (bidirectional, 0..T-1)
     ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
@@ -896,8 +915,8 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
         auto& B = dit.blocks[il];
         ggml_tensor* residual = cur;
 
-        // AdaLN modulation (6-way split)
-        core_adaln::Modulation6 mod = core_adaln::modulate6(ctx0, t_emb, B.adaln_w, B.adaln_b, true);
+        // AdaLN modulation (6-way split) from condition c = t_emb + g_cond
+        core_adaln::Modulation6 mod = core_adaln::modulate6(ctx0, c, B.adaln_w, B.adaln_b, true);
 
         // Pre-attention: LayerNorm + modulation
         cur = core_adaln::apply_norm_modulation(ctx0, cur, mod.scale_msa, mod.shift_msa);
@@ -929,16 +948,17 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
         K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, dit.rope_theta, 1.0f, 0.0f, 1.0f,
                           0.0f, 0.0f);
 
-        // Scaled dot-product attention (bidirectional — no mask)
-        // Permute to (hd, T, nh) for ggml_flash_attn_ext
-        Q = ggml_permute(ctx0, Q, 0, 2, 1, 3);
-        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
-        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
-
+        // Scaled dot-product attention (bidirectional, manual softmax — the
+        // validated penc pattern; avoids flash_attn_ext layout/precision pitfalls)
         float scale = 1.0f / std::sqrt((float)hd);
-        cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-        // Output: (hd, T, nh) → reshape to (D, T)
-        cur = ggml_reshape_2d(ctx0, cur, hd * nh, T);
+        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3)); // (hd, T, nh)
+        K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3)); // (hd, T, nh)
+        ggml_tensor* kq = ggml_mul_mat(ctx0, K, Q);             // (Tk, Tq, nh)
+        kq = ggml_soft_max_ext(ctx0, kq, nullptr, scale, 0.0f);
+        ggml_tensor* Vp = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 2, 0, 3)); // (T, hd, nh)
+        ggml_tensor* kqv = ggml_mul_mat(ctx0, Vp, kq);                        // (hd, Tq, nh)
+        kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));           // (hd, nh, Tq)
+        cur = ggml_reshape_2d(ctx0, kqv, hd * nh, T);
 
         // Output projection
         cur = ggml_mul_mat(ctx0, B.o_proj, cur);
@@ -952,28 +972,47 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
         // Pre-FFN: LayerNorm + modulation
         cur = core_adaln::apply_norm_modulation(ctx0, cur, mod.scale_mlp, mod.shift_mlp);
 
-        // FFN (2-layer MLP: fc1 → SiLU → fc2)
+        // FFN (2-layer MLP: fc1 → GELU(tanh) → fc2). DiT uses tanh-approx GELU
+        // (dit.py: act_layer=nn.GELU(approximate="tanh")), NOT SiLU.
         cur = ggml_mul_mat(ctx0, B.ffn_up, cur);
         if (B.ffn_up_b)
             cur = ggml_add(ctx0, cur, B.ffn_up_b);
-        cur = ggml_silu(ctx0, cur);
+        cur = ggml_gelu(ctx0, cur);
         cur = ggml_mul_mat(ctx0, B.ffn_down, cur);
         if (B.ffn_down_b)
             cur = ggml_add(ctx0, cur, B.ffn_down_b);
 
         // Gated residual
         cur = core_adaln::gated_residual(ctx0, residual, cur, mod.gate_mlp);
+        if (il == 0)
+            dbg_b0 = cur;
     }
 
-    // Final AdaLN + projection
-    core_adaln::Modulation2 final_mod = core_adaln::modulate2(ctx0, t_emb, dit.final_adaln_w, dit.final_adaln_b, true);
-    cur = core_adaln::apply_norm_modulation(ctx0, cur, final_mod.scale, final_mod.shift);
+    // Final AdaLN + projection (condition c = t_emb + g_cond).
+    // dots.tts FinalLayer splits `shift, scale = adaLN(c).chunk(2)` (shift FIRST),
+    // but the shared modulate2 helper labels chunk0=scale, chunk1=shift (the
+    // f5/cosyvoice3 convention). So swap: use .shift (chunk1) as scale and
+    // .scale (chunk0) as shift to match dots.tts.
+    core_adaln::Modulation2 final_mod = core_adaln::modulate2(ctx0, c, dit.final_adaln_w, dit.final_adaln_b, true);
+    cur = core_adaln::apply_norm_modulation(ctx0, cur, /*scale=*/final_mod.shift, /*shift=*/final_mod.scale);
     cur = ggml_mul_mat(ctx0, dit.final_proj_w, cur);
     if (dit.final_proj_b)
         cur = ggml_add(ctx0, cur, dit.final_proj_b);
 
     ggml_set_name(cur, "dit_output");
     ggml_set_output(cur);
+    if (dit_dbg) {
+        ggml_set_output(t_emb);
+        ggml_set_name(t_emb, "dbg_temb");
+        ggml_set_output(c);
+        ggml_set_name(c, "dbg_c");
+        ggml_set_output(dbg_x0);
+        ggml_set_name(dbg_x0, "dbg_x0");
+        if (dbg_b0) {
+            ggml_set_output(dbg_b0);
+            ggml_set_name(dbg_b0, "dbg_b0");
+        }
+    }
     ggml_build_forward_expand(gf, cur);
 
     // Allocate and compute
@@ -987,6 +1026,9 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
     dots_timestep_embed(timestep, t_dim, t_emb_data);
     ggml_backend_tensor_set(t_emb_in, t_emb_data.data(), 0, t_dim * sizeof(float));
 
+    if (g_cond_in)
+        ggml_backend_tensor_set(g_cond_in, g_cond, 0, D * sizeof(float));
+
     // Positions
     std::vector<int32_t> pos(T);
     for (int i = 0; i < T; i++)
@@ -998,6 +1040,20 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
     ggml_tensor* out = ggml_graph_get_tensor(gf, "dit_output");
     int out_dim = (int)out->ne[0];
     ggml_backend_tensor_get(out, out_velocity, 0, out_dim * T * sizeof(float));
+
+    if (dit_dbg) {
+        for (const char* nm : {"dbg_temb", "dbg_c", "dbg_x0", "dbg_b0"}) {
+            ggml_tensor* dt = ggml_graph_get_tensor(gf, nm);
+            if (!dt)
+                continue;
+            float v[6];
+            ggml_backend_tensor_get(dt, v, 0, sizeof(v));
+            std::fprintf(stderr, "[dit-cpp] %s:", nm);
+            for (int i = 0; i < 6; i++)
+                std::fprintf(stderr, " %+.4f", v[i]);
+            std::fprintf(stderr, "\n");
+        }
+    }
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx0);
@@ -1206,8 +1262,8 @@ static void dots_flow_match(dots_tts_context* ctx, const float* llm_hidden, int 
         // Run DiT
         std::vector<float> vel_full(fm_len * dit_dim);
 
-        // Conditional pass
-        dots_dit_forward(ctx, fm_seq.data(), fm_len, t, vel_full.data());
+        // Conditional pass (g_cond wiring is part of the full flow-match port; TODO)
+        dots_dit_forward(ctx, fm_seq.data(), fm_len, t, /*g_cond=*/nullptr, vel_full.data());
 
         // Extract velocity for the noise tokens (last patch_size positions)
         // The output dim from DiT final_proj is latent_dim, not dit_dim
@@ -1952,6 +2008,78 @@ extern "C" int dots_tts_penc_diff(const char* model_gguf, const char* ref_gguf, 
         std::printf("\n  ref[:6]:");
         for (int i = 0; i < 6 && i < out_n; i++)
             std::printf(" %+.4f", ref_out[i]);
+        std::printf("\n");
+    }
+
+    dots_tts_free(ctx);
+    return cos > 0.999 ? 0 : 1;
+}
+
+// ── Diff-harness: validate DiT (velocity_field_predictor) one forward ───────
+// Reference carries dit_x (D,T), dit_t (scalar), dit_gcond (D), dit_vel
+// (latent_dim,T) from tools/reference_backends/dots_tts_reference.py.
+extern "C" int dots_tts_dit_diff(const char* model_gguf, const char* ref_gguf, int verbosity) {
+    dots_tts_context_params p = dots_tts_context_default_params();
+    p.verbosity = verbosity;
+    p.use_gpu = false;
+    dots_tts_context* ctx = dots_tts_init_from_file(model_gguf, p);
+    if (!ctx) {
+        std::fprintf(stderr, "dots_dit_diff: failed to load model %s\n", model_gguf);
+        return 2;
+    }
+    core_gguf::WeightLoad rw;
+    if (!core_gguf::load_weights(ref_gguf, ctx->backend, "ref", rw)) {
+        std::fprintf(stderr, "dots_dit_diff: failed to load reference %s\n", ref_gguf);
+        dots_tts_free(ctx);
+        return 2;
+    }
+    ggml_tensor* t_x = ggml_get_tensor(rw.ctx, "dit_x");
+    ggml_tensor* t_t = ggml_get_tensor(rw.ctx, "dit_t");
+    ggml_tensor* t_g = ggml_get_tensor(rw.ctx, "dit_gcond");
+    ggml_tensor* t_vel = ggml_get_tensor(rw.ctx, "dit_vel");
+    if (!t_x || !t_t || !t_vel) {
+        std::fprintf(stderr, "dots_dit_diff: reference missing dit_x/dit_t/dit_vel\n");
+        dots_tts_free(ctx);
+        return 2;
+    }
+
+    const int D = (int)t_x->ne[0]; // fm hidden (1024)
+    const int T = (int)t_x->ne[1]; // sequence length
+    const int out_n = (int)ggml_nelements(t_vel);
+
+    std::vector<float> x_data((size_t)D * T);
+    ggml_backend_tensor_get(t_x, x_data.data(), 0, x_data.size() * sizeof(float));
+    float t_scalar = 0.0f;
+    ggml_backend_tensor_get(t_t, &t_scalar, 0, sizeof(float));
+    std::vector<float> g_data((size_t)D);
+    bool have_g = (t_g != nullptr);
+    if (have_g)
+        ggml_backend_tensor_get(t_g, g_data.data(), 0, g_data.size() * sizeof(float));
+    std::vector<float> ref_vel((size_t)out_n);
+    ggml_backend_tensor_get(t_vel, ref_vel.data(), 0, ref_vel.size() * sizeof(float));
+
+    std::vector<float> got((size_t)out_n, 0.0f);
+    dots_dit_forward(ctx, x_data.data(), T, t_scalar, have_g ? g_data.data() : nullptr, got.data());
+
+    double dot = 0, na = 0, nb = 0, maxabs = 0;
+    for (int i = 0; i < out_n; i++) {
+        dot += (double)got[i] * ref_vel[i];
+        na += (double)got[i] * got[i];
+        nb += (double)ref_vel[i] * ref_vel[i];
+        double d = std::fabs((double)got[i] - ref_vel[i]);
+        if (d > maxabs)
+            maxabs = d;
+    }
+    double cos = (na > 0 && nb > 0) ? dot / (std::sqrt(na) * std::sqrt(nb)) : 0.0;
+    std::printf("dots-tts dit forward: D=%d T=%d t=%.3f out=%d  cos=%.6f  max_abs=%.6f  %s\n", D, T, t_scalar, out_n,
+                cos, maxabs, cos > 0.999 ? "PASS" : "FAIL");
+    if (verbosity >= 2) {
+        std::printf("  got[:6]:");
+        for (int i = 0; i < 6 && i < out_n; i++)
+            std::printf(" %+.4f", got[i]);
+        std::printf("\n  ref[:6]:");
+        for (int i = 0; i < 6 && i < out_n; i++)
+            std::printf(" %+.4f", ref_vel[i]);
         std::printf("\n");
     }
 

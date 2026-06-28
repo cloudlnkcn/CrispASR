@@ -78,6 +78,11 @@ void dots_tts_set_seed(struct dots_tts_context* ctx, uint64_t seed);
 // tools/dots_penc_reference.py). Prints cosine/max_abs; returns 0 on PASS.
 int dots_tts_penc_diff(const char* model_gguf, const char* ref_gguf, int verbosity);
 
+// Diff-harness entry: validate the DiT (velocity_field_predictor) one forward
+// against a reference GGUF carrying dit_x / dit_t / dit_gcond / dit_vel.
+// Prints cosine/max_abs; returns 0 on PASS.
+int dots_tts_dit_diff(const char* model_gguf, const char* ref_gguf, int verbosity);
+
 #ifdef __cplusplus
 }
 #endif

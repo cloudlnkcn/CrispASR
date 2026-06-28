@@ -1035,10 +1035,13 @@ int main(int argc, char** argv) {
     const std::string ref_path = argv[3];
     const std::string audio_path = argv[4];
 
-    // dots-tts: self-contained PatchEncoder parity check (no audio needed; the
-    // reference is an isolated decode_patch dump from tools/dots_penc_reference.py).
+    // dots-tts: self-contained per-stage parity checks (no audio needed). The
+    // reference is the isolated component dump from
+    // tools/reference_backends/dots_tts_reference.py.
     if (backend_name == "dots-tts") {
-        return dots_tts_penc_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+        int rp = dots_tts_penc_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+        int rd = dots_tts_dit_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+        return (rp == 0 && rd == 0) ? 0 : 1;
     }
 
     // Load the reference archive.

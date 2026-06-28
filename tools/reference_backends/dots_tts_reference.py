@@ -44,6 +44,10 @@ DEFAULT_STAGES = [
     "penc_positions_patch0",
     "penc_conv_tail_patch0",
     "penc_out_patch0",
+    "dit_x",
+    "dit_t",
+    "dit_gcond",
+    "dit_vel",
 ]
 
 
@@ -52,13 +56,16 @@ def required_packages() -> list[str]:
 
 
 class _Cfg(dict):
-    """dict with attribute access + .get (duck-types dots_tts ConfigBase)."""
+    """dict with attribute access + .get + .to_dict (duck-types ConfigBase)."""
 
     def __getattr__(self, k):
         try:
             return self[k]
         except KeyError as e:  # pragma: no cover
             raise AttributeError(k) from e
+
+    def to_dict(self):
+        return dict(self)
 
 
 def _install_import_stubs() -> None:
@@ -156,6 +163,72 @@ def _dump_patch_encoder(model_dir: Path, seed: int) -> Dict[str, np.ndarray]:
     }
 
 
+def _dump_dit(model_dir: Path, seed: int) -> Dict[str, np.ndarray]:
+    """Isolated DiT (velocity_field_predictor) forward reference.
+
+    Loads ONLY the ~256 M DiT and runs one velocity prediction on a seeded
+    sequence (attn_mask=None => bidirectional, internal pos=arange, matching
+    the C++ dit forward), with a seeded global condition g_cond.
+    """
+    import torch
+    from safetensors import safe_open
+    from dots_tts.modules.backbone.dit import DiT
+
+    torch.set_num_threads(2)
+    torch.set_grad_enabled(False)
+
+    cj = json.loads((model_dir / "config.json").read_text())
+    latent_dim = int(cj["latent_dim"])
+    dit_cfg = _Cfg(cj["DiT"])
+    in_dim = int(dit_cfg["hidden_size"])  # fm_hidden_size
+
+    dit = DiT(in_dim=in_dim, out_dim=latent_dim, transformer_config=dit_cfg,
+              mode="flow_matching")
+    st_path = model_dir / "model.safetensors"
+    with safe_open(str(st_path), framework="pt") as f:
+        sd = {
+            k[len("velocity_field_predictor."):]: f.get_tensor(k).float()
+            for k in f.keys() if k.startswith("velocity_field_predictor.")
+        }
+    missing, unexpected = dit.load_state_dict(sd, strict=False)
+    if missing:
+        print(f"[dots-ref/dit] WARNING missing: {missing}")
+    if unexpected:
+        print(f"[dots-ref/dit] WARNING unexpected: {unexpected}")
+    dit.eval().float()
+    print(f"[dots-ref/dit] in_dim={in_dim} out_dim={latent_dim} tensors={len(sd)}")
+
+    g = torch.Generator().manual_seed(seed)
+    T = 6
+    x = torch.randn(1, T, in_dim, generator=g, dtype=torch.float32)
+    timesteps = torch.tensor([0.3], dtype=torch.float32)
+    g_cond = torch.randn(1, in_dim, generator=g, dtype=torch.float32)
+
+    if os.environ.get("DOTS_DIT_DEBUG"):
+        caps = {}
+        dit.input_layer.register_forward_hook(
+            lambda m, i, o: caps.__setitem__("x0", o.detach()))
+        dit.blocks[0].register_forward_hook(
+            lambda m, i, o: caps.__setitem__("b0", o.detach()))
+        dit.time_embedder.register_forward_hook(
+            lambda m, i, o: caps.__setitem__("temb", o.detach()))
+        _ = dit(x=x, timesteps=timesteps, g_cond=g_cond, attn_mask=None)
+        c_dbg = caps["temb"] + g_cond
+        for nm, t in [("temb", caps["temb"]), ("c", c_dbg),
+                      ("x0", caps["x0"]), ("b0", caps["b0"])]:
+            v = t.reshape(-1)[:6].tolist()
+            print(f"[dit-dbg] {nm}: " + " ".join(f"{x:+.4f}" for x in v))
+
+    vel = dit(x=x, timesteps=timesteps, g_cond=g_cond, attn_mask=None)
+
+    return {
+        "dit_x": _npf(x[0]),            # (T, in_dim)
+        "dit_t": _npf(timesteps),       # (1,)
+        "dit_gcond": _npf(g_cond[0]),   # (in_dim,)
+        "dit_vel": _npf(vel[0]),        # (T, latent_dim)
+    }
+
+
 def dump(
     model_dir: "Path | str | None" = None,
     audio: np.ndarray | None = None,
@@ -181,10 +254,12 @@ def dump(
 
     if any(s.startswith("penc_") for s in stages):
         results.update(_dump_patch_encoder(model_dir, seed))
+    if any(s.startswith("dit_") for s in stages):
+        results.update(_dump_dit(model_dir, seed))
 
-    # Keep only requested stages (plus always-present positions/conv_tail).
+    # Keep only requested stages (plus the always-present penc/dit tensors).
     out = {k: np.ascontiguousarray(v.astype(np.float32))
            for k, v in results.items()
-           if k in stages or k.startswith("penc_")}
+           if k in stages or k.startswith("penc_") or k.startswith("dit_")}
     print(f"[dots-ref] returning {len(out)} tensors: {sorted(out)}")
     return out
