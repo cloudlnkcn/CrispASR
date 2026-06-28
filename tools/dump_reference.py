@@ -92,6 +92,12 @@ import numpy as np
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
 REGISTERED_BACKENDS: Dict[str, str] = {
+    # dots.tts (rednote-hilab/dots.tts-soar) TTS: Qwen2.5-1.5B LLM +
+    # 18L DiT flow-matching head + 24L VAESemanticEncoder (PatchEncoder)
+    # + BigVGAN vocoder. The C++ diff branch ("dots-tts") validates the
+    # PatchEncoder decode_patch in isolation (penc_in_patch0 -> penc_out_patch0).
+    # Text comes from $DOTS_TEXT; the --audio arg is ignored (TTS).
+    "dots-tts":   "reference_backends.dots_tts_reference",
     "qwen3":      "reference_backends.qwen3",
     "voxtral":    "reference_backends.voxtral",
     "voxtral4b":  "reference_backends.voxtral4b",
