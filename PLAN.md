@@ -175,8 +175,18 @@ ggml-vulkan gallocr/graph dump, not MoltenVK. A **chunked codec decode** (decode
 time-windows under the breaking length, where short inputs are proven correct) is
 the pragmatic GPU-native workaround and sidesteps the root cause entirely.
 
-**Chunked-decode design (to implement + validate when the box is free).** Add
-`tada_codec_decode` a chunked wrapper, gated (e.g. `CRISPASR_TADA_CODEC_CHUNK=<N>`,
+**Chunked-decode design — DEFERRED, low priority (not queued; design-only).**
+Decision 2026-06-29: do **not** implement this now. The codec-on-CPU fix already
+solves #192 (validated, shipped, default). The codec is a one-shot decode, *not*
+the AR bottleneck, so a GPU-native codec buys little; the corruption is
+MoltenVK-only locally while the reporter is on RADV (it may not even reproduce
+there). Net: high implementation+validation complexity (window seams, absolute
+RoPE bookkeeping, empirical sample-trim — the codec emits `n_frames*480 − ~6`
+samples, non-exact) for a marginal, driver-specific payoff. Pick this up only if
+a RADV user actually needs the codec on GPU. Design preserved below for whoever
+does.
+
+Add `tada_codec_decode` a chunked wrapper, gated (e.g. `CRISPASR_TADA_CODEC_CHUNK=<N>`,
 default off; auto-on for the Vulkan-native codec). The codec upsamples 480×
 (strides 4·4·5·6) and is feed-forward; the only cross-frame coupling is (a) the
 block attention (each frame attends to its block + the previous block) and (b) the
