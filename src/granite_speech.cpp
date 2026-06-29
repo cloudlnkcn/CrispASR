@@ -2348,6 +2348,7 @@ extern "C" void granite_speech_set_decode_bucket(struct granite_speech_context* 
             ggml_free(ctx->cached_dec_ctx);
             ctx->cached_dec_ctx = nullptr;
             ctx->cached_dec_gf = nullptr;
+            ctx->cached_argmax_gf = nullptr;
         }
         ctx->cached_dec_bucket = 0;
     }
@@ -2597,6 +2598,12 @@ static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int
 static int granite_greedy_decode_step(granite_speech_context* ctx, int32_t token_id, const float* input_embed,
                                       int n_past, int bucket_len, float* out_logit) {
     ggml_cgraph* gf = granite_build_argmax_decode(ctx, bucket_len);
+    // NOTE: reset+alloc every step. The documented sched reuse pattern
+    // (build once, alloc once, then set+compute per step — ggml-backend.h:285)
+    // interacts badly with ggml's CUDA-graph capture here: skipping the alloc on
+    // a stable graph produced "CUDA error: invalid argument" mid-decode. The
+    // sched alloc on a cached plan is cheap, and CUDA-graph capture already
+    // removes the dominant per-launch cost, so we keep the safe per-step alloc.
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return -1;
