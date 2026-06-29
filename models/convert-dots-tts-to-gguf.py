@@ -271,6 +271,8 @@ def main():
                    help="Quantization level for bulk weights")
     p.add_argument("--name", type=str, default="dots-tts-soar",
                    help="Base name for output files")
+    p.add_argument("--skip-core", action="store_true",
+                   help="Skip core (LLM+DiT+PatchEncoder) conversion")
     p.add_argument("--skip-vocoder", action="store_true",
                    help="Skip vocoder conversion")
     p.add_argument("--skip-speaker", action="store_true",
@@ -307,119 +309,122 @@ def main():
     # 1. Core model GGUF (LLM + DiT + PatchEncoder + projections + tokenizer)
     # ════════════════════════════════════════════════════════════════════
     core_path = args.output_dir / f"{args.name}-{quant}.gguf"
-    print(f"\n=== Core model → {core_path} ===")
+    if args.skip_core:
+        print(f"\n=== Core model: SKIPPED (--skip-core) ===")
+    else:
+        print(f"\n=== Core model → {core_path} ===")
 
-    model_st = model_dir / "model.safetensors"
-    assert model_st.exists(), f"model.safetensors not found: {model_st}"
+        model_st = model_dir / "model.safetensors"
+        assert model_st.exists(), f"model.safetensors not found: {model_st}"
 
-    w = GGUFWriter(str(core_path), arch="dots-tts")
+        w = GGUFWriter(str(core_path), arch="dots-tts")
 
-    # ── Hyperparameters ──
-    w.add_string("dots.arch", "dots-tts")
-    # LLM
-    w.add_int32("dots.llm.n_layers", llm_config["num_hidden_layers"])
-    w.add_int32("dots.llm.hidden_size", llm_config["hidden_size"])
-    w.add_int32("dots.llm.intermediate_size", llm_config["intermediate_size"])
-    w.add_int32("dots.llm.n_heads", llm_config["num_attention_heads"])
-    w.add_int32("dots.llm.n_kv_heads", llm_config["num_key_value_heads"])
-    w.add_int32("dots.llm.vocab_size", llm_config["vocab_size"])
-    w.add_float32("dots.llm.rope_theta", llm_config["rope_theta"])
-    w.add_float32("dots.llm.rms_norm_eps", llm_config["rms_norm_eps"])
-    # PatchEncoder
-    w.add_int32("dots.penc.n_layers", config["PatchEncoder"]["num_layers"])
-    w.add_int32("dots.penc.hidden_size", config["PatchEncoder"]["hidden_size"])
-    w.add_int32("dots.penc.ffn_hidden_size", config["PatchEncoder"]["ffn_hidden_size"])
-    w.add_int32("dots.penc.n_heads", config["PatchEncoder"]["num_heads"])
-    w.add_int32("dots.penc.input_dim", config["PatchEncoder"]["input_dim"])
-    w.add_float32("dots.penc.rope_theta", config["PatchEncoder"]["rotary_theta"])
-    # DiT
-    w.add_int32("dots.dit.n_layers", config["DiT"]["num_layers"])
-    w.add_int32("dots.dit.hidden_size", config["DiT"]["hidden_size"])
-    w.add_int32("dots.dit.ffn_hidden_size", config["DiT"]["ffn_hidden_size"])
-    w.add_int32("dots.dit.n_heads", config["DiT"]["num_heads"])
-    w.add_float32("dots.dit.rope_theta", config["DiT"]["rotary_theta"])
-    # Model
-    w.add_int32("dots.latent_dim", config["latent_dim"])
-    w.add_int32("dots.patch_size", config["patch_size"])
-    w.add_float32("dots.cfg_droprate", config["cfg_droprate"])
-    w.add_int32("dots.spk_dim", config["campplus_embedding_size"])
-    w.add_float32("dots.fm_sigma", config.get("fm_sigma", 0.0))
+        # ── Hyperparameters ──
+        w.add_string("dots.arch", "dots-tts")
+        # LLM
+        w.add_int32("dots.llm.n_layers", llm_config["num_hidden_layers"])
+        w.add_int32("dots.llm.hidden_size", llm_config["hidden_size"])
+        w.add_int32("dots.llm.intermediate_size", llm_config["intermediate_size"])
+        w.add_int32("dots.llm.n_heads", llm_config["num_attention_heads"])
+        w.add_int32("dots.llm.n_kv_heads", llm_config["num_key_value_heads"])
+        w.add_int32("dots.llm.vocab_size", llm_config["vocab_size"])
+        w.add_float32("dots.llm.rope_theta", llm_config["rope_theta"])
+        w.add_float32("dots.llm.rms_norm_eps", llm_config["rms_norm_eps"])
+        # PatchEncoder
+        w.add_int32("dots.penc.n_layers", config["PatchEncoder"]["num_layers"])
+        w.add_int32("dots.penc.hidden_size", config["PatchEncoder"]["hidden_size"])
+        w.add_int32("dots.penc.ffn_hidden_size", config["PatchEncoder"]["ffn_hidden_size"])
+        w.add_int32("dots.penc.n_heads", config["PatchEncoder"]["num_heads"])
+        w.add_int32("dots.penc.input_dim", config["PatchEncoder"]["input_dim"])
+        w.add_float32("dots.penc.rope_theta", config["PatchEncoder"]["rotary_theta"])
+        # DiT
+        w.add_int32("dots.dit.n_layers", config["DiT"]["num_layers"])
+        w.add_int32("dots.dit.hidden_size", config["DiT"]["hidden_size"])
+        w.add_int32("dots.dit.ffn_hidden_size", config["DiT"]["ffn_hidden_size"])
+        w.add_int32("dots.dit.n_heads", config["DiT"]["num_heads"])
+        w.add_float32("dots.dit.rope_theta", config["DiT"]["rotary_theta"])
+        # Model
+        w.add_int32("dots.latent_dim", config["latent_dim"])
+        w.add_int32("dots.patch_size", config["patch_size"])
+        w.add_float32("dots.cfg_droprate", config["cfg_droprate"])
+        w.add_int32("dots.spk_dim", config["campplus_embedding_size"])
+        w.add_float32("dots.fm_sigma", config.get("fm_sigma", 0.0))
 
-    # ── Tokenizer ──
-    # Store as newline-joined strings (not GGUF string arrays) because the
-    # C GGUF reader can't handle 151K-element string arrays (type 9 error).
-    tokenizer_path = model_dir / "tokenizer.json"
-    if tokenizer_path.exists():
-        with open(tokenizer_path, "r", encoding="utf-8") as tf:
-            tok_data = json.load(tf)
-        # Extract vocab (token → id mapping)
-        vocab = tok_data.get("model", {}).get("vocab", {})
-        if vocab:
-            sorted_tokens = sorted(vocab.items(), key=lambda x: x[1])
-            token_strings = [t[0] for t in sorted_tokens]
-            # Store as single newline-joined string
-            w.add_string("dots.tokenizer.tokens", "\n".join(token_strings))
-            w.add_int32("dots.tokenizer.n_tokens", len(token_strings))
-            print(f"  Tokenizer: {len(token_strings)} tokens")
-        # Extract merges — may be list of strings or list of [str, str] pairs
-        merges_raw = tok_data.get("model", {}).get("merges", [])
-        if merges_raw:
-            merges = []
-            for m in merges_raw:
-                if isinstance(m, list):
-                    merges.append(" ".join(m))  # ["Ġ", "t"] → "Ġ t"
-                else:
-                    merges.append(str(m))
-            w.add_string("dots.tokenizer.merges", "\n".join(merges))
-            w.add_int32("dots.tokenizer.n_merges", len(merges))
-            print(f"  Merges: {len(merges)}")
+        # ── Tokenizer ──
+        # Store as newline-joined strings (not GGUF string arrays) because the
+        # C GGUF reader can't handle 151K-element string arrays (type 9 error).
+        tokenizer_path = model_dir / "tokenizer.json"
+        if tokenizer_path.exists():
+            with open(tokenizer_path, "r", encoding="utf-8") as tf:
+                tok_data = json.load(tf)
+            # Extract vocab (token → id mapping)
+            vocab = tok_data.get("model", {}).get("vocab", {})
+            if vocab:
+                sorted_tokens = sorted(vocab.items(), key=lambda x: x[1])
+                token_strings = [t[0] for t in sorted_tokens]
+                # Store as single newline-joined string
+                w.add_string("dots.tokenizer.tokens", "\n".join(token_strings))
+                w.add_int32("dots.tokenizer.n_tokens", len(token_strings))
+                print(f"  Tokenizer: {len(token_strings)} tokens")
+            # Extract merges — may be list of strings or list of [str, str] pairs
+            merges_raw = tok_data.get("model", {}).get("merges", [])
+            if merges_raw:
+                merges = []
+                for m in merges_raw:
+                    if isinstance(m, list):
+                        merges.append(" ".join(m))  # ["Ġ", "t"] → "Ġ t"
+                    else:
+                        merges.append(str(m))
+                w.add_string("dots.tokenizer.merges", "\n".join(merges))
+                w.add_int32("dots.tokenizer.n_merges", len(merges))
+                print(f"  Merges: {len(merges)}")
 
-    # ── Special tokens ──
-    special_tokens_path = model_dir / "added_tokens.json"
-    if special_tokens_path.exists():
-        with open(special_tokens_path) as f:
-            added_tokens = json.load(f)
-        # Find audio_gen_span and other special tokens
-        for tok_name, tok_id in added_tokens.items():
-            if "audio_gen_span" in tok_name:
-                w.add_int32("dots.token.audio_gen_span", tok_id)
-            elif "audio_comp_span" in tok_name:
-                w.add_int32("dots.token.audio_comp_span", tok_id)
-            elif "text_cond_end" in tok_name:
-                w.add_int32("dots.token.text_cond_end", tok_id)
-        print(f"  Special tokens: {len(added_tokens)}")
+        # ── Special tokens ──
+        special_tokens_path = model_dir / "added_tokens.json"
+        if special_tokens_path.exists():
+            with open(special_tokens_path) as f:
+                added_tokens = json.load(f)
+            # Find audio_gen_span and other special tokens
+            for tok_name, tok_id in added_tokens.items():
+                if "audio_gen_span" in tok_name:
+                    w.add_int32("dots.token.audio_gen_span", tok_id)
+                elif "audio_comp_span" in tok_name:
+                    w.add_int32("dots.token.audio_comp_span", tok_id)
+                elif "text_cond_end" in tok_name:
+                    w.add_int32("dots.token.text_cond_end", tok_id)
+            print(f"  Special tokens: {len(added_tokens)}")
 
-    # ── Latent stats (mean/std for denormalization) ──
-    latent_stats_path = model_dir / "latent_stats.pt"
-    if latent_stats_path.exists():
-        stats = torch.load(str(latent_stats_path), map_location="cpu",
-                          weights_only=False)
-        if isinstance(stats, dict):
-            for k, v in stats.items():
-                t = v if isinstance(v, torch.Tensor) else torch.tensor(v)
-                w.add_tensor(f"dots.latent_stats.{k}", to_f32(t))
-                print(f"  latent_stats.{k}: {list(t.shape)}")
+        # ── Latent stats (mean/std for denormalization) ──
+        latent_stats_path = model_dir / "latent_stats.pt"
+        if latent_stats_path.exists():
+            stats = torch.load(str(latent_stats_path), map_location="cpu",
+                              weights_only=False)
+            if isinstance(stats, dict):
+                for k, v in stats.items():
+                    t = v if isinstance(v, torch.Tensor) else torch.tensor(v)
+                    w.add_tensor(f"dots.latent_stats.{k}", to_f32(t))
+                    print(f"  latent_stats.{k}: {list(t.shape)}")
 
-    # ── Core tensors ──
-    n_core = 0
-    with safe_open(str(model_st), framework='pt') as f:
-        keys = sorted(f.keys())
-        for k in keys:
-            gguf_name = map_core_name(k)
-            if gguf_name is None:
-                print(f"  SKIP: {k}")
-                continue
-            t = f.get_tensor(k)
-            add_tensor(w, gguf_name, t, quant)
-            n_core += 1
-    print(f"  Core tensors: {n_core}")
+        # ── Core tensors ──
+        n_core = 0
+        with safe_open(str(model_st), framework='pt') as f:
+            keys = sorted(f.keys())
+            for k in keys:
+                gguf_name = map_core_name(k)
+                if gguf_name is None:
+                    print(f"  SKIP: {k}")
+                    continue
+                t = f.get_tensor(k)
+                add_tensor(w, gguf_name, t, quant)
+                n_core += 1
+        print(f"  Core tensors: {n_core}")
 
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_tensors_to_file()
-    w.close()
-    fsize = core_path.stat().st_size
-    print(f"  → {core_path} ({fsize/1024/1024:.1f} MiB)")
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        fsize = core_path.stat().st_size
+        print(f"  → {core_path} ({fsize/1024/1024:.1f} MiB)")
 
     # ════════════════════════════════════════════════════════════════════
     # 2. Vocoder GGUF (BigVGAN encoder + decoder)
