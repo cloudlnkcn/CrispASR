@@ -37,6 +37,7 @@
 
 #include "voxtral.h"
 #include "voxtral4b.h"
+#include "higgs_stt.h"
 #include "qwen3_asr.h"
 #include "qwen3_tts.h"
 #include "kokoro.h"
@@ -272,6 +273,45 @@ static StageResult voxtral_encoder(voxtral_context* ctx, const float* samples, i
     free(mel);
     if (!enc) {
         r.note = "voxtral_run_encoder returned null";
+        return r;
+    }
+    r.shape = {N_enc, pdim};
+    r.data.assign(enc, enc + (size_t)N_enc * pdim);
+    free(enc);
+    r.ok = true;
+    return r;
+}
+
+// ---- higgs-stt ----
+
+static StageResult higgs_mel(higgs_stt_context* ctx, const float* samples, int n_samples) {
+    StageResult r;
+    int n_mels = 0, T_mel = 0;
+    float* mel = higgs_stt_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
+    if (!mel) {
+        r.note = "higgs_stt_compute_mel returned null";
+        return r;
+    }
+    r.shape = {n_mels, T_mel};
+    r.data.assign(mel, mel + (size_t)n_mels * T_mel);
+    free(mel);
+    r.ok = true;
+    return r;
+}
+
+static StageResult higgs_encoder(higgs_stt_context* ctx, const float* samples, int n_samples) {
+    StageResult r;
+    int n_mels = 0, T_mel = 0;
+    float* mel = higgs_stt_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
+    if (!mel) {
+        r.note = "mel failed";
+        return r;
+    }
+    int N_enc = 0, pdim = 0;
+    float* enc = higgs_stt_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &pdim);
+    free(mel);
+    if (!enc) {
+        r.note = "higgs_stt_run_encoder returned null";
         return r;
     }
     r.shape = {N_enc, pdim};
@@ -1129,6 +1169,38 @@ int main(int argc, char** argv) {
         }
 
         voxtral_free(ctx);
+    } else if (backend_name == "higgs-stt") {
+        auto cp = higgs_stt_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        higgs_stt_context* ctx = higgs_stt_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load higgs-stt model\n");
+            return 4;
+        }
+
+        auto mel_r = higgs_mel(ctx, samples.data(), (int)samples.size());
+        if (mel_r.ok) {
+            auto rep = ref.compare("mel_spectrogram", mel_r.data.data(), mel_r.data.size());
+            print_row("mel_spectrogram", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] mel_spectrogram         %s\n", mel_r.note.c_str());
+            n_fail++;
+        }
+
+        // run_encoder returns the projector output (encoder_out, 2048-dim).
+        auto enc_r = higgs_encoder(ctx, samples.data(), (int)samples.size());
+        if (enc_r.ok) {
+            auto rep = ref.compare("encoder_out", enc_r.data.data(), enc_r.data.size());
+            print_row("encoder_out", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] encoder_out             %s\n", enc_r.note.c_str());
+            n_fail++;
+        }
+
+        higgs_stt_free(ctx);
     } else if (backend_name == "voxtral4b") {
         auto cp = voxtral4b_context_default_params();
         cp.n_threads = 4;

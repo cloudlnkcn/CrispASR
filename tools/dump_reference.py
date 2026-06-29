@@ -99,6 +99,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Text comes from $DOTS_TEXT; the --audio arg is ignored (TTS).
     "dots-tts":   "reference_backends.dots_tts_reference",
     "qwen3":      "reference_backends.qwen3",
+    "higgs-stt":  "reference_backends.higgs_stt",
     "voxtral":    "reference_backends.voxtral",
     "voxtral4b":  "reference_backends.voxtral4b",
     "granite":    "reference_backends.granite",

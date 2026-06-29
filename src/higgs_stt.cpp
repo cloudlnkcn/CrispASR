@@ -611,9 +611,19 @@ extern "C" float* higgs_stt_compute_mel(higgs_stt_context* ctx, const float* sam
     std::vector<float> filt((size_t)n_freqs * n_mels);
     ggml_backend_tensor_get(ctx->model.audio.mel_filters, filt.data(), 0, filt.size() * sizeof(float));
 
-    // Qwen3-ASR / Whisper HF feature extractor: log10 + max-clip guard,
-    // double-accumulator matmul, drop last STFT frame, fb in (n_freqs, n_mels)
-    // layout. No fixed-size padding — output T is whatever the audio yields.
+    // WhisperFeatureExtractor pads/truncates the raw audio to a fixed 30 s
+    // window BEFORE computing the mel, so the output is always (n_mels, 3000)
+    // and the GlobalClipMax normalization takes its max over the full padded
+    // mel. Reproduce that here (the padded region becomes the silence-mel
+    // floor — NOT zeros in normalized-mel space).
+    const int kWin = 30 * (int)hp.sample_rate; // 480000
+    std::vector<float> padded(kWin, 0.0f);
+    std::memcpy(padded.data(), samples, (size_t)std::min(n_samples, kWin) * sizeof(float));
+    samples = padded.data();
+    n_samples = kWin;
+
+    // Qwen/Whisper HF feature extractor: log10 + max-clip guard, double-accum
+    // matmul, drop last STFT frame, fb in (n_freqs, n_mels) layout.
     core_mel::Params p;
     p.n_fft = n_fft;
     p.hop_length = hop;
