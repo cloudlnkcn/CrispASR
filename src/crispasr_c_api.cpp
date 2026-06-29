@@ -220,6 +220,10 @@
 #include "mimo_asr.h"
 #define CA_HAVE_MIMO_ASR 1
 #endif
+#if __has_include("ark_asr.h")
+#include "ark_asr.h"
+#define CA_HAVE_ARK_ASR 1
+#endif
 #if __has_include("moss_audio.h")
 #include "moss_audio.h"
 #define CA_HAVE_MOSS_AUDIO 1
@@ -1240,6 +1244,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "voxtral";
     else if (strcmp(arch, "voxtral4b") == 0)
         backend = "voxtral4b";
+    else if (strcmp(arch, "arkasr") == 0)
+        backend = "ark-asr";
     else if (strcmp(arch, "granite-speech") == 0)
         backend = "granite";
     else if (strcmp(arch, "granite_nle") == 0 || strcmp(arch, "granite-nle") == 0)
@@ -1637,6 +1643,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_MIMO_ASR
     mimo_asr_context* mimo_asr_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_ARK_ASR
+    ark_asr_context* ark_asr_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_MOSS_AUDIO
     moss_audio_context* moss_audio_ctx = nullptr;
@@ -2742,6 +2751,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    if (s->backend == "ark-asr" || s->backend == "ark_asr" || s->backend == "arkasr" || s->backend == "ark") {
+        s->backend = "ark-asr";
+        ark_asr_context_params p = ark_asr_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->ark_asr_ctx = ark_asr_init_from_file(model_path, p);
+        if (!s->ark_asr_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     if (s->backend == "moss-audio" || s->backend == "moss_audio" || s->backend == "mossaudio") {
         s->backend = "moss-audio";
@@ -3037,6 +3061,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_MIMO_ASR
     list += ",mimo-asr";
+#endif
+#ifdef CA_HAVE_ARK_ASR
+    list += ",ark-asr";
 #endif
 #ifdef CA_HAVE_MOSS_AUDIO
     list += ",moss-audio";
@@ -4624,6 +4651,15 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
 #ifdef CA_HAVE_PARAFORMER
         if (!text && s->backend == "paraformer" && s->paraformer_ctx) {
             text = paraformer_transcribe(s->paraformer_ctx, pcm, n_samples);
+            need_free = true;
+        }
+#endif
+#ifdef CA_HAVE_ARK_ASR
+        if (!text && s->backend == "ark-asr" && s->ark_asr_ctx) {
+            const std::string eff_lang = lang_set ? lang : s->source_language;
+            if (!eff_lang.empty() && eff_lang != "auto")
+                ark_asr_set_language(s->ark_asr_ctx, eff_lang.c_str());
+            text = ark_asr_transcribe(s->ark_asr_ctx, pcm, n_samples);
             need_free = true;
         }
 #endif
@@ -6705,6 +6741,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_MIMO_ASR
     if (s->mimo_asr_ctx)
         mimo_asr_free(s->mimo_asr_ctx);
+#endif
+#ifdef CA_HAVE_ARK_ASR
+    if (s->ark_asr_ctx)
+        ark_asr_free(s->ark_asr_ctx);
 #endif
 #ifdef CA_HAVE_MOSS_AUDIO
     if (s->moss_audio_ctx)
