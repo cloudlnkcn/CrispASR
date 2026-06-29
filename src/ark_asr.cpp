@@ -923,11 +923,23 @@ static std::string ark_transcribe_window(ark_asr_context* ctx, const float* pcm,
         gen.pop_back();
 
     std::string txt = core_bpe::detokenize(ctx->vocab, gen.data(), gen.size());
-    // trim leading whitespace
-    size_t lead = 0;
-    while (lead < txt.size() && (txt[lead] == ' ' || txt[lead] == '\t' || txt[lead] == '\n'))
-        lead++;
-    txt.erase(0, lead);
+    // Output cleanup. ARK opens every transcript with a bare "." token (the
+    // reference .generate() output shows the same leading ". " — it's the model's
+    // trained format, not a bug here), which is noise in an ASR transcript. Trim
+    // leading whitespace, then drop a single leading bare period + its trailing
+    // whitespace. The numerical diff gate (mel/audio_embeds/first_logits) runs
+    // before detokenisation, so this normalisation doesn't affect it.
+    auto ltrim = [](std::string& s) {
+        size_t i = 0;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n'))
+            i++;
+        s.erase(0, i);
+    };
+    ltrim(txt);
+    if (!txt.empty() && txt[0] == '.' && (txt.size() == 1 || txt[1] == ' ' || txt[1] == '\t' || txt[1] == '\n')) {
+        txt.erase(0, 1);
+        ltrim(txt);
+    }
     return txt;
 }
 
