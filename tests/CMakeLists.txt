@@ -2478,3 +2478,42 @@ add_test(NAME test-release-workflow
 set_tests_properties(test-release-workflow PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 30)
+
+# ─── test_diarized_json — Catch2 unit tests for the diarized_json formatter
+# (issue #206) and max_len display segment splitting (issue #205).
+# Pure functions, no backend dependency.
+add_executable(test_diarized_json
+    test_diarized_json.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_output.cpp
+)
+target_include_directories(test_diarized_json PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test_diarized_json PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test_diarized_json
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;diarized-json;max-len"
+)
+
+# ─── test-server-diarized-json — live: /v1/audio/transcriptions with
+# response_format=diarized_json (issue #206). Boots whisper server, validates
+# speaker labels, type field, start/end timestamps. SKIPs without model.
+add_test(NAME test-server-diarized-json
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-server-diarized-json.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-diarized-json PROPERTIES
+    LABELS "live;server;diarized-json"
+    TIMEOUT 300)
+
+# ─── test-granite-maxlen — live: --max-len splitting on granite-speech
+# (issue #205). Runs CLI with --max-len and verifies segments are split.
+# SKIPs without a granite-speech PLUS GGUF.
+add_test(NAME test-granite-maxlen
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-granite-maxlen.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-granite-maxlen PROPERTIES
+    LABELS "live;granite;max-len"
+    TIMEOUT 300)

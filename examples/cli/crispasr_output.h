@@ -113,6 +113,12 @@ std::string crispasr_segments_to_openai_verbose_json(const std::vector<crispasr_
                                                      const std::string& language, const std::string& task,
                                                      float temperature);
 
+// Diarized JSON: OpenAI-compatible verbose JSON extended with speaker labels.
+// Speaker strings like "(speaker 0) " are normalised to single letters "A", "B", …
+// Matches the diarized_json schema requested in issue #206.
+std::string crispasr_segments_to_diarized_json(const std::vector<crispasr_segment>& segs, double duration_s,
+                                               const std::string& language, const std::string& task, float temperature);
+
 // CrispASR native JSON (the format returned by /inference).
 std::string crispasr_segments_to_native_json(const std::vector<crispasr_segment>& segs, const std::string& backend_name,
                                              double duration_s);

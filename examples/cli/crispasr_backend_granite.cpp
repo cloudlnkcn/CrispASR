@@ -202,7 +202,8 @@ public:
             // timestamps via mode-specific instruction strings.
             const bool is_plus = granite_speech_is_plus(ctx_);
             const bool want_saa = is_plus && params.diarize;
-            const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full);
+            const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full || params.max_len > 0 ||
+                                             params.output_srt || params.output_vtt || params.split_on_punct);
 
             std::string user_content;
             if (want_saa && want_ts) {
@@ -285,7 +286,8 @@ public:
 
         const bool is_plus = granite_speech_is_plus(ctx_);
         const bool want_saa = is_plus && params.diarize;
-        const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full);
+        const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full || params.max_len > 0 ||
+                                         params.output_srt || params.output_vtt || params.split_on_punct);
         const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : (want_ts ? 4096 : 200);
 
         // ---- Beam search path ----
@@ -569,7 +571,8 @@ public:
         // output can be structured — fall back to the batch transcribe() base path.
         const bool is_plus = granite_speech_is_plus(ctx_);
         const bool want_saa = is_plus && params.diarize;
-        const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full);
+        const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full || params.max_len > 0 ||
+                                         params.output_srt || params.output_vtt || params.split_on_punct);
         if (params.beam_size > 1 || want_saa || want_ts) {
             CrispasrBackend::transcribe_streaming(samples, n_samples, t_offset_cs, params, on_text);
             return;

@@ -891,6 +891,85 @@ std::string crispasr_segments_to_openai_verbose_json(const std::vector<crispasr_
     return js.str();
 }
 
+// ---------------------------------------------------------------------------
+// Normalise speaker labels: "(speaker 0) " → "A", "(speaker 1) " → "B", etc.
+// Falls through to the raw string (trimmed) for non-standard labels.
+// ---------------------------------------------------------------------------
+static std::string normalise_speaker(const std::string& raw) {
+    // Trim trailing whitespace.
+    std::string s = raw;
+    while (!s.empty() && (s.back() == ' ' || s.back() == ')'))
+        s.pop_back();
+    // Extract number from "(speaker N" pattern.
+    const char prefix[] = "(speaker ";
+    if (s.size() > sizeof(prefix) - 1 && s.compare(0, sizeof(prefix) - 1, prefix) == 0) {
+        int n = std::atoi(s.c_str() + sizeof(prefix) - 1);
+        if (n >= 0 && n < 26)
+            return std::string(1, (char)('A' + n));
+        // More than 26 speakers: "AA", "AB", …
+        return std::string(1, (char)('A' + n / 26)) + (char)('A' + n % 26);
+    }
+    // Already a clean label — return trimmed.
+    if (!s.empty() && s.front() == '(')
+        s.erase(s.begin());
+    return s.empty() ? "A" : s;
+}
+
+std::string crispasr_segments_to_diarized_json(const std::vector<crispasr_segment>& segs, double duration_s,
+                                               const std::string& language, const std::string& task,
+                                               float temperature) {
+    std::string full_text = crispasr_segments_to_text(segs);
+
+    std::ostringstream js;
+    js << std::fixed;
+    js << "{\n";
+    js << "  \"task\": \"" << json_escape(task) << "\",\n";
+    js << "  \"language\": \"" << json_escape(language) << "\",\n";
+    js << std::setprecision(3);
+    js << "  \"duration\": " << duration_s << ",\n";
+    js << "  \"text\": \"" << json_escape(full_text) << "\",\n";
+    js << "  \"segments\": [\n";
+    for (size_t i = 0; i < segs.size(); i++) {
+        const auto& s = segs[i];
+        js << "    {\n";
+        js << "      \"id\": " << i << ",\n";
+        js << std::setprecision(2);
+        js << "      \"start\": " << cs_to_sec(s.t0) << ",\n";
+        js << "      \"end\": " << cs_to_sec(s.t1) << ",\n";
+        js << "      \"text\": \"" << json_escape(s.text) << "\",\n";
+
+        // Speaker label — normalised to letter form.
+        std::string spk = s.speaker.empty() ? "A" : normalise_speaker(s.speaker);
+        js << "      \"speaker\": \"" << json_escape(spk) << "\",\n";
+
+        js << "      \"type\": \"transcript.text.segment\"";
+
+        // Word-level timestamps if available.
+        if (!s.words.empty()) {
+            js << ",\n      \"words\": [\n";
+            for (size_t j = 0; j < s.words.size(); j++) {
+                const auto& w = s.words[j];
+                js << "        {\"word\": \"" << json_escape(w.text) << "\", ";
+                js << std::setprecision(2);
+                js << "\"start\": " << cs_to_sec(w.t0) << ", ";
+                js << "\"end\": " << cs_to_sec(w.t1) << "}";
+                if (j + 1 < s.words.size())
+                    js << ",";
+                js << "\n";
+            }
+            js << "      ]";
+        }
+
+        js << "\n    }";
+        if (i + 1 < segs.size())
+            js << ",";
+        js << "\n";
+    }
+    js << "  ]\n";
+    js << "}\n";
+    return js.str();
+}
+
 std::string crispasr_segments_to_native_json(const std::vector<crispasr_segment>& segs, const std::string& backend_name,
                                              double duration_s) {
     std::ostringstream js;

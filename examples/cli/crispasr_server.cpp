@@ -1052,10 +1052,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
         // Validate response_format early.
         if (response_format != "json" && response_format != "verbose_json" && response_format != "text" &&
-            response_format != "srt" && response_format != "vtt") {
+            response_format != "srt" && response_format != "vtt" && response_format != "diarized_json") {
             json_error(res, 400,
                        "invalid response_format '" + response_format +
-                           "'; must be one of: json, verbose_json, text, srt, vtt");
+                           "'; must be one of: json, verbose_json, text, srt, vtt, diarized_json");
             return;
         }
 
@@ -1190,8 +1190,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             return;
         }
 
-        const bool need_timestamps =
-            response_format == "verbose_json" || response_format == "srt" || response_format == "vtt";
+        const bool need_timestamps = response_format == "verbose_json" || response_format == "srt" ||
+                                     response_format == "vtt" || response_format == "diarized_json";
         auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps, punc_ctx.get(),
                                     pcs_ctx.get(), tc_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
         if (!result.ok) {
@@ -1215,6 +1215,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             res.set_content(crispasr_segments_to_openai_verbose_json(result.segs, result.duration_s, result.language,
                                                                      task, temperature),
                             "application/json");
+        } else if (response_format == "diarized_json") {
+            std::string task = rp.translate ? "translate" : "transcribe";
+            res.set_content(
+                crispasr_segments_to_diarized_json(result.segs, result.duration_s, result.language, task, temperature),
+                "application/json");
         } else {
             // Default: json — {"text": "..."}
             res.set_content(crispasr_segments_to_openai_json(result.segs), "application/json");
