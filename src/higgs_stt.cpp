@@ -34,6 +34,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <map>
 #include <string>
@@ -1444,6 +1445,74 @@ extern "C" void higgs_stt_free(higgs_stt_context* ctx) {
     delete ctx;
 }
 
+// Port of the model's ngram_loop_fix.py (text post-processing). Greedy decode
+// on this model degenerates into repeated n-gram loops; the upstream pipeline
+// collapses them in `_post_process` rather than constraining generation, so we
+// reproduce that here. Collapse immediately-repeated n-grams (n from max_n down
+// to 1) to at most max_rep reps (3 for unigrams, 2 otherwise).
+static std::vector<std::string> higgs_collapse(const std::vector<std::string>& w, int n, int max_rep) {
+    std::vector<std::string> out;
+    const int L = (int)w.size();
+    int i = 0;
+    auto tail_eq = [&](size_t base) {
+        for (int k = 0; k < n; k++)
+            if (w[i + k] != out[out.size() - n + k])
+                return false;
+        return true;
+    };
+    while (i < L) {
+        bool matched = false;
+        if ((int)out.size() >= n && i + n <= L && tail_eq(0)) {
+            int reps = 1;
+            while ((int)out.size() >= n * (reps + 1)) {
+                bool eq = true;
+                const size_t b = out.size() - (size_t)n * (reps + 1);
+                for (int k = 0; k < n; k++)
+                    if (out[b + k] != out[out.size() - n + k]) {
+                        eq = false;
+                        break;
+                    }
+                if (!eq)
+                    break;
+                reps++;
+            }
+            if (reps >= max_rep) {
+                i += n;
+                matched = true;
+            }
+        }
+        if (!matched) {
+            out.push_back(w[i]);
+            i++;
+        }
+    }
+    return out;
+}
+
+static std::string higgs_fix_ngram_loops(const std::string& text, int max_n = 16) {
+    std::vector<std::string> words;
+    size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && std::isspace((unsigned char)text[i]))
+            i++;
+        size_t j = i;
+        while (j < text.size() && !std::isspace((unsigned char)text[j]))
+            j++;
+        if (j > i)
+            words.push_back(text.substr(i, j - i));
+        i = j;
+    }
+    for (int n = max_n; n >= 1; n--)
+        words = higgs_collapse(words, n, n == 1 ? 3 : 2);
+    std::string out;
+    for (size_t k = 0; k < words.size(); k++) {
+        if (k)
+            out += ' ';
+        out += words[k];
+    }
+    return out;
+}
+
 extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return strdup("");
@@ -1465,6 +1534,21 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
     free(mel);
     if (!audio || N_enc <= 0)
         return strdup("");
+
+    // Only the VALID (non-silence-padded) audio frames become <|AUDIO|> tokens,
+    // matching the upstream collator. run_encoder operates on the fixed 30 s
+    // window (375 frames); for a shorter clip the trailing frames are silence
+    // padding and must NOT be fed to the LLM (they derail the decoder). Apply
+    // the encoder's length formula to the valid mel length:
+    //   conv2(s2): (L-1)/2+1 ; avgpool(s2): (L-2)/2+1 ; projector(s2): (L-1)/2+1
+    {
+        const int hop = (int)hp.hop_length;
+        int lv = std::min(n_samples / hop, T_mel); // valid mel frames
+        lv = (lv - 1) / 2 + 1;                      // post conv2
+        lv = (lv - 2) / 2 + 1;                      // post avg-pool
+        lv = (lv - 1) / 2 + 1;                      // post projector
+        N_enc = std::max(1, std::min(lv, N_enc));
+    }
 
     // ---- build the ChatML prompt token ids ----
     //   <|im_start|>user\n{instruction}<|audio_bos|>{N x <|AUDIO|>}<|audio_eos|>
@@ -1559,6 +1643,8 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
     size_t b = text.find_first_not_of(" \t\r\n");
     size_t e = text.find_last_not_of(" \t\r\n");
     text = (b == std::string::npos) ? "" : text.substr(b, e - b + 1);
+    // Collapse degenerate greedy n-gram loops (model's _post_process step).
+    text = higgs_fix_ngram_loops(text);
     return strdup(text.c_str());
 }
 
