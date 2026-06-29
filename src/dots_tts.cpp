@@ -1880,22 +1880,37 @@ float* dots_tts_synthesize(struct dots_tts_context* ctx, const char* text, int* 
 
     dots_bench_stage bench_total("synthesize_total");
 
-    // 1. Tokenize text
+    // 1. Build the prefill token sequence matching the reference generation
+    //    template (tts_pipeline DEFAULT_TRAIN_TEMPLATE = "[文本]{text}[文本对应语音]{audio}"
+    //    → build_generation_schedule): [文本] text [文本对应语音] <|audio_gen_start|>.
+    //    The two Chinese prefixes are FIXED strings → hardcode their Qwen2.5 BPE
+    //    ids so conditioning is exact regardless of the C++ pretokenizer. Without
+    //    this wrapper the LLM conditioning is wrong → garbled audio + no EOS.
+    //    (text_cond_end is the INTERLEAVE template; not used here.)
+    static const int32_t TTS_TEXT_PREFIX_IDS[] = {58, 108704, 60};                  // "[文本]"
+    static const int32_t TTS_AUDIO_PREFIX_IDS[] = {58, 108704, 103124, 105761, 60}; // "[文本对应语音]"
+    const int audio_gen_start = ctx->token_audio_gen_span >= 0 ? ctx->token_audio_gen_span - 1 : 151668;
+
     std::string input_text(text);
-    std::vector<int32_t> token_ids = dots_tokenize(ctx, input_text);
-    if (token_ids.empty()) {
+    std::vector<int32_t> text_tok = dots_tokenize(ctx, input_text);
+    if (text_tok.empty()) {
         std::fprintf(stderr, "dots_tts: tokenization failed\n");
         return nullptr;
     }
-
-    // Add text_cond_end token if available
-    if (ctx->token_text_cond_end >= 0) {
-        token_ids.push_back(ctx->token_text_cond_end);
-    }
+    std::vector<int32_t> token_ids;
+    for (int32_t t : TTS_TEXT_PREFIX_IDS)
+        token_ids.push_back(t);
+    token_ids.insert(token_ids.end(), text_tok.begin(), text_tok.end());
+    for (int32_t t : TTS_AUDIO_PREFIX_IDS)
+        token_ids.push_back(t);
+    token_ids.push_back(audio_gen_start);
 
     int n_text = (int)token_ids.size();
     if (ctx->params.verbosity >= 2) {
-        std::fprintf(stderr, "dots_tts: %d text tokens\n", n_text);
+        std::fprintf(stderr, "dots_tts: prefill %d tokens:", n_text);
+        for (int32_t t : token_ids)
+            std::fprintf(stderr, " %d", t);
+        std::fprintf(stderr, "\n");
     }
 
     // 2. Embed text tokens
