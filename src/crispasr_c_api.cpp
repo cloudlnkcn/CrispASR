@@ -4656,9 +4656,18 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
 #endif
 #ifdef CA_HAVE_ARK_ASR
         if (!text && s->backend == "ark-asr" && s->ark_asr_ctx) {
-            const std::string eff_lang = lang_set ? lang : s->source_language;
-            if (!eff_lang.empty() && eff_lang != "auto")
-                ark_asr_set_language(s->ark_asr_ctx, eff_lang.c_str());
+            // EXPERIMENTAL language steering: ask > -l instruction > promptless.
+            if (!s->ask.empty()) {
+                ark_asr_set_ask(s->ark_asr_ctx, s->ask.c_str());
+            } else {
+                const std::string eff_lang = lang_set ? lang : s->source_language;
+                if (!eff_lang.empty() && eff_lang != "auto") {
+                    const std::string instr = "Transcribe the audio in " + ca_iso_to_english_lang(eff_lang) + ".";
+                    ark_asr_set_ask(s->ark_asr_ctx, instr.c_str());
+                } else {
+                    ark_asr_set_ask(s->ark_asr_ctx, nullptr);
+                }
+            }
             text = ark_asr_transcribe(s->ark_asr_ctx, pcm, n_samples);
             need_free = true;
         }

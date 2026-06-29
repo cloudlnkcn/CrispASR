@@ -29,9 +29,15 @@ struct ark_asr_context* ark_asr_init_from_file(const char* path_model, struct ar
 // malloc'd C string with free(). Returns nullptr on failure.
 char* ark_asr_transcribe(struct ark_asr_context* ctx, const float* pcm, int n_samples);
 
-// Optional language hint, e.g. "de" / "en". Stored and (when non-empty and
-// not "auto") prepended to the user turn as a short instruction.
+// Optional language hint, e.g. "de" / "en". Stored on the context.
 void ark_asr_set_language(struct ark_asr_context* ctx, const char* lang_iso);
+
+// EXPERIMENTAL: set a transcription instruction (e.g. "Transcribe the audio in
+// German.") that is BPE-tokenised and prepended to the user turn. Empty/null
+// clears it (default promptless behaviour). The CLI/session build this from the
+// `-l` language flag. Promptless ARK was not trained on instructions, so this
+// is best-effort language steering; the default (no instruction) is unchanged.
+void ark_asr_set_ask(struct ark_asr_context* ctx, const char* instruction);
 
 void ark_asr_free(struct ark_asr_context* ctx);
 

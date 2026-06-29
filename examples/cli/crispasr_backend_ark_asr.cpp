@@ -36,14 +36,21 @@ public:
             fprintf(stderr, "crispasr[ark-asr]: failed to load model '%s'\n", params.model.c_str());
             return false;
         }
-        if (!params.language.empty() && params.language != "auto")
-            ark_asr_set_language(ctx_, params.language.c_str());
         return true;
     }
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                              const whisper_params& params) override {
-        (void)params;
+        // EXPERIMENTAL language steering: ask > -l instruction > promptless.
+        // mirrors crispasr_backend_mimo_asr.cpp.
+        if (!params.ask.empty()) {
+            ark_asr_set_ask(ctx_, params.ask.c_str());
+        } else if (!params.language.empty() && params.language != "auto") {
+            const std::string instr = "Transcribe the audio in " + crispasr_iso_to_english_lang(params.language) + ".";
+            ark_asr_set_ask(ctx_, instr.c_str());
+        } else {
+            ark_asr_set_ask(ctx_, nullptr);
+        }
         std::vector<crispasr_segment> out;
         if (!ctx_)
             return out;

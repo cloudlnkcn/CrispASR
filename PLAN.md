@@ -6135,17 +6135,22 @@ key files under `sglang_omni/models/higgs_tts/`):
 **Testing:** 9.3 GB model requires Kaggle GPU kernel (won't fit 8 GB VPS).
 
 
-## §ARK — ARK-ASR-3B support (WORKING — verbatim ASR; branch feat/arkasr-3b)
+## §ARK — ARK-ASR-3B support (⚠️ EXPERIMENTAL / WIP; branch feat/arkasr-3b)
 
-**STATUS 2026-06-29**: end-to-end VALIDATED. jfk.wav → verbatim English;
+**STATUS 2026-06-29**: ⚠️ **experimental / WIP** — wired through CLI, session C
+ABI, model registry, and docs, but with known rough edges (CPU-only, slow decode,
+experimental language steering). Core ASR is VALIDATED: jfk.wav → verbatim English;
 De-Abwasch 79 s → verbatim German. CLI: `crispasr -m ark-asr-3b-q8_0.gguf
 --backend ark-asr -f audio.wav`. Backend defaults to **CPU** (GPU/Metal sched
-path emits no tokens — gated behind `CRISPASR_ARKASR_GPU=1`). Open follow-ups:
-(a) inject `-l` language instruction into the user turn (promptless ASR drifts
-language per 30 s chunk); (b) step-graph cache for decode perf (per-step graph
-rebuild is slow on long audio); (c) GPU/sched fix; (d) session ABI
-(crispasr_c_api.cpp) + tests + publish GGUF repo. Diff harness is built (running
-it is optional — the verbatim roundtrip is the stronger gate).
+path emits no tokens — gated behind `CRISPASR_ARKASR_GPU=1`).
+
+Done: session ABI (crispasr_c_api.cpp), `-l` language-instruction injection
+(§9b, experimental — model not instruction-trained, default stays promptless),
+model registry entry, live test, docs marked exp/WIP.
+Open follow-ups: (a) step-graph cache for decode perf (per-step graph rebuild is
+slow on long audio); (b) GPU/sched fix; (c) publish GGUF repo (cstr/ark-asr-3b-GGUF).
+Diff harness is built (running it is optional — the verbatim roundtrip is the
+stronger gate).
 
 Port of [AutoArk-AI/ARK-ASR-3B](https://huggingface.co/AutoArk-AI/ARK-ASR-3B):
 a 19-language ASR model = **Whisper-large-v3 encoder with partial RoPE** +

@@ -496,6 +496,26 @@ catch_discover_tests(test-nemotron
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - ark-asr — live integration tests for ARK-ASR-3B (experimental/WIP)
+add_executable(test-ark-asr
+    test_ark_asr_live.cpp
+)
+target_include_directories(test-ark-asr PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-ark-asr PRIVATE
+    Catch2::Catch2WithMain
+    ark_asr
+)
+catch_discover_tests(test-ark-asr
+    TEST_SPEC "[ark-asr]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test - lfm2-audio — live integration tests for LFM2-Audio ASR + TTS
 add_executable(test-lfm2-audio
     test_lfm2_audio_live.cpp

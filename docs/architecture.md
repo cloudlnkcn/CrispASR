@@ -180,6 +180,7 @@ regression test against `samples/jfk.wav`:
 | omniasr | wav2vec2 enc + CTC / LLM | ✔ | ✔ | CTC: — / LLM: ✔ | CPU | gguf_loader, kv_self_attn, swiglu |
 | gemma4-e2b | Conformer enc + Gemma4 LLM | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | mimo-asr | wav2vec2 enc + Qwen2 LM | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
+| ark-asr ⚠️*exp/WIP* | Whisper enc (partial RoPE) + Qwen2.5-3B LM | ✔ | — | CPU only | CPU (GPU emits no tokens) | mel, ffn, gguf_loader, kv_self_attn, swiglu, bpe |
 | vibevoice | σ-VAE + Qwen2 (ASR) / TTS LM (synth) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader |
 | kokoro | StyleTTS2 BERT + ProsodyPredictor + iSTFTNet | ✔ | — | — | CPU | gguf_loader, fft, ffn |
 | qwen3-tts | Qwen3 talker + 12 Hz codec + code-predictor | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
@@ -469,6 +470,33 @@ timestamps, diarization, hotwords) and TTS (DPM-Solver++ flow matching).
 into `~/.cache/crispasr/`; the runtime auto-discovers
 `mimo-tokenizer-q4_k.gguf` next to the LM. Override with `--codec-model
 PATH/mimo-tokenizer-q4_k.gguf` if you keep the tokenizer elsewhere.
+
+### ark-asr
+
+> ⚠️ **Experimental / WIP.** Validated verbatim on English + German (Q8_0, CPU),
+> but rough edges remain (see below). Single self-contained GGUF.
+
+[`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) — 19-language
+ASR = **Whisper-large-v3 encoder with partial interleaved RoPE** (rot_dim 32 of
+head_dim 64, θ=10000, applied to Q+K only; `k_proj` has no bias; the encoder's own
+final LayerNorm is dropped) + **MLP adapter** (LayerNorm → merge 4 consecutive
+frames → Linear 5120→4096 → GELU → Linear 4096→2048) + stock **Qwen2.5-3B decoder**
+(2048d, 36L, GQA 16Q/2KV, SwiGLU, RMSNorm, θ=1e6, tied embeddings). The
+`<|audio|>` (151663) placeholder embeddings are overwritten by the first
+N = `((mel_frames+1)//2)//4` adapter frames; mel is the stock WhisperFeatureExtractor
+recipe (128-bin, n_fft 400, hop 160). Convert with
+`models/convert-arkasr-to-gguf.py` (`--outtype f16|q8_0`).
+
+**Known limitations (WIP):**
+- **CPU only.** The GPU/`ggml_backend_sched` path emits no tokens (the
+  cross-backend audio-injection / KV graph hits the same weight-less-first-op
+  copy class as mimo-asr PLAN #115). Defaults to CPU; opt into the unvalidated
+  GPU path with `CRISPASR_ARKASR_GPU=1`.
+- **Language steering is experimental.** ARK is promptless, so language can drift
+  per 30 s chunk on long audio. Passing `-l <lang>` injects a best-effort
+  "Transcribe the audio in <Language>." instruction (the model was not trained on
+  instructions); the default (no `-l`) is the validated promptless path.
+- **Decode is slow** (per-step graph rebuild; no step-graph cache yet).
 
 ### moss-audio
 

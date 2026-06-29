@@ -159,6 +159,7 @@ struct ark_asr_context {
     int32_t id_assistant = 151668, id_im_end = 151645;
 
     std::string language;
+    std::string ask; // EXPERIMENTAL transcription instruction (see ark_asr_set_ask)
 };
 
 // ===========================================================================
@@ -429,6 +430,11 @@ extern "C" struct ark_asr_context* ark_asr_init_from_file(const char* path_model
 extern "C" void ark_asr_set_language(struct ark_asr_context* ctx, const char* lang_iso) {
     if (ctx && lang_iso)
         ctx->language = lang_iso;
+}
+
+extern "C" void ark_asr_set_ask(struct ark_asr_context* ctx, const char* instruction) {
+    if (ctx)
+        ctx->ask = instruction ? instruction : "";
 }
 
 // ===========================================================================
@@ -782,8 +788,14 @@ static bool ark_build_prefill_inputs(ark_asr_context* ctx, const float* pcm, int
         return false;
     }
     ids.clear();
-    ids.reserve((size_t)N + 8);
+    ids.reserve((size_t)N + 16);
     ids.push_back(ctx->id_user);
+    // EXPERIMENTAL: prepend a tokenised instruction (e.g. language steering)
+    // when set. Default (no ask) is promptless — the validated path.
+    if (!ctx->ask.empty()) {
+        std::vector<int32_t> tids = core_bpe::tokenize_simple(ctx->token_to_id, ctx->merge_rank, ctx->ask);
+        ids.insert(ids.end(), tids.begin(), tids.end());
+    }
     ids.push_back(ctx->id_boa);
     const int audio_start = (int)ids.size();
     for (int i = 0; i < N; i++)
