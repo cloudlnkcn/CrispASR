@@ -3118,8 +3118,10 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     }
 
     for (size_t i = 0; i < decode_feats.size(); i++) {
-        // Insert (time - 1) zero frames before this feature
-        int n_zeros = std::max(0, all_times[i] - 1);
+        // Insert (time - 1) zero frames before this feature. all_times and
+        // decode_feats are normally the same length (one duration per acoustic
+        // frame); guard the index so a length mismatch can't read out of bounds.
+        int n_zeros = (i < all_times.size()) ? std::max(0, all_times[i] - 1) : 0;
         for (int z = 0; z < n_zeros; z++) {
             for (int d = 0; d < ad; d++)
                 expanded.push_back(0.0f);
