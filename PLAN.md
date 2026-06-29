@@ -120,6 +120,57 @@ Tracked on #201 (left open for this).
 
 ---
 
+## §192 follow-up — native-Vulkan TADA garbled output FIXED (codec on CPU)
+
+**FIXED 2026-06-29** (branch `fix/tada-vulkan-repeat-f16`). The garbled/empty
+native-Vulkan output was **the codec, not the FM head** — the prior "FM
+time-dimension divergence" localization was a red herring. Now: native Vulkan
+"I went to school and back in four hours" (seed 1) → intelligible, **identical to
+Metal**; +2 sentences +seed2 all ASR-round-trip cleanly; deterministic; CPU
+output byte-identical to before (fix is Vulkan-gated). Still gated
+(`CRISPASR_TADA_VULKAN_NATIVE=1`), default remains CPU-fallback — ask reporter
+(BergmannAtmet, RADV) to confirm before flipping the default.
+
+**Actual root cause (the FM premise was wrong).** A/B'd Metal vs Vulkan native on
+the same input: both produce **bit-identical** durations (`time_before =
+[38,2,9,6,8,8,5,10,9,5,211]`) and 522 frames — i.e. the talker + FM + duration
+decode AGREE across GPUs. Metal renders them intelligibly; Vulkan rendered empty
+audio. So the divergence is purely in **audio rendering = the codec**
+(`tada_codec.cpp`). The codec still computed via `ggml_backend_sched`, whose
+cross-backend copies are corrupted on Vulkan/MoltenVK — the very #192 defect that
+gated the talker/FM onto a direct-`ggml_gallocr` path; the codec was never
+migrated. (Disproven en route: FM-head precision — forcing F32 FM weights or
+running the whole FM head on CPU left output bit-identical; and `time_before`
+durations come straight from the FM gray-code decode, which already matched
+across backends. The candidate-ranking sensitivity is real but secondary —
+candidates=1 was partially intelligible pre-fix, candidates=4 empty — both fixed
+by the codec change.)
+
+**Fix.** When the codec's GPU backend is Vulkan, run the whole codec on the CPU
+backend (`src/tada_codec.cpp`, `tada_codec_init_from_file_impl`). A pure-Vulkan
+gallocr path isn't viable — the codec offloads some ops (ISTFT, certain convs) to
+CPU, so it genuinely needs two backends, and the sched copies between them are
+what corrupt. The codec is a one-shot decode (not the AR loop) and its input
+features are bit-identical Metal-vs-Vulkan, so CPU rendering is faithful. The
+talker/FM keep their native-Vulkan path. Opt back into the broken native codec
+with `CRISPASR_TADA_CODEC_VULKAN_NATIVE=1` (debug only).
+
+**Caveat — MoltenVK can't fully validate GPU numerics.** MoltenVK's `mul_mm` /
+`mul_mat_vec` downconvert src0 to f16 regardless of stored dtype (storing F32 FM
+weights changed nothing; `GGML_VK_DISABLE_F16=1` barely moved cond cosine,
+0.99919→0.99966). So the talker `cond` is ~0.9997 vs CPU on MoltenVK — fine here
+(durations/candidates still agree with Metal), but a reminder that exact CPU
+parity isn't achievable on MoltenVK. On RADV (f32-native matmul) the talker is
+more precise; the codec-on-CPU fix is the operative change regardless.
+
+**Preconditions (hard-won — see LEARNINGS §192).** (1) Build with
+`-DGGML_METAL=OFF` and verify the `backend=Vulkan0` log line — Metal silently
+wins otherwise. (2) **Free the disk first** — benchmarking with `/Volumes/backups`
+near-full gives SIGBUS + nondeterministic frame counts that masquerade as a
+signal. (3) Re-run each config twice for determinism before forming a hypothesis.
+
+---
+
 ## Priority ordering
 
 | Priority | Item | Effort | Status |

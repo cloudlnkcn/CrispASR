@@ -692,6 +692,26 @@ static tada_codec_context* tada_codec_init_from_file_impl(const char* path, int 
         if (!c->backend)
             c->backend = c->backend_cpu;
     }
+
+    // #192: the codec compute uses ggml_backend_sched, whose cross-backend copies
+    // are corrupted on Vulkan/MoltenVK (the same defect that gated the talker/FM
+    // onto a direct-gallocr path). The codec offloads some ops (ISTFT, certain
+    // convs) to CPU, so a pure-Vulkan gallocr path is not viable — instead run
+    // the whole codec on CPU when the GPU backend is Vulkan. Verified: the codec
+    // *input* features are bit-identical Metal-vs-Vulkan, and Metal (which
+    // tolerates the sched copies) renders them correctly, so CPU rendering of the
+    // Vulkan-generated features is faithful. The talker/FM keep their native
+    // Vulkan path. Opt back into the (broken) native codec with
+    // CRISPASR_TADA_CODEC_VULKAN_NATIVE=1 for debugging.
+    if (c->backend != c->backend_cpu && std::strstr(ggml_backend_name(c->backend), "Vulkan")) {
+        const char* keep = std::getenv("CRISPASR_TADA_CODEC_VULKAN_NATIVE");
+        if (!(keep && keep[0] == '1')) {
+            fprintf(stderr, "tada-codec: Vulkan backend detected — running codec on CPU (#192 sched "
+                            "corruption; set CRISPASR_TADA_CODEC_VULKAN_NATIVE=1 to override)\n");
+            c->backend = c->backend_cpu;
+        }
+    }
+
     fprintf(stderr, "tada-codec: backend=%s%s\n", ggml_backend_name(c->backend),
             (c->backend == c->backend_cpu) ? " (CPU)" : " + CPU fallback");
 

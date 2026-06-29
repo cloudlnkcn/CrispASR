@@ -10,6 +10,73 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## A "garbled GPU output" bug can live entirely downstream — A/B the GPUs before localizing (§192)
+
+The #192 native-Vulkan TADA garbage was localized (by a prior handover) to the
+"FM head's time-dimension divergence" and a whole work plan was written around
+per-op FM diffing. That was **wrong**. The decisive test was a one-line A/B:
+generate the same sentence on **Metal** vs **Vulkan** native. Both produced
+**bit-identical durations and frame counts** (`time_before` matched exactly) —
+proving the talker + FM + duration decode AGREE across GPUs — yet Metal's audio
+was intelligible and Vulkan's was empty. So the divergence was purely in audio
+**rendering = the codec**, which still ran through `ggml_backend_sched` (the
+cross-backend-copy corruption that already gated the talker/FM onto a direct
+`ggml_gallocr` path; the codec was never migrated). Fix: run the codec on CPU
+when the GPU is Vulkan (it offloads ISTFT/some convs to CPU, so a pure-Vulkan
+gallocr isn't viable; the sched copies between the two backends are the defect).
+**Lessons:** (1) when two GPU backends exist, A/B them first — if they agree with
+each other but disagree with CPU-rendered output, the bug is in the
+backend-specific *rendering*, not the shared upstream math; (2) inherit a
+handover's *localization* skeptically — re-run its cheapest disproving test
+before building on it. Disproven en route: forcing F32 FM weights or running the
+whole FM head on CPU left output bit-identical (the FM was never the issue).
+
+## MoltenVK `mul_mm`/`mul_mat_vec` downconvert src0 to f16 regardless of stored dtype (§192)
+
+Storing FM weights as F32 instead of F16 on MoltenVK changed the matmul output by
+**exactly zero** — the shader downconverts src0 to its `FLOAT_TYPE` (f16) anyway,
+so f32-stored and f16-stored weights round identically. Even
+`GGML_VK_DISABLE_F16=1` only nudged a hidden-state cosine 0.99919→0.99966. So on
+MoltenVK you **cannot** reach CPU-exact GPU numerics by changing weight dtype;
+the only way to match CPU for a precision-critical sub-graph is to run it on the
+CPU backend. (On RADV, f32 matmuls accumulate in f32, so this is a MoltenVK
+quirk, not universal — but don't try to "validate a GPU f32 fix" on MoltenVK.)
+
+## Vulkan has no `REPEAT f16→f16` — cast K/V to F32 *before* the GQA repeat (§192)
+
+GQA decoders expand KV heads with `ggml_repeat_4d` on the cached K/V. When the
+cache is F16 (the default), that's an `f16→f16` REPEAT — which **Vulkan has no
+pipeline for**, on RADV *and* MoltenVK alike (`Missing op: REPEAT for f16 to
+f16`). It aborts the whole graph. The fix isn't a new kernel: cast K/V up to F32
+*before* the repeat (`core_attn::KvSelfAttnParams::force_kv_read_f32`, OR'd with
+the global `CRISPASR_KV_READ_F32`) so it lowers to a supported F32 REPEAT.
+Gate it to the Vulkan path; Metal/CPU keep the F16 fast path. **Caveat learned
+the hard way:** unblocking the *abort* is not the same as fixing *correctness* —
+the graph then ran but still produced garbage on longer text (a separate
+numerical divergence). "It runs now" ≠ "it's right now."
+
+## On macOS, GGML_METAL is default-ON and silently wins over Vulkan (§192)
+
+A build configured with `-DGGML_VULKAN=ON` but Metal left at its default still
+has Metal, and `--gpu-backend vulkan` will quietly run **MTL0**, not Vulkan. I
+spent a cycle "confirming a Vulkan fix" that was actually executing on Metal
+(where the bug doesn't exist). Always build the Vulkan test tree with
+`-DGGML_METAL=OFF`, and **read the `backend=Vulkan0` vs `backend=MTL0` log
+line** before trusting any Vulkan A/B. The original `crispasr-vk-build` had
+Metal OFF; a freshly-configured worktree build did not.
+
+## Never benchmark on a near-full disk — SIGBUS + nondeterminism masquerade as a code signal (§192)
+
+With `/Volumes/backups` at 100% (a few GB free), TADA-Vulkan runs threw
+intermittent **SIGBUS** (failed `mmap` of model files) and gave
+**nondeterministic** frame counts for *identical* invocations (148 vs 191 vs
+522). That noise looked exactly like a real A/B signal and sent me down a dead
+end ("disable FM B=2 fixes the drift" — it doesn't; ON and OFF both give the
+same 522-frame runaway once the disk is freed). Lesson: a parity/A-B result that
+won't reproduce across repeats is an *environment* alarm, not a finding — check
+`df` and re-run the same config twice **before** forming a hypothesis. Confirmed
+fixes only after the disk was freed and runs were deterministic.
+
 ## Always A/B against the *upstream reference*, not just your own option matrix (§216)
 
 Parakeet long-form shipped a "streamed" (chunked-encode + single-decode) default

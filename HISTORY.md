@@ -6,6 +6,73 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## §192 2026-06-29 TADA Vulkan — REPEAT-f16 abort unblocked; FM time-dim divergence localized (superseded below)
+
+On branch `fix/tada-vulkan-repeat-f16` (worktree `/Volumes/backups/code/tada-vk-stash`).
+Continues the #192 native-Vulkan work (CPU-fallback default + `TADA_MAX_EXPANDED_FRAMES`
+guard + gated `CRISPASR_TADA_VULKAN_NATIVE=1` direct-gallocr path already shipped to main).
+
+**Shipped on the branch (commit `0c519efa`) — the REPEAT-f16 unblock.** The gated
+native path was dead for *everyone*, not just MoltenVK: the talker's GQA head-expansion
+does `ggml_repeat_4d` directly on the **F16** KV cache, and Vulkan has no `REPEAT f16→f16`
+pipeline — so it aborts with `Missing op: REPEAT for f16 to f16` (confirmed on RADV by
+contributor BergmannAtmet *and* locally on MoltenVK). Fix: a per-call `force_kv_read_f32`
+in `core_attn::KvSelfAttnParams` (OR'd with the global `CRISPASR_KV_READ_F32`) that casts
+K/V up to F32 *before* the GQA repeat, lowering it to a supported F32 REPEAT. TADA sets it
+only when `c->vulkan_native`; Metal/CPU keep the F16 fast path (field defaults false → no
+behaviour change anywhere else). The native path now **runs end-to-end** on MoltenVK;
+"Hello world." round-trips verbatim through ASR.
+
+**Not fixed — execution unblocked ≠ correct output.** On non-trivial text the native
+Vulkan path still diverges: "I went to school and back in four hours" (seed 1) gives
+**522 expanded frames / 9.68 s / empty ASR (garbage)** vs CPU's **155 frames / verbatim**.
+"Hello world." only survives because it's too short for the divergence to compound through
+the autoregressive `cur_acoustic` feedback. Localized (by code reading) to the **FM head's
+time-dimension output**: durations are decoded from the latent `[ad..lat)` slice (duration
+CFG=1.0); the acoustic dims were validated (`speech_rms 426→1.14`) but the **time dims were
+never separately validated**, and they're what blows up.
+
+**Dead end (committed `126eb41a`, reverted `79c1cff9`).** Hypothesis "disable FM B=2 on
+Vulkan" — DISPROVEN once the machine was stable: FM-B2 ON and OFF both give the identical
+522-frame runaway. The 148/191/522-frame variance that looked like a signal was
+**disk-pressure noise** (`/Volumes/backups` at 100% → SIGBUS on mmap + nondeterministic
+runs). Reverting also keeps the batched-CFG win on Metal/CPU/CUDA.
+
+**Remaining work** (PLAN §192-followup): per-op diff-harness debugging of the FM time-dim
+path on Vulkan vs CPU. — **Superseded:** the FM localization was wrong; see the next entry
+(the codec was the actual culprit, now fixed).
+
+## §192 2026-06-29 (later) TADA Vulkan garbled output FIXED — it was the CODEC, not the FM
+
+Same branch. The "FM time-dimension divergence" localization above was a **red herring**.
+
+**Decisive A/B.** Ran the failing sentence on **Metal** native vs **Vulkan** native: both
+produced **bit-identical** durations (`time_before = [38,2,9,6,8,8,5,10,9,5,211]`) and 522
+frames — the talker + FM + gray-code duration decode AGREE across GPUs. Metal rendered them
+intelligibly ("I went to school in back in four hours"); Vulkan rendered **empty** audio.
+So the divergence is entirely in audio rendering = the **codec** (`tada_codec.cpp`), which
+still computed via `ggml_backend_sched` — the cross-backend-copy corruption that #192 had
+already gated the talker/FM away from (direct `ggml_gallocr`); the codec was never migrated.
+
+**Disproven en route** (so the next reader doesn't repeat it): forcing F32 FM weights on
+Vulkan left output **bit-identical** (MoltenVK `mul_mm` downconverts src0 to f16 regardless
+— see LEARNINGS §192); running the **whole FM head on CPU** also left it bit-identical; and
+`GGML_VK_DISABLE_F16=1` only moved a cond cosine 0.99919→0.99966 and didn't change the
+durations. The FM was never the problem — its gray-code time bits already matched CPU at
+the records that mattered.
+
+**Fix (this commit).** When the codec's GPU backend is Vulkan, run the whole codec on the
+**CPU backend** (`tada_codec_init_from_file_impl`). The codec offloads ISTFT / some convs to
+CPU, so a pure-Vulkan gallocr isn't viable — it needs two backends and the sched copies
+between them are the defect. The codec is a one-shot decode (not the AR loop) and its input
+features are bit-identical Metal-vs-Vulkan, so CPU rendering is faithful. Talker/FM keep the
+native-Vulkan path. Debug override: `CRISPASR_TADA_CODEC_VULKAN_NATIVE=1`.
+
+**Validation.** Native Vulkan now ASR-round-trips intelligibly on "four hours" (seed 1, ==
+Metal), "the quick brown fox…" (seed 1), and "four hours" (seed 2); deterministic across
+re-runs; CPU output **byte-identical** to before (fix is Vulkan-backend-gated). Still gated,
+default still CPU-fallback — ask BergmannAtmet (RADV) to confirm before flipping the default.
+
 ## §221 2026-06-27 tada-encoder — voice reference creation ported to C++/ggml
 
 Ported the TADA encoder pipeline (Aligner + WavEncoder + LocalAttentionEncoder
