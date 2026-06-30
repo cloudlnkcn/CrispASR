@@ -10,8 +10,11 @@
 // gains a real implementation, or once the shared LLM decode loop lands in
 // src/core/, this file should shrink dramatically.
 //
-// Granite does not expose native timestamps. Word-level timestamps via a
-// CTC aligner second pass will be wired up once crispasr_aligner lands.
+// The granite-speech-4.1-2b-PLUS variant exposes native word-level timestamps
+// ([T:N] tags) and speaker attribution ([Speaker N]: tags) via mode-specific
+// instructions — but ONLY through its real control-token chat template (see the
+// prompt-construction block below). Base / non-plus variants offer plain ASR +
+// translation and use the legacy "USER:/ASSISTANT:" template.
 
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
@@ -195,7 +198,15 @@ public:
             // Runtime-tokenize the control-token template.
             // granite_speech_tokenize() detects <|...|> markers and emits their
             // vocab id directly.
-            const std::string prefix_str = "<|start_of_role|>user<|end_of_role|>";
+            // Full control-token chat template, byte-for-byte what
+            // transformers' apply_chat_template() emits for these models — the
+            // default system turn is ALWAYS present (verified against
+            // ibm-granite/granite-speech-4.1-2b-plus). Omitting it leaves the
+            // model in an undefined state on the demanding timestamp / SAA
+            // instructions (#205).
+            const std::string prefix_str = "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please "
+                                           "ensure responses are professional, accurate, and safe.<|end_of_text|>\n"
+                                           "<|start_of_role|>user<|end_of_role|>";
             const std::string instr = user_content.empty()
                                           ? std::string("can you transcribe the speech into a written format?")
                                           : user_content;
@@ -473,8 +484,42 @@ public:
         }
 
         // ---- PLUS post-processing: parse structured output tags ----
+        // Parse [T:N] end-time tags (N = centiseconds, emitted mod 1000) out of
+        // `text` into words + clean text. The mod-1000 rollover state
+        // (ts_last_t / ts_offset_cs) is threaded across calls so absolute times
+        // stay monotonic even when parsing per-speaker chunks (#205: combined
+        // SAA + timestamps used to leak the raw [T:N] tags into the text).
+        int64_t ts_last_t = t_offset_cs;
+        int64_t ts_offset_cs = 0;
+        auto parse_ts = [&](const std::string& text, std::vector<crispasr_word>& words) -> std::string {
+            static const std::regex ts_re(R"((\S+)\s*\[T:(\d+)\])");
+            std::sregex_iterator it(text.begin(), text.end(), ts_re);
+            std::sregex_iterator end;
+            std::string clean;
+            for (; it != end; ++it) {
+                std::string word = (*it)[1].str();
+                int64_t raw_cs = std::stoll((*it)[2].str());
+                int64_t abs_cs = raw_cs + ts_offset_cs + t_offset_cs;
+                while (abs_cs < ts_last_t)
+                    abs_cs += 1000, ts_offset_cs += 1000;
+                if (word != "_") { // skip silence tokens
+                    crispasr_word w;
+                    w.text = word;
+                    w.t0 = ts_last_t;
+                    w.t1 = abs_cs;
+                    words.push_back(std::move(w));
+                    if (!clean.empty())
+                        clean += " ";
+                    clean += word;
+                }
+                ts_last_t = abs_cs;
+            }
+            return clean;
+        };
+
         if (want_saa && !seg.text.empty()) {
-            // Split on [Speaker N]: markers → one segment per speaker turn.
+            // Split on [Speaker N]: markers → one segment per speaker turn,
+            // parsing any [T:N] tags inside each turn when timestamps are also on.
             static const std::regex spk_re(R"(\[Speaker\s+(\d+)\]\s*:\s*)");
             std::sregex_iterator it(seg.text.begin(), seg.text.end(), spk_re);
             std::sregex_iterator end;
@@ -482,39 +527,42 @@ public:
             size_t last_pos = 0;
             std::vector<crispasr_segment> saa_segs;
 
+            auto emit = [&](std::string chunk) {
+                while (!chunk.empty() && chunk.back() == ' ')
+                    chunk.pop_back();
+                if (chunk.empty() || current_spk.empty())
+                    return;
+                crispasr_segment s;
+                s.speaker = current_spk;
+                if (want_ts) {
+                    std::vector<crispasr_word> words;
+                    std::string clean = parse_ts(chunk, words);
+                    if (!words.empty()) {
+                        s.t0 = words.front().t0;
+                        s.t1 = words.back().t1;
+                        s.text = std::move(clean);
+                        s.words = std::move(words);
+                        saa_segs.push_back(std::move(s));
+                        return;
+                    }
+                }
+                s.t0 = seg.t0;
+                s.t1 = seg.t1;
+                s.text = std::move(chunk);
+                saa_segs.push_back(std::move(s));
+            };
+
             for (; it != end; ++it) {
                 // Text before this speaker tag belongs to the previous speaker
                 size_t match_start = (size_t)it->position();
-                if (match_start > last_pos && !current_spk.empty()) {
-                    std::string chunk = seg.text.substr(last_pos, match_start - last_pos);
-                    while (!chunk.empty() && chunk.back() == ' ')
-                        chunk.pop_back();
-                    if (!chunk.empty()) {
-                        crispasr_segment s;
-                        s.t0 = seg.t0;
-                        s.t1 = seg.t1;
-                        s.speaker = current_spk;
-                        s.text = std::move(chunk);
-                        saa_segs.push_back(std::move(s));
-                    }
-                }
+                if (match_start > last_pos && !current_spk.empty())
+                    emit(seg.text.substr(last_pos, match_start - last_pos));
                 current_spk = "Speaker " + (*it)[1].str();
                 last_pos = (size_t)(it->position() + it->length());
             }
             // Remaining text after last speaker tag
-            if (last_pos < seg.text.size() && !current_spk.empty()) {
-                std::string chunk = seg.text.substr(last_pos);
-                while (!chunk.empty() && chunk.back() == ' ')
-                    chunk.pop_back();
-                if (!chunk.empty()) {
-                    crispasr_segment s;
-                    s.t0 = seg.t0;
-                    s.t1 = seg.t1;
-                    s.speaker = current_spk;
-                    s.text = std::move(chunk);
-                    saa_segs.push_back(std::move(s));
-                }
-            }
+            if (last_pos < seg.text.size() && !current_spk.empty())
+                emit(seg.text.substr(last_pos));
             if (!saa_segs.empty()) {
                 out = std::move(saa_segs);
                 return out;
@@ -522,37 +570,12 @@ public:
         }
 
         if (want_ts && !seg.text.empty()) {
-            // Parse [T:N] timestamp tags (N = centiseconds mod 1000).
-            // Unwrap the modulo rollover for absolute timestamps.
-            static const std::regex ts_re(R"((\S+)\s*\[T:(\d+)\])");
-            std::sregex_iterator it(seg.text.begin(), seg.text.end(), ts_re);
-            std::sregex_iterator end;
-            int64_t offset_cs = 0;
-            int64_t last_t = t_offset_cs;
-            std::string clean_text;
-
-            for (; it != end; ++it) {
-                std::string word = (*it)[1].str();
-                int64_t raw_cs = std::stoll((*it)[2].str());
-                int64_t abs_cs = raw_cs + offset_cs + t_offset_cs;
-                // Unwrap mod-1000 rollover
-                while (abs_cs < last_t)
-                    abs_cs += 1000, offset_cs += 1000;
-
-                if (word != "_") { // skip silence tokens
-                    crispasr_word w;
-                    w.text = word;
-                    w.t0 = last_t;
-                    w.t1 = abs_cs;
-                    seg.words.push_back(std::move(w));
-                    if (!clean_text.empty())
-                        clean_text += " ";
-                    clean_text += word;
-                }
-                last_t = abs_cs;
+            std::vector<crispasr_word> words;
+            std::string clean = parse_ts(seg.text, words);
+            if (!words.empty()) {
+                seg.words = std::move(words);
+                seg.text = std::move(clean);
             }
-            if (!seg.words.empty())
-                seg.text = std::move(clean_text);
         }
 
         // Per-token entries with decode-loop confidences. granite uses

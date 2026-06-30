@@ -6,6 +6,35 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #205c 2026-06-30 Granite-plus: byte-exact chat template (system turn) + combined SAA/timestamps
+
+Finishing #205b properly, by comparing against `transformers.apply_chat_template`
+(rendered from the real ibm-granite/granite-speech-4.1-2b-plus tokenizer). Two gaps
+remained:
+
+1. **Missing system turn.** The model card's chat template ALWAYS prepends a
+   default system message — the exact rendered prompt is
+   `<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure
+   responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|><|audio|>…`.
+   Our v3 prefix started at the *user* turn, so the prompt was not what the model
+   was trained on. Added the system turn → the C++ prompt is now byte-for-byte
+   what transformers emits. (Confirmed via the same tokenizer that
+   granite-speech-4.1-2b *base* genuinely renders `USER: <|audio|>X\n ASSISTANT:`,
+   so the legacy path for non-plus is correct — base and plus really do use
+   different templates.)
+
+2. **Combined SAA + timestamps leaked raw `[T:N]` tags.** The speaker-split block
+   returned early without ever running the timestamp parser, so `-osrt --diarize`
+   emitted `(speaker 0) and [T:56] so [T:95] …`. Refactored the `[T:N]` parser into
+   a shared lambda that threads the mod-1000 rollover state, and applied it inside
+   each speaker turn → clean text + real per-word times.
+
+Validated (M1/Metal, jfk.wav): plus plain / `--max-len` / `--output-json-full`
+(real `t0`/`t1`) / `--diarize` / `--diarize --max-len` (clean speaker+word output)
+all correct; non-plus granite & qwen3 `--max-len` text-split unchanged; 746/746
+unit tests. (Open: keyword-biasing / incremental-decoding capabilities are not
+wired to the CLI — feature work, not a regression.)
+
 ## moss-transcribe 2026-06-30 MOSS-Transcribe-preview-2B ASR backend (Qwen3-Omni encoder + Qwen3-1.7B)
 
 Port of `OpenMOSS-Team/MOSS-Transcribe-preview-2B` (~2.4 B, Apache-2.0): the stock
