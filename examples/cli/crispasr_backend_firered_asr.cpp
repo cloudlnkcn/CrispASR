@@ -43,6 +43,31 @@ public:
             cp.verbosity = 2;
         cp.use_gpu = crispasr_backend_should_use_gpu(params);
         cp.beam_size = params.beam_size > 0 ? params.beam_size : 3;
+
+        // FireRedASR2-AED auto-detects the spoken language (built-in LID) among
+        // the languages it was trained on: Chinese (+ ~20 Chinese dialects),
+        // English, and Cantonese. It has no token for any other language and
+        // offers no per-request language override, so `-l <lang>` cannot steer
+        // it. Warn instead of silently ignoring an unsupported request — issue
+        // #199: `-l ja` on this Mandarin/English model produced hallucinations
+        // because there is no Japanese in the model at all. zh/en/yue are
+        // handled by auto-detection regardless of the flag, so only flag the
+        // genuinely unsupported codes.
+        if (!params.no_prints && !params.language.empty() && params.language != "auto") {
+            const std::string& l = params.language;
+            const bool firered_lang = (l == "zh" || l == "en" || l == "yue" || l == "zh-en" || l == "zh_en" ||
+                                       l == "chinese" || l == "english" || l == "cantonese");
+            if (!firered_lang) {
+                fprintf(stderr,
+                        "crispasr[firered-asr]: WARNING: this model only transcribes Chinese (+ Chinese "
+                        "dialects), English, and Cantonese; '-l %s' is not supported and will be ignored "
+                        "(expect hallucinations for non-Chinese/English audio). For %s, use a native backend "
+                        "— e.g. reazonspeech / parakeet (parakeet-tdt-0.6b-ja) / fastconformer-ctc / funasr "
+                        "(zh,yue,en,ja,ko).\n",
+                        l.c_str(), crispasr_iso_to_english_lang(l).c_str());
+            }
+        }
+
         ctx_ = firered_asr_init_from_file(params.model.c_str(), cp);
         return ctx_ != nullptr;
     }
