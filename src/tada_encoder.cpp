@@ -938,6 +938,44 @@ int tada_encoder_encode(tada_encoder_context* ctx, const char* aligner_gguf, con
     int V = (int)aligner.hparams.vocab_size;
     int T_ctc = (int)(logits.size() / V);
 
+    // Diagnostic: free (text-less) greedy CTC decode of the aligner logits, to
+    // probe whether this alignment model doubles as a CTC ASR / word-timestamp
+    // model. Gated by CRISPASR_TADA_CTC_ASR=1. The aligner is trained for FORCED
+    // alignment, so this is exploratory — but the logits are a full distribution
+    // over the Llama-3.2 BPE vocab per frame, so argmax+collapse gives a
+    // transcript hypothesis (and per-token frame indices = timecodes).
+    if (const char* e = std::getenv("CRISPASR_TADA_CTC_ASR"); e && e[0] == '1') {
+        // blank id: wav2vec2 CTC uses the pad token as blank.
+        int blank = 0;
+        {
+            gguf_init_params mp = {true, nullptr};
+            if (gguf_context* g = gguf_init_from_file(aligner_gguf, mp)) {
+                int k = gguf_find_key(g, "wav2vec2.pad_token_id");
+                if (k >= 0)
+                    blank = (int)gguf_get_val_u32(g, k);
+                gguf_free(g);
+            }
+        }
+        std::vector<int32_t> ids;
+        std::vector<int> frames;
+        int prev = -1;
+        for (int t = 0; t < T_ctc; t++) {
+            const float* row = logits.data() + (size_t)t * V;
+            int am = (int)(std::max_element(row, row + V) - row);
+            if (am != blank && am != prev)
+                ids.push_back(am), frames.push_back(t);
+            prev = am;
+        }
+        std::string txt = core_bpe::detokenize(aligner.vocab, ids.data(), ids.size());
+        fprintf(stderr, "[tada-ctc-asr] blank=%d frames=%d decoded %zu tokens\n[tada-ctc-asr] TEXT: %s\n", blank, T_ctc,
+                ids.size(), txt.c_str());
+        // Timecodes: first ~12 tokens with their frame index (wav2vec2 frame rate).
+        fprintf(stderr, "[tada-ctc-asr] timecodes (token@frame):");
+        for (size_t i = 0; i < ids.size() && i < 12; i++)
+            fprintf(stderr, " '%s'@%d", core_bpe::token_bytes_to_utf8(aligner.vocab[ids[i]]).c_str(), frames[i]);
+        fprintf(stderr, "\n");
+    }
+
     // Step 3: Tokenize transcript using BPE from the aligner GGUF
     // The aligner GGUF embeds tokenizer.ggml.tokens + tokenizer.ggml.merges
     // (same Llama-3.2 vocab used by tada_tts.cpp).
