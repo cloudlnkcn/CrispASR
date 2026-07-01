@@ -1520,49 +1520,50 @@ int crispasr_run_backend(const whisper_params& params_in) {
         std::string aligner_path = params.make_ref_aligner;
         std::string out_path = params.make_ref_output.empty() ? "tada-ref-custom.gguf" : params.make_ref_output;
 
-        // Auto-discover encoder + aligner GGUFs from model dir or cache
-        if (encoder_path.empty()) {
-            auto dir_of = [](const std::string& p) -> std::string {
-                auto sep = p.find_last_of("/\\");
-                return (sep == std::string::npos) ? "." : p.substr(0, sep);
-            };
-            std::string dir = dir_of(params.model);
-            for (const char* name : {"tada-encoder-f16.gguf", "tada-encoder.gguf"}) {
-                std::string p = dir + "/" + name;
-                struct stat st;
-                if (stat(p.c_str(), &st) == 0) {
-                    encoder_path = p;
-                    break;
-                }
-            }
-        }
+        // Auto-discover encoder + aligner GGUFs: next to the model, then the
+        // shared cache dir, then auto-download from the model's HF repo (same
+        // repo the tada-ref-<lang>.gguf voices come from). The encoder/aligner
+        // are only needed by --make-ref, so they are opt-in downloads.
+        auto dir_of = [](const std::string& p) -> std::string {
+            auto sep = p.find_last_of("/\\");
+            return (sep == std::string::npos) ? "." : p.substr(0, sep);
+        };
+        const std::string aux_base = (params.backend == "tada-1b" || params.backend == "tada-tts-1b")
+                                         ? "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/"
+                                         : "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/";
+        // Resolve one aux GGUF by name: model dir → cache dir → download.
+        auto resolve_aux = [&](const std::string& name) -> std::string {
+            std::string local = dir_of(params.model) + "/" + name;
+            struct stat st;
+            if (stat(local.c_str(), &st) == 0)
+                return local;
+            std::string cached = crispasr_cache::dir(params.cache_dir) + "/" + name;
+            if (crispasr_cache::file_present(cached))
+                return cached;
+            if (params.auto_download)
+                return crispasr_cache::ensure_cached_file(name, aux_base + name, params.no_prints, "crispasr",
+                                                          params.cache_dir);
+            return std::string();
+        };
+        if (encoder_path.empty())
+            encoder_path = resolve_aux("tada-encoder-f16.gguf");
         if (aligner_path.empty()) {
-            auto dir_of = [](const std::string& p) -> std::string {
-                auto sep = p.find_last_of("/\\");
-                return (sep == std::string::npos) ? "." : p.substr(0, sep);
-            };
-            std::string dir = dir_of(params.model);
-            std::string lang_suffix = params.language.empty() ? "en" : params.language;
-            for (const char* fmt : {"tada-aligner-%s.gguf", "tada-aligner-en.gguf"}) {
-                char name[256];
-                snprintf(name, sizeof(name), fmt, lang_suffix.c_str());
-                std::string p = dir + "/" + name;
-                struct stat st;
-                if (stat(p.c_str(), &st) == 0) {
-                    aligner_path = p;
-                    break;
-                }
-            }
+            const std::string lang = params.language.empty() ? "en" : params.language;
+            aligner_path = resolve_aux("tada-aligner-" + lang + ".gguf");
+            if (aligner_path.empty() && lang != "en")
+                aligner_path = resolve_aux("tada-aligner-en.gguf");
         }
 
         if (encoder_path.empty()) {
-            fprintf(stderr, "crispasr[make-ref]: cannot find tada-encoder GGUF. "
-                            "Pass --make-ref-encoder <path> or place tada-encoder-f16.gguf next to the model.\n");
+            fprintf(stderr, "crispasr[make-ref]: cannot find tada-encoder GGUF. Add --auto-download to "
+                            "fetch it, pass --make-ref-encoder <path>, or place tada-encoder-f16.gguf "
+                            "next to the model.\n");
             return 20;
         }
         if (aligner_path.empty()) {
-            fprintf(stderr, "crispasr[make-ref]: cannot find tada-aligner GGUF. "
-                            "Pass --make-ref-aligner <path> or place tada-aligner-en.gguf next to the model.\n");
+            fprintf(stderr, "crispasr[make-ref]: cannot find tada-aligner GGUF. Add --auto-download to "
+                            "fetch it, pass --make-ref-aligner <path>, or place tada-aligner-en.gguf "
+                            "next to the model.\n");
             return 20;
         }
 
