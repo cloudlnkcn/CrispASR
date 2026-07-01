@@ -2317,11 +2317,12 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.n_threads = s->n_threads;
         p.verbosity = g_open_verbosity_tls > 0 ? g_open_verbosity_tls : 1;
         p.use_gpu = g_open_use_gpu_tls;
-        // Mirror the CLI default: rank several flow-matching timing
-        // candidates per token so multilingual output is reliable (the
-        // lib default of 1 reproduces a single noise draw, which can
-        // collapse durations). Override with TADA_NUM_CANDIDATES.
-        p.num_acoustic_candidates = 4;
+        // Mirror the CLI + upstream default of 1 (#192): the reconstruction
+        // scorer used to rank >1 candidates fits the OT velocity field, which
+        // does not correlate with intelligibility, so best-of-N can pick a
+        // WORSE draw (measured: N=4 mangles "…four hours" → "…and forth").
+        // Opt in to >1 with TADA_NUM_CANDIDATES for A/B only.
+        p.num_acoustic_candidates = 1;
         if (const char* env = std::getenv("TADA_NUM_CANDIDATES"); env && *env) {
             int n = atoi(env);
             if (n >= 1)

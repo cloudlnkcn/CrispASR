@@ -2718,23 +2718,25 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     // Starts at prefill_len when batched prefill ran, otherwise at 0.
     const int loop_start = do_batch_prefill ? prefill_len : 0;
 
-    // Match Python's _generate() exactly (#192): run for a fixed number
-    // of steps, auto-regressively generate text tokens (appending to
-    // all_ids), but NEVER stop on EOS.  Python (tada.py line 880-1102)
-    // runs `for step in range(step_start, num_steps)` where
-    // num_steps = len(input_ids) + num_extra_steps (default 0).  At each
-    // step >= len(input_ids)-1, it samples the next text token and appends
-    // it to input_ids.  The loop continues unconditionally.
-    //
-    // The old C++ code stopped on the first EOT, truncating the last word
-    // because the acoustic features lag by shift_acoustic (5) positions.
-    // Default extra = shift_acoustic so the FM produces tail features.
-    // CRISPASR_TADA_EXTRA_STEPS overrides (0 = exact Python default).
+    // Match Python's _generate() behaviour (#192): run for exactly
+    // num_prompt steps, never auto-regressively generate text tokens,
+    // never stop early on EOS.  Python's generate() calls _generate with
+    // num_steps = input_ids.shape[-1] + num_extra_steps where num_extra_steps
+    // defaults to 0, and input_ids already carries shift (5) trailing EOTs
+    // baked in by _add_bos_eos (num_eos_tokens == shift_acoustic).  Those
+    // trailing EOTs *are* the text→acoustic tail: they run the extra decode
+    // steps that flush acoustic features for the final real tokens.  So the
+    // faithful default is extra_steps = 0 (total_steps == num_prompt).  An
+    // earlier fix added extra = shift here on top of the already-present EOTs,
+    // over-generating by 5 steps and appending trailing junk frames after the
+    // last word (ASR "…four hours" → "…for out").  The real bug it chased was
+    // the early EOS-stop below (now removed), not a missing tail.
+    // CRISPASR_TADA_EXTRA_STEPS overrides (default 0 = exact Python).
     static const int s_extra_steps = []() {
         const char* e = std::getenv("CRISPASR_TADA_EXTRA_STEPS");
         return e && e[0] ? atoi(e) : -1;
     }();
-    const int extra_steps = (s_extra_steps >= 0) ? s_extra_steps : shift;
+    const int extra_steps = (s_extra_steps >= 0) ? s_extra_steps : 0;
     const int total_steps = num_prompt + extra_steps;
 
     // Main AR + FM loop: runs for exactly total_steps steps.

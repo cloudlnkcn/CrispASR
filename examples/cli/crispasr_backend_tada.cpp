@@ -110,15 +110,17 @@ public:
             cp.temperature = p.temperature;
         cp.seed = p.seed;
 
-        // TADA's per-token flow-matching duration head is noise-sensitive: a
-        // single unlucky noise draw can collapse token durations (rushed,
-        // unintelligible speech). Generate several candidates per step and keep
-        // the best by reconstruction score (Python num_acoustic_candidates).
-        // Q4_K quantization amplifies the noise lottery — 4 candidates aren't
-        // enough to reliably find a good sample (#192 "four hours" truncation).
-        // 8 candidates make Q4_K produce correct output across seeds.
-        // Override with TADA_NUM_CANDIDATES (1 = fastest/least robust).
-        cp.num_acoustic_candidates = 8;
+        // num_acoustic_candidates: draw N flow-matching noise samples per token
+        // and keep the best by reconstruction score (Python
+        // _solve_flow_matching_ranked). Upstream InferenceOptions default is 1,
+        // and 1 is what we default to: the reconstruction ("likelihood") scorer
+        // fits the OT velocity field, which does NOT correlate with speech
+        // intelligibility, so best-of-N can reliably pick a WORSE draw than a
+        // single one. Measured on "I went to school and back in four hours"
+        // (#192): N=1 → verbatim "…four hours"; N=4 → mangled "…and forth"
+        // with a spurious 43-frame duration gap. The Python reference behaves
+        // the same at N=4. Opt in to >1 with TADA_NUM_CANDIDATES for A/B only.
+        cp.num_acoustic_candidates = 1;
         if (const char* env = std::getenv("TADA_NUM_CANDIDATES"); env && *env) {
             int n = atoi(env);
             if (n >= 1)
@@ -353,7 +355,7 @@ private:
     int def_top_k_ = 0;
     float def_rep_penalty_ = 1.1f;
     bool def_do_sample_ = true;
-    int def_num_candidates_ = 4;
+    int def_num_candidates_ = 1;
     // Resolved acoustic-FM defaults ("slow vs fast" axis, #197).
     int def_num_fm_steps_ = 10;
     float def_acoustic_cfg_ = 1.6f;
