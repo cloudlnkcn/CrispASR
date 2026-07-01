@@ -202,7 +202,10 @@ public:
                             "Pass --codec-model PATH or place tada-codec.gguf next to model.\n");
         }
         std::string prompt_path;
-        if (!p.tts_voice.empty() && p.tts_voice != "default" && p.tts_voice != "auto") {
+        // In --make-ref mode the --voice <wav> is the input to the ref builder,
+        // not a synth voice prompt — the make-ref handler (crispasr_run.cpp)
+        // consumes it, so don't try to load it as a prompt or fail on the .wav.
+        if (!p.make_ref && !p.tts_voice.empty() && p.tts_voice != "default" && p.tts_voice != "auto") {
             // Check for .wav — not yet supported; user needs a tada-ref.gguf
             const std::string& v = p.tts_voice;
             bool is_wav = v.size() >= 4 && (v.substr(v.size() - 4) == ".wav" || v.substr(v.size() - 4) == ".WAV");

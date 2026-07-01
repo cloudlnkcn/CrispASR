@@ -247,16 +247,27 @@ def main():
     w.add_array("tokenizer.ggml.tokens", vocab_list)
     w.add_uint32("tokenizer.ggml.padding_token_id", 0)
 
-    # Also embed BPE merges if available (for C++ tokenization)
-    if hasattr(tokenizer, 'bpe_ranks') or hasattr(tokenizer, '_tokenizer'):
-        # Try to get merges from the fast tokenizer backend
-        try:
-            merges = tokenizer.backend_tokenizer.model.get_merges()
-            if merges:
-                w.add_array("tokenizer.ggml.merges", merges)
-                print(f"  Embedded {len(merges)} BPE merges")
-        except Exception:
-            pass
+    # Embed BPE merges (REQUIRED for C++ tokenization). Without them the C++
+    # core_bpe::tokenize_simple falls back to byte-level tokens (e.g. a 5-word
+    # transcript becomes ~26 byte-tokens), which mismatches the runtime's BPE
+    # prompt tokenization and breaks voice cloning (empty/garbled synth).
+    # tokenizers' get_merges() is version-dependent, so parse tokenizer.json
+    # directly. Its "model.merges" is either ["a b", ...] (older) or
+    # [["a","b"], ...] (tokenizers >= 0.20); core_bpe wants "a b" strings in
+    # rank order.
+    merges = []
+    try:
+        import json as _json
+        tj = _json.loads(tokenizer.backend_tokenizer.to_str())
+        raw = tj.get("model", {}).get("merges", [])
+        for m in raw:
+            merges.append(m if isinstance(m, str) else (m[0] + " " + m[1]))
+    except Exception as e:
+        print(f"  WARNING: could not extract BPE merges ({e}); "
+              "C++ tokenization will byte-fall-back and voice refs will be broken")
+    if merges:
+        w.add_array("tokenizer.ggml.merges", merges)
+        print(f"  Embedded {len(merges)} BPE merges")
 
     # ── Write tensors ──
     print("\nWriting tensors:")
