@@ -573,6 +573,12 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.make_ref_aligner = ARGV_NEXT;
     } else if (arg == "--make-ref-encoder") {
         params.make_ref_encoder = ARGV_NEXT;
+    } else if (arg == "--align") {
+        params.align = true;
+    } else if (arg == "--align-output") {
+        params.align_output = ARGV_NEXT;
+    } else if (arg == "--align-format") {
+        params.align_format = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
@@ -1137,6 +1143,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
         stderr,
         "             --make-ref                create a TADA voice reference GGUF (with --voice <audio.wav>\n"
         "                                                 --ref-text \"transcript\" [--make-ref-output path.gguf])\n");
+    fprintf(stderr,
+            "             --align                   forced-alignment word timestamps via the TADA aligner\n"
+            "                                                 (--voice <audio.wav> --ref-text \"transcript\"\n"
+            "                                                 [--align-format srt|json|plain] [--align-output f])\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",
@@ -2120,7 +2130,7 @@ int main(int argc, char** argv) {
     }
 
     if (params.fname_inp.empty() && !params.stream && params.tts_text.empty() && params.text_input.empty() &&
-        !params.make_ref) {
+        !params.make_ref && !params.align) {
         fprintf(stderr, "error: no input files specified\n");
         whisper_print_usage(argc, argv, params);
         return 2;

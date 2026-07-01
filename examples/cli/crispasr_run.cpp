@@ -1504,14 +1504,18 @@ int crispasr_run_backend(const whisper_params& params_in) {
         return 0;
     }
 
-    // ---- make-ref mode: create TADA voice reference GGUF ----
-    if (params.make_ref) {
+    // ---- make-ref / align mode: TADA aligner pipeline ----
+    // --make-ref writes a voice reference GGUF; --align emits forced-alignment
+    // word timestamps. Both share the encoder+aligner resolution, audio load,
+    // and encode; they differ only in what they do with the result.
+    if (params.make_ref || params.align) {
+        const char* verb = params.make_ref ? "make-ref" : "align";
         if (params.tts_voice.empty()) {
-            fprintf(stderr, "crispasr[make-ref]: --make-ref requires --voice <audio.wav>\n");
+            fprintf(stderr, "crispasr[%s]: requires --voice <audio.wav>\n", verb);
             return 20;
         }
         if (params.tts_ref_text.empty()) {
-            fprintf(stderr, "crispasr[make-ref]: --make-ref requires --ref-text \"transcript of the audio\"\n");
+            fprintf(stderr, "crispasr[%s]: requires --ref-text \"transcript of the audio\"\n", verb);
             return 20;
         }
 
@@ -1612,11 +1616,90 @@ int crispasr_run_backend(const whisper_params& params_in) {
         tada_encoder_free(ectx);
 
         if (rc != 0) {
-            fprintf(stderr, "crispasr[make-ref]: encode failed (rc=%d)\n", rc);
+            fprintf(stderr, "crispasr[%s]: encode failed (rc=%d)\n", verb, rc);
             return 20;
         }
 
-        // Write GGUF via tada_encoder helper
+        // --align: emit forced-alignment word timestamps and exit.
+        if (params.align) {
+            const double fps = result.frame_rate > 0 ? (double)result.frame_rate : 50.0;
+            // Group BPE tokens into words: a token whose decoded text starts with
+            // a space (GPT-2 space marker) begins a new word.
+            struct Word {
+                std::string text;
+                double start;
+            };
+            std::vector<Word> words;
+            for (int i = 0; i < result.n_tokens; i++) {
+                const std::string& tk = i < (int)result.token_texts.size() ? result.token_texts[i] : std::string();
+                double t = (i < (int)result.token_positions.size() ? result.token_positions[i] : 0.0f) / fps;
+                bool new_word = words.empty() || (!tk.empty() && tk[0] == ' ');
+                if (new_word) {
+                    std::string w = tk;
+                    if (!w.empty() && w[0] == ' ')
+                        w.erase(0, 1);
+                    words.push_back({w, t});
+                } else {
+                    words.back().text += tk;
+                }
+            }
+            const double clip_end = (double)n_24k / 24000.0;
+            auto ts = [](double s, bool comma) -> std::string {
+                if (s < 0)
+                    s = 0;
+                int h = (int)(s / 3600);
+                int m = (int)((s - h * 3600) / 60);
+                int sec = (int)(s - h * 3600 - m * 60);
+                int ms = (int)((s - (int)s) * 1000 + 0.5);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%02d:%02d:%02d%c%03d", h, m, sec, comma ? ',' : '.', ms);
+                return buf;
+            };
+            std::string out;
+            const std::string& fmt = params.align_format;
+            if (fmt == "json") {
+                out = "[\n";
+                for (size_t i = 0; i < words.size(); i++) {
+                    double end = (i + 1 < words.size()) ? words[i + 1].start : clip_end;
+                    std::string esc;
+                    for (char c : words[i].text) {
+                        if (c == '"' || c == '\\')
+                            esc += '\\';
+                        esc += c;
+                    }
+                    char line[256];
+                    snprintf(line, sizeof(line), "  {\"word\": \"%s\", \"start\": %.3f, \"end\": %.3f}%s\n",
+                             esc.c_str(), words[i].start, end, i + 1 < words.size() ? "," : "");
+                    out += line;
+                }
+                out += "]\n";
+            } else if (fmt == "plain") {
+                for (auto& w : words)
+                    out += ts(w.start, false) + "\t" + w.text + "\n";
+            } else { // srt (default)
+                for (size_t i = 0; i < words.size(); i++) {
+                    double end = (i + 1 < words.size()) ? words[i + 1].start : clip_end;
+                    out += std::to_string(i + 1) + "\n" + ts(words[i].start, true) + " --> " + ts(end, true) + "\n" +
+                           words[i].text + "\n\n";
+                }
+            }
+            if (params.align_output.empty()) {
+                fputs(out.c_str(), stdout);
+            } else {
+                FILE* f = fopen(params.align_output.c_str(), "wb");
+                if (!f) {
+                    fprintf(stderr, "crispasr[align]: cannot write '%s'\n", params.align_output.c_str());
+                    return 20;
+                }
+                fwrite(out.data(), 1, out.size(), f);
+                fclose(f);
+                fprintf(stderr, "crispasr[align]: %d tokens → %zu words → %s\n", result.n_tokens, words.size(),
+                        params.align_output.c_str());
+            }
+            return 0;
+        }
+
+        // --make-ref: write the voice reference GGUF.
         fprintf(stderr, "crispasr[make-ref]: %d tokens × %d-d → %s\n", result.n_tokens, result.embed_dim,
                 out_path.c_str());
         rc = tada_encoder_write_ref_gguf(out_path.c_str(), result, params.tts_ref_text.c_str(),

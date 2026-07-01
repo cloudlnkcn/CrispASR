@@ -1100,8 +1100,21 @@ int tada_encoder_encode(tada_encoder_context* ctx, const char* aligner_gguf, con
                 (int)std::count(token_masks.begin(), token_masks.end(), 1), T_mask, T_enc);
 
     // Step 6: Run encoder with positions
-    return tada_encoder_encode_with_positions(ctx, audio_24k, n_samples_24k, token_masks.data(), T_mask,
-                                              positions_1idx.data(), N, result);
+    int rc6 = tada_encoder_encode_with_positions(ctx, audio_24k, n_samples_24k, token_masks.data(), T_mask,
+                                                 positions_1idx.data(), N, result);
+    // Expose the aligned BPE token ids + decoded text (1:1 with token_positions)
+    // for the --align / forced-alignment path. align_tokens[i] was aligned to
+    // frame positions[i]; result.token_positions[i] mirrors that.
+    if (rc6 == 0) {
+        result.token_ids = align_tokens;
+        result.token_texts.clear();
+        result.token_texts.reserve(align_tokens.size());
+        for (int32_t id : align_tokens)
+            result.token_texts.push_back((id >= 0 && (size_t)id < aligner.vocab.size())
+                                             ? core_bpe::token_bytes_to_utf8(aligner.vocab[id])
+                                             : std::string());
+    }
+    return rc6;
 }
 
 float* tada_encoder_extract_stage(tada_encoder_context* ctx, const float* audio_24k, int n_samples_24k,

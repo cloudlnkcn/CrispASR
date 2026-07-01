@@ -289,6 +289,12 @@ struct whisper_params {
     std::string make_ref_aligner; // aligner GGUF path (auto-discovered if empty)
     std::string make_ref_encoder; // encoder GGUF path (auto-discovered if empty)
 
+    // Forced alignment / word timestamps via the TADA aligner (reuses the
+    // make-ref encoder+aligner). Input: --voice <audio> + --ref-text "<text>".
+    bool align = false;
+    std::string align_output;         // output path (default: stdout)
+    std::string align_format = "srt"; // srt | json | plain
+
     // AudioSeal neural watermark model (optional upgrade from spread-spectrum).
     // When set, loads the GGUF and uses it for watermark embed/detect
     // instead of the built-in spread-spectrum watermark.

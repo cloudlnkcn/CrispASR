@@ -44,10 +44,13 @@ void tada_encoder_free(tada_encoder_context* ctx);
  * Result of the encode pipeline.
  */
 struct tada_encoder_result {
-    std::vector<float> token_values;    // (n_tokens, 512) flat row-major
-    std::vector<float> token_positions; // (n_tokens,)
+    std::vector<float> token_values;      // (n_tokens, 512) flat row-major
+    std::vector<float> token_positions;   // (n_tokens,) frame index (~50 fps)
+    std::vector<int32_t> token_ids;       // (n_tokens,) BPE token ids (for --align labels)
+    std::vector<std::string> token_texts; // (n_tokens,) decoded UTF-8 per token
     int n_tokens = 0;
     int embed_dim = 512;
+    int frame_rate = 50; // aligner CTC frames per second (positions / frame_rate = seconds)
 };
 
 /**
