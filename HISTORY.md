@@ -225,8 +225,17 @@ starts with "Vulkan"; overridable with `CRISPASR_MOSS_TRANSCRIBE_ENC_FLASH=1`
 (`crispasr-diff` cos identical to 5 decimals), jfk.wav transcribes verbatim on
 CPU and on MoltenVK-Vulkan under both paths. The native NVIDIA/AMD segfault is
 not reproducible on MoltenVK (Metal-translation layer never exercises the vendor
-command-pool path). The sibling `moss-audio` encoder shares the same
-`flash_attn_ext` pattern and likely needs the same guard (separate follow-up).
+command-pool path).
+
+Follow-up: the sibling `moss-audio` (Qwen3-Omni) encoder has the byte-identical
+`flash_attn_ext` attention block (same `(hd,T,n_h)` Q/K/V layout, scale, F16 mask,
+reshape), so it got the same guard — auto-manual on Vulkan, `CRISPASR_MOSS_AUDIO_ENC_FLASH=1`
+/ `…_ENC_MANUAL=1` overrides, baked into the §176s cached encoder graph. The change
+touches only the Vulkan path (flash stays default on CPU/Metal/CUDA — zero regression
+risk to any working config), and the manual≡flash identity is already proven on this
+exact code shape via moss-transcribe. No moss-audio omni model was available locally
+for an end-to-end A/B, so it is verified by code-pattern equivalence + clean compile,
+not a fresh diff run — worth a jfk A/B once the omni GGUF is on hand.
 
 ## #205 2026-06-30 `--max-len` for text-only backends + granite-plus timestamp-mode derail
 
