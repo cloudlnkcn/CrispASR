@@ -562,10 +562,22 @@ static std::vector<float> run_encoder(bananamind_tts_context* ctx, const std::ve
     // Compute
     ggml_backend_graph_compute(ctx->backend, gf);
 
-    // Read output: (H, T) -> flat
+    // Read output: (H, T) -> flat (ne[0]-contiguous = T_H interleaved)
     ggml_tensor* out = ggml_graph_get_tensor(gf, "encoder_out");
     std::vector<float> result(H * T);
     ggml_backend_tensor_get(out, result.data(), 0, H * T * sizeof(float));
+
+    if (debug_enabled()) {
+        // Data is ne[0]-contiguous: data[t * H + h]. Print first token's features.
+        fprintf(stderr, "bananamind_tts: enc[0,:8] =");
+        for (int h = 0; h < 8 && h < H; h++)
+            fprintf(stderr, " %.7f", result[0 * H + h]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "bananamind_tts: enc[1,:8] =");
+        for (int h = 0; h < 8 && h < H; h++)
+            fprintf(stderr, " %.7f", result[1 * H + h]);
+        fprintf(stderr, "\n");
+    }
 
     ggml_gallocr_free(galloc);
     ggml_free(gc);
@@ -1115,9 +1127,15 @@ static std::vector<float> run_postnet(bananamind_tts_context* ctx, const std::ve
         return mel;
     }
 
-    // Set inputs
+    // Set inputs — transpose from row-major (T, M) to ggml ne[0]-contiguous
     ggml_tensor* in_t = ggml_graph_get_tensor(gf, "postnet_in");
-    ggml_backend_tensor_set(in_t, mel.data(), 0, T_mel * M * sizeof(float));
+    {
+        std::vector<float> mel_tr(T_mel * M);
+        for (int t = 0; t < T_mel; t++)
+            for (int m = 0; m < M; m++)
+                mel_tr[m * T_mel + t] = mel[t * M + m];
+        ggml_backend_tensor_set(in_t, mel_tr.data(), 0, T_mel * M * sizeof(float));
+    }
 
     for (auto& bn : bn_inputs) {
         ggml_backend_tensor_set(bn.scale_t, bn.scale_data.data(), 0, bn.scale_data.size() * sizeof(float));
@@ -1127,8 +1145,13 @@ static std::vector<float> run_postnet(bananamind_tts_context* ctx, const std::ve
     ggml_backend_graph_compute(ctx->backend, gf);
 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "postnet_out");
+    // Read ggml ne[0]-contiguous data and transpose back to row-major (T, M)
+    std::vector<float> raw(T_mel * M);
+    ggml_backend_tensor_get(out, raw.data(), 0, T_mel * M * sizeof(float));
     std::vector<float> result(T_mel * M);
-    ggml_backend_tensor_get(out, result.data(), 0, T_mel * M * sizeof(float));
+    for (int t = 0; t < T_mel; t++)
+        for (int m = 0; m < M; m++)
+            result[t * M + m] = raw[m * T_mel + t];
 
     ggml_gallocr_free(galloc);
     ggml_free(gc);
@@ -1166,7 +1189,10 @@ static std::vector<float> run_vocoder(bananamind_tts_context* ctx, const std::ve
     if (!gc)
         return {};
 
-    // Input mel: (T_mel, M) — hifigan expects (T, C) = (T_mel, M) in ggml time-first
+    // Input mel: ggml (T_mel, M) means ne[0]=T_mel, ne[1]=M.
+    // Data stored ne[0]-contiguous: element at (t, m) = data[m * T_mel + t].
+    // Our mel array is row-major (T, M): data[t * M + m].
+    // We need to transpose the data to match ggml's layout.
     ggml_tensor* mel_t = ggml_new_tensor_2d(gc, GGML_TYPE_F32, T_mel, M);
     ggml_set_name(mel_t, "voc_mel_in");
     ggml_set_input(mel_t);
@@ -1187,7 +1213,16 @@ static std::vector<float> run_vocoder(bananamind_tts_context* ctx, const std::ve
         return {};
     }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "voc_mel_in"), mel.data(), 0, T_mel * M * sizeof(float));
+    // Transpose mel from row-major (T, M) -> ggml ne[0]-contiguous (T, M)
+    // ggml layout: data[m * T_mel + t], our layout: data[t * M + m]
+    std::vector<float> mel_transposed(T_mel * M);
+    for (int t = 0; t < T_mel; t++) {
+        for (int m = 0; m < M; m++) {
+            mel_transposed[m * T_mel + t] = mel[t * M + m];
+        }
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "voc_mel_in"), mel_transposed.data(), 0,
+                            T_mel * M * sizeof(float));
 
     ggml_backend_graph_compute(ctx->backend, gf);
 
@@ -1307,6 +1342,23 @@ int bananamind_tts_synthesize(struct bananamind_tts_context* ctx, const char* te
 
     // Denormalize mel
     denormalize_mel(mel_refined, ctx->hp);
+
+    if (debug_enabled()) {
+        int M = ctx->hp.n_mels;
+        float mel_min_v = mel_refined[0], mel_max_v = mel_refined[0], mel_sum = 0;
+        for (float v : mel_refined) {
+            mel_min_v = std::min(mel_min_v, v);
+            mel_max_v = std::max(mel_max_v, v);
+            mel_sum += v;
+        }
+        fprintf(stderr, "bananamind_tts: mel denorm: min=%.4f max=%.4f mean=%.4f\n", mel_min_v, mel_max_v,
+                mel_sum / (float)mel_refined.size());
+        // mel is (T_mel * M) flat, row-major (T_mel, M). Print mel[0,:8]
+        fprintf(stderr, "bananamind_tts: mel[0,:8] =");
+        for (int h = 0; h < 8 && h < M; h++)
+            fprintf(stderr, " %.4f", mel_refined[0 * M + h]);
+        fprintf(stderr, "\n");
+    }
 
     // Vocoder
     std::vector<float> pcm = run_vocoder(ctx, mel_refined, dec.T_mel);
