@@ -83,6 +83,10 @@ std::string kv_str(gguf_context* gctx, const char* key, const char* default_val)
 // vector when the key is missing or has the wrong type.
 std::vector<std::string> kv_str_array(gguf_context* gctx, const char* key);
 
+// Read a float32 array (e.g. tokenizer.ggml.scores). Returns an empty vector
+// when the key is missing or has the wrong type.
+std::vector<float> kv_f32_array(gguf_context* gctx, const char* key);
+
 // ---------------------------------------------------------------------------
 // Pass 2: tensor allocation + weight data copy.
 // ---------------------------------------------------------------------------
