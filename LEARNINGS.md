@@ -56,13 +56,25 @@ the encoder pools features **at** the aligned positions, so a shifted alignment
 degrades the acoustic prompt too.
 
 Follow-up (norms/biases/convs/pos_conv): these stay F32 by **runtime
-requirement, not just precaution**. `wav2vec2_compute_logits` reads them via
-`tensor_data_f32()` — a raw `float*` view (src/wav2vec2-ggml.cpp:916–1280) — so
-storing them F16 halves the byte count and triggers
-`GGML_ASSERT(offset+size <= ggml_nbytes … tensor read out of bounds)` on the
-first logits pass. Verified: converting them F16 (494 MB) crashes on load. So
-**520 MB q8-everything is the true floor** — going smaller would need those
-CPU-side reads to handle F16, for ~26 MB, not worth it.
+requirement, not just precaution — and there are TWO independent requirements**,
+so "just fix the assert" doesn't unlock it:
+1. **CPU read path.** `wav2vec2_compute_logits` reads norms/biases via
+   `tensor_data_f32()` — a raw `float*` view (src/wav2vec2-ggml.cpp:916–1280) —
+   so F16 storage halves the byte count → `GGML_ASSERT(... tensor read out of
+   bounds)`. This one *is* individually fixable (dequantise non-F32 to a cached
+   F32 buffer in `tensor_data_f32`, mirroring bark/chatterbox), but it unlocks
+   nothing on its own because of (2), and the norms/biases are only ~1 MB.
+2. **Metal graph path.** The convs / pos_conv (and even a norm/bias used as an
+   op input) flow through Metal ops that assert `op->src[1]->type == F32`
+   (ggml/src/ggml-metal/ggml-metal-ops.cpp:3355). Fixing this needs load-time
+   dequantisation of those tensors into F32 ggml tensors — a real change to the
+   load path, for ~26 MB (mostly pos_conv).
+Verified both empirically (F16-all = 494 MB clears (1) then hits (2); F16
+norms/biases-only = 519.5 MB, ~1 MB saved, still hits (2)). Net: **520 MB
+q8-everything is the practical floor**; the ~26 MB isn't worth converting the
+Metal conv path. Both experimental gates (converter `TADA_ALIGNER_AUX_F16`, the
+`tensor_data_f32` dequant) were reverted — keeping the code honest that aux is
+F32 rather than half-enabling a path Metal still blocks.
 
 ## A production default that diverges from the upstream reference is a whole class of bug the stage-cosine diff can't see (#192 TADA)
 
