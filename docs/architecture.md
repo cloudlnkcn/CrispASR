@@ -700,6 +700,37 @@ Tokenizer: ARPABET vocabulary (115 tokens: space + 24 consonants +
 45 stressed vowels + 26 lowercase chars + apostrophe + 15 punct +
 pad/blank/oov). Currently character-level; G2P not yet implemented.
 
+### bananamind-tts
+
+BananaMind-TTS-V2.1 (`Banaxi-Tech/BananaMind-TTS-V2.1-Preview`,
+Apache-2.0, ~13M params), single GGUF (~50 MB F32) per locale, 22 kHz
+mono. **Autoregressive** Tacotron-lite with HiFi-GAN vocoder. Supports
+English (en-us, LJ Speech) and German (de-de, ThorstenVoice).
+Character-based tokenizer (39 symbols en-us, 43 de-de with umlauts).
+
+- **Text encoder** — Embedding(39/43, 256) → 3× Conv1d(256, 256, k=5)
+  + BatchNorm + ReLU → BiLSTM(256→128+128). Output: (T, 256).
+- **Decoder** — autoregressive GRU loop with reduction factor 4
+  (produces 4 mel frames per step):
+  - Prenet: Linear(80→256) + ReLU → Linear(256→128) + ReLU.
+  - Attention GRU: GRUCell(128+256=384, 512).
+  - Location-sensitive attention: Conv1d(2, 32, k=31) on stacked
+    [prev_weights, cumulative_weights] + Linear projections →
+    additive energy → softmax → context (256-d).
+  - Decoder GRU: GRUCell(512+256=768, 512).
+  - Mel projection: Linear(512+256=768, 80×4=320).
+  - Stop projection: Linear(768, 4), sigmoid > 0.55 triggers stop.
+- **Postnet** — 5× Conv1d(80/512, 512/80, k=5) + BatchNorm + Tanh
+  (residual refinement of mel spectrogram).
+- **Mel denormalization** — `mel × std + mean`, clamped to [min, max].
+  Statistics differ per locale (from training data).
+- **HiFi-GAN vocoder** — conv_pre(80→256) + 4× upsample (rates
+  [8,8,2,2], kernels [16,16,4,4]) with MRF resblocks (kernels
+  [3,7,11], dilations [[1,3,5]×3]) + conv_post → 22 kHz PCM.
+
+Env vars: `CRISPASR_BANANAMIND_DEBUG=1` (per-step decoder diagnostics),
+`BANANAMIND_TTS_BENCH=1` (per-stage timing).
+
 ### pocket-tts
 
 Kyutai Pocket TTS (100M, MIT / CC-BY-4.0). Continuous-latent AR TTS —

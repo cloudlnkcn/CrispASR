@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +45,32 @@ static bool debug_enabled() {
     }
     return v == 1;
 }
+
+// ---------------------------------------------------------------------------
+// Bench instrumentation (BANANAMIND_TTS_BENCH=1)
+// ---------------------------------------------------------------------------
+
+static bool bananamind_tts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BANANAMIND_TTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct bananamind_tts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit bananamind_tts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~bananamind_tts_bench_stage() {
+        if (!bananamind_tts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  bananamind_tts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
@@ -1315,7 +1342,11 @@ int bananamind_tts_synthesize(struct bananamind_tts_context* ctx, const char* te
     }
 
     // Encoder
-    std::vector<float> enc_out = run_encoder(ctx, token_ids);
+    std::vector<float> enc_out;
+    {
+        bananamind_tts_bench_stage _b("encoder");
+        enc_out = run_encoder(ctx, token_ids);
+    }
     if (enc_out.empty()) {
         fprintf(stderr, "bananamind_tts: encoder failed\n");
         return 0;
@@ -1327,7 +1358,11 @@ int bananamind_tts_synthesize(struct bananamind_tts_context* ctx, const char* te
     }
 
     // Decoder (autoregressive)
-    decoder_result dec = run_decoder(ctx, enc_out, T_enc);
+    decoder_result dec;
+    {
+        bananamind_tts_bench_stage _b("ar_decoder");
+        dec = run_decoder(ctx, enc_out, T_enc);
+    }
     if (dec.mel.empty()) {
         fprintf(stderr, "bananamind_tts: decoder failed\n");
         return 0;
@@ -1338,7 +1373,11 @@ int bananamind_tts_synthesize(struct bananamind_tts_context* ctx, const char* te
     }
 
     // Postnet refinement
-    std::vector<float> mel_refined = run_postnet(ctx, dec.mel, dec.T_mel);
+    std::vector<float> mel_refined;
+    {
+        bananamind_tts_bench_stage _b("postnet");
+        mel_refined = run_postnet(ctx, dec.mel, dec.T_mel);
+    }
 
     // Denormalize mel
     denormalize_mel(mel_refined, ctx->hp);
@@ -1361,7 +1400,11 @@ int bananamind_tts_synthesize(struct bananamind_tts_context* ctx, const char* te
     }
 
     // Vocoder
-    std::vector<float> pcm = run_vocoder(ctx, mel_refined, dec.T_mel);
+    std::vector<float> pcm;
+    {
+        bananamind_tts_bench_stage _b("vocoder");
+        pcm = run_vocoder(ctx, mel_refined, dec.T_mel);
+    }
     if (pcm.empty()) {
         fprintf(stderr, "bananamind_tts: vocoder failed\n");
         return 0;

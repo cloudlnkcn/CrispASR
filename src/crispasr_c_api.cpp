@@ -148,6 +148,10 @@
 #include "chatterbox.h"
 #define CA_HAVE_CHATTERBOX 1
 #endif
+#if __has_include("bananamind_tts.h")
+#include "bananamind_tts.h"
+#define CA_HAVE_BANANAMIND_TTS 1
+#endif
 #if __has_include("outetts.h")
 #include "outetts.h"
 #define CA_HAVE_OUTETTS 1
@@ -1608,6 +1612,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_CHATTERBOX
     chatterbox_context* chatterbox_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    bananamind_tts_context* bananamind_tts_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_OUTETTS
     outetts_context* outetts_ctx = nullptr;
 #endif
@@ -2306,6 +2313,22 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
             return nullptr;
         }
         // S3Gen GGUF must be loaded via crispasr_session_set_s3gen_path
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->backend == "bananamind-tts" || s->backend == "bananamind_tts" || s->backend == "bananamind" ||
+        s->backend == "banana-tts") {
+        s->backend = "bananamind-tts";
+        bananamind_tts_params p = bananamind_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->bananamind_tts_ctx = bananamind_tts_init_from_file(model_path, p);
+        if (!s->bananamind_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
         return s;
     }
 #endif
@@ -3079,6 +3102,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_CHATTERBOX
     list += ",chatterbox";
+#endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    list += ",bananamind-tts";
 #endif
 #ifdef CA_HAVE_TADA
     list += ",tada,tada-1b,tada-tts-1b,tada-3b-ml";
@@ -6457,6 +6483,18 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         return chatterbox_synthesize(s->chatterbox_ctx, text, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->bananamind_tts_ctx) {
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = bananamind_tts_synthesize(s->bananamind_tts_ctx, text, &pcm, &sr);
+        if (n > 0 && pcm) {
+            *out_n_samples = n;
+            return pcm;
+        }
+        return nullptr;
+    }
+#endif
 #ifdef CA_HAVE_TADA
     if (s->tada_ctx) {
         return tada_synthesize(s->tada_ctx, text, out_n_samples);
@@ -7081,6 +7119,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx)
         chatterbox_free(s->chatterbox_ctx);
+#endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->bananamind_tts_ctx)
+        bananamind_tts_free(s->bananamind_tts_ctx);
 #endif
 #ifdef CA_HAVE_TADA
     if (s->tada_ctx)

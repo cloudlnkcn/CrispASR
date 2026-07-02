@@ -2248,9 +2248,10 @@ class Session:
 
         Works with any TTS-capable backend — ``vibevoice``, ``qwen3-tts``,
         ``kokoro``, ``orpheus``, ``chatterbox``, ``indextts``, ``voxcpm2-tts``,
-        ``csm``, ``dia``, ``fastpitch``, ``speecht5``, ``melotts``, ``piper``,
-        ``parler-tts``, ``outetts``, ``cosyvoice3-tts``, ``pocket-tts``,
-        ``f5-tts``, ``bark``, ``kugelaudio``, ``tada``, ``lfm2-audio``.
+        ``csm``, ``dia``, ``fastpitch``, ``bananamind-tts``, ``speecht5``,
+        ``melotts``, ``piper``, ``parler-tts``, ``outetts``, ``cosyvoice3-tts``,
+        ``pocket-tts``, ``f5-tts``, ``bark``, ``kugelaudio``, ``tada``,
+        ``lfm2-audio``.
         For qwen3-tts call :meth:`set_codec_path` and one of:
 
         * :meth:`set_voice` — Base variants (WAV + ref_text, or voice-pack GGUF)
