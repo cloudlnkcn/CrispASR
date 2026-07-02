@@ -58,6 +58,21 @@ def main():
     # Get vocab as list of strings
     vocab = [tokenizer.convert_ids_to_tokens(i) for i in range(vocab_size)]
 
+    # Unigram piece scores (log-probs) — required for correct Viterbi tokenization.
+    # XLM-RoBERTa's SP model is a Unigram model; greedy longest-match mis-segments
+    # multi-subword words, so the engine runs Viterbi over these scores.
+    import sentencepiece as spm
+    from huggingface_hub import hf_hub_download
+
+    sp_path = hf_hub_download(args.input, "sentencepiece.bpe.model")
+    sp = spm.SentencePieceProcessor()
+    sp.Load(sp_path)
+    scores = []
+    for tok in vocab:
+        sid = sp.PieceToId(tok)  # 0 (<unk>) for HF special tokens not in the SP model
+        scores.append(float(sp.GetScore(sid)) if sid > 0 else 0.0)
+    print(f"  SP unigram scores: {len(scores)} (nonzero: {sum(1 for s in scores if s != 0.0)})")
+
     # Get labels
     labels = [config.id2label[i] for i in range(n_classes)]
     # Map '0' to space
@@ -80,6 +95,7 @@ def main():
     writer.add_string("fireredpunc.tokenizer_type", "sentencepiece")
 
     writer.add_array("tokenizer.ggml.tokens", vocab)
+    writer.add_array("tokenizer.ggml.scores", scores)
     writer.add_array("fireredpunc.labels", labels)
 
     def f16(t):

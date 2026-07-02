@@ -173,9 +173,9 @@ static ggml_tensor* bert_layer_norm(ggml_context* ctx, ggml_tensor* x, ggml_tens
     return x;
 }
 
-// GELU approximation matching BERT's implementation
+// BERT hidden_act="gelu" is EXACT (erf) in HF/PyTorch, not the tanh approximation.
 static ggml_tensor* bert_gelu(ggml_context* ctx, ggml_tensor* x) {
-    return ggml_gelu(ctx, x);
+    return ggml_gelu_erf(ctx, x);
 }
 
 static bool bert_forward(bert_encoder_context* bctx, const std::vector<int>& token_ids,
