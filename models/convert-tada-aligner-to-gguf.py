@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -371,8 +372,13 @@ def main():
     # LM head (CTC output → 128256 classes)
     lm_w_key = "encoder.lm_head.weight"
     lm_b_key = "encoder.lm_head.bias"
-    # LM head is huge (128256 × 1024) — store as F32 for quantization later
-    write_t("lm_head.weight", lm_w_key, force_f32=True)
+    # LM head is huge (128256 × 1024, ~525 MB F32). It is the CTC projection that
+    # drives the alignment argmax/DP, so it is stored F32 by default (safest).
+    # TADA_ALIGNER_LMHEAD_F16=1 stores it at --outtype precision (F16 halves it to
+    # ~262 MB) — only enable if validated (forced alignment is robust to logit
+    # rounding, but #192 measured q4_k on the ENCODER already costs ~220 ms drift).
+    lm_head_force_f32 = os.environ.get("TADA_ALIGNER_LMHEAD_F16", "") not in ("1", "true", "yes")
+    write_t("lm_head.weight", lm_w_key, force_f32=lm_head_force_f32)
     if lm_b_key in name_to_idx:
         write_t("lm_head.bias", lm_b_key, force_f32=True)
     else:

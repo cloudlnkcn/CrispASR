@@ -10,6 +10,35 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## Quantizing a forced-aligner: q8 everywhere (incl. lm_head) is bit-identical; q4 on the encoder is not (#192 TADA aligner)
+
+The TADA voice-reference aligner is a wav2vec2 CTC model over the Llama-3.2 128k
+BPE vocab. Quantization safety is **different for forced alignment than for free
+CTC ASR** (cf. the OmniASR learning "Q4_K too lossy for CTC-decoded ASR", 22.7%
+WER). Methodically verified against an f16 gold on 2 JFK inputs (metric = per-token
+alignment position drift in 20 ms frames + the resulting `token_values` cosine):
+
+| config | size | pos max\|Δ\| | token_values cos |
+|---|---|---|---|
+| q8 enc + F32 lm_head (originally shipped) | 906 MB | 0 frames | 1.000000 |
+| q8 enc + F16 lm_head | 644 MB | 0 frames | 1.000000 |
+| **q8 enc + q8 lm_head** | **520 MB** | **0 frames** | **1.000000** |
+| q4 enc + F32 lm_head | 755 MB | **11 frames (~220 ms)** | 0.952 |
+
+Conclusions: (1) the **encoder** attn/FFN weights are safe at **q8** (bit-identical)
+but NOT q4 — noise compounds through 24 residual layers and flips knife-edge CTC
+boundaries by up to ~220 ms (a q4 that happens to score 1 frame on some input is
+a lucky tie-break, not evidence). (2) The **lm_head** (128k×1024 CTC projection,
+~525 MB F32) is safe even at **q8** — it's a single projection into the DP, no
+compounding — so storing it F32 wasted ~385 MB for zero benefit. (3) Norms,
+biases, conv feature-extractor, pos_conv stay F32. So the optimal bit-identical
+aligner is **q8 everything = 520 MB (43% smaller than the F32-lm_head build)**.
+lm_head is normally skipped by crispasr-quantize (LLM/free-CTC sampling-critical);
+`CRISPASR_QUANT_LMHEAD=1` overrides it — only safe because the forced-alignment DP
+is robust to q8 logit rounding. `token_values` cos tracks position drift because
+the encoder pools features **at** the aligned positions, so a shifted alignment
+degrades the acoustic prompt too.
+
 ## A production default that diverges from the upstream reference is a whole class of bug the stage-cosine diff can't see (#192 TADA)
 
 TADA's #192 "last word clipped / crammed tempo" survived every numerical diff because the

@@ -404,6 +404,15 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     ggml_init_params scratch_params = {ggml_tensor_overhead() * (size_t)n_tensors + 1024, nullptr, true};
     ggml_context* ctx_scratch = ggml_init(scratch_params);
 
+    // Normally lm_head / tok_emb / lang_emb are kept at input precision (they are
+    // sampling/argmax-critical). CRISPASR_QUANT_LMHEAD=1 lets the caller quantize
+    // lm_head too, for measuring its impact (e.g. the TADA aligner, whose forced
+    // alignment is robust to logit rounding).
+    const bool allow_lmhead = []() {
+        const char* e = std::getenv("CRISPASR_QUANT_LMHEAD");
+        return e && *e && *e != '0';
+    }();
+
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(ctx_in, i);
         struct ggml_tensor* t = ggml_get_tensor(ctx_in_ggml, name);
@@ -433,7 +442,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(arch == "moss_transcribe" &&
               (sname.find("enc.") == 0 || sname.find("adapter.") == 0 || sname == "llm.embed.weight")) &&
             !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) && (sname.find("enc_proj.") != 0) &&
-            (sname.find("lm_head.") != 0) && (sname.find("tok_emb.") != 0) && (sname.find("lang_emb.") != 0) &&
+            (allow_lmhead || (sname.find("lm_head.") != 0)) && (sname.find("tok_emb.") != 0) &&
+            (sname.find("lang_emb.") != 0) &&
             !(is_chatterbox && (sname.find("s3.v.") == 0 || sname.find("conds.") == 0 || sname.find("ve.") == 0 ||
                                 sname.find("t3.text_emb") == 0 || sname.find("t3.speech_emb") == 0 ||
                                 sname.find("t3.wpe") == 0 || sname.find("t3.text_pos_emb") == 0 ||
