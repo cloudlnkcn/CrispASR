@@ -66,6 +66,8 @@ std::unique_ptr<CrispasrBackend> crispasr_make_parler_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastpitch_backend();
 // csm-tts (§135): sesame/csm-1b — Llama backbone + depth decoder + Mimi codec.
 std::unique_ptr<CrispasrBackend> crispasr_make_csm_tts_backend();
+// bananamind-tts: BananaMind-TTS-V2.1 Tacotron-lite + HiFi-GAN (en-us/de-de).
+std::unique_ptr<CrispasrBackend> crispasr_make_bananamind_tts_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -212,6 +214,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_zonos_backend();
     if (name == "csm" || name == "csm-tts" || name == "csm_tts" || name == "sesame" || name == "sesame-csm")
         return crispasr_make_csm_tts_backend();
+    if (name == "bananamind" || name == "bananamind-tts" || name == "bananamind_tts" || name == "banana-tts")
+        return crispasr_make_bananamind_tts_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -304,6 +308,7 @@ std::vector<std::string> crispasr_list_backends() {
         "csm",
         "csm-tts",
         "sesame",
+        "bananamind-tts",
     };
 }
 
@@ -550,6 +555,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "pocket-tts";
     if (contains_ci("fastpitch"))
         return "fastpitch";
+    if (contains_ci("bananamind"))
+        return "bananamind-tts";
     if (contains_ci("melotts") || contains_ci("melo-tts") || contains_ci("melo_tts"))
         return "melotts";
     if (contains_ci("piper") && !contains_ci("piper-phonemize"))
@@ -660,6 +667,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "cosyvoice3-tts";
             else if (a == "fastpitch" || a == "fastpitch-tts" || a == "fastpitch_tts")
                 result = "fastpitch";
+            else if (a == "bananamind_tts" || a == "bananamind-tts")
+                result = "bananamind-tts";
             else if (a == "piper" || a == "piper-tts" || a == "piper_tts" || a == "vits")
                 result = "piper";
             else if (a == "melotts" || a == "melo-tts" || a == "melo_tts" || a == "vits2")

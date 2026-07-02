@@ -700,6 +700,55 @@ Tokenizer: ARPABET vocabulary (115 tokens: space + 24 consonants +
 45 stressed vowels + 26 lowercase chars + apostrophe + 15 punct +
 pad/blank/oov). Currently character-level; G2P not yet implemented.
 
+### bananamind-tts
+
+BananaMind-TTS-V2.1 (`Banaxi-Tech/BananaMind-TTS-V2.1-Preview`,
+Apache-2.0, ~13M params), single GGUF (~50 MB F32) per locale, 22 kHz
+mono. **Autoregressive** Tacotron-lite with HiFi-GAN vocoder. Supports
+English (en-us, LJ Speech) and German (de-de, ThorstenVoice).
+Character-based tokenizer (39 symbols en-us, 43 de-de with umlauts).
+
+- **Text encoder** — Embedding(39/43, 256) → 3× Conv1d(256, 256, k=5)
+  + BatchNorm + ReLU → BiLSTM(256→128+128). Output: (T, 256).
+- **Decoder** — autoregressive GRU loop with reduction factor 4
+  (produces 4 mel frames per step):
+  - Prenet: Linear(80→256) + ReLU → Linear(256→128) + ReLU.
+  - Attention GRU: GRUCell(128+256=384, 512).
+  - Location-sensitive attention: Conv1d(2, 32, k=31) on stacked
+    [prev_weights, cumulative_weights] + Linear projections →
+    additive energy → softmax → context (256-d).
+  - Decoder GRU: GRUCell(512+256=768, 512).
+  - Mel projection: Linear(512+256=768, 80×4=320).
+  - Stop projection: Linear(768, 4), sigmoid > 0.55 triggers stop.
+- **Postnet** — 5× Conv1d(80/512, 512/80, k=5) + BatchNorm + Tanh
+  (residual refinement of mel spectrogram).
+- **Mel denormalization** — `mel × std + mean`, clamped to [min, max].
+  Statistics differ per locale (from training data).
+- **HiFi-GAN vocoder** — conv_pre(80→256) + 4× upsample (rates
+  [8,8,2,2], kernels [16,16,4,4]) with MRF resblocks (kernels
+  [3,7,11], dilations [[1,3,5]×3]) + conv_post → 22 kHz PCM.
+
+Env vars: `CRISPASR_BANANAMIND_DEBUG=1` (per-step decoder diagnostics),
+`BANANAMIND_TTS_BENCH=1` (per-stage timing).
+
+**Tacotron2 generalization note.** BananaMind is a "Tacotron-lite" variant
+of the standard Tacotron2 architecture (NVIDIA, 1712.05884). The main
+difference is the decoder RNN: BananaMind uses 2× GRU cells with
+reduction_factor=4, while standard Tacotron2 uses 2-layer LSTM with
+reduction_factor=1 and always-on prenet dropout. The encoder, attention
+mechanism, postnet, and HiFi-GAN vocoder are architecturally identical.
+~145 Tacotron2 models exist on HuggingFace (SpeechBrain, torchaudio,
+ESPnet frameworks), but most are small single-speaker models with low
+download counts and the architecture is largely superseded by VITS,
+VALLE, and flow-matching TTS. Porting a specific standard Tacotron2 model
+would require: (1) a per-framework converter (weight naming differs), (2)
+an LSTM decoder branch in `run_decoder()` alongside the existing GRU path
+(the gate math differs: 4 gates i/f/g/o vs 3 gates r/z/n), and (3)
+always-on prenet dropout. The BananaMind runtime is designed to serve as
+the template for this — all hyperparameters are already read from GGUF KV
+metadata, so a standard Tacotron2 GGUF just needs a `decoder_rnn_type`
+key to select the LSTM path.
+
 ### pocket-tts
 
 Kyutai Pocket TTS (100M, MIT / CC-BY-4.0). Continuous-latent AR TTS —

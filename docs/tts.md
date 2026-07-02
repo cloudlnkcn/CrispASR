@@ -24,6 +24,7 @@ trade-off:
 | **`bark`** | Suno Bark: 3-stage GPT-2 (text→semantic→coarse→fine) + EnCodec 24 kHz decoder. All sub-models packed into one GGUF. Supports speaker conditioning via `.npz` prompts. MIT license. | Yes (`--voice <speaker.npz>`) | ~423 MB via `-m auto` (selective Q4_K) |
 | **`speecht5`** | Microsoft SpeechT5 80M: char-level encoder (12L) + AR mel decoder (6L) + 5-conv postnet + HiFi-GAN @ 16 kHz. MIT. Speaker via 512-d x-vector. | Yes (`--voice <xvector.bin>`, raw float32) | ~300 MB via `-m auto` (F16 GGUF) |
 | **`fastpitch`** | NVIDIA FastPitch 60M: non-autoregressive parallel TTS — 6L FFTransformer encoder + duration/pitch predictors + length regulator + 6L FFTransformer decoder + HiFi-GAN @ 22 kHz. Deterministic (no sampling). CC-BY-4.0. | No (single speaker) | ~230 MB via `-m auto` (Q8_0 GGUF) |
+| **`bananamind-tts`** | BananaMind-TTS-V2.1 13M: Tacotron-lite (char tokenizer + Conv1d+BN+ReLU encoder + BiLSTM + AR GRU decoder with location-sensitive attention + postnet) + HiFi-GAN @ 22 kHz. English (LJ Speech) and German (ThorstenVoice). Apache-2.0. Runtime is designed as a template for standard Tacotron2 ports — add `decoder_rnn_type=lstm` to the GGUF to switch to the LSTM decoder path ([architecture notes](architecture.md#bananamind-tts)). | No (fixed voice per locale) | ~40 MB Q8_0 / ~50 MB F32 per locale |
 | **`parler-tts`** | Parler TTS Mini v1.1 (~900M): T5 encoder + MusicGen decoder + DAC 44.1 kHz. Apache-2.0. Prompt-conditioned: describe the voice in natural language via `--instruct`. | No (prompt-conditioned) | ~900 MB via `-m auto` (Q8_0 GGUF) |
 | **`voxcpm2-tts`** | VoxCPM2: 2B Qwen2 backbone + flow matching + BigVGAN @ 48 kHz (decimated to 24 kHz). Zero-shot voice cloning via `--voice <ref.wav>`. | Yes | ~2.4 GB via `-m auto` |
 | **`pocket-tts`** | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. MIT / CC-BY-4.0. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~220 MB via `-m auto` (F16 GGUF) |
@@ -34,7 +35,7 @@ trade-off:
 | **`dots-tts`** | rednote-hilab dots.tts-soar: Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (16-step Euler CFG) + BigVGAN vocoder → 48 kHz. Continuous-latent AR (patch-by-patch). Apache-2.0. **The CFG flow-match needs F16 — a full-q8 core derails; use the F16 core or a mixed-quant (`crispasr-quantize` keeps the DiT at F16, quantizes the LLM+PatchEncoder to Q8_0 → ~3.1 GB).** | TODO (CAM++ speaker; text-only today) | ~4.6 GB F16 / ~3.1 GB mixed-Q8 core + 345 MB vocoder companion |
 | **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
 
-All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch, 16 kHz for speecht5, 24 kHz for most others, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
+All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch/bananamind-tts, 16 kHz for speecht5, 24 kHz for most others, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
 
 ## TADA — multilingual and voice cloning
 

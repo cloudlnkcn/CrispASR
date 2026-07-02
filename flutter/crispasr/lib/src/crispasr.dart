@@ -3282,7 +3282,8 @@ class CrispasrSession {
 
   /// Synthesise [text] to 24 kHz mono float32 PCM.
   ///
-  /// Requires a TTS-capable backend (vibevoice, qwen3-tts, kokoro, orpheus).
+  /// Requires a TTS-capable backend (vibevoice, qwen3-tts, kokoro, orpheus,
+  /// bananamind-tts, chatterbox, fastpitch, melotts, piper, and others).
   /// For qwen3-tts call [setCodecPath] and one of: [setVoice] (Base),
   /// [setSpeakerName] (CustomVoice), [setInstruct] (VoiceDesign). Branch
   /// via [isVoiceDesign] / [isCustomVoice]. For orpheus call
