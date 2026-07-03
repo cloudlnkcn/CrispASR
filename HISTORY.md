@@ -345,11 +345,38 @@ local patch to vendored ggml (marked "MUST RE-APPLY on ggml sync"); the clean
 upstream draft + reference patch live in `tools/upstream-prs/21-vulkan-async-command-
 pool-reset.{md,patch}` (file at ggml-org/llama.cpp once confirmed on native HW).
 Verified on MoltenVK: async on + guard transcribes jfk and jfk×3 verbatim with no
-perf regression (the `waitIdle` is a no-op when idle). The guard makes the async
-path safe, so once the reporter confirms `CRISPASR_MOSS_TRANSCRIBE_VULKAN_ASYNC=1`
-runs clean on RADV/NVIDIA, the #215b async-disable default can be dropped and moss
-returns to full native-async speed. Not reproducible on MoltenVK (Metal
-auto-manages command-buffer lifetime), so crash-gone is HW-pending.
+perf regression (the `waitIdle` is a no-op when idle).
+
+### #215d 2026-07-03 the sync theories were WRONG — platform-gated CPU fallback
+
+The reporter tested the #215c build on a **Radeon** (debug `bt full` attached to
+the issue) and it **still segfaults** — with no env changes. The backtrace is
+decisive: `resetCommandPool` is at the patched line (so the `waitIdle` guard is
+compiled in), `ctx->compute_cmd_pool.q` is a valid queue (so `waitIdle` *ran*), and
+`resetCommandPool` **still faults**. A queue that is provably idle cannot have
+pending buffers — so the fault is NOT "reset with pending buffers", and both #215b
+(async-disable) and #215c (queue-drain) were chasing the wrong cause. A
+`resetCommandPool` fault after the queue is idle = corrupted pool/driver state, the
+TADA-#192 signature (graph-scale corruption, native-only, unreproducible on
+MoltenVK). Crash is on the **2nd** CLI audio slice (state accumulates across the
+shared context), conv chunk 0.
+
+Reverted both: the `GGML_VK_DISABLE_ASYNC` setenv (also timing-fragile —
+`support_async` is frozen at device creation, so a setenv after any earlier device
+enumeration is a silent no-op) and the ggml-vulkan `waitIdle` patch (draft 21
+downgraded to a bug report, patch removed). Replaced with a **timing-safe,
+platform-gated** decision: MoltenVK is the only Vulkan on Apple and macOS has no
+native Vulkan driver, so `#if !defined(__APPLE__)` a Vulkan backend == a native
+driver → run the model on CPU; Apple(MoltenVK)/CUDA/Metal keep the GPU. The
+decision reads the backend we actually got (compile-time platform + created-device
+description for the log), with no env / device-creation-ordering race that the
+earlier attempts died on. Only AMD-on-Linux (no CUDA) loses acceleration —
+deterministically, instead of crashing. `CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1`
+(and `..._MOSS_AUDIO_...`) force the native GPU path for hardware A/B of any future
+GPU experiment (e.g. batching the conv-stem so the encoder stops churning ~11 tiny
+graphs/slice — the likely real trigger, unverifiable without native HW). Verified
+on MoltenVK: still full GPU, jfk verbatim (1.5× RT). Native crash-gone is the
+reporter's to confirm.
 
 ## #205 2026-06-30 `--max-len` for text-only backends + granite-plus timestamp-mode derail
 

@@ -2111,21 +2111,6 @@ extern "C" struct moss_audio_context* moss_audio_init_from_file(const char* path
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
-    // #215: like moss-transcribe, the moss-audio encoder segfaults on native
-    // Vulkan (RADV/NVIDIA) — ggml-vulkan's async command-buffer lifecycle resets
-    // the command pool (ggml_vk_queue_command_pools_cleanup, buffers_in_use>=10)
-    // while buffers are still pending → vkResetCommandPool faults after enough
-    // small per-chunk graph computes. Disable Vulkan async so every graph_compute
-    // drains the GPU first; buffers never reach the mid-flight reset and moss-audio
-    // stays on the GPU (~10-15% slower than native async). Must be set before the
-    // Vulkan device is created (i.e. before crispasr_init_gpu_backend); harmless
-    // for CUDA/Metal. Override with CRISPASR_MOSS_AUDIO_VULKAN_ASYNC=1.
-    if (params.use_gpu) {
-        const char* keep_async = std::getenv("CRISPASR_MOSS_AUDIO_VULKAN_ASYNC");
-        if (!(keep_async && keep_async[0] == '1'))
-            setenv("GGML_VK_DISABLE_ASYNC", "1", 0);
-    }
-
     // Backend selection
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
@@ -2133,6 +2118,29 @@ extern "C" struct moss_audio_context* moss_audio_init_from_file(const char* path
     ctx->backend_cpu = ggml_backend_cpu_init();
     if (ctx->backend_cpu)
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+
+        // #215: like moss-transcribe, the moss-audio encoder segfaults in
+        // vkResetCommandPool on NATIVE Vulkan (RADV/NVIDIA) — graph-scale state
+        // corruption in the driver, not pending buffers (queue-drain + async-disable
+        // both proved insufficient on real hardware). MoltenVK/CUDA/Metal are safe.
+        // MoltenVK is the only Vulkan on Apple and there is no native Vulkan on macOS,
+        // so gate on the platform (compile-time — no device-string or env-ordering
+        // race). Force the native GPU path with CRISPASR_MOSS_AUDIO_VULKAN_NATIVE=1.
+#if !defined(__APPLE__)
+    if (backend_is_vulkan(ctx->backend)) {
+        const char* force_native = std::getenv("CRISPASR_MOSS_AUDIO_VULKAN_NATIVE");
+        if (!(force_native && force_native[0] == '1')) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+            const char* desc = dev ? ggml_backend_dev_description(dev) : "";
+            fprintf(stderr,
+                    "moss_audio: native Vulkan backend (%s) — running on CPU (encoder segfaults "
+                    "in vkResetCommandPool on RADV/NVIDIA, issue #215). CUDA/Metal/MoltenVK use "
+                    "the GPU; set CRISPASR_MOSS_AUDIO_VULKAN_NATIVE=1 to force GPU.\n",
+                    desc);
+            ctx->backend = ctx->backend_cpu;
+        }
+    }
+#endif
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 

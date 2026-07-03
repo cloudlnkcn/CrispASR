@@ -1498,34 +1498,41 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
-    // #215: moss-transcribe segfaults on Vulkan (RADV/NVIDIA) inside the encoder's
-    // per-chunk sched loop. Root cause is ggml-vulkan's *async* command-buffer
-    // lifecycle: ggml_vk_queue_command_pools_cleanup resets the command pool once
-    // buffers_in_use() >= 10 (cleanup_frequency), and in async mode that reset can
-    // fire while command buffers are still pending on the GPU → vkResetCommandPool
-    // faults in the vendor driver. That is exactly why "multiple slices" are
-    // needed: you must accumulate >=10 command buffers first (moss runs one small
-    // graph per ~1 s of audio, so ~10 s of audio trips it). Disabling Vulkan async
-    // submission makes every graph_compute fully drain the GPU before returning,
-    // so command buffers never accumulate to the mid-flight reset — moss stays on
-    // the GPU (~10-15% slower than native async, vs. no GPU at all). The env is
-    // read when the Vulkan device is first created, so it MUST be set before
-    // crispasr_init_gpu_backend(); it is harmless for CUDA/Metal (ignored) and
-    // overwrite=0 respects an explicit user setting. Same class as upstream
-    // ggml-org/llama.cpp#17302; remove once the ggml-vulkan async lifecycle is
-    // fixed. Override with CRISPASR_MOSS_TRANSCRIBE_VULKAN_ASYNC=1 to keep async.
-    if (params.use_gpu) {
-        const char* keep_async = std::getenv("CRISPASR_MOSS_TRANSCRIBE_VULKAN_ASYNC");
-        if (!(keep_async && keep_async[0] == '1'))
-            setenv("GGML_VK_DISABLE_ASYNC", "1", 0);
-    }
-
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
     if (ctx->backend_cpu)
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+
+        // #215: moss-transcribe segfaults on NATIVE Vulkan (RADV/NVIDIA) inside the
+        // encoder — vkResetCommandPool faults in the driver during graph cleanup once
+        // the shared context has accumulated state across audio slices. Draining the
+        // queue before the reset AND disabling async both proved insufficient on real
+        // hardware (the reporter's backtrace shows the fault persists after the queue
+        // is provably idle → graph-scale state corruption, not pending buffers). It
+        // only hits native Vulkan drivers; MoltenVK is verified safe, as are CUDA and
+        // Metal. MoltenVK is the ONLY Vulkan implementation on Apple platforms, and
+        // there is no native Vulkan driver on macOS — so "native Vulkan" == a Vulkan
+        // backend on a non-Apple build. Gating on the platform is a compile-time
+        // decision: no device-string parsing and no env-before-device-creation race.
+        // Force the (still-crashing) native GPU path for A/B with
+        // CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1.
+#if !defined(__APPLE__)
+    if (backend_is_vulkan(ctx->backend)) {
+        const char* force_native = std::getenv("CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE");
+        if (!(force_native && force_native[0] == '1')) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+            const char* desc = dev ? ggml_backend_dev_description(dev) : "";
+            fprintf(stderr,
+                    "moss_transcribe: native Vulkan backend (%s) — running on CPU (encoder "
+                    "segfaults in vkResetCommandPool on RADV/NVIDIA, issue #215). CUDA/Metal/"
+                    "MoltenVK use the GPU; set CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1 to force GPU.\n",
+                    desc);
+            ctx->backend = ctx->backend_cpu;
+        }
+    }
+#endif
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 
