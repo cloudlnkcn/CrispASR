@@ -6,6 +6,30 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-07 CPU weight-read hardening + Mimi codec causal default
+
+Audit follow-up to the CrispEmbed quantized-weight-read fixes; two threads.
+
+**Weight readers.** Added `core_cpu::to_f32` (`src/core/cpu_ops.h`): a GPU-safe CPU weight
+reader that dequantizes F32/F16/any block-quantized type via `ggml_backend_tensor_get` + the
+`to_float` trait (sized by `ggml_nbytes`). Replaced the recurring "handle F32/F16, no quantized
+`else`" pattern — which silently garbles, or over-reads and asserts, a quantized weight — across
+paraformer (CIF), parakeet (ctc), piper (emb), cohere, openvoice2, dots_tts, moonshine_streaming,
+omniasr, tada_encoder/codec, canary (conv_dw BN-fold), mimo_tokenizer (codebook), sensevoice
+(query-embed), pocket_tts (cache miss). All inert in shipped GGUFs (these weights ship F16);
+defensive against re-quant. Unit test `test-cpu-ops-to-f32` (F32/F16/Q8_0/Q4_K round-trip).
+**Not routed:** wav2vec2 conv_w — 3-D (never quantized) and its old code was a correct zero-copy
+F32 fast path on a per-transcription loop; routing it would only add copies.
+
+**Mimi codec causal default.** The Mimi (Kyutai) codec transformer ran full non-causal attention
+(`flash_attn_ext` mask=nullptr), diverging from moshi's streaming-causal Mimi (sliding_window=250;
+`mimi_context=250` was loaded but dead). A >250-frame WER A/B (3× jfk ≈ 412 frames) showed the
+non-causal path **truncates the tail** (~25% of content dropped once the sequence exceeds the
+window); causal+window captured all of it; on short audio (<250 frames) the two tie. So
+`kyutai_stt` now **defaults to causal+sliding-window**, old path behind `CRISPASR_MIMI_NONCAUSAL=1`.
+`csm_tts` has the identical gate but stays opt-in (`CRISPASR_MIMI_CAUSAL`) pending a TTS→ASR A/B.
+Verified on Metal + CUDA (Tesla P100). → LEARNINGS.
+
 ## #171 2026-07-03 VibeVoice TTS server "3rd-request garbage" — voice-KV stride leak
 
 Reporter (logiclove, RDNA4 / RADV GFX1201) saw VibeVoice-realtime-0.5b TTS degrade in
