@@ -37,6 +37,7 @@
 
 #include "chatterbox_campplus.h"
 #include "core/activation.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/adaln.h"
 #include "core/attention.h"
 #include "core/audio_resample.h"
@@ -2036,19 +2037,7 @@ int dots_tts_set_vocoder_path(struct dots_tts_context* ctx, const char* path) {
 static std::vector<float> dots_read_f32(ggml_tensor* t) {
     if (!t)
         return {};
-    const int64_t n = ggml_nelements(t);
-    std::vector<float> out((size_t)n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, (size_t)n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp((size_t)n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, (size_t)n * sizeof(ggml_fp16_t));
-        for (int64_t i = 0; i < n; i++)
-            out[(size_t)i] = ggml_fp16_to_fp32(tmp[(size_t)i]);
-    } else {
-        return {};
-    }
-    return out;
+    return core_cpu::to_f32(t); // F32/F16/quantized-safe
 }
 
 // Bind the 3D-Speaker CAM++ tensors from a loaded `dots-tts-soar-spk` GGUF

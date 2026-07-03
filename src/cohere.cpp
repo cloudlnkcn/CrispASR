@@ -1075,6 +1075,7 @@ static ggml_tensor* ct_get_tensor_fmt(cohere_model& model, const char* fmt, int 
 // ---------------------------------------------------------------------------
 
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/audio_chunking.h"
 #include "core/gguf_loader.h"
@@ -2039,20 +2040,7 @@ int cohere_str_to_token(struct cohere_context* ctx, const char* s) {
 // ---------------------------------------------------------------------------
 
 static std::vector<float> ct_get_f32(const ggml_tensor* t) {
-    const int n = (int)ggml_nelements(t);
-    std::vector<float> res(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, res.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-        for (int i = 0; i < n; i++)
-            res[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        fprintf(stderr, "ct_get_f32: unsupported type %d\n", (int)t->type);
-        abort();
-    }
-    return res;
+    return core_cpu::to_f32(t); // F32/F16/quantized-safe
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@
 #include "ggml-cpu.h"
 
 #include "core/conv.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/g2p_de.h"
 #include "core/g2p_en.h"
 #include "core/g2p_es.h"
@@ -1003,19 +1004,9 @@ static void text_encoder_forward(piper_tts_context* ctx, const std::vector<int64
     float sqrt_c = sqrtf((float)C);
     int emb_ne0 = (int)ctx->w.emb->ne[0]; // C
     int emb_ne1 = (int)ctx->w.emb->ne[1]; // n_vocab
-    std::vector<float> emb_table(emb_ne0 * emb_ne1);
-    {
-        size_t emb_bytes = ggml_nbytes(ctx->w.emb);
-        std::vector<uint8_t> emb_raw(emb_bytes);
-        ggml_backend_tensor_get(ctx->w.emb, emb_raw.data(), 0, emb_bytes);
-        if (ctx->w.emb->type == GGML_TYPE_F16) {
-            const ggml_fp16_t* src = (const ggml_fp16_t*)emb_raw.data();
-            for (int i = 0; i < emb_ne0 * emb_ne1; i++)
-                emb_table[i] = ggml_fp16_to_fp32(src[i]);
-        } else {
-            memcpy(emb_table.data(), emb_raw.data(), emb_ne0 * emb_ne1 * sizeof(float));
-        }
-    }
+    // Quantized-safe read: the old else-branch memcpy'd n*sizeof(float) bytes,
+    // which over-reads + garbles a quantized emb (piper ships it F16 today).
+    std::vector<float> emb_table = core_cpu::to_f32(ctx->w.emb);
 
     std::vector<float> x(C * T);
     for (int t = 0; t < T; t++) {

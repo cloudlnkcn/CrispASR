@@ -27,6 +27,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include "core/asr_context_bias.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/ctc.h"
 #include "core/fastconformer.h"
 
@@ -2288,18 +2289,11 @@ static std::vector<parakeet_emitted_token> parakeet_ctc_decode(parakeet_context*
     // Pull CTC head weights to CPU.
     // ctc_w is Conv1d(d_model, ctc_vocab, 1) stored as (ctc_vocab, d_model, 1)
     // → effectively a (ctc_vocab, d_model) matmul. May be F16.
-    const size_t w_numel = (size_t)ctc_vocab * d_model;
-    std::vector<float> w(w_numel);
-    std::vector<float> b((size_t)ctc_vocab);
-    if (ctx->model.ctc_w->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(ctx->model.ctc_w, w.data(), 0, w_numel * sizeof(float));
-    } else {
-        std::vector<ggml_fp16_t> tmp(w_numel);
-        ggml_backend_tensor_get(ctx->model.ctc_w, tmp.data(), 0, w_numel * sizeof(ggml_fp16_t));
-        for (size_t i = 0; i < w_numel; i++)
-            w[i] = ggml_fp16_to_fp32(tmp[i]);
-    }
-    ggml_backend_tensor_get(ctx->model.ctc_b, b.data(), 0, (size_t)ctc_vocab * sizeof(float));
+    // Quantized-safe: to_f32 dequantizes F16/quantized correctly (sizing a raw
+    // read by w_numel*sizeof(float) would over-read a quantized ctc_w). ctc_w is
+    // 3-D conv-shaped so the quantizer keeps it F16 today; this is defensive.
+    std::vector<float> w = core_cpu::to_f32(ctx->model.ctc_w);
+    std::vector<float> b = core_cpu::to_f32(ctx->model.ctc_b);
 
     // Compute CTC logits for all frames: logits[t][v] = w[v] @ enc[t] + b[v]
     std::vector<float> all_logits((size_t)T_enc * ctc_vocab);

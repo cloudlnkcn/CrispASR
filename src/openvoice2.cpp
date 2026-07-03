@@ -21,6 +21,7 @@
 #include "ggml-cpu.h"
 
 #include "core/conv.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
 
 #if defined(HAVE_ACCELERATE)
@@ -72,19 +73,7 @@ struct openvoice2_bench_stage {
 // ── Helpers ──────────────────────────────────────────────────────────
 
 static void read_f32(const ggml_tensor* t, std::vector<float>& out) {
-    int64_t n = ggml_nelements(t);
-    out.resize(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-        for (int64_t i = 0; i < n; i++)
-            out[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        fprintf(stderr, "openvoice2: unsupported tensor type %d for read_f32\n", t->type);
-        std::fill(out.begin(), out.end(), 0.0f);
-    }
+    out = core_cpu::to_f32(t); // F32/F16/quantized-safe
 }
 
 // Local conv1d_cf helper (channels-first conv1d via ggml)

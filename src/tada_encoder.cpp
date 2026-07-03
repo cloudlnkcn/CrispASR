@@ -23,6 +23,7 @@
 #include "tada_encoder.h"
 #include "wav2vec2-ggml.h"
 #include "core/bpe.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
 
 #include "ggml.h"
@@ -275,15 +276,8 @@ static void precompute_inv_alphas(tada_encoder_context* c) {
 
     for (auto& p : pairs) {
         int64_t n = ggml_nelements(p.src);
-        std::vector<float> a(n), inv(n);
-        if (p.src->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> tmp(n);
-            ggml_backend_tensor_get(p.src, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-            for (int64_t i = 0; i < n; i++)
-                a[i] = ggml_fp16_to_fp32(tmp[i]);
-        } else {
-            ggml_backend_tensor_get(p.src, a.data(), 0, n * sizeof(float));
-        }
+        std::vector<float> a = core_cpu::to_f32(p.src); // F32/F16/quantized-safe
+        std::vector<float> inv(n);
         for (int64_t i = 0; i < n; i++)
             inv[i] = 1.0f / (a[i] + 1e-12f);
         ggml_backend_tensor_set(*p.dst, inv.data(), 0, n * sizeof(float));

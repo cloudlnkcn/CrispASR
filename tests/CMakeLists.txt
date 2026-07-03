@@ -219,6 +219,26 @@ catch_discover_tests(test-params
     PROPERTIES LABELS "unit"
 )
 
+# ─── test - cpu-ops-to-f32 — Catch2 unit tests for core_cpu::to_f32 ───────────────
+# The quantized-safe CPU weight reader. Verifies F32/F16/Q8_0/Q4_K round-trip so a
+# quantized weight is dequantized (not read as garbage / over-read). Header-only
+# helper; links ggml for quantize + backend tensor_get.
+add_executable(test-cpu-ops-to-f32
+    test-cpu-ops-to-f32.cpp
+)
+target_include_directories(test-cpu-ops-to-f32 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-cpu-ops-to-f32 PRIVATE
+    Catch2::Catch2WithMain
+    ggml
+)
+catch_discover_tests(test-cpu-ops-to-f32
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test - stream - finalize — Catch2 unit tests for the streaming
 # `final.text` stitcher used by `--stream-json` finalize_utterance.
 # Header-only target (no crispasr lib needed): the helper is a pure

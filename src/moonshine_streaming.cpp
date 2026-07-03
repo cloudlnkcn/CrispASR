@@ -13,6 +13,7 @@
 
 #include "moonshine_streaming.h"
 #include "core/beam_decode.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "moonshine-tokenizer.h"
@@ -435,17 +436,8 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
 static void tensor_get_as_f32(const ggml_tensor* t, float* dst, size_t n_elems) {
     if (!t)
         return;
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, dst, 0, n_elems * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n_elems);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n_elems * sizeof(ggml_fp16_t));
-        for (size_t i = 0; i < n_elems; i++)
-            dst[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        fprintf(stderr, "moonshine_streaming: unsupported tensor dtype %d for CPU frontend\n", (int)t->type);
-        memset(dst, 0, n_elems * sizeof(float));
-    }
+    std::vector<float> v = core_cpu::to_f32(t); // F32/F16/quantized-safe
+    std::memcpy(dst, v.data(), n_elems * sizeof(float));
 }
 
 static void audio_frontend_cpu(const float* pcm, int n_samples, const ms_model& m, std::vector<float>& out,
