@@ -96,6 +96,11 @@ constexpr Entry k_registry[] = {
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
      "~1.3 GB", nullptr, nullptr},
+    // Qwen3-ASR-1.7B fine-tuned for Japanese anime/galgame speech (Apache-2.0).
+    // Same architecture as qwen3-1.7b; uses the standard qwen3 backend.
+    {"qwen3-ja-anime", "qwen3-asr-1.7b-ja-anime-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-asr-1.7b-ja-anime-GGUF/resolve/main/qwen3-asr-1.7b-ja-anime-q4_k.gguf",
+     "~1.3 GB", nullptr, nullptr},
     // higgs-audio-v3-stt: Whisper-large-v3 encoder + Qwen3-1.7B decoder (Apache-2.0).
     {"higgs-stt", "higgs-stt-q4_k.gguf",
      "https://huggingface.co/cstr/higgs-audio-v3-stt-GGUF/resolve/main/higgs-stt-q4_k.gguf",
