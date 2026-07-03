@@ -406,7 +406,7 @@ work:
 | **DONE** | [#173 `--tts-play` / `--tts-play-device`](#173-tts-play--tts-play-device--local-speaker-output) | Small | **DONE 2026-06-19.** `crispasr_speaker.{h,cpp}` wraps miniaudio playback; pre-resamples to hardware-native rate (avoids 4× upsampler artefacts). → see HISTORY |
 | **DONE** | [#158 transcribe_streaming for opaque-C-library backends](#158-transcribe_streaming-for-opaque-c-library-backends) | Medium | **DONE 2026-06-19.** All 7 backends done: `_transcribe_cb` C entry points added to moss_audio, gemma4_e2b, moonshine_streaming, kyutai_stt, mimo_asr, nemotron; GLM-ASR uses exported step APIs directly. → see HISTORY |
 | **DONE** | [#86 Per-backend flash-attention wiring](#86-per-backend-flash-attention-wiring-crisperweaver-driven) | — | All backends now route through core helpers (`core_attn`, `core_sanm`, `core_conformer`) that unconditionally use `ggml_flash_attn_ext`. → see HISTORY |
-| **LOW** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | ~1 week | Needs ggml-side multi-backend dispatch to land first. CrisperWeaver UI placeholder ready when the C-side is. |
+| **DONE** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | — | **DONE 2026-07-02.** `src/core/gpu_backend_pref.h` + `crispasr_init_gpu_backend()` replaces `ggml_backend_init_best()` in all 60+ backends. Process-global preference, C API `crispasr_set_gpu_backend()`. Issue #214 fix. |
 | **LOW** | [#95 IndexTTS Chinese TN binary alternative](#95-indextts-15-chinese-tn--binary-alternative-to-the-python-wetext-hook) | survey only | Python `INDEXTTS_TEXT_NORMALIZER` hook shipped 2026-05-19. Hand-roll (#95a) is the right next step *when* a user reports a digit/date prompt that breaks; OpenFST vendoring (#95b) only after #95a grows past ~5 cases. |
 | **IN PROGRESS** | [#97 More Parakeet variants](#97-more-parakeet-variants) | Small per-variant | TDT/TDT+CTC DONE; **parakeet-rnnt 0.6b+1.1b DONE 2026-05-24**. **parakeet-unified-en-0.6b surveyed 2026-06-13:** Unified-FastConformer-RNNT (24L, 600M), jointly trained offline+streaming with shared params. NOT converter-only — 8× subsampling (vs 4×) + Dynamic Chunked Convolutions are new. ~80% overlap with #81 nemotron streaming work. Offline mode may work through existing converter (standard bidir FC + RNNT). realtime-EOU blocked on #81 cache-aware streaming. |
 | **DONE** | [#98 Hotwords / contextual biasing](#98-hotwords--contextual-biasing) | Phased | **Phase A+B DONE.** CTC-WS Aho-Corasick trie wired into parakeet CTC + TDT; LLM prompt injection for qwen3-asr + voxtral. → see HISTORY |
@@ -3477,46 +3477,22 @@ each backend is independent.
 
 ## 87. `gpu_backend` runtime selector (multi-backend ggml build)
 
-**Status:** open. Needs ggml-side support to land first.
+**Status: DONE** (2026-07-02, issue #214, commit 9a26976a).
 
-### Context
+ggml's `ggml_backend_load_all()` + device registry made `#ifdef` chains
+unnecessary. Created `src/core/gpu_backend_pref.h` with
+`crispasr_init_gpu_backend()` as drop-in for `ggml_backend_init_best()`.
+Process-global preference set at CLI startup via
+`crispasr_set_gpu_backend_pref()`, filters registered devices by
+case-insensitive name prefix ("vulkan" → "Vulkan0"). Falls back to
+`ggml_backend_init_best()` when no preference or no match.
 
-CrisperWeaver's *Settings → Performance* exposes an "ASR on GPU"
-boolean today. The deeper knob — picking BETWEEN Metal, CUDA,
-Vulkan at runtime when more than one is built into libcrispasr —
-isn't doable yet because each `*_init_from_file` calls a single
-`ggml_backend_*_init()` directly, and the CMake flag picks which
-ggml backend gets compiled in.
+Replaced all 60+ `ggml_backend_init_best()` call sites mechanically.
+Also patched `whisper_backend_init_gpu()` in `crispasr.cpp`.
+C API: `crispasr_set_gpu_backend()` in `crispasr_session.h`.
 
-### What ggml supports today
-
-`ggml_backend_*_init()` returns a per-backend handle. Multiple
-backends CAN compile into one binary (`-DGGML_METAL=ON
--DGGML_VULKAN=ON` builds both); each backend's init function lives
-behind its own `#ifdef`, and the runtime can call any of them. What
-ggml doesn't yet have is a uniform "auto-pick the best available"
-selector — that's the missing piece.
-
-### Approach when we tackle it
-
-1. Add `crispasr_select_backend(const char* hint)` helper that
-   resolves a hint string (`"auto" / "metal" / "cuda" / "vulkan" /
-   "cpu"`) to a `ggml_backend_t` using `#ifdef GGML_METAL` /
-   `#ifdef GGML_CUDA` / `#ifdef GGML_VULKAN` chains. `auto`
-   prefers Metal on macOS, CUDA on Linux+NV, Vulkan on Linux+AMD
-   or Windows, CPU as fallback.
-2. Refactor every per-backend `*_init_from_file()` to take a
-   `ggml_backend_t* preferred_backend` param (or read a thread-
-   local set by a new `crispasr_session_open_params_v3`).
-3. Add `gpu_backend_hint` (string field) to the open params struct
-   v3.
-4. Plumb through CrisperWeaver's `AdvancedTranscribeOptions` →
-   `LoadModel` → `openWithParams`.
-
-### Effort estimate
-
-~1 week of focused work — touches every backend's init path. Best
-done as a separate phased PR, one backend per commit.
+Kaggle P100 validation: 7/7 ASR backends pass, `--gpu-backend cpu`
+3.6× slower than CUDA with zero CUDA library references.
 
 ---
 

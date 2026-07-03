@@ -11515,3 +11515,32 @@ pos_conv `original0` (g) as `[Cout, 1, 1]` (dim=0 norm). The TADA aligner
 stores it as `[1, 1, K]` (dim=2 norm). The materialization formula
 `w = g * v / ||v||` must detect which dimension was normed by finding which
 dims of g are size 1 while v is larger.
+
+## 2026-07-02 — `--gpu-backend` was silently ignored (#214)
+
+**Symptom:** `--gpu-backend vulkan` on a CUDA+Vulkan build still routed all
+inference through CUDA. `perf report` showed 20%+ in `libcuda.so`.
+
+**Root cause:** Every backend (60+ init sites) called `ggml_backend_init_best()`
+which unconditionally picks GPU backends by priority (CUDA > Vulkan > Metal).
+The `--gpu-backend` CLI flag was parsed into `whisper_params::gpu_backend` and
+logged in verbose mode, but never wired into any backend's GPU init path.
+
+**Fix:** Created `src/core/gpu_backend_pref.h` with `crispasr_init_gpu_backend()`
+as a drop-in replacement. It checks a process-global preference (set once at CLI
+startup via `crispasr_set_gpu_backend_pref()`), filters registered devices by
+name (case-insensitive prefix match: "vulkan" matches "Vulkan0"), and falls back
+to `ggml_backend_init_best()` when no preference is set or the preferred backend
+isn't found. Replaced all 60+ call sites mechanically. Also patched
+`whisper_backend_init_gpu()` in `crispasr.cpp` to skip non-matching devices.
+
+**Validation:** Kaggle P100 regression test — 7/7 ASR backends pass with correct
+JFK transcripts. `--gpu-backend cpu` runs 3.6x slower than `--gpu-backend cuda`
+with `CUDA leak: False`, confirming the routing is real.
+
+**Lesson:** A CLI flag that's parsed and logged but never threaded into the code
+that acts on it is worse than not having the flag — users assume it works.
+Process-global preference (set once, read everywhere) is the right pattern when
+the preference applies to the entire process, not per-model. Adding an `#include`
+to 60+ files invalidates the entire ccache — budget for a cold rebuild when
+touching shared headers.

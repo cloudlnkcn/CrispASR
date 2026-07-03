@@ -10832,3 +10832,16 @@ jumps over lazy dog"), where pre-fix it aborted 0-byte. SpeechT5 is
 autoregressive so GPU≠CPU bit-for-bit, but both give the same 28160-sample
 output and transcript. CUDA re-test of speecht5 still pending. Worktree:
 `/Volumes/backups/code/fastpitch-cuda-stash`.
+
+## 2026-07-02 — `--gpu-backend` selection fix (#214)
+
+`--gpu-backend vulkan` was silently ignored when CUDA was also compiled in.
+All 60+ backend init sites called `ggml_backend_init_best()` which picks CUDA
+unconditionally. Added `src/core/gpu_backend_pref.h` with
+`crispasr_init_gpu_backend()` — process-global preference set at CLI startup,
+filters devices by name prefix. Replaced all call sites. Also exposed as
+`crispasr_set_gpu_backend()` C API for library consumers.
+
+Kaggle P100 validation: 7/7 ASR backends pass (moonshine, firered-asr,
+parakeet, sensevoice, qwen3, glm-asr, fastconformer-ctc). `--gpu-backend cpu`
+runs 3.6× slower than CUDA with zero CUDA library references.
