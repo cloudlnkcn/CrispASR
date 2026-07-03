@@ -92,6 +92,43 @@ set_tests_properties(${TEST_TARGET} PROPERTIES
     LABELS "medium;en;live"
     TIMEOUT 300)
 
+# ── weight-reader (core_cpu::to_f32) + Mimi-codec live transcript checks ──
+# Auto-download real models and assert the jfk transcript, so the quantized-safe
+# CPU reads and the opt-in Mimi causal path are guarded end-to-end (not just
+# "ran without crashing"). PASS_REGULAR_EXPRESSION matches a punctuation-robust
+# substring present regardless of the codec attention mode.
+
+# paraformer exercises the CIF predictor read (read_f32 → core_cpu::to_f32).
+set(TEST_TARGET test-paraformer-jfk-live)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:crispasr-cli>
+    --backend paraformer --auto-download -f ${PROJECT_SOURCE_DIR}/samples/jfk.mp3)
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "live;asr;weight-read"
+    TIMEOUT 600
+    PASS_REGULAR_EXPRESSION "do for your country")
+
+# kyutai-stt (Mimi codec) — default non-causal attention.
+set(TEST_TARGET test-kyutai-stt-jfk-live)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:crispasr-cli>
+    --backend kyutai-stt --auto-download -f ${PROJECT_SOURCE_DIR}/samples/jfk.mp3)
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "live;asr;mimi"
+    TIMEOUT 600
+    PASS_REGULAR_EXPRESSION "what you can do for your country")
+
+# kyutai-stt with the opt-in Mimi causal+window mask — must still transcribe.
+set(TEST_TARGET test-kyutai-stt-mimi-causal-jfk-live)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:crispasr-cli>
+    --backend kyutai-stt --auto-download -f ${PROJECT_SOURCE_DIR}/samples/jfk.mp3)
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "live;asr;mimi"
+    TIMEOUT 600
+    ENVIRONMENT "CRISPASR_MIMI_CAUSAL=1"
+    PASS_REGULAR_EXPRESSION "what you can do for your country")
+
 set(TEST_TARGET test-crispasr-cli-large)
 add_test(NAME ${TEST_TARGET}
     COMMAND $<TARGET_FILE:crispasr-cli>
