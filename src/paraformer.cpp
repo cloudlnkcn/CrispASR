@@ -351,16 +351,27 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
     // Conv1d(D, D, 3, padding=1) → ReLU → Linear(D, 1) → sigmoid
     // Then CIF accumulation loop.
 
-    // Read weights, dequantizing F16 as needed.
+    // Read weights as F32. F32 is a direct copy; F16 and any block-quantized
+    // type are dequantized per row via the type's to_float trait (native bytes
+    // sized by ggml_nbytes, row stride ggml_row_size — never n_elem*4, which
+    // reads garbage/asserts on quantized tensors). Shipped paraformer GGUFs keep
+    // the CIF predictor weights at F16/F32 (the quantizer skips them: the '.w'
+    // names miss the is_weight test and the 3-D/vector dims fail ok_dims), so the
+    // quantized path is defensive — but without it a quantized tensor would leave
+    // dst as uninitialized garbage, silently. Mirrors pcs.cpp's read helper.
     auto read_f32 = [](ggml_tensor* t, float* dst, size_t n_elem) {
         if (t->type == GGML_TYPE_F32) {
             ggml_backend_tensor_get(t, dst, 0, n_elem * sizeof(float));
-        } else if (t->type == GGML_TYPE_F16) {
-            std::vector<uint16_t> tmp(n_elem);
-            ggml_backend_tensor_get(t, tmp.data(), 0, n_elem * sizeof(uint16_t));
-            for (size_t i = 0; i < n_elem; i++)
-                dst[i] = ggml_fp16_to_fp32((ggml_fp16_t)tmp[i]);
+            return;
         }
+        const int64_t ne0 = t->ne[0];
+        const int64_t n_rows = ne0 > 0 ? (int64_t)n_elem / ne0 : 0;
+        const size_t row_size = ggml_row_size(t->type, ne0);
+        std::vector<uint8_t> raw(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+        const ggml_type_traits* tr = ggml_get_type_traits(t->type);
+        for (int64_t r = 0; r < n_rows; r++)
+            tr->to_float(raw.data() + (size_t)r * row_size, dst + (size_t)r * ne0, ne0);
     };
 
     std::vector<float> conv_w((size_t)D * D * 3);
