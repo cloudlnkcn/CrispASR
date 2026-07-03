@@ -147,6 +147,11 @@ add_library(crispasr-lib
             # by the library's VAD / LID / diarize auto-download paths
             # and by the CLI's `-m auto` resolver.
             crispasr_cache.cpp
+            # Importance-matrix (imatrix) activation-stats collector. No-op
+            # unless CRISPASR_IMATRIX_OUT is set; installed on ASR decoder
+            # scheds so `crispasr-quantize --imatrix` can weight k-quant/IQ
+            # error by real activation energy (see docs/quantize.md).
+            crispasr_imatrix.cpp
             # Known-model registry lookup (backend → canonical GGUF URL).
             # CLI keeps the TTY prompting shim; the library does the
             # non-interactive resolve.

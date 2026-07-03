@@ -5,6 +5,7 @@
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
@@ -1021,6 +1022,7 @@ static bool whisper_sched_graph_init(struct whisper_sched& allocr, std::vector<g
     auto& meta = allocr.meta;
 
     sched = ggml_backend_sched_new(backends.data(), nullptr, backends.size(), CRISPASR_MAX_NODES, false, true);
+    crispasr_imatrix_install(sched); // no-op unless CRISPASR_IMATRIX_OUT is set
 
     meta.resize(ggml_tensor_overhead() * CRISPASR_MAX_NODES + ggml_graph_overhead());
 

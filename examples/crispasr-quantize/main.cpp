@@ -21,10 +21,64 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 #include <thread>
 #include <cmath>
+
+// Per-tensor importance vectors loaded from an importance-matrix (imatrix)
+// GGUF file. Keyed by weight name; value length == n_cols (ne[0]).
+// importance[c] = sum_of_squares[c] / count, i.e. the mean activation energy
+// seen in column c over a calibration run. Passed straight to
+// ggml_quantize_chunk, which uses it to minimise *activation-weighted* error
+// for k-quants / IQ-quants instead of plain L2 — the same mechanism as
+// llama.cpp's `llama-imatrix`. Ported from CrispEmbed tools/quantize.cpp.
+//
+// File format (a GGUF produced by a calibration run): one F32 tensor per
+// weight, name == the weight's tensor name, holding the per-column
+// sum-of-squares, plus a `count.<name>` u64 metadata key holding the sample
+// count. importance[c] = sum_of_squares[c] / count. When empty /
+// shape-mismatched we fall back to unweighted quantization, so `--imatrix` is
+// always safe to pass. (An importance-matrix *producer* — a calibration pass
+// that emits this file — is not yet in CrispASR; see PLAN.md §llama.cpp
+// comparison Tier-1. This is the consumer side, ported from CrispEmbed.)
+static std::map<std::string, std::vector<float>> g_imatrix;
+
+static bool crispasr_load_imatrix(const std::string& path) {
+    struct ggml_context* ctx = nullptr;
+    struct gguf_init_params p = {/*no_alloc*/ false, /*ctx*/ &ctx};
+    struct gguf_context* g = gguf_init_from_file(path.c_str(), p);
+    if (!g) {
+        fprintf(stderr, "imatrix: failed to open '%s'\n", path.c_str());
+        return false;
+    }
+    const int64_t nt = gguf_get_n_tensors(g);
+    int loaded = 0;
+    for (int64_t i = 0; i < nt; i++) {
+        const char* name = gguf_get_tensor_name(g, i);
+        struct ggml_tensor* t = ggml_get_tensor(ctx, name);
+        if (!t || t->type != GGML_TYPE_F32)
+            continue;
+        const int64_t ne0 = t->ne[0];
+        const float* d = (const float*)t->data;
+        std::string ck = std::string("count.") + name;
+        int64_t kid = gguf_find_key(g, ck.c_str());
+        uint64_t count = (kid >= 0) ? gguf_get_val_u64(g, kid) : 0;
+        if (count == 0)
+            continue;
+        std::vector<float> imp((size_t)ne0);
+        const double inv = 1.0 / (double)count;
+        for (int64_t c = 0; c < ne0; c++)
+            imp[c] = (float)((double)d[c] * inv);
+        g_imatrix[name] = std::move(imp);
+        loaded++;
+    }
+    gguf_free(g);
+    ggml_free(ctx);
+    fprintf(stderr, "imatrix: loaded importance vectors for %d tensors from '%s'\n", loaded, path.c_str());
+    return loaded > 0;
+}
 
 static bool crispasr_model_quantize(const std::string& fname_inp, const std::string& fname_out, ggml_ftype ftype) {
     ggml_type qtype = GGML_TYPE_F32;
@@ -59,6 +113,17 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         break;
     case GGML_FTYPE_MOSTLY_Q6_K:
         qtype = GGML_TYPE_Q6_K;
+        break;
+    // IQ4_NL / IQ4_XS: 4-bit non-linear codebook quants. A/B on CrispEmbed
+    // beat Q4_K on both quality and size for the same bit budget (they use a
+    // shared non-linear value map + super-block scale). IQ4_XS uses 256-wide
+    // super-blocks; IQ4_NL is the 32-wide legacy-block variant used as the
+    // row-width fallback below. Both benefit most with an --imatrix.
+    case GGML_FTYPE_MOSTLY_IQ4_NL:
+        qtype = GGML_TYPE_IQ4_NL;
+        break;
+    case GGML_FTYPE_MOSTLY_IQ4_XS:
+        qtype = GGML_TYPE_IQ4_XS;
         break;
     default:
         fprintf(stderr, "%s: unsupported quantization type %d\n", __func__, ftype);
@@ -427,8 +492,17 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         const bool ok_dims = (ggml_n_dims(t) == 2) || ((is_firered || is_ecapa) && ggml_n_dims(t) >= 2);
         const int64_t ncols = t->ne[0];
 
+        // Source may be F32/F16 OR already quantized. Accepting a quantized
+        // source lets us re-quantize a big model straight from its q8_0 GGUF
+        // (dequantized to F32 in the write loop, then re-quantized to the
+        // target) instead of needing the full F16/F32 base on disk — q8_0 is
+        // ~lossless (cos ~0.9998) so q8→f32→q4 ≈ f32→q4, and the q8_0 is a
+        // fraction of the download. Matters here because several backends
+        // (ark-asr 3B, …) have F16 bases too large for the local disks.
+        const bool src_ok =
+            (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || ggml_is_quantized(t->type));
         bool should_quantize =
-            ggml_is_quantized(qtype) && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && ok_dims &&
+            ggml_is_quantized(qtype) && src_ok && ok_dims &&
             is_weight && (sname.find("norm") == std::string::npos) && (granite_quant_all || sname.find("proj.") != 0) &&
             !(is_granite_family && !granite_quant_all && sname.find("enc.") == 0) &&
             // MOSS-Audio: keep encoder + adapter + deepstack at F16
@@ -535,6 +609,15 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             case GGML_TYPE_Q6_K:
                 fallback = GGML_TYPE_Q8_0;
                 break;
+            // IQ4_XS uses 256-wide super-blocks; fall back to IQ4_NL (32-wide,
+            // same 4-bit non-linear codebook) when the row isn't 256-aligned,
+            // then to legacy Q4_0 if it isn't 32-aligned either.
+            case GGML_TYPE_IQ4_XS:
+                fallback = GGML_TYPE_IQ4_NL;
+                break;
+            case GGML_TYPE_IQ4_NL:
+                fallback = GGML_TYPE_Q4_0;
+                break;
             default:
                 break;
             }
@@ -629,7 +712,7 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                     fprintf(stderr, "failed to read f32 data\n");
                     return false;
                 }
-            } else {
+            } else if (type == GGML_TYPE_F16) {
                 std::vector<ggml_fp16_t> f16_data(nelements);
                 if (fread(f16_data.data(), sizeof(ggml_fp16_t), nelements, fin) != (size_t)nelements) {
                     fprintf(stderr, "failed to read f16 data\n");
@@ -637,13 +720,43 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                 }
                 for (int j = 0; j < nelements; j++)
                     f32_data[j] = ggml_fp16_to_fp32(f16_data[j]);
+            } else {
+                // Quantized source: read the raw quantized bytes and dequantize
+                // to F32 via the type's traits, then re-quantize to the target.
+                const size_t src_bytes = ggml_nbytes(t);
+                std::vector<uint8_t> qbuf(src_bytes);
+                if (fread(qbuf.data(), 1, src_bytes, fin) != src_bytes) {
+                    fprintf(stderr, "failed to read quantized source data\n");
+                    return false;
+                }
+                const ggml_type_traits* tr = ggml_get_type_traits(type);
+                if (!tr || !tr->to_float) {
+                    fprintf(stderr, "no dequantizer for source type %s\n", ggml_type_name(type));
+                    return false;
+                }
+                tr->to_float(qbuf.data(), f32_data.data(), nelements);
             }
 
             const size_t max_q_size = ggml_row_size(qtype_used, t->ne[0]) * (nelements / t->ne[0]);
             q_data.resize(max_q_size);
 
+            // Importance matrix (if loaded and shape-matched): steers k-quant/IQ
+            // precision toward the columns the calibration data actually used.
+            const float* imatrix = nullptr;
+            if (!g_imatrix.empty()) {
+                auto it = g_imatrix.find(name);
+                if (it != g_imatrix.end()) {
+                    if ((int64_t)it->second.size() == t->ne[0]) {
+                        imatrix = it->second.data();
+                        printf("(imatrix) ");
+                    } else {
+                        printf("(imatrix shape %zu!=%lld, skipped) ", it->second.size(), (long long)t->ne[0]);
+                    }
+                }
+            }
+
             size_t q_size = ggml_quantize_chunk(qtype_used, f32_data.data(), q_data.data(), 0, nelements / t->ne[0],
-                                                t->ne[0], nullptr);
+                                                t->ne[0], imatrix);
 
             fwrite(q_data.data(), 1, q_size, fout);
 
@@ -720,15 +833,39 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s model-f16.gguf model-quant.gguf type\n", argv[0]);
+    // Collect positional args, allowing an optional --imatrix flag anywhere.
+    std::vector<std::string> pos;
+    std::string imatrix_path;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--imatrix") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--imatrix requires a file path\n");
+                return 1;
+            }
+            imatrix_path = argv[++i];
+        } else {
+            pos.push_back(a);
+        }
+    }
+
+    if (pos.size() != 3) {
+        fprintf(stderr, "usage: %s model-f16.gguf model-quant.gguf type [--imatrix <file>]\n", argv[0]);
+        fprintf(stderr, "  input may be F16/F32 OR an already-quantized (e.g. q8_0) GGUF — a\n");
+        fprintf(stderr, "  quantized source is dequantized then re-quantized to the target.\n");
+        fprintf(stderr, "  --imatrix <f>  use an importance-matrix GGUF to steer k-quant/IQ\n");
+        fprintf(stderr, "                 precision (improves quality, esp. for iq4_* / low-bit).\n");
         ggml_print_ftypes(stderr);
         return 1;
     }
 
-    const std::string fname_inp = argv[1];
-    const std::string fname_out = argv[2];
-    const ggml_ftype ftype = ggml_parse_ftype(argv[3]);
+    const std::string fname_inp = pos[0];
+    const std::string fname_out = pos[1];
+    const ggml_ftype ftype = ggml_parse_ftype(pos[2].c_str());
+
+    if (!imatrix_path.empty()) {
+        crispasr_load_imatrix(imatrix_path);  // non-fatal: falls back to unweighted if empty
+    }
 
     if (!crispasr_model_quantize(fname_inp, fname_out, ftype)) {
         fprintf(stderr, "failed to quantize model\n");

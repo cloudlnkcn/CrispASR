@@ -6633,3 +6633,168 @@ Both local volumes are ~full (`/Volumes/backups` 7.5 GB free, `/Users` 9.9 GB).
 The 8.14 GB safetensors + ~6 GB F16 GGUF do not fit. Scaffolding + graph code is
 done on the M1; **download + conversion + diff validation must run on the VPS**
 (`/mnt/storage`, `/mnt/akademie_storage`) or after freeing local space.
+
+## llama.cpp comparison — model overlap, support approach, perf-tricks to adopt (ANALYSIS / OPEN)
+
+Comparative study (2026-07-03) of what CrispASR shares with the ggml-org
+ecosystem (whisper.cpp + llama.cpp `libmtmd`) and what performance
+infrastructure we could adopt. Sources verified against upstream repo files /
+PRs where cited; low-confidence items flagged.
+
+### Framing: CrispASR and llama.cpp are *siblings*, not parent/child
+
+Both sit on top of **ggml**. The kernel-level performance machinery
+(flash-attn kernels, CUDA MMQ, tensor cores, CPU tinyBLAS/sgemm, Metal
+`mul_mm`, Vulkan coopmat, k-quants) lives in **ggml**, which we vendor
+in-tree — so we *inherit* those wins automatically **as long as our ggml sync
+stays current**. The things llama.cpp genuinely has that we lack are almost all
+at the **orchestration layer above ggml** (imatrix tooling, quantize CLI
+mixed-precision, speculative decoding, continuous batching). This split
+determines what is a "free upgrade" (bump ggml) vs. "real work" (build the
+tooling ourselves).
+
+### 4.1 — Model overlap (what both support)
+
+| Model | CrispASR backend | llama.cpp | Type | Notes |
+|---|---|---|---|---|
+| OpenAI Whisper (tiny→large-v3-turbo) | `whisper` (`src/crispasr.cpp`) | whisper.cpp | ASR | shared whisper.cpp lineage |
+| Voxtral Mini 3B | `voxtral` (`src/voxtral.h`) | mtmd | ASR-LLM | we also have `voxtral4b` streaming (llama.cpp only *plans* it, upstream #20914) |
+| Qwen3-ASR 0.6B/1.7B | `qwen3` / `mega-asr` | mtmd | ASR-LLM | direct overlap |
+| Gemma 4 E2B/E4B (audio) | `gemma4-e2b/e4b` | mtmd (upstream #21421) | ASR-LLM | both use USM/Conformer audio encoder |
+| LFM2-Audio | `lfm2-audio` | mtmd (unverified, DeepWiki-listed) | ASR+TTS | verify against `clip.cpp` projector enums |
+| OuteTTS 0.2/0.3/1.0 | `outetts` | `tools/tts` | TTS | llama.cpp's *only* TTS pipeline |
+| Qwen3-Omni encoder | inside `moss-transcribe` | mtmd (full omni, input-only) | — | we reuse the encoder; llama.cpp runs the whole 30B-A3B MoE |
+
+**llama.cpp has, we don't:** Ultravox v0.5, Qwen2-Audio (supported but "very
+poor"), Qwen2.5-Omni / Qwen3-Omni as full models.
+
+**We have, llama.cpp doesn't** (~29 ASR + ~30 TTS architectures with zero
+upstream equivalent): Parakeet/NeMo (TDT/RNN-T/CTC), Nemotron streaming,
+Canary, Cohere, FireRedASR, Moonshine, MiMo, ARK, MOSS-Transcribe/Audio,
+FunASR, Paraformer (NAR+CIF), SenseVoice, wav2vec2/HuBERT/data2vec, Higgs-STT,
+GLM-ASR, **Granite-Speech** (llama.cpp explicitly absent), Kyutai/Moshi STT,
+mini-omni2, VibeVoice-ASR — plus the entire TTS roster (chatterbox, dots-tts,
+tada, qwen3-tts, cosyvoice3, f5, csm, dia, zonos, kokoro, piper, melotts,
+voxcpm2, kugelaudio…) and neural diarization. whisper.cpp is Whisper-only;
+llama.cpp mtmd is ~8 audio-input models. Our breadth is a different category.
+
+### 4.2 — HOW they support audio (approach difference)
+
+| Dimension | llama.cpp | CrispASR |
+|---|---|---|
+| Encoder path | one unified `clip.cpp` graph shared by vision+audio; encoder/projector type from mmproj GGUF metadata | bespoke hand-written ggml graph per backend, validated vs Python diff-harness |
+| Audio injection | embeddings spliced into the **text KV cache** like image tokens | per-model token injection (ark audio_token 151663, mimo 8-ch RVQ, …) |
+| Packaging | two files: `model.gguf` + `mmproj.gguf` | single GGUF; backend auto-detected from `arch` (`crispasr_detect_backend_from_gguf`, `src/crispasr_c_api.cpp:1221`) |
+| Long audio | **naive fixed 30 s window + silence-pad** (the design our higgs/ark notes found derails decoders) | **per-model chunking**: parakeet overlap-merge (§208), higgs 4 s, ark single-pass, cohere per-30 s. **We are ahead.** |
+| New model | add projector enum + `convert_hf_to_gguf.py --mmproj`, reuse stock LLM decode | full C++ graph port + converter + harness (heavier, but why we cover ~60 architectures) |
+
+Core difference: llama.cpp forces every audio model through the stock LLM
+decoder + one clip encoder (so it is limited to Whisper-style-encoder +
+standard-LLM combos). We write a bespoke graph per model → we can run
+Conformer/SANM/CIF/RNN-T/flow-matching architectures llama.cpp structurally
+cannot.
+
+### 4.3 — Performance tricks: we vs. them
+
+Legend: ✅ have · ⚠️ partial/manual · ❌ missing · 🎁 inherited-via-ggml.
+
+| Technique | llama.cpp | CrispASR | Verdict |
+|---|---|---|---|
+| Flash attention (`ggml_flash_attn_ext`) | ✅ default-on, tri-state `-fa on/off/auto` | ✅ per-backend, gated (`src/canary.cpp:886`, m2m100, nemotron, moonshine, lfm2, …) | 🎁 same op; adopt default-on discipline |
+| Quantized KV cache | ✅ symmetric K/V → fused FA path | ✅ `CRISPASR_KV_QUANT_K/V`, `KV_ON_CPU` | ⚠️ keep K/V **symmetric** or drop off fast path |
+| k-quants (Q2_K–Q6_K) | ✅ | ✅ ship Q4_K/Q8_0/F16 (+ scattered Q5_K/Q6_K/Q3_K/Q2_K) | 🎁 parity |
+| CPU SGEMM (tinyBLAS/llamafile) | ✅ | 🎁 inherited via vendored ggml-cpu | 🎁 free — confirm compiled in |
+| MMQ / tensor cores / CUDA FA kernels | ✅ | 🎁 inherited via ggml-cuda | 🎁 free (keep ggml current) |
+| Metal `mul_mm` / residency sets / Metal FA (#12612) | ✅ | 🎁 inherited via ggml-metal | 🎁 free — biggest M1 encoder-prefill lever |
+| Vulkan coopmat | ✅ | 🎁 inherited (coopmat2 absent on MoltenVK/RX580 anyway) | 🎁 parity |
+| **imatrix (importance-matrix quant)** | ✅ `llama-imatrix` | ❌ **not in our converters** (registry: 0 imatrix) | **GAP — low-risk quality lever** |
+| **i-quants (IQ1..IQ4_NL)** | ✅ | ❌ (registry: 0 IQ types) | GAP — but low-bit breaks audio backbones (kokoro finding); low priority |
+| **Per-tensor mixed-precision quant** | ✅ `--tensor-type regex=type` CLI | ⚠️ done by hand in converters (keep embd/head/adapter high) | systematize it |
+| **Speculative decoding** (draft/EAGLE-3/n-gram) | ✅ | ❌ (our "lookahead" hits are DSP convs, not spec-decode) | GAP — conditional value for AR ASR/TTS heads |
+| **Continuous batching / server slots** | ✅ `--parallel N`, ~3× | ❌ single-stream bespoke decode | GAP for multi-request serving |
+| CUDA graphs | ✅ ~14% | ⚠️ we graph-*fold* manually (qwen3-tts §161) | partial, CUDA-only |
+| Operator fusion (`ggml_can_fuse`) | ✅ runtime RMSNorm+MUL, GEMV+gated, TopK-MoE | ⚠️ manual graph construction + gallocr bypass | 🎁 fusion is in ggml; we get it when we don't bypass sched |
+| Compute-graph reuse | ✅ `-gr` generic | ✅ per-backend cache (§176s) + raw gallocr | ⚠️ parity, bespoke |
+| Per-model long-audio chunking | ❌ naive 30 s | ✅ overlap-merge / single-pass | **we're ahead** |
+| Batched CFG for diffusion TTS | ❌ (OuteTTS token-only) | ✅ cosyvoice3 / chatterbox B=2 | **we're ahead** |
+| Neural diarization / voice cloning | ❌ (tinydiarize = channel split) | ✅ TitaNet / pyannote / CAMPPlus | **we're ahead** |
+
+### 4.4 — Adoption roadmap (ranked)
+
+**Tier 1 — real gaps, genuine ROI:**
+
+1. **imatrix + systematic per-tensor quant overrides.** ~~Our converters ship
+   Q4_K/Q8_0/F16 with hand-chosen high-precision embeddings/head/adapter —
+   llama.cpp does the *same intent* but calibrated.~~ **DONE (imatrix, both
+   sides).** Ported CrispEmbed's tool: `crispasr-quantize` now takes
+   `--imatrix <file>` (activation-weighted k-quant/IQ error) + `iq4_nl/iq4_xs`
+   types + accepts an already-quantized source (requant from q8_0, no F16 base
+   needed). The **producer** is `src/crispasr_imatrix.{h,cpp}`: set
+   `CRISPASR_IMATRIX_OUT` and any instrumented ASR backend accumulates
+   per-column activation sum-of-squares over a calibration run (merges across
+   runs), emitting the imatrix GGUF. Installed on the decode scheduler of
+   whisper, parakeet, canary, cohere, qwen3-asr/mega-asr, higgs-stt, ark-asr,
+   moss-transcribe, granite(+nle), glm-asr, mimo-asr, voxtral(+4b). Validated
+   end-to-end on mega-asr: 2 calib runs → 141 tensors → 113 decoder tensors
+   imatrix-weighted at quantize → JFK verbatim. See `docs/quantize.md`.
+   **A/B harness `tools/imatrix_ab.py`** (prefill-logit cosine vs f16 gold, via
+   the `CRISPASR_ACTDUMP_OUT` tensor-dump in the observer module) proved the
+   quality win — but ONLY with a good corpus:
+   - qwen3-asr-0.6b q4_k, **CC0 Common Voice EN+DE** (12+12 calib / 3+3 held
+     out): mean prefill-logit cos **0.890 → 0.941 (+0.051)**, every clip up,
+     German gained most (+0.087). Zero size change (540 MB either way).
+   - Same model, **LibriSpeech-EN-only** (20 calib): **−0.013 REGRESSION**;
+     EN+ZH 2-clip: −0.009. So corpus **diversity + in-distribution + language
+     coverage** is decisive — a narrow/mismatched corpus makes imatrix *worse*.
+   **Community note (§llama.cpp):** bartowski/mradermacher imatrix their
+   audio-LLM GGUFs (Voxtral, Qwen2-Audio) with a *text* corpus
+   (`calibration_datav3`) calibrating only the LLM decoder — the Whisper
+   encoder is never audio-calibrated. Our producer runs real audio, so it also
+   covers the audio-conditioned decoder activations. No off-the-shelf ASR-audio
+   imatrix corpus exists; **CC0 Common Voice (EN/DE/…)** is the clean-license
+   build source (LibriSpeech/FLEURS are CC-BY).
+   Still **OPEN**: (a) an explicit quantize-time `--tensor-type <regex>=<type>`
+   override CLI (today the per-tensor precision rules are hard-coded arch
+   guards in `crispasr-quantize/main.cpp`, not user-overridable); (b) wiring
+   the collector into the remaining backends if we want imatrix there too.
+2. **FA default-on audit.** Upstream flipped flash-attn to baseline. Re-check
+   our two known FA bugs — batched-FA corruption (§176h) and the Vulkan
+   GQA-REPEAT-f16 path — against the *current* `FLASH_ATTN_EXT` in vendored
+   ggml; some may already be fixed upstream.
+3. **Keep ggml sync current — the kernel wins are free there.** Metal `mul_mm`
+   (M1 encoder prefill), Metal FA with head_size_k≠head_size_v (#12612 —
+   matters for our partial-RoPE ASR encoders: ark rot32/hd64, higgs, parakeet),
+   CPU RMSNorm+MUL fusion (2026, +43–68% on M2), MMQ, tinyBLAS. None require
+   llama.cpp; verify our pinned ggml is recent enough to include them.
+
+**Tier 2 — conditional on serving story:**
+
+4. **Symmetric quantized-KV (q8_0)** for the Qwen-family audio-LLM decoders
+   (ark, higgs-stt, moss-transcribe). Near-lossless, shrinks decoder KV. Must
+   be symmetric K==V type or it silently falls off the fused FA path. Validate
+   against the per-head KV-stride bugs (#171) first.
+5. **Continuous batching** if the server ever needs concurrent transcription.
+   Today our bespoke single-stream decode paths can't multi-slot, and #171
+   shows per-slot KV isolation is a real hazard for audio decoders.
+6. **Prompt-lookup / n-gram speculative decoding** for AR ASR heads
+   (transcripts echo their own context → high acceptance). Heed the §161
+   lesson: the draft must reproduce the target's *exact realization* or
+   generation derails.
+
+**Don't bother:** i-quants (low-bit breaks audio backbones; codebook decode is
+slow on compute-bound TTS/ASR), KV defrag (deprecated upstream; single-pass
+audio doesn't fragment), paged attention (not merged upstream).
+
+**Where we're better and should NOT converge to them:** model breadth (~60 vs
+~8 architectures), per-model long-audio chunking (their fixed-30 s is worse
+than our overlap-merge), diffusion/flow TTS with batched CFG, neural
+diarization, voice cloning, single-file arch-autodetect UX.
+
+### Verify-in-tree caveats (from the upstream survey)
+- Exact `ggml_rope_ext` arg order / `GGML_ROPE_TYPE_*` enum values against the
+  pinned `ggml/include/ggml.h` (signature has been revised upstream).
+- Current speculative-decode flag namespace (`--spec-*` vs older
+  `--model-draft/--draft-max`) if we ever mirror it.
+- mtmd mel preprocessing params (128 HTK bins) + LFM2-Audio/MiniCPM-o audio
+  status are DeepWiki-sourced, not quoted from `clip.cpp` — confirm if
+  load-bearing.

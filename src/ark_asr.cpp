@@ -9,6 +9,7 @@
 #include "ark_asr.h"
 
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -420,6 +421,7 @@ extern "C" struct ark_asr_context* ark_asr_init_from_file(const char* path_model
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 

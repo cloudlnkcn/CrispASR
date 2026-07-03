@@ -20,6 +20,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -792,6 +793,7 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
@@ -2662,6 +2664,7 @@ extern "C" int parakeet_run_encoder_dump(struct parakeet_context* ctx, const flo
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));

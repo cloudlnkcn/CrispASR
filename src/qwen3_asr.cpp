@@ -14,6 +14,7 @@
 
 #include "qwen3_asr.h"
 #include "../crisp_audio/include/crisp_audio.h"
+#include "crispasr_imatrix.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1559,6 +1560,7 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 

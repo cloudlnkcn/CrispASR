@@ -13,6 +13,7 @@
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -1969,9 +1970,11 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     if (using_gpu) {
         ggml_backend_t backends[] = {ctx->ggml_backend, ctx->ggml_backend_cpu};
         ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 2, 16384, false, false);
+        crispasr_imatrix_install(ctx->ggml_alloc); // no-op unless CRISPASR_IMATRIX_OUT is set
     } else {
         ggml_backend_t backends[] = {ctx->ggml_backend};
         ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
+        crispasr_imatrix_install(ctx->ggml_alloc); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
 
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + 1024);

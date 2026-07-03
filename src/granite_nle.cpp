@@ -28,6 +28,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "core/bpe.h"
@@ -702,6 +703,7 @@ extern "C" struct granite_nle_context* granite_nle_init_from_file(const char* pa
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 

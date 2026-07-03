@@ -51,10 +51,24 @@ scripts/dev-build.sh --target crispasr-quantize
 ## Usage
 
 ```bash
-./build/bin/crispasr-quantize <input.gguf> <output.gguf> <type>
+./build/bin/crispasr-quantize <input.gguf> <output.gguf> <type> [--imatrix <file>]
 ```
 
 `<type>` is one of the `ggml_ftype` names below.
+
+`<input.gguf>` may be an **F16/F32 base OR an already-quantized GGUF**
+(e.g. a shipped `q8_0`). A quantized input is dequantized to F32 and
+then re-quantized to the target, so you can produce a `q4_k` / `iq4_xs`
+build straight from a `q8_0` download without keeping the multi-GB F16
+base on disk (q8_0 is ~lossless, so `q8→f32→q4 ≈ f32→q4`).
+
+`--imatrix <file>` (optional) supplies an **importance matrix** — a
+per-tensor, per-column activation-energy vector from a calibration
+run — which steers k-quant / IQ-quant precision toward the columns the
+model actually uses (activation-weighted error instead of plain L2,
+the same idea as llama.cpp's `llama-imatrix`). It helps most for the
+low-bit types (`iq4_*`, `q3_k`, `q2_k`); it is always safe to pass
+(missing / shape-mismatched entries fall back to unweighted).
 
 ### Supported types
 
@@ -70,6 +84,8 @@ scripts/dev-build.sh --target crispasr-quantize
 | `q4_k` | 4-bit K-quant (preferred over legacy q4_0/q4_1)                      |
 | `q5_k` | 5-bit K-quant (preferred over legacy q5_0/q5_1)                      |
 | `q6_k` | 6-bit K-quant (close to F16 quality, 60% of F16 size)                |
+| `iq4_nl` | 4-bit non-linear codebook (32-wide blocks)                         |
+| `iq4_xs` | 4-bit non-linear codebook (256-wide super-blocks) — beats `q4_k` on quality *and* size for the same ~4-bit budget; pair with `--imatrix` |
 
 ### Examples
 
@@ -86,17 +102,65 @@ scripts/dev-build.sh --target crispasr-quantize
 
 # Canary 1B F16 → Q6_K (near-lossless)
 ./build/bin/crispasr-quantize canary-1b-v2-f16.gguf canary-1b-v2-q6_k.gguf q6_k
+
+# Re-quantize straight from a shipped q8_0 (no F16 base needed) → IQ4_XS
+./build/bin/crispasr-quantize mega-asr-1.7b-q8_0.gguf mega-asr-1.7b-iq4_xs.gguf iq4_xs
+
+# IQ4_XS with an importance matrix for best low-bit quality
+./build/bin/crispasr-quantize model-f16.gguf model-iq4_xs.gguf iq4_xs --imatrix model.imatrix.gguf
 ```
 
 ### Alignment fallback
 
-K-quants (`q2_k` through `q6_k`) require tensor row sizes to be
-multiples of 256. If a tensor doesn't meet this requirement (e.g. the
-896-wide tensors in some Qwen3-ASR layers), the tool transparently
-falls back to a compatible legacy quant (typically `q4_0` or `q8_0`)
-for that tensor only, and the rest of the model still gets the
-requested K-quant. The output GGUF is always fully quantized — there
-is no half-quantized failure mode.
+K-quants (`q2_k` through `q6_k`) and `iq4_xs` require tensor row sizes
+to be multiples of 256. If a tensor doesn't meet this requirement (e.g.
+the 896-wide tensors in some Qwen3-ASR layers), the tool transparently
+falls back to a compatible smaller-block quant for that tensor only
+(`q4_k`→`q4_0`, `q5_k`→`q5_0`, `q6_k`→`q8_0`, `iq4_xs`→`iq4_nl`→`q4_0`),
+and the rest of the model still gets the requested type. The output
+GGUF is always fully quantized — there is no half-quantized failure
+mode.
+
+### Generating an importance matrix (calibration)
+
+An importance matrix records, per weight and per input column, how much
+activation energy the model actually put through that column on a
+representative corpus. Feeding it to the quantizer (`--imatrix`) lets
+k-quant / IQ-quant spend its bits where they matter, which recovers
+quality at low bit-widths (`iq4_*`, `q3_k`, `q2_k`).
+
+CrispASR produces the imatrix as a **side effect of normal
+transcription**. Set `CRISPASR_IMATRIX_OUT` and run the model over your
+calibration audio; every run **merges into** the same file, so you can
+stream a corpus across many invocations:
+
+```bash
+export CRISPASR_IMATRIX_OUT=mega-asr.imatrix.gguf
+for f in calib/*.wav; do
+    ./build/bin/crispasr -m mega-asr-1.7b-q8_0.gguf -f "$f"
+done
+# → "imatrix: wrote N tensors to 'mega-asr.imatrix.gguf'" after each run
+
+# Then quantize with it:
+./build/bin/crispasr-quantize mega-asr-1.7b-q8_0.gguf \
+    mega-asr-1.7b-iq4_xs.gguf iq4_xs --imatrix mega-asr.imatrix.gguf
+```
+
+Notes:
+
+- **No-op unless the env var is set** — production paths are unaffected.
+- Collection copies each `mul_mat` activation to host, so a calibration
+  run is slower than a normal transcription; that cost is only paid when
+  `CRISPASR_IMATRIX_OUT` is set.
+- Calibrate on **in-distribution audio** (the languages / domain you
+  care about), not a single clip — the matrix is only as good as the
+  corpus that produced it.
+- Implemented for the ASR backends whose large weights actually benefit
+  (whisper, parakeet, canary, cohere, qwen3-asr / mega-asr, higgs-stt,
+  ark-asr, moss-transcribe, granite, glm-asr, mimo-asr, voxtral). The
+  collector is installed on the decode scheduler
+  (`crispasr_imatrix_install`); adding it to another backend is a
+  one-line call after its `ggml_backend_sched_new`.
 
 ## Recommended quants per backend
 
