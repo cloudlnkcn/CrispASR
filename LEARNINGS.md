@@ -42,9 +42,15 @@ real win, not equality. **The default is now causal+sliding-window** for `kyutai
 full-attention path is preserved for bisection behind `CRISPASR_MIMI_NONCAUSAL=1` (gate the OLD path
 once the new is proven — mandate). Lesson: **an A/B on a sample shorter than the model's context
 window can't see a context/windowing bug** — size the probe to exceed the window (here, concatenate
-the clip past `mimi_context` frames). `csm_tts`'s decoder has the identical gate but is **still
-opt-in** (`CRISPASR_MIMI_CAUSAL`) — the STT WER A/B doesn't transfer to TTS; a TTS→ASR round-trip A/B
-on >250-frame output is needed before flipping its default.
+the clip past `mimi_context` frames). `csm_tts`'s decoder has the identical gate and now **also
+defaults to causal** (opt out with `CRISPASR_MIMI_NONCAUSAL=1`): a TTS→ASR round-trip A/B (2026-07,
+~256 decoder frames — `T_up = 2 × 128` codec frames, so the window engages) gave causal **9.3% WER
+vs non-causal 12.0%** — causal wins and is never worse. Note the TTS margin is far smaller than the
+STT one: on TTS the non-causal codec stayed fully intelligible (no truncation), it just synthesised
+slightly-worse audio, whereas on STT non-causal dropped ~25% of the transcript. Deterministic RNG
+(reseed) made the two synths identical in length (128 frames / 30.56 s), so the only variable was the
+codec attention. Single-sample and modest, but directionally consistent with STT + the architecture,
+so flipped for consistency.
 
 ## Auditing CrispASR against CrispEmbed's bug classes: a weight reader with no quantized branch fails silently (2026-07)
 

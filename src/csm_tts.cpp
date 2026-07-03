@@ -887,12 +887,14 @@ static ggml_tensor* build_mimi_dec_transformer(ggml_context* ctx, const std::vec
     int T = (int)x->ne[1];
     int dim = (int)x->ne[0];
 
-    // Optional causal + sliding-window mask (symmetric with kyutai_stt's Mimi
-    // encoder). OPT-IN via CRISPASR_MIMI_CAUSAL, default OFF (nullptr = today's
-    // full non-causal attention). Filled by the caller after alloc. See
-    // LEARNINGS "Mimi codec transformer runs non-causal".
+    // Causal + sliding-window is the DEFAULT (symmetric with kyutai_stt's Mimi
+    // encoder), matching moshi's streaming Mimi. TTS→ASR A/B (2026-07, ~256 dec
+    // frames > 250): causal 9.3% WER vs non-causal 12.0% — causal wins (modest,
+    // single-sample) and is never worse; both stay fully intelligible (unlike the
+    // STT side where non-causal truncated). CRISPASR_MIMI_NONCAUSAL=1 restores the
+    // old full-attention path. Filled by the caller after alloc.
     ggml_tensor* attn_mask = nullptr;
-    if (std::getenv("CRISPASR_MIMI_CAUSAL")) {
+    if (!std::getenv("CRISPASR_MIMI_NONCAUSAL")) {
         attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, T, T); // [Lk, Lq]
         ggml_set_name(attn_mask, "mimi_dec_causal_mask");
         ggml_set_input(attn_mask);

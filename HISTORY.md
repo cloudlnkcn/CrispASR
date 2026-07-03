@@ -27,7 +27,10 @@ F32 fast path on a per-transcription loop; routing it would only add copies.
 non-causal path **truncates the tail** (~25% of content dropped once the sequence exceeds the
 window); causal+window captured all of it; on short audio (<250 frames) the two tie. So
 `kyutai_stt` now **defaults to causal+sliding-window**, old path behind `CRISPASR_MIMI_NONCAUSAL=1`.
-`csm_tts` has the identical gate but stays opt-in (`CRISPASR_MIMI_CAUSAL`) pending a TTS→ASR A/B.
+`csm_tts` has the identical gate and now **also defaults to causal** — a TTS→ASR A/B (~256 decoder
+frames, `T_up = 2× 128` codec frames) gave causal 9.3% WER vs non-causal 12.0% (a win, though far
+smaller than STT's, since non-causal TTS stayed intelligible rather than truncating). Opt out with
+`CRISPASR_MIMI_NONCAUSAL=1`.
 Verified on Metal + CUDA (Tesla P100). → LEARNINGS.
 
 ## #171 2026-07-03 VibeVoice TTS server "3rd-request garbage" — voice-KV stride leak
