@@ -6946,3 +6946,43 @@ Follow the release process in the dev guide: notes from
 `git log v0.8.7..HEAD --oneline --no-merges` into RELEASE_NOTES_v0.8.8.md,
 `scripts/bump-version.sh 0.8.8`, push main, wait for green CI, push tag,
 `gh release create` with notes, then remove the repo-root notes file.
+
+## §222 Aligner model expansion — permissive-license fleet (OPEN)
+
+Motivated by #217 follow-ups. Constraint: **non-NC licenses only** (the
+popular MMS-based aligners, e.g. `MahmoudAshraf/mms-300m-1130-forced-aligner`,
+are CC-BY-NC-4.0 → excluded; verified 2026-07-04 via the HF API).
+
+**Shipped so far (2026-07-04):**
+- `--align-only` segment mode: `.srt` cue-preserving re-timing +
+  `--align-granularity auto|word|segment` (feat/#217, `0149262a`).
+- FastConformer-CTC standalones confirmed working as aligners as-is (GGUF
+  arch `canary-ctc` → default dispatch); registry aliases
+  `fastconformer-aligner[-en]` added. At ~83 MB q4_k this is the
+  smallest/fastest aligner we ship.
+- Hybrid CTC-branch extraction: `convert-stt-fastconformer-ctc-to-gguf.py`
+  now also accepts `EncDecHybridRNNTCTCBPEModel` checkpoints
+  (`ctc_decoder.*` head, RNNT `decoder.*`/`joint.*` skipped, `xscaling`
+  honoured from YAML). First fleet member converted + validated + uploaded:
+  `cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF` (de, punct+caps,
+  ASR transcript exact on FLEURS-de sample; word alignment cross-checked
+  against canary-ctc-aligner, agreement ≤0.2 s once speech starts).
+  Registry: `fastconformer-aligner-de` / `fastconformer-ctc-de`.
+
+**Remaining fleet (each ≈30 min: download .nemo → convert → q4_k/q8_0 →
+validate ASR + align on a FLEURS sample → upload + registry entry):**
+`stt_{es,fr,it,pt,nl,pl,ru,ua,hr,be,ar,fa,ka,hy,uz}_fastconformer_hybrid_large_pc`
+and `stt_kk_ru_fastconformer_hybrid_large` — all CC-BY-4.0 (de/ar
+spot-checked). Batch on Kaggle if local bandwidth is the bottleneck.
+
+**Also open:**
+- parakeet-tdt-0.6b-ja CTC head upload (#89 leftover) → Japanese
+  FastConformer aligner (better than wav2vec2-aligner-ja).
+- Known artifact: FastConformer hybrid CTC branches glue the FIRST word's
+  start to 0.0 across leading silence (blank-absorption at Viterbi start);
+  canary-ctc-aligner places it correctly. If it bothers users, clamp the
+  first word's t0 to (first non-blank frame − margin) in the shared CTC
+  Viterbi.
+- OWSM-CTC (CC-BY-4.0, ESPnet E-Branchformer, 151 languages): would need a
+  new encoder runtime — only worth it if the per-language fleet above
+  proves insufficient.

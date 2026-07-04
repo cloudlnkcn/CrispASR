@@ -313,6 +313,24 @@ constexpr Entry k_registry[] = {
     {"fastconformer-ctc", "stt-en-fastconformer-ctc-large-q4_k.gguf",
      "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
      "~83 MB", nullptr, nullptr},
+    // FastConformer-CTC models double as compact CTC forced aligners
+    // (-am <name>): the GGUF arch tag is canary-ctc, so crispasr_aligner's
+    // default dispatch loads them directly. The *-aligner-* aliases below
+    // mirror the wav2vec2-aligner-<lang> naming for discoverability.
+    {"fastconformer-aligner", "stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "~83 MB", nullptr, nullptr},
+    {"fastconformer-aligner-en", "stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "~83 MB", nullptr, nullptr},
+    // CTC branch of nvidia/stt_de_fastconformer_hybrid_large_pc (CC-BY-4.0):
+    // German ASR + forced alignment with punctuation/capitalisation.
+    {"fastconformer-ctc-de", "stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~78 MB", nullptr, nullptr},
+    {"fastconformer-aligner-de", "stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~78 MB", nullptr, nullptr},
     // nvidia/parakeet-ctc-{0.6b,1.1b} — same FastConformer-CTC architecture
     // as the stt_en_fastconformer_ctc_* family (24 / 42 layers respectively),
     // English-only, lowercase + light-punct output. Filename heuristic

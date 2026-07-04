@@ -3,7 +3,11 @@
 
 Handles the NeMo ``stt_*_fastconformer_ctc_*`` family of standalone ASR
 models — currently smoke-tested with ``nvidia/stt_en_fastconformer_ctc_large``
-but the same architecture applies to every FastConformer-CTC release:
+— and the ``stt_*_fastconformer_hybrid_large_pc`` transducer+CTC hybrids
+(``EncDecHybridRNNTCTCBPEModel``), whose auxiliary CTC head lives at
+``ctc_decoder.decoder_layers.0.*`` instead of ``decoder.decoder_layers.0.*``;
+the RNNT prediction network (``decoder.*``) and joint (``joint.*``) are
+skipped. The same architecture applies to every FastConformer-CTC release:
 
   - input        = 16 kHz mono PCM, 80 log-mel features
   - pre-encoder  = dw_striding ×8 subsampling (5 × Conv2d + Linear)
@@ -111,11 +115,16 @@ def remap_name(nemo_name: str) -> str | None:
         return f"encoder.layers.{layer_id}.{sub}"
     # NeMo CTC head: `decoder.decoder_layers.0.{weight,bias}` with
     # weight shape (vocab+1, hidden, kernel=1). We squeeze the last dim
-    # during tensor write.
-    if n == "decoder.decoder_layers.0.weight":
+    # during tensor write. Hybrid (transducer+CTC) checkpoints name the
+    # auxiliary CTC head `ctc_decoder.decoder_layers.0.*` instead.
+    if n in ("decoder.decoder_layers.0.weight", "ctc_decoder.decoder_layers.0.weight"):
         return "ctc.weight"
-    if n == "decoder.decoder_layers.0.bias":
+    if n in ("decoder.decoder_layers.0.bias", "ctc_decoder.decoder_layers.0.bias"):
         return "ctc.bias"
+    # Hybrid RNNT branch: prediction network + joint are not needed for
+    # CTC alignment/decoding — skip without warning.
+    if n.startswith("decoder.") or n.startswith("joint."):
+        return None
     print(f"  [warn] unmapped tensor: {n}", file=sys.stderr)
     return None
 
@@ -160,6 +169,8 @@ def parse_yaml_hparams(yaml_path: Path) -> dict:
                     hp[k] = float(v)
                 except ValueError:
                     pass
+            elif v.lower() in ("true", "false"):
+                hp.setdefault(k, v.lower() == "true")
     return hp
 
 
@@ -184,7 +195,13 @@ def convert(nemo_path: Path, out_path: Path, extract_dir: Path | None = None) ->
         hp = parse_yaml_hparams(paths["config"]) if "config" in paths else {}
 
     # Infer vocab size from the CTC head (most authoritative source).
-    ctc_w = sd["decoder.decoder_layers.0.weight"]  # (vocab+1, hidden, 1)
+    # Standalone CTC: decoder.decoder_layers.0.*; hybrid: ctc_decoder.*.
+    ctc_head_key = "decoder.decoder_layers.0.weight"
+    if ctc_head_key not in sd:
+        ctc_head_key = "ctc_decoder.decoder_layers.0.weight"
+        if ctc_head_key not in sd:
+            sys.exit("no CTC head found (neither decoder.* nor ctc_decoder.*) — not a CTC/hybrid checkpoint")
+    ctc_w = sd[ctc_head_key]  # (vocab+1, hidden, 1)
     vocab_plus_blank = int(ctc_w.shape[0])
     vocab_size = vocab_plus_blank - 1
     hidden = int(ctc_w.shape[1])
@@ -244,7 +261,9 @@ def convert(nemo_path: Path, out_path: Path, extract_dir: Path | None = None) ->
     writer.add_uint32("canary_ctc.vocab_size", vocab_size)
     writer.add_uint32("canary_ctc.blank_id", vocab_size)
     writer.add_uint32("canary_ctc.frame_dur_cs", 8)
-    writer.add_uint32("canary_ctc.xscaling", 1)
+    # NeMo ConformerEncoder xscaling (default true for the stt_* releases;
+    # honour an explicit `xscaling: false` in model_config.yaml).
+    writer.add_uint32("canary_ctc.xscaling", 1 if hp.get("xscaling", True) else 0)
 
     writer.add_array("tokenizer.ggml.tokens", vocab)
 

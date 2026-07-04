@@ -540,6 +540,28 @@ Granularity is controlled by `--align-granularity`:
 | `segment` | one output entry per input SRT cue / non-empty `.txt` line, re-timed from the word alignment; JSON nests the per-word timings under each segment |
 | `word` | one output entry per aligned word (the pre-0.8.9 behaviour, also for `.srt` input) |
 
+### Aligner model options
+
+Any of these resolves via `-am <name> --auto-download`. All are
+permissively licensed (no NC restriction):
+
+| `-am` name | Family | Size (q4_k) | Languages | Upstream license |
+|---|---|---|---|---|
+| `canary-ctc-aligner` (= `auto`) | FastConformer-CTC (canary-1b-v2 aux) | ~442 MB | 25 European | CC-BY-4.0 |
+| `fastconformer-aligner[-en]` / `fastconformer-ctc` | FastConformer-CTC standalone | ~83 MB | en | CC-BY-4.0 |
+| `fastconformer-aligner-de` / `fastconformer-ctc-de` | FastConformer hybrid CTC branch | ~78 MB | de (+punct/caps) | CC-BY-4.0 |
+| `parakeet-ctc-0.6b` / `parakeet-ctc-1.1b` | FastConformer-CTC | ~455 / ~795 MB | en | CC-BY-4.0 |
+| `wav2vec2-aligner-{en,de,fr,es,it,ja,zh,nl,uk,…}` | wav2vec2/XLSR CTC | ~212–300 MB | per-language (incl. CJK) | Apache-2.0 |
+| `qwen3-forced-aligner` / `qwen3-fa` | Qwen3 timestamp head | ~500 MB | multilingual | Apache-2.0 |
+
+Everything with GGUF arch `canary-ctc` (the whole NeMo
+`stt_*_fastconformer_ctc_*` standalone family, plus CTC branches
+extracted from the `stt_*_fastconformer_hybrid_large_pc` hybrids via
+`models/convert-stt-fastconformer-ctc-to-gguf.py`) loads through the
+default aligner dispatch — the ~80 MB FastConformer models are the
+smallest/fastest aligner option. The popular MMS-based aligners are
+deliberately absent: their weights are CC-BY-**NC**-4.0.
+
 ### Granite word-level timestamps and `--max-len` (#205)
 
 `--backend granite` (Granite Speech 4.1 PLUS variant) now requests
