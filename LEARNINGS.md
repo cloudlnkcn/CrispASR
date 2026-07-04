@@ -11847,3 +11847,51 @@ uploads lacked it and `--parakeet-decoder ctc` silently fell back to TDT
 with only a stderr note). When a backend advertises alternative decode
 heads, verify the published GGUFs actually CONTAIN them.
 
+## A once-allocated-then-reused bucket step graph is a CUDA-graph-capture hazard: reset+alloc the sched EVERY step (#220, 2026-07-04)
+
+Chatterbox T3 aborted out of the box on an RTX 3090 Ti (`crispasr:main-cuda`)
+with `CUDA error: an illegal memory access was encountered` in
+`ggml_backend_cuda_synchronize`, at AR decode step ~2, right after a
+`CUDA Graph id N reused` log line. It works on CPU, and T3-on-GPU is the
+default for "non-Metal GPU", so every affected card hits it immediately.
+
+**Mechanism.** ggml-cuda replays a captured CUDA graph as a single
+`cudaGraphLaunch` when it can. It keys the captured executable on the split
+graph's `uid` and, in `ggml_cuda_graph_update_required` (ggml-cuda.cu), takes a
+fast path: *if `cgraph->uid == graph->uid`, return "no update required" and
+replay the previous capture verbatim* — with every device pointer baked in at
+capture time, skipping all per-node pointer/shape re-validation. A **fresh split
+uid is minted only inside `ggml_backend_sched_alloc_graph`** (ggml-backend.cpp
+`sched->splits[i].graph.uid = ggml_graph_next_uid()`).
+
+The §186 Lk-bucketed T3 decode was written for M1: it pre-builds the step graph
+AND allocates its dedicated step scheduler **once per bucket**, then for every
+subsequent step just re-runs `ggml_backend_sched_graph_compute` (the sched stays
+`is_alloc`, so the compute call skips reset+alloc). That "reuse-shortcut" keeps
+the split uid constant across steps → on sm_80+ the second step hits the uid
+fast-path and replays a **stale** capture → illegal access. It's the CUDA twin
+of the Vulkan null-subbuffer segfault (#170) that already keeps T3 on CPU there,
+and the same class as qwen3-tts #52/#56.
+
+**Two non-obvious gates that shaped the fix and its testing:**
+1. **CUDA-graph capture is hard-gated to sm_80+** (`cc < GGML_CUDA_CC_AMPERE →
+   disable_due_to_gpu_arch`, ggml-cuda.cu). Below Ampere there is no capture, so
+   the reuse-shortcut is harmless — which is exactly why this never showed on a
+   T4/P100 (Kaggle free tier) and only bit a real Ampere+ card. **Corollary: you
+   cannot reproduce this bug on Kaggle's free GPUs; a repro needs sm_80+.**
+2. The reuse-shortcut is **correct on Metal** (no capture at all) and is the
+   validated §186 M1 fast path — so the fix must not blanket-remove it.
+
+**Fix.** On a non-Metal GPU backend, `ggml_backend_sched_reset` +
+`ggml_backend_sched_alloc_graph` the bucket step sched **every step**. This mints
+a new split uid each step so `ggml_cuda_graph_update_required` goes through
+`cudaGraphExecUpdate` (which refreshes the baked pointers) instead of blindly
+replaying — while the *cached cgraph* keeps `nodes[0]` (the capture key) stable
+so capture still engages and the speedup survives. This is precisely the
+granite/outetts CUDA-graph-bucket pattern (`docs/contributing.md` §210: "even on
+a topology-stable captured graph you must still reset+alloc per step"). Metal
+keeps the alloc-once reuse; old path stays available for A/B via
+`CRISPASR_CHATTERBOX_T3_BUCKET_REUSE=1`. **General rule: any bucket/step graph
+that is allocated once and reused across steps is unsafe on CUDA (and Vulkan) —
+reset+alloc per step; granite_speech is the reference implementation.**
+

@@ -7001,3 +7001,29 @@ Notes from the batch:
 - OWSM-CTC (CC-BY-4.0, ESPnet E-Branchformer, 151 languages): would need a
   new encoder runtime — only worth it if the per-language fleet above
   proves insufficient.
+
+## §223 Issue #220 — chatterbox T3 CUDA illegal memory access (FIXED, sm_80+ verify pending)
+
+Reporter (RTX 3090 Ti, `crispasr:main-cuda` v0.8.8): every chatterbox request
+aborts `CUDA error: an illegal memory access was encountered` at AR step ~2,
+right after `CUDA Graph id N reused`. CPU works.
+
+- **Root cause:** §186 Lk-bucketed T3 decode allocates its step sched once per
+  bucket then reuses it (skips per-step reset+alloc). ggml-cuda replays a
+  captured CUDA-graph exec on a split-graph `uid` match with capture-time
+  pointers baked in; the reuse never re-mints the uid → step 2 replays a stale
+  capture → illegal access. CUDA twin of Vulkan #170; same class as qwen3-tts
+  #52/#56. Capture is arch-gated to sm_80+, so only Ampere+ cards are affected.
+- **Fix (SHIPPED, commit c78b187b, branch fix/chatterbox-t3-cuda-illegal-access):**
+  reset+alloc the bucket step sched every step on non-Metal GPU (granite/outetts
+  pattern, docs/contributing.md §210). Cached cgraph keeps `nodes[0]` stable so
+  capture still engages (new uid → `cudaGraphExecUpdate`); T3 stays on GPU.
+  Metal keeps alloc-once reuse. Old path A/B via
+  `CRISPASR_CHATTERBOX_T3_BUCKET_REUSE=1`.
+- **Verification:** both `#if defined(GGML_USE_METAL)` and forced-CUDA `#else`
+  branches compile clean. Kaggle A/B kernel
+  `tools/kaggle/issue220-chatterbox-cuda/` (old_reuse vs fix_default vs cpu_ref,
+  ASR-roundtripped) runs on chr1str — but Kaggle free GPUs are T4/P100 (< sm_80),
+  so it only proves no-regression, NOT the crash fix. **OPEN: an sm_80+ run
+  (reporter's 3090 Ti, or a rented A100/L4/4090) to confirm old_reuse crashes
+  while fix_default passes with capture engaged.**

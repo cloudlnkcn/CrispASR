@@ -6,6 +6,28 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-07-04 #220 chatterbox T3 CUDA illegal-memory-access — reset+alloc bucket sched per step
+
+Reporter hit `CUDA error: an illegal memory access was encountered` on an
+RTX 3090 Ti (`crispasr:main-cuda`, v0.8.8) for every chatterbox request; CPU
+worked. Root cause: the §186 Lk-bucketed T3 decode allocated its step scheduler
+once per bucket then only re-ran `graph_compute` each step (the M1
+"reuse-shortcut"). ggml-cuda keys a captured CUDA-graph executable on the split
+graph's `uid` and, on a uid match, replays it verbatim with capture-time device
+pointers; the reuse-shortcut never mints a new uid, so decode step ~2 replays a
+stale capture → illegal access (the CUDA twin of the Vulkan #170 T3 segfault).
+CUDA-graph capture is arch-gated to sm_80+, so it only bites Ampere+ cards — a
+T4/P100 (incl. Kaggle free tier) never captures and never crashed.
+
+Fix (commit c78b187b): on a non-Metal GPU backend, `sched_reset` +
+`sched_alloc_graph` the bucket step sched every step — the granite/outetts
+CUDA-graph-bucket pattern (docs/contributing.md §210). New split uid per step →
+`cudaGraphExecUpdate` refreshes the pointers, cached cgraph keeps `nodes[0]`
+stable so capture still engages and T3 stays on GPU (no CPU fallback). Metal
+keeps the cheaper alloc-once reuse; old path A/B-gated via
+`CRISPASR_CHATTERBOX_T3_BUCKET_REUSE=1`. See LEARNINGS "A once-allocated-then-
+reused bucket step graph is a CUDA-graph-capture hazard".
+
 ## 2026-07-04 #221 issue #89 hardening (regression guard, server mirror, Vulkan, q4 guard)
 
 Follow-through batch (PLAN #221) making the #89 fix durable:
