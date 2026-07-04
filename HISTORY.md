@@ -6,6 +6,59 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-07-04 #89 parakeet-ja long-form — VAD slice cap + per-slice single-pass (56 % → 80 % recall)
+
+Issue #89 audit: the reporter's default run (`parakeet-tdt-0.6b-ja`, no flags)
+recalled only **56 %** of spoken content on his 60 s clip / 54 % on 120 s
+(char-bigram recall vs a whisper-large-v3-turbo reference; precision ~92-97 %,
+i.e. what came out was right — half the speech was silently missing). Every
+available path (auto-VAD default, firered VAD, streamed, chunk-30) sat in a
+53-60 % band. §216 had fixed non-JA to NeMo-exact but left JA as-is.
+
+**Blueprint comparison (NeMo 2.7.3, original `nvidia/parakeet-tdt_ctc-0.6b-ja`
+checkpoint, same audio).** Our port is *bit-faithful*: NeMo plain transcribe
+scores 11.2 % (42 chars — char-identical to our single-pass), NeMo
+local-attention `[128,128]` 45.6 % (157 chars — char-identical to ours via the
+already-implemented `parakeet.att_context_*` mask), NeMo CTC-branch single-pass
+1 % (= ours after reconverting the GGUF **with** the hybrid model's CTC head —
+the published GGUF lacks it; `--parakeet-decoder ctc` silently fell back to
+TDT). NeMo's own recommended long-form path (buffered `BatchedFrameASRTDT`)
+scores **14.7 %** (4 s/8 s) and **51.3 %** (stock 1.6 s/4 s) on this clip. The
+collapse is **encoder-level** (CTC head over the same features also dies
+single-pass) and input-specific (clean TTS audio doesn't trigger it) — a model
+pathology, not a port bug.
+
+**What actually loses the content on the VAD path:** silero merges continuous
+podcast speech into 40 s+ slices — far past the JA encoder's ~12 s safe
+window — and the old equal-part post-split cut mid-word (both neighbours drop
+the boundary words). Additionally the JA backend decoded *every* slice via the
+streamed path (threshold 0), never single-pass.
+
+**Fix (3 pieces, all env-gated, old paths intact):**
+- `crispasr_vad.cpp` post-split now cuts at **energy minima** (±2 s search,
+  100 ms RMS window, reusing `audio_chunking::split_at_energy_minima`) instead
+  of equal parts.
+- New backend hook `vad_slice_cap_seconds()` (JA=12, others 0;
+  `CRISPASR_PARAKEET_VAD_SLICE_CAP`): the dispatcher re-splits VAD slices down
+  to the cap when the user didn't pass an explicit `--chunk-seconds`.
+- JA `CRISPASR_PARAKEET_STREAM_THRESHOLD` default 0 → **12**: capped slices now
+  decode **single-pass (NeMo-exact)** instead of streamed.
+- Bonus gate: `CRISPASR_PARAKEET_ATT_CONTEXT="L,R"` — runtime equivalent of
+  NeMo's `change_attention_model("rel_pos_local_attn")`, wired to the existing
+  mask support in `core/fastconformer.h` (verified char-identical to NeMo at
+  [128,128]; not a win on this model — 46-67 % — but the A/B gate is free).
+
+**Validated** (default flags, latin-stripped char-bigram recall vs whisper GT):
+yt_60s 62.3 → **79.6 %**, yt_120s 57.5 → **81.0 %**, precision held; cap sweep
+8/10/12 confirms 12 best. Residual loss is dominated by the clip's
+English-heavy intro utterance ("Speak Japanese Naturally Podcast…"), which the
+JA model skips whenever the window extends past it — even NeMo emits it only
+letter-by-letter. **Non-JA regression: none** — v3 q8_0 on EN/DE FLEURS
+60 s/300 s byte-identical before/after; reazon-baseball ×3 keeps 3/3 岡本;
+777/777 unit tests. Follow-ups: mirror the cap policy into the session ABI
+(`crispasr_c_api.cpp` reimplements the CLI dispatch) and upload the
+CTC-head-bearing JA GGUF so `--parakeet-decoder ctc` works.
+
 ## 2026-07 CPU weight-read hardening + Mimi codec causal default
 
 Audit follow-up to the CrispEmbed quantized-weight-read fixes; two threads.

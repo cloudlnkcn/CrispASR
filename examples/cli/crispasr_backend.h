@@ -204,6 +204,14 @@ public:
     // override this to get silence-bounded segments that match training.
     virtual bool prefers_vad() const { return false; }
 
+    // Maximum VAD slice duration (seconds) the backend can decode reliably
+    // in one pass; 0 = unbounded. VAD merges continuous speech into slices
+    // as long as the speech runs (40 s+ on podcast audio) — issue #89:
+    // parakeet-ja's encoder collapses past ~12 s, so slices are re-split at
+    // energy minima down to this cap before transcription. Only applied on
+    // the VAD path when the user didn't pass an explicit --chunk-seconds.
+    virtual int vad_slice_cap_seconds() const { return 0; }
+
     // Streaming transcription callback type.
     // Called with partial text (empty string counts as keep-alive)
     // and is_final flag. When is_final is true, partial_text is the

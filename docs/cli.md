@@ -243,16 +243,24 @@ multilingual / v3 / EN models behave very differently:
 - **JA-only (vocab ≤ 4096):** the bidirectional encoder is numerically unstable
   when attention spans the whole utterance — codec-level perturbations as small
   as 0.3 % RMS flipped the encoder output std by ~14 % on the #89 clip, driving
-  the TDT decoder into emit-blank-forever past ~20 s. JA therefore keeps the
-  **streamed** path (global z-norm + overlapping encoder windows + single TDT
-  decode) driven by the dispatcher's VAD / 30 s chunking — unchanged from
-  before §216.
+  the TDT decoder into emit-blank-forever past ~20 s. (Upstream NeMo fails the
+  same way on the same audio — plain, local-attention, and buffered TDT
+  inference all score 1–51 % content recall vs a whisper-large-v3 reference.)
+  JA therefore uses **auto-VAD + a 12 s slice cap + single-pass per slice**:
+  VAD finds speech, slices longer than 12 s (continuous speech merges far past
+  the encoder's ~12 s safe window) are re-split at energy minima, and each
+  slice gets one NeMo-exact full-attention pass. Measured on the issue #89
+  reporter's clips: 80 % content recall vs whisper-large-v3 (up from 56–62 %
+  with the previous streamed default; NeMo's best long-form mode scores 51 %
+  on the same audio).
 
 **Env vars for tuning (all override the per-model defaults):**
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CRISPASR_PARAKEET_STREAM_THRESHOLD` | non-JA 300, JA 0 | Single-pass cap (seconds). Audio ≤ this gets one full-attention pass; `0` disables single-pass entirely (always streamed). |
+| `CRISPASR_PARAKEET_STREAM_THRESHOLD` | non-JA 300, JA 12 | Single-pass cap (seconds). Audio ≤ this gets one full-attention pass; `0` disables single-pass entirely (always streamed). |
+| `CRISPASR_PARAKEET_VAD_SLICE_CAP` | non-JA 0, JA 12 | Max VAD slice duration (seconds); longer slices are re-split at energy minima before decoding. `0` = no cap. |
+| `CRISPASR_PARAKEET_ATT_CONTEXT` | unset | `"L,R"` switches the encoder to rel_pos_local_attn with that window (encoder frames, 1 = 80 ms) — NeMo's `change_attention_model` equivalent. `"-1,-1"` forces full attention. |
 | `CRISPASR_PARAKEET_LONGFORM` | non-JA 1, JA 0 | `1` = silence-split single-pass above the cap; `0` = streamed fallback above the cap. |
 | `CRISPASR_PARAKEET_INTERNAL_CHUNKING` | non-JA on, JA off | `0` = revert to the dispatcher's chunk-30 + overlap-save + LCS-merge path (A/B). |
 | `CRISPASR_PARAKEET_STREAM_CHUNK` | 0 (auto: 8 JA / 30 non-JA) | Streamed-path encoder chunk size (seconds). |
@@ -268,8 +276,9 @@ N-second chunk + merge; `--vad` forces the VAD path.
 # no flags needed, any length:
 crispasr -m parakeet-tdt-0.6b-v3.gguf -f long_de.wav -osrt
 
-# JA model — streamed by default (single-pass collapses past ~20 s):
-crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast_ja.wav --vad -osrt
+# JA model — auto-VAD + 12 s slice cap + per-slice single-pass by default
+# (whole-clip single-pass collapses past ~12 s), no flags needed:
+crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast_ja.wav -osrt
 
 # Force the old dispatcher chunk+merge path for comparison:
 CRISPASR_PARAKEET_INTERNAL_CHUNKING=0 \

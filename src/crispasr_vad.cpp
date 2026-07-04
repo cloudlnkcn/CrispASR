@@ -331,20 +331,25 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
 
     // Post-split: break any VAD segment that exceeds chunk_seconds into
     // sub-segments. Prevents OOM on very long continuous speech (10+ min
-    // lectures). We split into roughly equal parts.
+    // lectures). Cuts land on the lowest-RMS 100 ms inside a ±2 s search
+    // window around each target instead of equal parts, so a cut inside
+    // continuous speech doesn't slice mid-word (issue #89: the words
+    // spanning an arbitrary cut are lost by both adjacent slices).
     if (opts.chunk_seconds > 0) {
         const int max_samples = opts.chunk_seconds * sample_rate;
+        const size_t search_window_samples = (size_t)(2.0 * sample_rate);
+        const size_t energy_win_samples = (size_t)((double)sample_rate * 0.1); // 100 ms
         std::vector<crispasr_audio_slice> split;
         for (auto& sl : slices) {
             const int dur = sl.end - sl.start;
             if (dur <= max_samples) {
                 split.push_back(sl);
             } else {
-                const int n_parts = (dur + max_samples - 1) / max_samples;
-                const int part_samples = dur / n_parts;
-                for (int p = 0; p < n_parts; p++) {
-                    const int s = sl.start + p * part_samples;
-                    const int e = (p == n_parts - 1) ? sl.end : sl.start + (p + 1) * part_samples;
+                auto ranges = audio_chunking::split_at_energy_minima(
+                    samples + sl.start, (size_t)dur, (size_t)max_samples, search_window_samples, energy_win_samples);
+                for (auto& r : ranges) {
+                    const int s = sl.start + (int)r.first;
+                    const int e = sl.start + (int)r.second;
                     split.push_back({
                         s,
                         e,

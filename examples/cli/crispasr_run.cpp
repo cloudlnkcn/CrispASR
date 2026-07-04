@@ -488,8 +488,18 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         }
     }
 
+    // Issue #89: backends with a bounded safe decode window (parakeet-ja,
+    // ~12 s) need VAD slices re-split at energy minima down to that cap —
+    // continuous speech merges into 40 s+ slices that decode sparse. An
+    // explicit --chunk-seconds keeps the user in charge of the split size.
+    int slice_chunk_seconds = effective_chunk_seconds;
+    const int vad_cap = backend.vad_slice_cap_seconds();
+    if (wants_vad && !params.chunk_seconds_explicit && vad_cap > 0 &&
+        (slice_chunk_seconds == 0 || slice_chunk_seconds > vad_cap)) {
+        slice_chunk_seconds = vad_cap;
+    }
     const auto slices =
-        crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, effective_chunk_seconds, params);
+        crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, slice_chunk_seconds, params);
 
     if (slices.empty()) {
         fprintf(stderr, "crispasr: warning: no speech detected in '%s'\n", fname_inp.c_str());

@@ -326,6 +326,19 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         hp.att_context_left = core_gguf::kv_i32(gctx, "parakeet.att_context_left", hp.att_context_left);
         hp.att_context_right = core_gguf::kv_i32(gctx, "parakeet.att_context_right", hp.att_context_right);
         hp.global_tokens = core_gguf::kv_u32(gctx, "parakeet.global_tokens", hp.global_tokens);
+        // Issue #89: NeMo supports switching a full-attention FastConformer to
+        // rel_pos_local_attn at inference time (change_attention_model) for
+        // long-form audio; the mask math is identical, only the window
+        // changes. CRISPASR_PARAKEET_ATT_CONTEXT="L,R" (encoder frames,
+        // 1 frame = 80 ms) applies the same switch here. "-1,-1" forces full
+        // attention even for GGUFs that ship a local-attn context.
+        if (const char* e = getenv("CRISPASR_PARAKEET_ATT_CONTEXT")) {
+            int l = -1, r = -1;
+            if (sscanf(e, "%d,%d", &l, &r) == 2) {
+                hp.att_context_left = l;
+                hp.att_context_right = r;
+            }
+        }
 
         // CTC head metadata (hybrid TDT+CTC models).
         model.has_ctc = core_gguf::kv_bool(gctx, "parakeet.has_ctc", false);

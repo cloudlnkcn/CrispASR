@@ -203,7 +203,11 @@ public:
         //   CRISPASR_PARAKEET_STREAM_CHUNK / _OVERLAP : streamed encoder window.
         // CLI escape hatches (no env needed): --chunk-seconds N forces the
         // dispatcher's N-second chunk+merge; --vad forces the VAD path.
-        int stream_threshold_s = is_ja_model_ ? 0 : 300;
+        // JA: single-pass is NeMo-exact and safe up to ~12 s (issue #89 —
+        // past that the encoder collapses on real speech); with the VAD
+        // slice cap at 12 s every slice decodes single-pass. Longer inputs
+        // (explicit --chunk-seconds 0) still stream.
+        int stream_threshold_s = is_ja_model_ ? 12 : 300;
         bool longform_enabled = !is_ja_model_;
         int stream_chunk_s = 0; // 0 = let the C library pick per-model
         int stream_overlap_s = 2;
@@ -376,6 +380,20 @@ public:
         // (repetition loops). VAD gives silence-bounded segments matching
         // the ~10-15 s utterances the model was trained on.
         return is_ja_model_;
+    }
+
+    int vad_slice_cap_seconds() const override {
+        // Issue #89: on continuous speech (podcasts) VAD merges slices far
+        // past the JA encoder's ~12 s safe single-pass window and the
+        // decode goes sparse (56 % content recall on the reporter's clip).
+        // Capping slices at 12 s + single-pass per slice measured best
+        // (73-81 % vs whisper-large-v3 reference, NeMo's own long-form
+        // paths score 15-46 % on the same audio). Non-JA models are exact
+        // in single-pass and don't need a cap.
+        int cap = is_ja_model_ ? 12 : 0;
+        if (const char* e = getenv("CRISPASR_PARAKEET_VAD_SLICE_CAP"))
+            cap = std::max(0, atoi(e));
+        return cap;
     }
 
     void shutdown() override {
