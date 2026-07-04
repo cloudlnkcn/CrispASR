@@ -37,6 +37,7 @@ add_executable(${TARGET}
     crispasr_backend_tada.cpp
     crispasr_backend_indextts.cpp
     crispasr_backend_f5_tts.cpp
+    crispasr_backend_irodori_tts.cpp
     crispasr_backend_pocket_tts.cpp
     crispasr_backend_csm.cpp
     crispasr_backend_parler.cpp
@@ -301,6 +302,7 @@ target_link_libraries(${TARGET} PRIVATE
     bark-tts
     dia-tts
     dots-tts
+    irodori-tts
     pocket-tts
     csm-tts
     voxcpm2_tts

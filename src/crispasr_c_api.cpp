@@ -1292,6 +1292,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "indextts";
     else if (strcmp(arch, "f5-tts") == 0 || strcmp(arch, "f5tts") == 0)
         backend = "f5-tts";
+    else if (strcmp(arch, "irodori-tts") == 0 || strcmp(arch, "irodori_tts") == 0)
+        backend = "irodori-tts";
     else if (strcmp(arch, "m2m100") == 0)
         backend = "m2m100";
     else if (strcmp(arch, "parler-tts") == 0 || strcmp(arch, "parler_tts") == 0 || strcmp(arch, "parlertts") == 0)

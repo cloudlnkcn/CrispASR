@@ -1603,6 +1603,18 @@ endif()
 endif()
 
 # ---------------------------------------------------------------------------
+# irodori-tts — Aratako/Irodori-TTS RF-DiT flow matching TTS (native ggml)
+# ---------------------------------------------------------------------------
+add_library(irodori-tts STATIC irodori_tts.h irodori_tts.cpp)
+set_target_properties(irodori-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(irodori-tts PUBLIC .)
+target_compile_features   (irodori-tts PUBLIC cxx_std_17)
+target_link_libraries     (irodori-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(irodori-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # f5-tts — SWivid/F5-TTS DiT-based flow matching TTS (native ggml runtime)
 # ---------------------------------------------------------------------------
 add_library(f5-tts STATIC f5_tts.h f5_tts.cpp)

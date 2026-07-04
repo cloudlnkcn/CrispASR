@@ -772,6 +772,11 @@ constexpr Entry k_registry[] = {
     {"f5-tts", "f5-tts-v1-base-f16.gguf",
      "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-f16.gguf",
      "~953 MB", nullptr, nullptr},
+    // Irodori-TTS v3 500M: RF-DiT flow-matching TTS with zero-shot voice
+    // cloning via DAC-VAE latents. 48 kHz output, Japanese-focused.
+    {"irodori-tts", "irodori-tts-500m-v3-f16.gguf",
+     nullptr, // URL TBD — model needs conversion first
+     "~1 GB", nullptr, nullptr},
     // CTC forced aligner — used by `-am auto` to attach word-level
     // timestamps (LLM-decode backends, or any backend when paired
     // with `--force-aligner` / `-fa`). Q4_K is the recommended quant
