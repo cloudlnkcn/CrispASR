@@ -26,6 +26,7 @@
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_aligner_cli.h"
+#include "crispasr_aligner.h"
 #include "crispasr_lid_cli.h"
 #include "crispasr_lid.h" // crispasr_lid_free_cache()
 #include "crispasr_diarize_cli.h"
@@ -1300,6 +1301,201 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
 
         crispasr_wm_dispatch::shutdown();
+        return 0;
+    }
+
+    // ── --align-only: standalone CTC forced alignment (issue #217) ─────────
+    // Runs the CTC aligner on user-provided text + audio without ASR.
+    // Accepts text from --ref-text or --text-file (.txt or .srt).
+    if (params.align_only) {
+        // Resolve aligner model.
+        std::string am = params.aligner_model;
+        if (am.empty() || am == "auto" || am == "default") {
+            am = crispasr_resolve_model_cli(am.empty() ? "auto" : am, "canary-ctc-aligner", params.no_prints,
+                                            params.cache_dir, params.auto_download);
+        } else {
+            const std::string resolved =
+                crispasr_resolve_model_cli(am, "", params.no_prints, params.cache_dir, params.auto_download);
+            if (!resolved.empty())
+                am = resolved;
+        }
+        if (am.empty()) {
+            fprintf(stderr, "crispasr[align-only]: no aligner model. Pass -am <path.gguf> "
+                            "or -am auto --auto-download.\n");
+            return 10;
+        }
+
+        // Read transcript text.
+        std::string transcript;
+        if (!params.text_file.empty()) {
+            FILE* tf = fopen(params.text_file.c_str(), "rb");
+            if (!tf) {
+                fprintf(stderr, "crispasr[align-only]: cannot open text file '%s'\n", params.text_file.c_str());
+                return 10;
+            }
+            fseek(tf, 0, SEEK_END);
+            long sz = ftell(tf);
+            fseek(tf, 0, SEEK_SET);
+            std::string raw(sz, '\0');
+            if ((long)fread(&raw[0], 1, sz, tf) != sz) {
+                fprintf(stderr, "crispasr[align-only]: short read from '%s'\n", params.text_file.c_str());
+                fclose(tf);
+                return 10;
+            }
+            fclose(tf);
+
+            // Detect .srt by extension and strip timestamps/indices.
+            const std::string& p = params.text_file;
+            bool is_srt = (p.size() >= 4 && (p.substr(p.size() - 4) == ".srt" || p.substr(p.size() - 4) == ".SRT"));
+            if (is_srt) {
+                // SRT parsing: extract only text lines (skip indices + timestamps).
+                std::string text_only;
+                enum { S_INDEX, S_TIME, S_TEXT } state = S_INDEX;
+                size_t i = 0;
+                while (i < raw.size()) {
+                    // Read one line.
+                    size_t nl = raw.find('\n', i);
+                    if (nl == std::string::npos)
+                        nl = raw.size();
+                    std::string line = raw.substr(i, nl - i);
+                    // Strip \r
+                    if (!line.empty() && line.back() == '\r')
+                        line.pop_back();
+                    i = nl + 1;
+
+                    if (state == S_INDEX) {
+                        // Expect a numeric index line (or blank between entries).
+                        if (line.empty())
+                            continue;
+                        // Advance to timestamp line.
+                        state = S_TIME;
+                    } else if (state == S_TIME) {
+                        // Timestamp line: contains "-->".
+                        state = S_TEXT;
+                    } else { // S_TEXT
+                        if (line.empty()) {
+                            state = S_INDEX;
+                        } else {
+                            if (!text_only.empty())
+                                text_only += ' ';
+                            text_only += line;
+                        }
+                    }
+                }
+                transcript = text_only;
+            } else {
+                // Plain .txt: use as-is, collapse newlines to spaces.
+                for (char& c : raw) {
+                    if (c == '\n' || c == '\r')
+                        c = ' ';
+                }
+                transcript = raw;
+            }
+        } else if (!params.tts_ref_text.empty()) {
+            transcript = params.tts_ref_text;
+        } else {
+            fprintf(stderr, "crispasr[align-only]: requires --ref-text or --text-file.\n");
+            return 10;
+        }
+
+        // Trim leading/trailing whitespace.
+        while (!transcript.empty() && (transcript.front() == ' ' || transcript.front() == '\t'))
+            transcript.erase(transcript.begin());
+        while (!transcript.empty() && (transcript.back() == ' ' || transcript.back() == '\t'))
+            transcript.pop_back();
+
+        if (transcript.empty()) {
+            fprintf(stderr, "crispasr[align-only]: transcript is empty.\n");
+            return 10;
+        }
+
+        // Load audio.
+        if (params.fname_inp.empty()) {
+            fprintf(stderr, "crispasr[align-only]: requires an audio file (-f <audio.wav>).\n");
+            return 10;
+        }
+        std::vector<float> samples;
+        std::vector<std::vector<float>> stereo_dummy;
+        if (!read_audio_data(params.fname_inp[0], samples, stereo_dummy, false)) {
+            fprintf(stderr, "crispasr[align-only]: failed to load audio '%s'\n", params.fname_inp[0].c_str());
+            return 10;
+        }
+        if (!params.no_prints) {
+            fprintf(stderr, "crispasr[align-only]: aligner=%s\n", am.c_str());
+            fprintf(stderr, "crispasr[align-only]: audio=%.2fs (%d samples @ 16kHz)\n",
+                    (float)samples.size() / 16000.0f, (int)samples.size());
+            fprintf(stderr, "crispasr[align-only]: transcript='%.80s%s'\n", transcript.c_str(),
+                    transcript.size() > 80 ? "…" : "");
+        }
+
+        // Run alignment.
+        auto aligned = crispasr_align_words(am, transcript, samples.data(), (int)samples.size(), /*t_offset_cs=*/0,
+                                            params.n_threads);
+        if (aligned.empty()) {
+            fprintf(stderr, "crispasr[align-only]: alignment failed or produced no words.\n");
+            return 10;
+        }
+
+        // Format output.
+        const double clip_end = (double)samples.size() / 16000.0;
+        auto ts = [](double s, bool comma) -> std::string {
+            if (s < 0)
+                s = 0;
+            int h = (int)(s / 3600);
+            int m = (int)((s - h * 3600) / 60);
+            int sec = (int)(s - h * 3600 - m * 60);
+            int ms = (int)((s - (int)s) * 1000 + 0.5);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d%c%03d", h, m, sec, comma ? ',' : '.', ms);
+            return buf;
+        };
+        std::string out;
+        const std::string& fmt = params.align_format;
+        if (fmt == "json") {
+            out = "[\n";
+            for (size_t i = 0; i < aligned.size(); i++) {
+                double t0 = aligned[i].t0_cs / 100.0;
+                double t1 = aligned[i].t1_cs / 100.0;
+                std::string esc;
+                for (char c : aligned[i].text) {
+                    if (c == '"' || c == '\\')
+                        esc += '\\';
+                    esc += c;
+                }
+                char line[256];
+                snprintf(line, sizeof(line), "  {\"word\": \"%s\", \"start\": %.3f, \"end\": %.3f}%s\n", esc.c_str(),
+                         t0, t1, i + 1 < aligned.size() ? "," : "");
+                out += line;
+            }
+            out += "]\n";
+        } else if (fmt == "plain") {
+            for (auto& w : aligned)
+                out += ts(w.t0_cs / 100.0, false) + "\t" + w.text + "\n";
+        } else { // srt (default)
+            for (size_t i = 0; i < aligned.size(); i++) {
+                double t0 = aligned[i].t0_cs / 100.0;
+                double t1 = aligned[i].t1_cs / 100.0;
+                if (t1 <= t0)
+                    t1 = (i + 1 < aligned.size()) ? aligned[i + 1].t0_cs / 100.0 : clip_end;
+                out += std::to_string(i + 1) + "\n" + ts(t0, true) + " --> " + ts(t1, true) + "\n" + aligned[i].text +
+                       "\n\n";
+            }
+        }
+
+        if (params.align_output.empty()) {
+            fputs(out.c_str(), stdout);
+        } else {
+            FILE* f = fopen(params.align_output.c_str(), "wb");
+            if (!f) {
+                fprintf(stderr, "crispasr[align-only]: cannot write '%s'\n", params.align_output.c_str());
+                return 10;
+            }
+            fwrite(out.data(), 1, out.size(), f);
+            fclose(f);
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr[align-only]: %zu words → %s\n", aligned.size(), params.align_output.c_str());
+        }
+        crispasr_aligner_free_cache();
         return 0;
     }
 

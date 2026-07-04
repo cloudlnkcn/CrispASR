@@ -580,6 +580,10 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.align_output = ARGV_NEXT;
     } else if (arg == "--align-format") {
         params.align_format = ARGV_NEXT;
+    } else if (arg == "--align-only") {
+        params.align_only = true;
+    } else if (arg == "--text-file") {
+        params.text_file = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
@@ -1149,7 +1153,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr,
             "             --align                   forced-alignment word timestamps via the TADA aligner\n"
             "                                                 (--voice <audio.wav> --ref-text \"transcript\"\n"
-            "                                                 [--align-format srt|json|plain] [--align-output f])\n");
+            "                                                 [--align-format srt|json|plain] [--align-output f])\n"
+            "             --align-only              standalone CTC forced alignment (issue #217)\n"
+            "                                                 (-am <aligner.gguf> -f <audio> --ref-text \"text\"\n"
+            "                                                 or --text-file <file.txt|file.srt>)\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",
@@ -2135,6 +2142,12 @@ int main(int argc, char** argv) {
     // or input files — route directly to the backend (which handles it
     // and exits before any model resolution).
     if (!params.detect_watermark_file.empty()) {
+        return crispasr_run_backend(params);
+    }
+
+    // Issue #217: --align-only is a standalone verb that needs only an aligner
+    // model + audio + text — no ASR backend.
+    if (params.align_only) {
         return crispasr_run_backend(params);
     }
 

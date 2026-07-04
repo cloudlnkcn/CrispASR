@@ -295,6 +295,13 @@ struct whisper_params {
     std::string align_output;         // output path (default: stdout)
     std::string align_format = "srt"; // srt | json | plain
 
+    // Issue #217: standalone CTC forced alignment mode.
+    // Input: audio file + text (--ref-text or --text-file).
+    // Runs the CTC aligner (canary-ctc / wav2vec2 / qwen3-fa) without
+    // requiring an ASR model or transcription step.
+    bool align_only = false;
+    std::string text_file; // path to .txt or .srt (text extracted, timestamps stripped)
+
     // AudioSeal neural watermark model (optional upgrade from spread-spectrum).
     // When set, loads the GGUF and uses it for watermark embed/detect
     // instead of the built-in spread-spectrum watermark.
