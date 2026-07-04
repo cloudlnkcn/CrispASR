@@ -256,6 +256,31 @@ unrelated foot-gun stacked on top: the prompt buffer was sized `T_enc+8` but the
 template needs `T_enc+10`, so `build_prompt` returned −1 and the transcribe silently
 produced *empty* output — size prompt scratch generously and check the return.
 
+## An input feature the checkpoint wasn't trained with is worse than nothing — the moss-transcribe time-marker experiment (#218)
+
+`processing_Moss.py` has an `enable_time_marker` mode that interleaves digit
+tokens (the running second count, digit d → token id 15+d) into the audio token
+stream every 2 s at 12.5 tok/s — an input-side temporal anchor, not an output
+alignment. The tempting hypothesis (#218): those anchors might give the greedy
+decoder positional grounding and curb the long-audio repeated-phrase loops,
+letting us use larger chunks and shrink the segmentation tradeoff. Tested it
+behind `CRISPASR_MOSS_TRANSCRIBE_TIME_MARKER=1`, with the prompt construction
+verified **byte-identical** to `_build_audio_tokens_with_time_markers` for 8
+lengths (incl. edge cases 13/25/26). Result on `t32-145s.wav` at 30 s, raw
+(no loop-fix): **markedly worse.** The model *reads the digits aloud* — slice 1
+became "Two, three, four, five, six, seven, eight, nine, ten, eleven…", slice 3
+"Two, four, five, six…", slice 6 "…how do you know **it's two**…" — hallucinated
+other slices, looped catastrophically (a 66-token slice ballooned to the 512-token
+cap: "go go go come on!" ×N), and ran 2.5× slower (0.5× vs 1.2× RT). Cause: the
+feature defaults to `False` (the README example sets it `False`) and this preview
+checkpoint was RL-tuned with markers **off**, so it has no learned meaning for the
+interleaved digits and transcribes them as speech. Lesson: an input-conditioning
+feature that exists in the *processor* code is worthless — actively harmful —
+unless the *weights* were trained with it. Verify the checkpoint's default/training
+config before wiring a processor knob into the runtime; byte-perfect parity with
+the reference *construction* proves nothing if the model was never trained on it.
+Reverted (not shipped); documented so it isn't re-attempted.
+
 ## Stage the PyTorch reference load — encoder and LM as separate standalone modules, never the monolithic `*ForCausalLM` (moss-transcribe)
 
 On a 16 GB box the obvious `MossForCausalLM(config)` + `load_state_dict` reference

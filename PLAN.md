@@ -421,6 +421,15 @@ work:
   a word straddling a 30 s cut can be lost/split; net far better than the dup + longer
   loops. Proper per-token timestamps would let overlap-save trim cleanly, but moss has
   no alignment — noted as a future option, not worth the crude uniform-timestamp hack.
+- **REJECTED #218 — input time markers.** `processing_Moss.py`'s `enable_time_marker`
+  (interleave digit tokens every 2 s at 12.5 tok/s) was tested as a possible way to
+  give the greedy decoder positional grounding → fewer long-audio loops → larger
+  chunks → smaller seam tradeoff. Prompt construction verified byte-identical to the
+  reference, but on `t32-145s.wav` it was **markedly worse**: the model reads the digits
+  aloud ("Two, three, four, five…"), hallucinates, loops to the 512 cap, and runs 2.5×
+  slower — because the feature defaults to `False` and this checkpoint was RL-tuned with
+  markers off (no learned meaning for the digits). Reverted; see LEARNINGS. Only worth
+  revisiting for a future MOSS checkpoint trained with `enable_time_marker=True`.
 - **Publish f16 + q8_0** to `cstr/MOSS-Transcribe-preview-2B-GGUF` (q4_k + card are
   live; f16/q8_0 were held back for WLAN bandwidth). Re-stage from
   `/Volumes/backups/ai/moss-transcribe-preview-2b-{f16,q8_0}.gguf` and
