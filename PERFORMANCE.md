@@ -1531,7 +1531,32 @@ bandwidth, is what limits them.
 
 ---
 
-## Long-audio coverage benchmark — 2026-05-21 (issue #89)
+## Long-audio coverage — 2026-07-04 final state (issue #89 closed out)
+
+Platform: Apple M1 16 GB, Metal. Commits `ca1e871b` (VAD slice cap 12 s +
+per-slice single-pass) + `3a8141e3` (gap-fill second pass). Scoring:
+char-bigram recall/precision vs a whisper-large-v3-turbo reference with
+hiragana-reading normalization (pykakasi) — the coverage metric that
+erases kanji/kana spelling variants; latin stripped (the JA model renders
+English in katakana, which a latin reference can't credit).
+
+| clip | old default (streamed) | shipped default | precision | notes |
+|---|---|---|---|---|
+| yt_60s (reporter's clip) | 64.2 % | **97.2 %** | 90.5 % | auto-VAD + 12 s cap + gap-fill |
+| yt_120s | 61.3 % | **96.9 %** | 91.2 % | |
+| first300 (reporter's 300 s repro) | — (June main-default.srt: 0.7 %) | **95.9 %** | 93.4 % | |
+| session ABI (yt_60s, bindings/server path) | ~58 % | **94.8 %** | 89.2 % | energy slices instead of silero |
+
+Ceiling calibration: an independent SenseVoice-small run scores 97.2/96.8 %
+recall against the same reference at 78 % precision — the shipped pipeline
+sits AT the inter-model agreement ceiling; the residual is hearing variants,
+not missing content. Blueprint comparison on the same audio: NeMo 2.7.3
+plain transcribe 11 %, local-attn [128,128] 46 % (both char-identical to our
+port — bit-faithfulness check), buffered BatchedFrameASRTDT 15-51 %.
+Gap-fill cost: one extra short encode per recovered gap (~1.3-2× wall on
+gap-heavy clips); `CRISPASR_GAP_FILL=0` restores single-pass-per-slice.
+
+## Long-audio coverage benchmark — 2026-05-21 (issue #89, historical)
 
 Platform: x86_64 VPS, 4 threads, CPU-only, no GPU. Commit `5e16414`
 (30 s auto-chunk fallback + PR #116 VAD gate fix).

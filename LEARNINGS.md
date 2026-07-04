@@ -11772,3 +11772,72 @@ similar for the punctuation engines.
 `quick_gelu` (CLIP) is `ggml_gelu_quick`. Fixed in `bert_encoder.cpp` (bert-base-uncased,
 MeloTTS conditioning) and, in the shared crisp_punc lib, in `pcs.cpp` + `fireredpunc.cpp`.
 Verify each hit against the model's real `config.json`, not intuition.
+
+---
+
+## Issue #89 close-out: four transferable lessons (2026-07-04)
+
+### 1. FastConformer-JA blanks a whole utterance whenever enough context *follows* it — test the missing span in isolation before blaming chunking
+
+The reporter's clip's first 4.6 s ("皆さんこんにちは…") transcribes **verbatim
+in isolation** but is skipped inside *any* window ≥8 s that extends past it —
+even a window starting at exactly 0.0 s. This is not decoder cold-start, not
+z-norm drift at the boundary, and no amount of chunk/overlap tuning recovers
+it (cap sweep 8/10/12 s: the intro is skipped in all of them). Upstream NeMo
+does the same. The **diagnostic that cracked it**: cut the missing span out
+with ffmpeg and transcribe it alone. If that works, the fix is a **gap-fill
+second pass** (find ≥1 s spans with no emitted words inside a slice,
+re-transcribe each in isolation, merge non-duplicate words back) — shipped in
+`crispasr_run.cpp` (`crispasr_gap_fill_slice`, inside `process_slice` so all
+output paths get it) and mirrored in the session ABI. Coverage went
+80 % → 97.2/96.9/95.9 % on the 60/120/300 s reproducers. Cost: one extra
+short encode per recovered gap. Counterintuitive tuning result: lowering the
+trigger from 1.0 s to 0.6 s made recall *worse* (more transcription-variant
+noise) and much slower — the 1.0 s default is a sweet spot, don't "more is
+more" it.
+
+### 2. Cross-model content-recall scoring has a ceiling — measure it with a second independent system before chasing 100 %
+
+Char-bigram recall of parakeet output against a whisper-large-v3-turbo
+reference saturates around **93-95 % raw** even when nothing is missing,
+because two correct systems spell the same Japanese differently (皆さん vs
+みなさん, くる vs クルー, 初め vs 始め). Two normalizations matter for JA:
+(a) **strip latin** from the reference — a JA-only model renders "Speak
+Japanese Naturally Podcast" in katakana (correct!) which a latin-script
+reference can't credit, and (b) **hiragana-reading normalization** (pykakasi
+`convert → hira`) to erase kanji/kana spelling variants — this is the honest
+*coverage* metric. Calibrate the ceiling by scoring an unrelated strong model
+(SenseVoice-small) against the same reference: it landed at 97.2/96.8 %
+recall — exactly where our fixed pipeline landed — at far lower precision
+(78 % vs our 90 %). When your recall equals the independent-model ceiling,
+the residual is hearing variants, not missing content; stop optimizing.
+
+### 3. Prove the port bit-faithful FIRST (same-audio blueprint parity), then the fix hunt changes from "find our bug" to "pick a better pipeline policy"
+
+NeMo 2.7.3 with the original checkpoint, same audio: plain transcribe
+42 chars / local-attn [128,128] 157 chars / CTC single-pass 7 chars —
+**char-identical to our GGUF runtime in every mode** (the local-attn parity
+came free because `core/fastconformer.h` + `parakeet.cpp` already had the
+band-mask; `CRISPASR_PARAKEET_ATT_CONTEXT="L,R"` now exposes it as NeMo's
+`change_attention_model` equivalent). And NeMo's *recommended* long-form
+path (buffered `BatchedFrameASRTDT`) scored 14.7 % (4 s/8 s) and 51.3 %
+(stock 1.6 s/4 s) — worse than our then-current default. Two cheap decisive
+A/Bs to run before any code: (a) **CTC head over the same encoder features**
+(single-pass CTC also collapsed → the pathology is in the ENCODER, not TDT
+decode dynamics), (b) **the blueprint on the same audio** (identical failure
+→ not a port bug). Each took minutes and killed whole classes of hypotheses.
+
+### 4. Autoregressive decode compounds quant noise; non-autoregressive decode over the same weights doesn't — offer CTC as the q4_k mode
+
+parakeet-ja q4_k TDT enters a "りましたけど" fixed-point repetition loop
+(the OLD published q4_k does exactly the same — pre-existing, not a
+conversion regression). The **CTC head over the same q4_k encoder is clean**
+and matches the F16 CTC transcript: CTC has no predictor-LSTM feedback loop
+for the quantisation noise to compound through. q8_0 TDT is byte-identical
+to F16. So instead of dropping q4_k (the Kokoro precedent), ship it with
+"use `--parakeet-decoder ctc`" guidance — which required actually including
+the hybrid model's CTC head in the GGUF (`ctc.weight/bias`; the pre-2026-07
+uploads lacked it and `--parakeet-decoder ctc` silently fell back to TDT
+with only a stderr note). When a backend advertises alternative decode
+heads, verify the published GGUFs actually CONTAIN them.
+

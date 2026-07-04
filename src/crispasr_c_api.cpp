@@ -3893,6 +3893,136 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     }
 #ifdef CA_HAVE_PARAKEET
     if (s->backend == "parakeet" && s->parakeet_ctx) {
+        // Issue #89 (JA long audio): mirror of the CLI default — energy-minima
+        // slices at most `cap_s` long (the JA encoder collapses past ~12 s of
+        // context on real speech), one exact single pass per slice, then a
+        // gap-fill second pass re-transcribing any span >=1 s the first pass
+        // left empty inside a slice (the encoder blanks an utterance whenever
+        // enough context follows it; the same span decodes verbatim in
+        // isolation). See examples/cli/crispasr_run.cpp gap-fill for the
+        // measured numbers (97/97/96 % recall vs 53-62 % streamed).
+        auto transcribe_ja_sliced = [&](const float* audio, int n, int sr, int cap_s) -> crispasr_session_seg {
+            int64_t min_gap_cs = 100;
+            if (const char* e = getenv("CRISPASR_GAP_FILL_MIN_CS"))
+                min_gap_cs = std::max((int64_t)30, (int64_t)atoi(e));
+            bool gap_fill = true;
+            if (const char* e = getenv("CRISPASR_GAP_FILL"))
+                gap_fill = atoi(e) != 0;
+            constexpr int64_t kEdgePadCs = 20;
+            constexpr int64_t kCoverSlopCs = 30;
+
+            const auto slices = crispasr_energy_chunk_slices(audio, n, sr, cap_s, 2.0f);
+            std::vector<crispasr_session_seg::word> words;
+            auto run_window = [&](int w0, int w1, int64_t t0_cs, std::vector<crispasr_session_seg::word>& out) {
+                parakeet_result* pr = parakeet_transcribe_ex(s->parakeet_ctx, audio + w0, w1 - w0, t0_cs);
+                if (!pr)
+                    return;
+                for (int i = 0; i < pr->n_words; ++i) {
+                    crispasr_session_seg::word w;
+                    w.text = pr->words[i].text;
+                    w.t0 = pr->words[i].t0;
+                    w.t1 = pr->words[i].t1;
+                    w.p = pr->words[i].p > 0.0f ? pr->words[i].p : 1.0f;
+                    out.push_back(std::move(w));
+                }
+                parakeet_result_free(pr);
+            };
+            for (size_t si = 0; si < slices.size(); ++si) {
+                const auto& sl = slices[si];
+                std::vector<crispasr_session_seg::word> sw;
+                run_window(sl.start, sl.end, sl.t0_cs, sw);
+                // Gap-fill rounds within this slice.
+                for (int round = 0; gap_fill && round < 2; ++round) {
+                    std::vector<std::pair<int64_t, int64_t>> merged;
+                    {
+                        std::vector<std::pair<int64_t, int64_t>> cov;
+                        for (const auto& w : sw)
+                            cov.push_back({w.t0, std::max(w.t1, w.t0 + 1)});
+                        std::sort(cov.begin(), cov.end());
+                        for (auto& iv : cov) {
+                            if (!merged.empty() && iv.first <= merged.back().second + kCoverSlopCs)
+                                merged.back().second = std::max(merged.back().second, iv.second);
+                            else
+                                merged.push_back(iv);
+                        }
+                    }
+                    std::vector<std::pair<int64_t, int64_t>> gaps;
+                    int64_t cursor = sl.t0_cs;
+                    for (auto& iv : merged) {
+                        if (iv.first - cursor >= min_gap_cs)
+                            gaps.push_back({cursor, iv.first});
+                        cursor = std::max(cursor, iv.second);
+                    }
+                    if (sl.t1_cs - cursor >= min_gap_cs)
+                        gaps.push_back({cursor, sl.t1_cs});
+                    if (gaps.empty())
+                        break;
+                    bool recovered = false;
+                    for (auto& g : gaps) {
+                        const int64_t win0_cs = std::max(sl.t0_cs, g.first - kEdgePadCs);
+                        const int64_t win1_cs = std::min(sl.t1_cs, g.second + kEdgePadCs);
+                        const int w0 = std::max(0, (int)(win0_cs * sr / 100));
+                        const int w1 = std::min(n, (int)(win1_cs * sr / 100));
+                        if (w1 - w0 < sr / 4)
+                            continue;
+                        std::vector<crispasr_session_seg::word> fw;
+                        run_window(w0, w1, win0_cs, fw);
+                        for (auto& w : fw) {
+                            const int64_t mid = (w.t0 + w.t1) / 2;
+                            if (mid < g.first - kCoverSlopCs || mid >= g.second + kCoverSlopCs)
+                                continue;
+                            bool covered = false;
+                            for (const auto& iv : merged)
+                                if (mid >= iv.first && mid < iv.second) {
+                                    covered = true;
+                                    break;
+                                }
+                            if (!covered) {
+                                sw.push_back(std::move(w));
+                                recovered = true;
+                            }
+                        }
+                    }
+                    if (!recovered)
+                        break;
+                    std::sort(sw.begin(), sw.end(),
+                              [](const crispasr_session_seg::word& a, const crispasr_session_seg::word& b) {
+                                  return a.t0 < b.t0;
+                              });
+                }
+                for (auto& w : sw)
+                    words.push_back(std::move(w));
+                if (s->progress_cb)
+                    s->progress_cb((int)si + 1, (int)slices.size(), s->progress_ud);
+            }
+            std::sort(
+                words.begin(), words.end(),
+                [](const crispasr_session_seg::word& a, const crispasr_session_seg::word& b) { return a.t0 < b.t0; });
+            crispasr_session_seg seg;
+            for (const auto& w : words) {
+                if (w.text.empty())
+                    continue;
+                if (!seg.text.empty()) {
+                    const unsigned char prev_last = (unsigned char)seg.text.back();
+                    const unsigned char cur_first = (unsigned char)w.text[0];
+                    // CJK boundaries take no space (>= 0xE0 lead byte = 3-byte
+                    // UTF-8: kana / CJK / hangul); latin words usually carry a
+                    // leading space from the tokenizer already.
+                    if (cur_first != ' ' && prev_last < 0xE0 && cur_first < 0xE0)
+                        seg.text += ' ';
+                }
+                seg.text += w.text;
+            }
+            if (!seg.text.empty() && seg.text[0] == ' ')
+                seg.text.erase(0, 1);
+            if (!words.empty()) {
+                seg.t0 = words.front().t0;
+                seg.t1 = words.back().t1;
+            }
+            seg.words = std::move(words);
+            return seg;
+        };
+
         // Issue #208: the session path used to call parakeet_transcribe_ex,
         // routing the WHOLE buffer through one full-length FastConformer
         // encode. Two problems on long audio: (1) the encoder's
@@ -3967,7 +4097,21 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             return r;
         }
 
-        // JA long audio → streamed; short audio → the exact single pass.
+        // JA long audio → capped-slice single-pass + gap-fill (issue #89
+        // mirror of the CLI default; CRISPASR_PARAKEET_VAD_SLICE_CAP=0
+        // reverts to the old streamed path, an explicit chunked request via
+        // crispasr_session_transcribe_chunked keeps the caller's sizing).
+        int ja_cap_s = 12;
+        if (const char* e = getenv("CRISPASR_PARAKEET_VAD_SLICE_CAP"))
+            ja_cap_s = std::max(0, atoi(e));
+        if (!use_single_pass && is_ja && ja_cap_s > 0 && !force_chunked) {
+            g_progress.store(0, std::memory_order_relaxed);
+            r->segments.push_back(transcribe_ja_sliced(pcm, n_samples, SR, ja_cap_s));
+            g_progress.store(-1, std::memory_order_relaxed);
+            return r;
+        }
+
+        // JA long audio (streamed fallback); short audio → the exact single pass.
         parakeet_result* pr =
             (!use_single_pass && is_ja)
                 ? parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, stream_chunk_s, stream_overlap_s)

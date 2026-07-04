@@ -48,6 +48,17 @@ streamed path (threshold 0), never single-pass.
   mask support in `core/fastconformer.h` (verified char-identical to NeMo at
   [128,128]; not a win on this model — 46-67 % — but the A/B gate is free).
 
+**Session-ABI mirror (same day).** `crispasr_c_api.cpp`'s parakeet session
+path (bindings / server) still routed JA long audio through the streamed
+encoder (~58 % recall). Mirrored the CLI policy at the `s->parakeet_ctx`
+site: `crispasr_energy_chunk_slices` at the 12 s cap (no VAD model needed on
+the session path — energy minima only), one exact pass per slice, the same
+two-round gap-fill, words merged into the session's single-segment shape
+with CJK-aware text rebuild. yt_60s via the session harness: **94.8 %
+recall / 89.2 % prec** (CLI: 97.2 — silero VAD bounds beat pure energy
+slicing slightly). `CRISPASR_PARAKEET_VAD_SLICE_CAP=0` reverts to streamed;
+an explicit `crispasr_session_transcribe_chunked` keeps the caller's sizing.
+
 **Gap-fill second pass (same day, follow-up for >95 % coverage).** Even with
 capped single-pass slices the encoder sometimes emits *nothing* for a
 multi-second span inside a slice — it blanks an utterance whenever enough
