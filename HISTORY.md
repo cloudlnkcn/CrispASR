@@ -425,6 +425,37 @@ graphs/slice — the likely real trigger, unverifiable without native HW). Verif
 on MoltenVK: still full GPU, jfk verbatim (1.5× RT). Native crash-gone is the
 reporter's to confirm.
 
+### #218 2026-07-04 greedy n-gram loops + 30 s-seam duplication on long audio
+
+Reporter: q8_0 on a 145 s clip (`t32-145s.wav`) emits "a lot of" repeated "hey"s
+and "come on"s. Two independent defects, both specific to long audio (the clip is
+auto-sliced into 6×30 s because moss-transcribe lacks `CAP_UNBOUNDED_INPUT`):
+
+1. **Greedy n-gram loops.** On two of the six slices the greedy decoder fell into a
+   repeated-phrase attractor and emitted it up to the 512-token cap — slice 2 ran
+   ~490 consecutive "hey," tokens, slice 5 cycled "run hey hey hey hey hey run".
+   Upstream MOSS decodes greedily with no `repetition_penalty` and no post-process,
+   so our runtime already matched the reference exactly; the raw output is just
+   unusable on this audio. Fixed by collapsing immediately-repeated n-grams in the
+   decoded **text** — the same algorithm the sibling higgs-stt backend already
+   ships (a port of the model's `ngram_loop_fix.py`), extracted to the shared header
+   `src/core/ngram_loop_fix.h` (`core_ngram::fix_loops`) and used by both. It is a
+   pure text post-process (token/logit parity vs the reference is unchanged) and a
+   no-op on non-degenerate slices, so clean slices stay byte-identical and the jfk
+   diff-harness is unaffected. Opt out with `CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX=1`.
+   Shipped `3339a710`; unit test `tests/test-ngram-loop-fix.cpp`.
+2. **Seam duplication.** moss-transcribe is an LLM decoder that emits neither word
+   nor token timestamps, but it was NOT on the overlap-save opt-out list, so each
+   30 s slice was extended by ±3 s of acoustic context (issue #89) and then — with
+   no timestamps to trim by — kept whole via segment-level filtering. The overlap
+   region was therefore transcribed twice and duplicated at every seam
+   ("…move much **of** the fence. Don't move much **to** the fence."). The over-long
+   30 s+2×3 s buffer also pushes the greedy decoder further out of its trained window,
+   worsening (1). Fixed by adding `"moss-transcribe"` to `kBlocked` in
+   `crispasr_chunk_context_gate.h` — the same opt-out its LLM-decoder peers (qwen3,
+   granite, voxtral, …) already use — so long audio is sliced at a bare 30 s with no
+   overlap extension. Gate unit test updated (`test-issue-114-chunk-context-gate.cpp`).
+
 ## #205 2026-06-30 `--max-len` for text-only backends + granite-plus timestamp-mode derail
 
 Reporter: `--max-len` had no effect on granite / qwen3 (worked on whisper/cohere).

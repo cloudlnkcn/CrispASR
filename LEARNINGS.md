@@ -1539,6 +1539,28 @@ the same boundaries — kanji → hiragana, multi-word phrases →
 chopped syllables. Single-shot diff against PyTorch reference looks
 fine because the diff harness only feeds one continuous segment.
 
+### Overlap-save also breaks timestamp-less LLM-decoder ASR (issue #218)
+
+The overlap-save extension is trimmed back to the slice range by
+**word-level filtering** — which needs per-word (or per-token)
+timestamps. Autoregressive LLM-decoder ASR backends (cohere, qwen3,
+granite, voxtral, kyutai-stt, glm-asr, gemma4-e2b, and — added in
+#218 — **moss-transcribe**) emit plain text with no alignment, so the
+trim falls through to segment-level filtering that keeps the *whole*
+extended segment. The ±`chunk_overlap_seconds` of context is then
+transcribed twice and **duplicates at every seam** (moss on a 145 s
+clip: "…move much **of** the fence. Don't move much **to** the
+fence."). Worse, feeding these models a 30 s+2×3 s buffer pushes them
+further outside their trained window: on moss it lengthened the
+greedy repeated-phrase loops (#218 part 1) — the same slice that
+looped to the 512-token cap with context only looped ~50 tokens on the
+bare 30 s slice. So for a timestamp-less decoder the extension is
+net-negative on both axes; the fix is the `kBlocked` opt-out in
+`crispasr_chunk_context_gate.h` (bare-slice path, no extension), which
+its peers already used. Rule: only backends that emit trustworthy
+word/token timestamps may take overlap-save context — everything else
+belongs on the opt-out list.
+
 ---
 
 ## mel / preprocessor

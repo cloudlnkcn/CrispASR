@@ -406,6 +406,21 @@ work:
   slices (verified: clean slices byte-identical, jfk diff-harness unaffected). Opt out
   with **`CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX=1`** for raw upstream-parity output. Unit
   coverage: `tests/test-ngram-loop-fix.cpp` (`[ngram-loop]`, label `unit`).
+- **DONE #218 — 30 s-seam duplication.** Same clip: adjacent 30 s slices duplicated
+  their shared audio at each boundary ("…move much **of** the fence. Don't move much
+  **to** the fence."). Cause: overlap-save (issue #89) extends each slice by ±3 s and
+  trims back by **word-level filtering**, but moss-transcribe emits no word/token
+  timestamps, so the trim falls through to segment-level filtering that keeps the whole
+  extended segment → the ±3 s context is transcribed twice. The over-long buffer also
+  worsened the greedy loops above (a slice that looped to the 512-token cap *with*
+  context only looped ~50 tokens on the bare 30 s slice). Fixed by adding
+  `"moss-transcribe"` to `kBlocked` in `examples/cli/crispasr_chunk_context_gate.h` —
+  the opt-out its LLM-decoder peers (qwen3, granite, voxtral, …) already use — so long
+  audio is sliced at a bare 30 s with no overlap extension. Gate unit test updated
+  (`tests/test-issue-114-chunk-context-gate.cpp`). Tradeoff (accepted, matches peers):
+  a word straddling a 30 s cut can be lost/split; net far better than the dup + longer
+  loops. Proper per-token timestamps would let overlap-save trim cleanly, but moss has
+  no alignment — noted as a future option, not worth the crude uniform-timestamp hack.
 - **Publish f16 + q8_0** to `cstr/MOSS-Transcribe-preview-2B-GGUF` (q4_k + card are
   live; f16/q8_0 were held back for WLAN bandwidth). Re-stage from
   `/Volumes/backups/ai/moss-transcribe-preview-2b-{f16,q8_0}.gguf` and
