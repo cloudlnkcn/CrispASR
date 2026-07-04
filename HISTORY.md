@@ -48,6 +48,28 @@ streamed path (threshold 0), never single-pass.
   mask support in `core/fastconformer.h` (verified char-identical to NeMo at
   [128,128]; not a win on this model — 46-67 % — but the A/B gate is free).
 
+**Gap-fill second pass (same day, follow-up for >95 % coverage).** Even with
+capped single-pass slices the encoder sometimes emits *nothing* for a
+multi-second span inside a slice — it blanks an utterance whenever enough
+context follows it, though the same span transcribes verbatim in isolation
+(the reporter's clip's first 4.6 s: perfect alone, skipped inside any ≥8 s
+window; NeMo behaves identically). `crispasr_gap_fill_slice()` in
+`crispasr_run.cpp`: after the per-slice transcribe, spans ≥1 s with no
+emitted words are re-transcribed in isolation and words landing inside the
+gap (and not restating covered content) are merged back. Runs inside
+`process_slice`, so all output paths (sequential / parallel / progressive)
+get it; gated on `vad_slice_cap_seconds() > 0` (JA parakeet only today),
+`CRISPASR_GAP_FILL=0` disables, `CRISPASR_GAP_FILL_MIN_CS` tunes (min-gap 60
+measured strictly worse than 100 — more variant noise, much slower).
+Phonetic (hiragana-reading) char-bigram recall vs whisper-large-v3-turbo:
+yt_60s 64.2 → **97.2 %**, yt_120s 61.3 → **96.9 %**, first300 → **95.9 %**,
+precision 90-93 %. Ceiling check: an independent SenseVoice-small run scores
+the same recall (97.2/96.8 %) at far lower precision (78 %) — we are at the
+inter-model agreement ceiling; the residual is kana/kanji hearing variants,
+not missing speech. The katakana rendering of the clip's English brand name
+(スピークジャパニーズ…) is correct JA-model output that a latin-script
+reference can't credit — use reading-normalized scoring for JA coverage.
+
 **Validated** (default flags, latin-stripped char-bigram recall vs whisper GT):
 yt_60s 62.3 → **79.6 %**, yt_120s 57.5 → **81.0 %**, precision held; cap sweep
 8/10/12 confirms 12 best. Residual loss is dominated by the clip's

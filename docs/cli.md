@@ -249,10 +249,17 @@ multilingual / v3 / EN models behave very differently:
   JA therefore uses **auto-VAD + a 12 s slice cap + single-pass per slice**:
   VAD finds speech, slices longer than 12 s (continuous speech merges far past
   the encoder's ~12 s safe window) are re-split at energy minima, and each
-  slice gets one NeMo-exact full-attention pass. Measured on the issue #89
-  reporter's clips: 80 % content recall vs whisper-large-v3 (up from 56–62 %
-  with the previous streamed default; NeMo's best long-form mode scores 51 %
-  on the same audio).
+  slice gets one NeMo-exact full-attention pass. A **gap-fill second pass**
+  then re-transcribes any span ≥1 s the first pass left empty inside a slice
+  (the encoder sometimes blanks an utterance whenever enough context follows
+  it, even though the same span transcribes verbatim in isolation) and merges
+  the recovered words back. Measured on the issue #89 reporter's clips
+  (phonetic char-bigram recall vs whisper-large-v3-turbo): 60 s **97.2 %**,
+  120 s **96.9 %**, 300 s **95.9 %** — up from 61–64 % with the previous
+  streamed default; NeMo's best long-form mode scores ~51 % raw recall on the
+  same audio, and an independent SenseVoice-small run tops out at the same
+  ~97 % (the inter-model agreement ceiling — the rest is kana/kanji hearing
+  variants, not missing content).
 
 **Env vars for tuning (all override the per-model defaults):**
 
@@ -261,6 +268,8 @@ multilingual / v3 / EN models behave very differently:
 | `CRISPASR_PARAKEET_STREAM_THRESHOLD` | non-JA 300, JA 12 | Single-pass cap (seconds). Audio ≤ this gets one full-attention pass; `0` disables single-pass entirely (always streamed). |
 | `CRISPASR_PARAKEET_VAD_SLICE_CAP` | non-JA 0, JA 12 | Max VAD slice duration (seconds); longer slices are re-split at energy minima before decoding. `0` = no cap. |
 | `CRISPASR_PARAKEET_ATT_CONTEXT` | unset | `"L,R"` switches the encoder to rel_pos_local_attn with that window (encoder frames, 1 = 80 ms) — NeMo's `change_attention_model` equivalent. `"-1,-1"` forces full attention. |
+| `CRISPASR_GAP_FILL` | 1 (bounded-window backends only) | Second pass re-transcribing spans ≥1 s the first pass left empty inside a slice; recovered words are merged back. `0` disables. |
+| `CRISPASR_GAP_FILL_MIN_CS` | 100 | Gap-fill trigger threshold in centiseconds (100 = 1.0 s of missing speech). |
 | `CRISPASR_PARAKEET_LONGFORM` | non-JA 1, JA 0 | `1` = silence-split single-pass above the cap; `0` = streamed fallback above the cap. |
 | `CRISPASR_PARAKEET_INTERNAL_CHUNKING` | non-JA on, JA off | `0` = revert to the dispatcher's chunk-30 + overlap-save + LCS-merge path (A/B). |
 | `CRISPASR_PARAKEET_STREAM_CHUNK` | 0 (auto: 8 JA / 30 non-JA) | Streamed-path encoder chunk size (seconds). |
