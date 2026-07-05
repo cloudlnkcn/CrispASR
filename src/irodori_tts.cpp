@@ -976,8 +976,10 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
     ctx->w_ctx = wl.ctx;
     ctx->buf_weights = wl.buf;
 
-    // Set default tokenizer BOS
-    ctx->bos_token_id = hp.text_vocab_size - 1; // sarashina2.2 convention
+    // Set BOS token: prefer GGUF tokenizer value, fall back to sarashina2.2 default (1)
+    if (ctx->bos_token_id < 0) {
+        ctx->bos_token_id = 1; // sarashina2.2 BOS token ID
+    }
 
     if (ctx->verbosity >= 1) {
         std::fprintf(stderr, "[irodori] model loaded successfully\n");
