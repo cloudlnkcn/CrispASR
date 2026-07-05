@@ -8052,6 +8052,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
         touched++;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx) {
+        irodori_tts_set_seed(s->irodori_ctx, seed);
+        touched++;
+    }
+#endif
 #ifdef CA_HAVE_MELOTTS
     if (s->melotts_ctx) {
         melotts_set_seed(s->melotts_ctx, (uint32_t)seed);
