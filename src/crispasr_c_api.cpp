@@ -210,6 +210,10 @@
 #include "f5_tts.h"
 #define CA_HAVE_F5TTS 1
 #endif
+#if __has_include("irodori_tts.h")
+#include "irodori_tts.h"
+#define CA_HAVE_IRODORI_TTS 1
+#endif
 #if __has_include("m2m100.h")
 #include "m2m100.h"
 #define CA_HAVE_M2M100 1
@@ -1677,6 +1681,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_F5TTS
     f5_tts_context* f5tts_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    irodori_tts_context* irodori_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_PIPER
     piper_tts_context* piper_ctx = nullptr;
 #endif
@@ -2791,6 +2798,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->backend == "irodori-tts" || s->backend == "irodori_tts" || s->backend == "irodori") {
+        s->backend = "irodori-tts";
+        irodori_tts_params p = irodori_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->irodori_ctx = irodori_tts_init_from_file(model_path, p);
+        if (!s->irodori_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_PIPER
     if (s->backend == "piper" || s->backend == "piper-tts") {
         s->backend = "piper";
@@ -3223,6 +3245,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_F5TTS
     list += ",f5-tts";
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    list += ",irodori-tts";
 #endif
 #ifdef CA_HAVE_PIPER
     list += ",piper";
@@ -6852,6 +6877,18 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         return pcm;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx) {
+        // Irodori-TTS outputs 48 kHz mono. DAC-VAE decode pending (outputs silence placeholder).
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = irodori_tts_synthesize(s->irodori_ctx, text, &pcm, &sr);
+        if (n <= 0 || !pcm)
+            return nullptr;
+        *out_n_samples = n;
+        return pcm;
+    }
+#endif
 #ifdef CA_HAVE_PARLER_TTS
     if (s->parler_tts_ctx) {
         // Parler outputs 44.1 kHz mono. Resample to 24 kHz for the session
@@ -7410,6 +7447,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_F5TTS
     if (s->f5tts_ctx)
         f5_tts_free(s->f5tts_ctx);
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx)
+        irodori_tts_free(s->irodori_ctx);
 #endif
 #ifdef CA_HAVE_PIPER
     if (s->piper_ctx)
