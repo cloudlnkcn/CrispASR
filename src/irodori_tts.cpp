@@ -1332,14 +1332,24 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         t_schedule[i] = (1.0f - u) * 0.999f; // decreasing: 0.999 → 0
     }
 
-    // Initial noise x_t ~ N(0, 1)
+    // Initial noise x_t ~ N(0, 1) or loaded from reference file
     std::vector<float> x_t(patched_steps * latent_d);
     {
-        unsigned int seed_val = ctx->seed ? (unsigned int)ctx->seed : std::random_device{}();
-        std::mt19937 rng(seed_val);
-        std::normal_distribution<float> dist(0.0f, 1.0f);
-        for (auto& v : x_t)
-            v = dist(rng);
+        const char* ref_noise = std::getenv("CRISPASR_IRODORI_REF_NOISE");
+        if (ref_noise && *ref_noise) {
+            FILE* f = std::fopen(ref_noise, "rb");
+            if (f) {
+                size_t n = std::fread(x_t.data(), sizeof(float), x_t.size(), f);
+                std::fclose(f);
+                std::fprintf(stderr, "[irodori] loaded reference noise from '%s' (%zu floats)\n", ref_noise, n);
+            }
+        } else {
+            unsigned int seed_val = ctx->seed ? (unsigned int)ctx->seed : std::random_device{}();
+            std::mt19937 rng(seed_val);
+            std::normal_distribution<float> dist(0.0f, 1.0f);
+            for (auto& v : x_t)
+                v = dist(rng);
+        }
     }
 
     // ODE integration loop
