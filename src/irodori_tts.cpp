@@ -1271,7 +1271,10 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
     if (T_text == 0)
         return 0;
 
-    IRODORI_DBG("[irodori] text tokens: %d\n", T_text);
+    IRODORI_DBG("[irodori] text tokens: %d →", T_text);
+    for (int i = 0; i < std::min(T_text, 20); i++)
+        IRODORI_DBG(" %d", token_ids[i]);
+    IRODORI_DBG("\n");
 
     // Determine output length (heuristic: ~6.3 frames per token, or override)
     const char* t_lat_override = std::getenv("CRISPASR_IRODORI_T_LATENT");
@@ -1397,8 +1400,10 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         }
 
         // CFG: independent text guidance
-        // v = v_cond + cfg_text * (v_cond - v_uncond_text)
         float cfg_text = ctx->cfg_scale_text;
+        const char* cfg_env = std::getenv("CRISPASR_IRODORI_CFG_TEXT");
+        if (cfg_env)
+            cfg_text = (float)std::atof(cfg_env);
         float cfg_min_t = 0.5f;
         float cfg_max_t = 1.0f;
         bool use_cfg = (cfg_text > 0.0f) && (t_val >= cfg_min_t) && (t_val <= cfg_max_t);
