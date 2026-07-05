@@ -420,10 +420,11 @@ static bool load_weights_from_map(irodori_tts_context* ctx, GetFn get, TryGetFn 
 // ── Graph: Text encoder forward ─────────────────────────────────────
 
 // Build text encoder graph for a batch of token IDs.
-// Input: token_ids (T_text,) I32
+// Input: token_ids (T_text,) I32, pos_ids (T_text,) I32
 // Output: text_state (text_dim, T_text) F32
 static ggml_tensor* build_text_encoder_graph(ggml_context* ctx, const irodori_tts_context* model,
-                                             ggml_tensor* token_ids, ggml_tensor* mask_f, int T_text) {
+                                             ggml_tensor* token_ids, ggml_tensor* mask_f, ggml_tensor* pos_ids,
+                                             int T_text) {
     const auto& w = model->weights;
     const auto& hp = model->hparams;
 
@@ -461,10 +462,9 @@ static ggml_tensor* build_text_encoder_graph(ggml_context* ctx, const irodori_tt
         k = ggml_rms_norm(ctx, k, hp.norm_eps);
         k = ggml_mul(ctx, k, blk.k_norm);
 
-        // RoPE
-        // TODO: implement manual RoPE (ggml_rope_ext with nullptr positions crashes)
-        // q = apply_rope_manual(ctx, q, ...);
-        // k = apply_rope_manual(ctx, k, ...);
+        // RoPE (standard interleaved, mode=0)
+        q = ggml_rope_ext(ctx, q, pos_ids, nullptr, hd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(ctx, k, pos_ids, nullptr, hd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         // Permute for flash attention: (head_dim, T, heads) -> SDPA expects (T, head_dim, heads)
         // ggml_flash_attn_ext expects Q(hd, T, nh), K(hd, T_kv, nh), V(hd, T_kv, nh)
@@ -500,7 +500,8 @@ static ggml_tensor* build_text_encoder_graph(ggml_context* ctx, const irodori_tt
 // ── Graph: Speaker encoder forward ──────────────────────────────────
 
 static ggml_tensor* build_speaker_encoder_graph(ggml_context* ctx, const irodori_tts_context* model,
-                                                ggml_tensor* latent_in, ggml_tensor* mask_f, int T_ref) {
+                                                ggml_tensor* latent_in, ggml_tensor* mask_f, ggml_tensor* pos_ids,
+                                                int T_ref) {
     const auto& w = model->weights;
     const auto& hp = model->hparams;
 
@@ -532,9 +533,9 @@ static ggml_tensor* build_speaker_encoder_graph(ggml_context* ctx, const irodori
         k = ggml_rms_norm(ctx, k, hp.norm_eps);
         k = ggml_mul(ctx, k, blk.k_norm);
 
-        // TODO: implement manual RoPE (ggml_rope_ext with nullptr positions crashes)
-        // q = apply_rope_manual(ctx, q, ...);
-        // k = apply_rope_manual(ctx, k, ...);
+        // RoPE (standard interleaved)
+        q = ggml_rope_ext(ctx, q, pos_ids, nullptr, hd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(ctx, k, pos_ids, nullptr, hd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f / std::sqrt((float)hd), 0.0f, 0.0f);
         attn_out = ggml_reshape_2d(ctx, attn_out, hp.speaker_dim, T_ref);
@@ -606,7 +607,7 @@ static void apply_low_rank_adaln(ggml_context* ctx, const irodori_low_rank_adaln
 static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_context* model,
                                           const irodori_dit_block_weights& blk, ggml_tensor* x, ggml_tensor* cond_embed,
                                           ggml_tensor* text_state, int T_text, ggml_tensor* spk_state, int T_ref,
-                                          int T_latent) {
+                                          int T_latent, ggml_tensor* pos_ids) {
     const auto& hp = model->hparams;
     int hd = hp.head_dim();
     int nh = hp.num_heads;
@@ -666,24 +667,49 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
         T_kv_total += T_ref;
     }
 
-    // Reshape Q: (head_dim, T_latent, heads) — ggml_flash_attn_ext convention
-    // mul_mat output is (model_dim, T_latent) = (hd*nh, T_latent)
-    // We need (hd, T_latent, nh) for flash attn
-    // Reshape to (hd, nh, T) for QK norm, then permute to (hd, T, nh) for flash attn
+    // All tensors start as (hd*nh, T) from mul_mat → reshape to (hd, nh, T)
+    // Apply QK norm and half-RoPE in (hd, nh, T) layout (ne[2]=T matches pos_ids)
+    // Then permute to (hd, T, nh) for flash_attn_ext
+
     q = ggml_reshape_3d(ctx, q, hd, nh, T_latent);
     q = ggml_rms_norm(ctx, q, hp.norm_eps);
     q = ggml_mul(ctx, q, ggml_cast(ctx, blk.q_norm, GGML_TYPE_F32));
-    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3)); // (hd, nh, T) → (hd, T, nh)
 
-    // Self K/V
     k_self = ggml_reshape_3d(ctx, k_self, hd, nh, T_latent);
     k_self = ggml_rms_norm(ctx, k_self, hp.norm_eps);
     k_self = ggml_mul(ctx, k_self, ggml_cast(ctx, blk.k_norm, GGML_TYPE_F32));
-    k_self = ggml_cont(ctx, ggml_permute(ctx, k_self, 0, 2, 1, 3));
+
     v_self = ggml_reshape_3d(ctx, v_self, hd, nh, T_latent);
+
+    // Half-RoPE in (hd, nh, T) layout: split heads dim (ne[1]) in half
+    {
+        int half_nh = nh / 2;
+        size_t nb1 = q->nb[1]; // stride for head dim
+        size_t nb2 = q->nb[2]; // stride for T dim
+
+        // Q: first half_nh heads get RoPE
+        ggml_tensor* q_rot = ggml_view_3d(ctx, q, hd, half_nh, T_latent, nb1, nb2, 0);
+        ggml_tensor* q_pass = ggml_view_3d(ctx, q, hd, nh - half_nh, T_latent, nb1, nb2, half_nh * nb1);
+        q_rot = ggml_cont(ctx, q_rot);
+        q_rot = ggml_rope_ext(ctx, q_rot, pos_ids, nullptr, hd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        q = ggml_concat(ctx, q_rot, ggml_cont(ctx, q_pass), 1); // concat on head dim
+
+        // K_self: same half-RoPE
+        nb1 = k_self->nb[1];
+        nb2 = k_self->nb[2];
+        ggml_tensor* ks_rot = ggml_view_3d(ctx, k_self, hd, half_nh, T_latent, nb1, nb2, 0);
+        ggml_tensor* ks_pass = ggml_view_3d(ctx, k_self, hd, nh - half_nh, T_latent, nb1, nb2, half_nh * nb1);
+        ks_rot = ggml_cont(ctx, ks_rot);
+        ks_rot = ggml_rope_ext(ctx, ks_rot, pos_ids, nullptr, hd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k_self = ggml_concat(ctx, ks_rot, ggml_cont(ctx, ks_pass), 1);
+    }
+
+    // Permute all to (hd, T, nh) for flash_attn_ext
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    k_self = ggml_cont(ctx, ggml_permute(ctx, k_self, 0, 2, 1, 3));
     v_self = ggml_cont(ctx, ggml_permute(ctx, v_self, 0, 2, 1, 3));
 
-    // Text K/V
+    // Text K/V: no RoPE (context KV), just norm + permute
     k_text = ggml_reshape_3d(ctx, k_text, hd, nh, T_text);
     k_text = ggml_rms_norm(ctx, k_text, hp.norm_eps);
     k_text = ggml_mul(ctx, k_text, ggml_cast(ctx, blk.k_norm, GGML_TYPE_F32));
@@ -691,9 +717,9 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
     v_text = ggml_reshape_3d(ctx, v_text, hd, nh, T_text);
     v_text = ggml_cont(ctx, ggml_permute(ctx, v_text, 0, 2, 1, 3));
 
-    // Concatenate K and V along sequence dim (dim=1): (hd, T_self+T_text, nh)
-    ggml_tensor* k_cat = ggml_concat(ctx, k_self, k_text, /*dim=*/1);
-    ggml_tensor* v_cat = ggml_concat(ctx, v_self, v_text, /*dim=*/1);
+    // Concatenate K and V along sequence dim (dim=1): (hd, T_total, nh)
+    ggml_tensor* k_cat = ggml_concat(ctx, k_self, k_text, 1);
+    ggml_tensor* v_cat = ggml_concat(ctx, v_self, v_text, 1);
     if (k_spk && v_spk) {
         k_spk = ggml_reshape_3d(ctx, k_spk, hd, nh, T_ref);
         k_spk = ggml_rms_norm(ctx, k_spk, hp.norm_eps);
@@ -704,9 +730,6 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
         k_cat = ggml_concat(ctx, k_cat, k_spk, 1);
         v_cat = ggml_concat(ctx, v_cat, v_spk, 1);
     }
-
-    // TODO: implement half-RoPE for JointAttention
-    // For now, skip RoPE in DiT blocks (produces wrong output but doesn't crash)
 
     // Flash attention: Q(hd, T_q, nh), K(hd, T_kv, nh), V(hd, T_kv, nh)
     ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q, k_cat, v_cat, nullptr, 1.0f / std::sqrt((float)hd), 0.0f, 0.0f);
@@ -997,8 +1020,12 @@ static std::vector<float> run_text_encoder(irodori_tts_context* ctx, const int32
     ggml_set_name(mask_f, "text_mask_f");
     ggml_set_input(mask_f);
 
+    ggml_tensor* pos = ggml_new_tensor_1d(g, GGML_TYPE_I32, T_text);
+    ggml_set_name(pos, "pos_ids");
+    ggml_set_input(pos);
+
     // Build graph
-    ggml_tensor* out = build_text_encoder_graph(g, ctx, ids, mask_f, T_text);
+    ggml_tensor* out = build_text_encoder_graph(g, ctx, ids, mask_f, pos, T_text);
     ggml_set_name(out, "text_state");
     ggml_set_output(out);
 
@@ -1014,9 +1041,12 @@ static std::vector<float> run_text_encoder(irodori_tts_context* ctx, const int32
     }
 
     ggml_backend_tensor_set(ids, token_ids, 0, T_text * sizeof(int32_t));
-    // Mask: all 1.0f (no padding in single-utterance mode)
     std::vector<float> mask_data(T_text, 1.0f);
     ggml_backend_tensor_set(mask_f, mask_data.data(), 0, T_text * sizeof(float));
+    std::vector<int32_t> pos_data(T_text);
+    for (int i = 0; i < T_text; i++)
+        pos_data[i] = i;
+    ggml_backend_tensor_set(pos, pos_data.data(), 0, T_text * sizeof(int32_t));
 
     // Compute
     ggml_backend_graph_compute(ctx->backend, gf);
@@ -1041,7 +1071,7 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
     const int D = hp.model_dim;
     const int latent_d = hp.patched_latent_dim();
 
-    const int n_tensors = 2048 + hp.num_layers * 150;
+    const int n_tensors = 2048 + hp.num_layers * 200; // extra for half-RoPE views/concats
     size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_tensors, false);
     ggml_init_params ip = {ctx_size, nullptr, true};
     ggml_context* g = ggml_init(ip);
@@ -1058,6 +1088,10 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
     ggml_tensor* text_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, hp.text_dim, T_text);
     ggml_set_name(text_in, "text_state");
     ggml_set_input(text_in);
+
+    ggml_tensor* pos_latent = ggml_new_tensor_1d(g, GGML_TYPE_I32, T_latent);
+    ggml_set_name(pos_latent, "pos_latent");
+    ggml_set_input(pos_latent);
 
     ggml_tensor* spk_in = nullptr;
     if (spk_state_data && T_ref > 0) {
@@ -1080,7 +1114,8 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
         n_build_layers = std::min(std::atoi(env_layers), hp.num_layers);
     for (int i = 0; i < n_build_layers; i++) {
         IRODORI_DBG("[irodori]     building DiT block %d...\n", i);
-        x = build_dit_block_graph(g, ctx, w.dit_blocks[i], x, cond_in, text_in, T_text, spk_in, T_ref, T_latent);
+        x = build_dit_block_graph(g, ctx, w.dit_blocks[i], x, cond_in, text_in, T_text, spk_in, T_ref, T_latent,
+                                  pos_latent);
         IRODORI_DBG("[irodori]     DiT block %d built OK\n", i);
     }
 
@@ -1117,6 +1152,12 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
         ggml_backend_tensor_set(text_in, text_state_data, 0, T_text * hp.text_dim * sizeof(float));
     if (spk_in && spk_in->buffer) {
         ggml_backend_tensor_set(spk_in, spk_state_data, 0, T_ref * hp.speaker_dim * sizeof(float));
+    }
+    if (pos_latent->buffer) {
+        std::vector<int32_t> pos_data(T_latent);
+        for (int i = 0; i < T_latent; i++)
+            pos_data[i] = i;
+        ggml_backend_tensor_set(pos_latent, pos_data.data(), 0, T_latent * sizeof(int32_t));
     }
 
     ggml_backend_graph_compute(ctx->backend, gf);
@@ -1272,12 +1313,33 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
             return 0;
         }
 
-        // TODO: CFG (unconditioned pass with zeroed text/speaker state)
-        // For now, no CFG — just use conditioned velocity directly.
+        // CFG: independent text guidance
+        // v = v_cond + cfg_text * (v_cond - v_uncond_text)
+        float cfg_text = ctx->cfg_scale_text;
+        float cfg_min_t = 0.5f;
+        float cfg_max_t = 1.0f;
+        bool use_cfg = (cfg_text > 0.0f) && (t_val >= cfg_min_t) && (t_val <= cfg_max_t);
 
-        // Euler step: x_t = x_t + v * dt
-        for (size_t i = 0; i < x_t.size(); i++) {
-            x_t[i] += v_cond[i] * dt;
+        if (use_cfg) {
+            // Unconditioned pass: zero text state
+            std::vector<float> text_uncond(T_text * hp.text_dim, 0.0f);
+            auto v_uncond = run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(),
+                                            T_text, spk_state.empty() ? nullptr : spk_state.data(), T_ref);
+            if (!v_uncond.empty()) {
+                for (size_t i = 0; i < x_t.size(); i++) {
+                    float v = v_cond[i] + cfg_text * (v_cond[i] - v_uncond[i]);
+                    x_t[i] += v * dt;
+                }
+            } else {
+                // Fallback: no CFG
+                for (size_t i = 0; i < x_t.size(); i++)
+                    x_t[i] += v_cond[i] * dt;
+            }
+        } else {
+            // No CFG for this timestep
+            for (size_t i = 0; i < x_t.size(); i++) {
+                x_t[i] += v_cond[i] * dt;
+            }
         }
 
         if (ctx->verbosity >= 2 || (ctx->verbosity >= 1 && (step == 0 || step == n_ode - 1))) {
