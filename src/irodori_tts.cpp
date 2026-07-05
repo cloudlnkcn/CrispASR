@@ -1312,11 +1312,12 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         }
     }
 
-    // ── Step 2: Encode speaker reference (or zeros) ──
-    std::vector<float> spk_state;
-    int T_ref = 0;
-    // TODO: speaker encoder integration once DAC-VAE latent encoding is available.
-    // For now, unconditional generation (no speaker reference).
+    // ── Step 2: Encode speaker reference (or zeros for unconditional) ──
+    // The DiT's JointAttention REQUIRES speaker context tensors even when
+    // unconditional (no_ref=True). Pass zeros with False mask.
+    int T_ref = 1; // minimum 1 frame for the zeroed speaker context
+    std::vector<float> spk_state(T_ref * hp.speaker_dim, 0.0f);
+    // TODO: when ref_latent is set, run speaker encoder instead of zeros.
 
     // ── Step 3: Euler RF ODE solver ──
     IRODORI_DBG("[irodori] ODE solver: %d steps\n", ctx->ode_steps);
