@@ -1689,7 +1689,9 @@ class Session:
     def set_hotwords(self, hotwords: str, boost: float = 2.0) -> None:
         """Contextual biasing: comma-separated words/phrases to boost during
         decoding. Parakeet CTC/TDT use an Aho-Corasick trie; LLM backends inject
-        them into the prompt. Empty string clears."""
+        them into the prompt (vibevoice splices the raw string into its
+        "with extra info:" prompt slot, same as the CLI's --context). Empty
+        string clears."""
         if not hasattr(self._lib, "crispasr_session_set_hotwords"):
             raise RuntimeError("session-state API not present in this libcrispasr build")
         self._lib.crispasr_session_set_hotwords.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_float]

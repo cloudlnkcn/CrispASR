@@ -4961,7 +4961,12 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         };
 
         const std::vector<float> pcm24 = resample_16k_to_24k(pcm, n_samples);
-        vibevoice_result* vr = vibevoice_transcribe_with_probs(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size());
+        // Session hotwords double as vibevoice's free-form context injection
+        // (CLI: --context; here the comma-separated hotword list is spliced
+        // into the prompt's "with extra info:" slot, PR #223 / issue #224).
+        const char* vv_context = s->hotwords.empty() ? nullptr : s->hotwords.c_str();
+        vibevoice_result* vr =
+            vibevoice_transcribe_with_probs_and_context(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size(), vv_context);
         if (!vr || !vr->text) {
             if (vr)
                 vibevoice_result_free(vr);
