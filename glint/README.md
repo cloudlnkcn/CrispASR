@@ -34,4 +34,4 @@ is behind glint main. To sync by hand, run `tools/sync-glint.sh` —
 never `cp` from a glint working tree (it may hold another session's
 WIP; the script always takes a committed state).
 
-Synced at upstream commit: `fbb9cc686f58a917bf65d1b58546dad22c314be5` (docs: v0.8.0 release notes + fresh league log).
+Synced at upstream commit: `44828f59d50bfaa8bafa859f02aa37512527b5cd` (fix: MSVC build — portable clz32 in intmath (no __builtin_clz on MSVC)).
