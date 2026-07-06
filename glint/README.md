@@ -34,4 +34,4 @@ is behind glint main. To sync by hand, run `tools/sync-glint.sh` —
 never `cp` from a glint working tree (it may hold another session's
 WIP; the script always takes a committed state).
 
-Synced at upstream commit: `f1ce51b94b0998de5ebb1c733b5c0448a05c54c4` (docs: README precision pass — FPU claims, embedded RAM, post-league AAC numbers).
+Synced at upstream commit: `ee6be073d533d02c80d1b32e07998d509a71339d` (perf: AAC pass 1 — -52..54% encode time, byte-identical; now 272x/168x realtime).
