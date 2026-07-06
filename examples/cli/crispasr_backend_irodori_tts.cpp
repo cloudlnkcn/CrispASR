@@ -45,12 +45,26 @@ public:
             return false;
         }
 
-        // Load reference audio for voice cloning
-        if (!p.tts_voice.empty()) {
-            // For now, only pre-encoded latent files are supported.
-            // TODO: integrate DAC-VAE encoder for raw WAV input.
-            std::fprintf(stderr, "crispasr[irodori-tts]: voice cloning from WAV requires "
-                                 "pre-encoded .latent files (DAC-VAE encoder not yet integrated)\n");
+        // Load DAC-VAE codec (companion model for audio decode)
+        // Try --codec-model first, then look next to the model, then auto-download
+        std::string codec_path = p.tts_codec_model;
+        if (codec_path.empty()) {
+            // Look for dacvae GGUF next to the model
+            std::string model_dir = p.model.substr(0, p.model.find_last_of("/\\"));
+            std::string candidate = model_dir + "/dacvae-ja-32dim-f16.gguf";
+            FILE* f = std::fopen(candidate.c_str(), "rb");
+            if (f) {
+                std::fclose(f);
+                codec_path = candidate;
+            }
+        }
+        if (!codec_path.empty()) {
+            if (irodori_tts_set_codec_path(ctx_, codec_path.c_str()) != 0) {
+                std::fprintf(stderr, "crispasr[irodori-tts]: warning: codec load failed, output will be silent\n");
+            }
+        } else {
+            std::fprintf(stderr, "crispasr[irodori-tts]: no DAC-VAE codec found. "
+                                 "Use --codec-model <dacvae.gguf> for audio output.\n");
         }
 
         return true;

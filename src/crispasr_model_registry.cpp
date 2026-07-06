@@ -776,7 +776,10 @@ constexpr Entry k_registry[] = {
     // cloning via DAC-VAE latents. 48 kHz output, Japanese-focused.
     {"irodori-tts", "irodori-tts-500m-v3-q4_k.gguf",
      "https://huggingface.co/cstr/irodori-tts-GGUF/resolve/main/irodori-tts-500m-v3-q4_k.gguf",
-     "~852 MB", nullptr, nullptr},
+     "~852 MB",
+     "dacvae-ja-32dim-f16.gguf",
+     "https://huggingface.co/cstr/irodori-tts-GGUF/resolve/main/dacvae-ja-32dim-f16.gguf",
+     "~135 MB"},
     // CTC forced aligner — used by `-am auto` to attach word-level
     // timestamps (LLM-decode backends, or any backend when paired
     // with `--force-aligner` / `-fa`). Q4_K is the recommended quant

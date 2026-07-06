@@ -183,16 +183,40 @@ def main():
                 write_tensor(writer, gguf_name, to_f16(tval))
 
     # Final layers: wm_model.encoder_block (used for watermark-free output path)
-    # When alpha=0 (Irodori disables watermark), decode just runs:
-    #   for layer in self.model: x = layer(x)
-    #   return self.wm_model.encoder_block.forward_no_conv(x)
-    # forward_no_conv runs through pre[:-1] (Snake activation only, no conv)
-    # So we just need the Snake alpha from the encoder_block
+    # forward_no_conv runs: Snake1d(96) → Conv1d(96→1, k=7) → Tanh → Identity
+    # We need: pre.0.alpha (Snake), pre.1.weight+bias (Conv 96→1)
+    # pre.3 (Conv 1→32, k=7) is replaced by Identity, so skip it
     wm_prefix = "decoder.wm_model.encoder_block.pre"
-    for tname, tval in state.items():
-        if tname.startswith(wm_prefix) and "alpha" in tname:
-            short = tname.replace("decoder.", "")
-            write_tensor(writer, f"dacvae.{short}", to_f32(tval))
+    for tname, tval in sorted(state.items()):
+        if not tname.startswith(wm_prefix):
+            continue
+        # Skip pre.3 (replaced by Identity in forward_no_conv)
+        if ".pre.3." in tname:
+            continue
+        short = tname.replace("decoder.", "")
+        # Reconstruct weight-normed convs
+        if "weight_v" in tname:
+            base = tname.replace("weight_v", "")
+            g_key = base + "weight_g"
+            if g_key in state:
+                v = tval
+                g = state[g_key]
+                norm = torch.linalg.norm(v.reshape(v.shape[0], -1), dim=1, keepdim=True)
+                if v.ndim == 3:
+                    norm = norm.unsqueeze(-1)
+                eff_w = g * v / (norm + 1e-12)
+                gguf_name = f"dacvae.{short}".replace(".weight_v", ".weight")
+                write_tensor(writer, gguf_name, to_f16(eff_w))
+                print(f"  wm {gguf_name}: {list(eff_w.shape)}")
+                continue
+        if "weight_g" in tname:
+            continue  # handled above
+        gguf_name = f"dacvae.{short}"
+        if "alpha" in tname:
+            write_tensor(writer, gguf_name, to_f32(tval))
+        else:
+            write_tensor(writer, gguf_name, to_f32(tval))
+        print(f"  wm {gguf_name}: {list(tval.shape)}")
 
     # Finalize
     writer.write_header_to_file()

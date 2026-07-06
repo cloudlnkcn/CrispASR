@@ -21,6 +21,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include "core/dac_decoder.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/sentencepiece.h"
@@ -218,6 +219,16 @@ struct irodori_tts_context {
     // Reference latent (speaker conditioning)
     std::vector<float> ref_latent; // (T_ref * latent_dim)
     int ref_latent_frames = 0;
+
+    // DAC-VAE decoder (companion model for audio reconstruction)
+    bool has_codec = false;
+    ggml_backend_buffer_t codec_buf = nullptr;
+    ggml_context* codec_ctx = nullptr;
+    // out_proj: Conv1d(codebook_dim → latent_dim, k=1)
+    ggml_tensor* codec_out_proj_w = nullptr;
+    ggml_tensor* codec_out_proj_b = nullptr;
+    // DAC decoder weights (reusing core_dac structure with DACVAE config)
+    core_dac::DacWeights dac;
 
     // Runtime params
     int seed = 0;
@@ -994,6 +1005,10 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
 void irodori_tts_free(struct irodori_tts_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->codec_buf)
+        ggml_backend_buffer_free(ctx->codec_buf);
+    if (ctx->codec_ctx)
+        ggml_free(ctx->codec_ctx);
     if (ctx->buf_weights)
         ggml_backend_buffer_free(ctx->buf_weights);
     if (ctx->w_ctx)
@@ -1001,6 +1016,126 @@ void irodori_tts_free(struct irodori_tts_context* ctx) {
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     delete ctx;
+}
+
+int irodori_tts_set_codec_path(struct irodori_tts_context* ctx, const char* codec_gguf_path) {
+    if (!ctx || !codec_gguf_path)
+        return -1;
+
+    // Load DACVAE decoder GGUF
+    if (ctx->verbosity >= 1) {
+        std::fprintf(stderr, "[irodori] loading DAC-VAE codec: %s\n", codec_gguf_path);
+    }
+
+    // Read metadata
+    gguf_context* meta = core_gguf::open_metadata(codec_gguf_path);
+    if (!meta) {
+        std::fprintf(stderr, "[irodori] failed to open codec GGUF: %s\n", codec_gguf_path);
+        return -1;
+    }
+
+    int codec_sr = core_gguf::kv_i32(meta, "dacvae.sample_rate", 48000);
+    int codec_hop = core_gguf::kv_i32(meta, "dacvae.hop_length", 1920);
+    int codec_dim = core_gguf::kv_i32(meta, "dacvae.codebook_dim", 32);
+    int codec_latent = core_gguf::kv_i32(meta, "dacvae.latent_dim", 1024);
+    int codec_dec_dim = core_gguf::kv_i32(meta, "dacvae.decoder_dim", 1536);
+    int n_dec_blocks = core_gguf::kv_i32(meta, "dacvae.n_decoder_blocks", 4);
+    core_gguf::free_metadata(meta);
+
+    if (ctx->verbosity >= 1) {
+        std::fprintf(stderr, "[irodori] codec: sr=%d, hop=%d, codebook_dim=%d, decoder_dim=%d, blocks=%d\n", codec_sr,
+                     codec_hop, codec_dim, codec_dec_dim, n_dec_blocks);
+    }
+
+    // Configure DAC decoder (reuse core_dac with DACVAE config)
+    auto& dac = ctx->dac;
+    dac.config.hidden_size = codec_latent;
+    dac.config.decoder_hidden_size = codec_dec_dim;
+    dac.config.sample_rate = codec_sr;
+    dac.config.hop_length = codec_hop;
+    dac.config.n_decoder_blocks = std::min(n_dec_blocks, 4);
+    // DACVAE strides [12,10,8,2] — read from GGUF or hardcode
+    int dacvae_strides[4] = {12, 10, 8, 2};
+    int dacvae_channels[5] = {codec_dec_dim, codec_dec_dim / 2, codec_dec_dim / 4, codec_dec_dim / 8,
+                              codec_dec_dim / 16};
+    for (int i = 0; i < 4; i++)
+        dac.config.upsampling_ratios[i] = dacvae_strides[i];
+    for (int i = 0; i < 5; i++)
+        dac.config.decoder_channels[i] = dacvae_channels[i];
+
+    // Load weights
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(codec_gguf_path, ctx->backend, "dacvae_codec", wl)) {
+        std::fprintf(stderr, "[irodori] failed to load codec weights\n");
+        return -1;
+    }
+
+    auto& ts = wl.tensors;
+    auto get = [&](const char* name) -> ggml_tensor* { return core_gguf::require(ts, name, "dacvae_codec"); };
+    auto try_get = [&](const char* name) -> ggml_tensor* { return core_gguf::try_get(ts, name); };
+
+    // out_proj: Conv1d(codebook_dim → latent_dim, k=1)
+    ctx->codec_out_proj_w = get("dacvae.out_proj.w");
+    ctx->codec_out_proj_b = try_get("dacvae.out_proj.b");
+
+    // in_conv: Conv1d(latent_dim → decoder_dim, k=7)
+    dac.in_conv_w = get("dacvae.dec.in_conv.w");
+    dac.in_conv_b = try_get("dacvae.dec.in_conv.b");
+
+    // Decoder blocks — the DACVAE GGUF stores all block tensors
+    // For the watermark-free path, we need: snake_alpha, up convtranspose, 3 residual units
+    for (int b = 0; b < dac.config.n_decoder_blocks; b++) {
+        auto& blk = dac.blocks[b];
+        char buf[128];
+
+        // Snake alpha (block.0.alpha in the GGUF naming)
+        snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.0.alpha", b);
+        blk.snake_alpha = try_get(buf);
+
+        // ConvTranspose1d (block.1.weight)
+        snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.1.weight", b);
+        blk.up_w = try_get(buf);
+        snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.1.bias", b);
+        blk.up_b = try_get(buf);
+
+        // 3 Residual units (block.4, block.5, block.8 in the DACVAE GGUF)
+        // block.4 = ResUnit(d=1), block.5 = ResUnit(d=3), block.8 = ResUnit(d=9)
+        int res_indices[3] = {4, 5, 8};
+        for (int r = 0; r < 3; r++) {
+            auto& ru = blk.res[r];
+            int ri = res_indices[r];
+            // ResUnit: block[0]=Snake alpha, block[1]=Conv(k=7,dil), block[2]=Snake alpha, block[3]=Conv(k=1)
+            snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.%d.block.0.alpha", b, ri);
+            ru.alpha0 = try_get(buf);
+            snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.%d.block.1.weight", b, ri);
+            ru.conv0_w = try_get(buf);
+            snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.%d.block.1.bias", b, ri);
+            ru.conv0_b = try_get(buf);
+            snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.%d.block.2.alpha", b, ri);
+            ru.alpha1 = try_get(buf);
+            snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.%d.block.3.weight", b, ri);
+            ru.conv1_w = try_get(buf);
+            snprintf(buf, sizeof(buf), "dacvae.dec.blk.%d.block.%d.block.3.bias", b, ri);
+            ru.conv1_b = try_get(buf);
+        }
+    }
+
+    // Final output: from watermark encoder_block (Snake + Conv → Tanh)
+    // wm_model.encoder_block.pre.0.alpha = Snake(96) alpha
+    // wm_model.encoder_block.pre.1 = NormConv1d(96→1, k=7)
+    dac.out_snake_alpha = try_get("dacvae.wm_model.encoder_block.pre.0.alpha");
+    // The Conv(96→1) weight — stored with weight_norm reconstructed in GGUF
+    dac.out_conv_w = try_get("dacvae.wm_model.encoder_block.pre.1.weight");
+    dac.out_conv_b = try_get("dacvae.wm_model.encoder_block.pre.1.bias");
+
+    ctx->codec_ctx = wl.ctx;
+    ctx->codec_buf = wl.buf;
+    ctx->has_codec = true;
+
+    if (ctx->verbosity >= 1) {
+        std::fprintf(stderr, "[irodori] DAC-VAE codec loaded (%d decoder blocks)\n", dac.config.n_decoder_blocks);
+    }
+    return 0;
 }
 
 int irodori_tts_set_reference(struct irodori_tts_context* ctx, const float* ref_pcm, int n_samples, int sample_rate) {
@@ -1480,25 +1615,122 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         }
     }
 
-    // ── Step 4: Output ──
-    // The latent (patched_steps × latent_d) needs DAC-VAE decoding to produce PCM.
-    // For now, output silence and log that DAC-VAE decode is needed.
-    // TODO: integrate DACVAE decoder from dacvae-ja-32dim-f16.gguf
-    int n_pcm = latent_steps * hp.codec_hop_length;
-    float* out = (float*)std::malloc(n_pcm * sizeof(float));
-    if (!out)
-        return 0;
-    std::memset(out, 0, n_pcm * sizeof(float));
-
-    if (ctx->verbosity >= 1) {
-        std::fprintf(stderr,
-                     "[irodori] output: %d samples (%.2f sec @ %d Hz) "
-                     "[DAC-VAE decode pending — latent produced]\n",
-                     n_pcm, (float)n_pcm / hp.sample_rate, hp.sample_rate);
+    // ── Step 4: DAC-VAE decode (latent → PCM) ──
+    if (!ctx->has_codec) {
+        // No codec loaded — output silence with warning
+        int n_pcm = latent_steps * hp.codec_hop_length;
+        float* out = (float*)std::malloc(n_pcm * sizeof(float));
+        if (!out)
+            return 0;
+        std::memset(out, 0, n_pcm * sizeof(float));
+        if (ctx->verbosity >= 1) {
+            std::fprintf(stderr,
+                         "[irodori] output: %d samples (%.2f sec @ %d Hz) "
+                         "[DAC-VAE codec not loaded — outputting silence. Use --codec-model]\n",
+                         n_pcm, (float)n_pcm / hp.sample_rate, hp.sample_rate);
+        }
+        *pcm_out = out;
+        return n_pcm;
     }
 
-    *pcm_out = out;
-    return n_pcm;
+    IRODORI_DBG("[irodori] decoding latent (%d frames) with DAC-VAE...\n", patched_steps);
+
+    // Build DAC-VAE decode graph:
+    //   latent (latent_d, T) → out_proj Conv1d(32→1024, k=1) → DAC decoder → Tanh → PCM
+    {
+        const auto& dac = ctx->dac;
+        const auto& cfg = dac.config;
+        int T = patched_steps;
+
+        const int n_dec_tensors = 4096;
+        size_t dec_ctx_size = n_dec_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_dec_tensors, false);
+        ggml_init_params ip = {dec_ctx_size, nullptr, true};
+        ggml_context* g = ggml_init(ip);
+
+        // Input: latent (latent_d, T) in ggml layout
+        ggml_tensor* lat_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, latent_d, T);
+        ggml_set_name(lat_in, "latent_in");
+        ggml_set_input(lat_in);
+
+        // out_proj: Conv1d(codebook_dim → hidden, k=1)
+        ggml_tensor* h = lat_in;
+        if (ctx->codec_out_proj_w) {
+            h = core_dac::conv1d(g, h, ctx->codec_out_proj_w, ctx->codec_out_proj_b, 1);
+            h = ggml_cast(g, h, GGML_TYPE_F32);
+        }
+
+        // in_conv: Conv1d(hidden → decoder_dim, k=7)
+        if (dac.in_conv_w) {
+            h = core_dac::conv1d(g, h, dac.in_conv_w, dac.in_conv_b, 7);
+            h = ggml_cast(g, h, GGML_TYPE_F32);
+        }
+
+        // 4 decoder blocks: Snake → ConvTranspose1d(stride) → 3× ResUnit(d=1,3,9)
+        for (int b = 0; b < cfg.n_decoder_blocks; b++) {
+            h = core_dac::dec_block(g, h, dac.blocks[b], cfg.upsampling_ratios[b]);
+            h = ggml_cont(g, h);
+            h = ggml_cast(g, h, GGML_TYPE_F32);
+        }
+
+        // Final: Snake(out_ch) → Conv1d(out_ch → 1, k=7) → Tanh
+        if (dac.out_snake_alpha) {
+            h = core_dac::snake(g, h, dac.out_snake_alpha);
+        }
+        if (dac.out_conv_w) {
+            h = core_dac::conv1d(g, h, dac.out_conv_w, dac.out_conv_b, 7);
+            h = ggml_cast(g, h, GGML_TYPE_F32);
+        }
+        h = ggml_tanh(g, h);
+
+        // Flatten to 1D PCM
+        int T_pcm = (int)h->ne[1]; // after all upsampling
+        h = ggml_reshape_1d(g, h, T_pcm);
+        ggml_set_name(h, "pcm_out");
+        ggml_set_output(h);
+
+        ggml_cgraph* gf = ggml_new_graph_custom(g, n_dec_tensors, false);
+        ggml_build_forward_expand(gf, h);
+
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!ggml_gallocr_reserve(galloc, gf) || !ggml_gallocr_alloc_graph(galloc, gf)) {
+            std::fprintf(stderr, "[irodori] ERROR: DAC-VAE decode graph alloc failed\n");
+            ggml_gallocr_free(galloc);
+            ggml_free(g);
+            // Fallback: output silence
+            int n_pcm = latent_steps * hp.codec_hop_length;
+            float* out = (float*)std::malloc(n_pcm * sizeof(float));
+            if (out)
+                std::memset(out, 0, n_pcm * sizeof(float));
+            *pcm_out = out;
+            return out ? n_pcm : 0;
+        }
+
+        // Set latent input (x_t after ODE is in ggml (D, T) layout)
+        ggml_backend_tensor_set(lat_in, x_t.data(), 0, x_t.size() * sizeof(float));
+
+        ggml_backend_graph_compute(ctx->backend, gf);
+
+        // Read PCM output
+        int n_pcm = (int)h->ne[0];
+        float* out = (float*)std::malloc(n_pcm * sizeof(float));
+        if (!out) {
+            ggml_gallocr_free(galloc);
+            ggml_free(g);
+            return 0;
+        }
+        ggml_backend_tensor_get(h, out, 0, n_pcm * sizeof(float));
+
+        ggml_gallocr_free(galloc);
+        ggml_free(g);
+
+        if (ctx->verbosity >= 1) {
+            std::fprintf(stderr, "[irodori] output: %d samples (%.2f sec @ %d Hz)\n", n_pcm,
+                         (float)n_pcm / hp.sample_rate, hp.sample_rate);
+        }
+
+        *pcm_out = out;
+        return n_pcm;
+    }
 }
 
 void irodori_tts_set_seed(struct irodori_tts_context* ctx, int seed) {

@@ -62,6 +62,11 @@ void irodori_tts_clear_reference(struct irodori_tts_context* ctx);
 // Caller owns the returned buffer (malloc'd; free with free()).
 int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, float** pcm_out, int* sample_rate_out);
 
+// Load the DAC-VAE decoder GGUF (companion model for audio reconstruction).
+// Must be called before synthesize for audio output (otherwise outputs silence).
+// Returns 0 on success, -1 on failure.
+int irodori_tts_set_codec_path(struct irodori_tts_context* ctx, const char* codec_gguf_path);
+
 // Runtime parameter setters.
 void irodori_tts_set_seed(struct irodori_tts_context* ctx, int seed);
 void irodori_tts_set_ode_steps(struct irodori_tts_context* ctx, int steps);

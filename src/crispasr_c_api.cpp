@@ -6163,6 +6163,10 @@ CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* p
         return 0;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx)
+        return irodori_tts_set_codec_path(s->irodori_ctx, path);
+#endif
 #ifdef CA_HAVE_INDEXTTS
     // indextts routes its BigVGAN vocoder companion (indextts-bigvgan)
     // through the shared codec-path setter, same as qwen3-tts/orpheus.
