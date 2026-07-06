@@ -7052,15 +7052,20 @@ that option). LID graph auto-routes to CPU on Vulkan;
 (reporter has RX 9070 XT) — may be MoltenVK-only; if it reproduces, minimal
 upstream repro.
 
-**Diarization CPU perf (OPEN, measured M1, 31.5 s multispeaker.wav):**
-`--diarize-speakers` = pyannote seg **4.39 s** (scalar SincNet + serial biLSTM)
-+ TitaNet **0.70 s per speaker turn** (all-scalar forward). Long multi-turn
-audio → minutes (matches #222 reporter's complaint). Cure = same ggml-graph
-port as silero LID: (a) pyannote_seg (SincNet convs + biLSTM via core/lstm.h);
-(b) titanet (conv trunk + SE + ASP; segments batchable). Also: pyannote is
-re-initialized per call (PERFORMANCE.md), fix alongside.
+**Diarization CPU perf (DONE, 3340054f):** both models ported to ggml graphs,
+legacy paths gated as A/B ground truth. pyannote_seg 4.38 s → 0.55 s (31.5 s
+audio, M1), frame-identical (CRISPASR_PYANNOTE_LEGACY=1). TitaNet embeddings
+cos=1.000000; inverse-default: without Accelerate the scalar path measured
+**106–131 s per embedding** (the actual #222 "extremely slow" cause on Linux)
+→ 3.4 s ggml (~35×); with Accelerate the legacy AMX path (0.7 s) stays default
+(CRISPASR_TITANET_GGML=1 / CRISPASR_TITANET_LEGACY=1). OPEN: batch segments;
+F16 weights to close the ggml-vs-AMX gap on Apple.
 
-**FireRed ASR CPU perf (ANALYSIS):** 0.5–0.6× realtime is model-size bound
-(900M encoder-AED, already Q4_K SIMD, 60 ms/decode step, no exposed KV to
-cache further per PERFORMANCE.md). No quick win; levers = GPU decode path or
-recommending a smaller backend for CPU-only users.
+**FireRed ASR perf (PARTLY DONE, d6e2ad85):** measured split on 11 s jfk (M1):
+fbank 0.08 s + subsample 0.16 s + **encoder 11.3 s** + decoder ~0.5 s/step
+(beam=3, ~16 s) = 0.3× RT. Root cause of the CPU-only encoder: it relied on
+the sched auto-copying CPU weights to GPU, which ggml removed → silent
+regression. Fix: CRISPASR_FIRERED_ENC_GPU=1 split-loads enc.* to GPU —
+transcript-identical, encoder 2.3× on Metal, 2.1× on Vulkan/MoltenVK. OPEN:
+CUDA A/B on Kaggle, then flip default; decoder beam path (~0.5 s/step vs
+60 ms/step greedy) is the next lever — profile the beam batching.
