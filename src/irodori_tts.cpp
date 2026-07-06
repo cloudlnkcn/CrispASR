@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <queue>
 #include <random>
 #include <string>
 #include <vector>
@@ -220,10 +221,12 @@ struct irodori_tts_context {
     ggml_backend_buffer_t buf_weights = nullptr;
     ggml_context* w_ctx = nullptr; // weight tensor context (kept alive)
 
-    // Tokenizer (SentencePiece unigram)
+    // Tokenizer (BPE with Metaspace pre-tokenization — matches HF LlamaTokenizer)
     std::vector<std::string> vocab;
     std::unordered_map<std::string, int32_t> token_to_id;
     std::vector<float> token_scores;
+    std::unordered_map<std::string, int32_t> merge_rank;
+    bool use_bpe = false; // true when merges are loaded (correct path)
     int bos_token_id = -1;
     int pad_token_id = -1;
 #ifdef IRODORI_HAVE_SENTENCEPIECE
@@ -806,6 +809,114 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
 }
 
 // ── Tokenizer ───────────────────────────────────────────────────────
+//
+// sarashina2.2 uses HuggingFace's LlamaTokenizer (tokenizers BPE with
+// Metaspace pre-tokenizer + byte_fallback). The algorithm:
+//   1. Metaspace: replace spaces with ▁ (U+2581), no prefix prepend
+//   2. BPE: split into UTF-8 characters, iteratively merge lowest-rank pair
+//   3. byte_fallback: unknown chars → <0xHH> hex tokens per UTF-8 byte
+//
+// This matches CrispEmbed's BPETokenizer::bpe_merge() (spm_style path).
+
+// BPE merge: split text into UTF-8 chars, iteratively merge by rank.
+// Uses linked-list + priority queue for O(N log N) merging.
+static std::vector<int32_t> bpe_merge(const std::string& text,
+                                      const std::unordered_map<std::string, int32_t>& token_to_id,
+                                      const std::unordered_map<std::string, int32_t>& merge_rank) {
+    if (text.empty())
+        return {};
+
+    // Split into individual UTF-8 characters as initial symbols
+    struct Node {
+        std::string text;
+        int prev, next;
+    };
+    std::vector<Node> nodes;
+    {
+        size_t i = 0;
+        while (i < text.size()) {
+            size_t len = 1;
+            unsigned char c = (unsigned char)text[i];
+            if (c >= 0xC0) {
+                if (c < 0xE0)
+                    len = 2;
+                else if (c < 0xF0)
+                    len = 3;
+                else
+                    len = 4;
+            }
+            len = std::min(len, text.size() - i);
+            int idx = (int)nodes.size();
+            nodes.push_back({text.substr(i, len), idx - 1, -1});
+            if (idx > 0)
+                nodes[idx - 1].next = idx;
+            i += len;
+        }
+    }
+    if (nodes.empty())
+        return {};
+
+    // Priority-queue BPE: merge lowest-rank pairs first
+    using PQE = std::pair<int, int>; // (rank, left_index)
+    auto cmp = [](const PQE& a, const PQE& b) { return a.first > b.first; };
+    std::priority_queue<PQE, std::vector<PQE>, decltype(cmp)> pq(cmp);
+
+    auto try_add = [&](int i) {
+        int j = nodes[i].next;
+        if (j < 0)
+            return;
+        std::string pair = nodes[i].text + " " + nodes[j].text;
+        auto it = merge_rank.find(pair);
+        if (it != merge_rank.end())
+            pq.push({it->second, i});
+    };
+    for (int i = 0; i < (int)nodes.size(); i++)
+        try_add(i);
+
+    while (!pq.empty()) {
+        auto [rank, left] = pq.top();
+        pq.pop();
+        int right = nodes[left].next;
+        if (right < 0)
+            continue;
+        // Verify the pair hasn't been invalidated by a prior merge
+        std::string pair = nodes[left].text + " " + nodes[right].text;
+        auto it = merge_rank.find(pair);
+        if (it == merge_rank.end() || it->second != rank)
+            continue;
+        // Merge right into left
+        nodes[left].text += nodes[right].text;
+        nodes[left].next = nodes[right].next;
+        if (nodes[right].next >= 0)
+            nodes[nodes[right].next].prev = left;
+        nodes[right].next = -1;
+        nodes[right].prev = -1;
+        // Re-check neighbors for new merge opportunities
+        if (nodes[left].prev >= 0)
+            try_add(nodes[left].prev);
+        try_add(left);
+    }
+
+    // Collect symbols and convert to token IDs
+    std::vector<int32_t> ids;
+    for (int i = 0; i >= 0; i = nodes[i].next) {
+        auto it = token_to_id.find(nodes[i].text);
+        if (it != token_to_id.end()) {
+            ids.push_back(it->second);
+        } else {
+            // Byte fallback: encode each UTF-8 byte as <0xHH>
+            for (unsigned char byte : nodes[i].text) {
+                char hex[16];
+                std::snprintf(hex, sizeof(hex), "<0x%02X>", byte);
+                auto bit = token_to_id.find(hex);
+                if (bit != token_to_id.end()) {
+                    ids.push_back(bit->second);
+                }
+            }
+        }
+    }
+    return ids;
+}
 
 static std::vector<int32_t> tokenize_text(const irodori_tts_context* ctx, const char* text) {
     // Override token IDs from env var for parity testing:
@@ -833,28 +944,42 @@ static std::vector<int32_t> tokenize_text(const irodori_tts_context* ctx, const 
         tokens.push_back(ctx->bos_token_id);
     }
 
+    if (!ctx->token_to_id.empty()) {
+        if (ctx->use_bpe && !ctx->merge_rank.empty()) {
+            // BPE with Metaspace pre-tokenization (for BPE-family tokenizers)
+            // Metaspace: replace spaces with ▁, no prefix prepend (prepend_scheme=never)
+            std::string processed;
+            for (const char* p = text; *p; p++) {
+                if (*p == ' ')
+                    processed += "\xe2\x96\x81"; // ▁ (U+2581)
+                else
+                    processed += *p;
+            }
+            auto bpe_ids = bpe_merge(processed, ctx->token_to_id, ctx->merge_rank);
+            tokens.insert(tokens.end(), bpe_ids.begin(), bpe_ids.end());
 #ifdef IRODORI_HAVE_SENTENCEPIECE
-    if (ctx->sp_processor) {
-        // Prepend ▁ to match HuggingFace LlamaTokenizer behavior
-        // (the SP model has add_dummy_prefix=False but HF forces it)
-        std::string sp_text = std::string("\xE2\x96\x81") + text; // ▁ + text
-        std::vector<int> sp_ids;
-        ctx->sp_processor->Encode(sp_text, &sp_ids);
-        for (int id : sp_ids)
-            tokens.push_back(id);
-    } else
+        } else if (ctx->sp_processor) {
+            // Native SentencePiece processor (when embedded .model is available)
+            std::string sp_text = std::string("\xE2\x96\x81") + text; // ▁ + text
+            std::vector<int> sp_ids;
+            ctx->sp_processor->Encode(sp_text, &sp_ids);
+            for (int id : sp_ids)
+                tokens.push_back(id);
 #endif
-        if (!ctx->token_to_id.empty() && !ctx->token_scores.empty()) {
-        // Fallback: custom Viterbi tokenizer (may not match HF exactly)
-        core_spm::Config cfg;
-        cfg.unk_id = 0;
-        cfg.utf8_aligned = true;
-        cfg.merge_consecutive_unk = true;
-        auto sp_tokens = core_spm::tokenize(text, ctx->token_to_id, ctx->token_scores, cfg, false);
-        tokens.insert(tokens.end(), sp_tokens.begin(), sp_tokens.end());
+        } else if (!ctx->token_scores.empty()) {
+            // Unigram (SentencePiece Viterbi) — correct for llm-jp/llm-jp-3 style tokenizers
+            core_spm::Config cfg;
+            cfg.unk_id = 0;
+            cfg.utf8_aligned = true;
+            cfg.merge_consecutive_unk = true;
+            auto sp_tokens = core_spm::tokenize(text, ctx->token_to_id, ctx->token_scores, cfg, true);
+            tokens.insert(tokens.end(), sp_tokens.begin(), sp_tokens.end());
+        } else {
+            IRODORI_DBG("[irodori] WARNING: no tokenizer data loaded\n");
+        }
     } else {
         // Byte-level fallback (works but suboptimal)
-        IRODORI_DBG("[irodori] WARNING: no SentencePiece vocab loaded, using byte fallback\n");
+        IRODORI_DBG("[irodori] WARNING: no vocab loaded, using byte fallback\n");
         const uint8_t* p = (const uint8_t*)text;
         while (*p) {
             tokens.push_back((int32_t)*p);
@@ -995,14 +1120,33 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
                 ctx->vocab[i] = vocab_strs[i];
                 ctx->token_to_id[vocab_strs[i]] = (int32_t)i;
             }
-            // Load scores
+            // Load scores (used only by legacy SP Viterbi fallback)
             auto scores = core_gguf::kv_f32_array(meta, "tokenizer.ggml.scores");
             if (!scores.empty()) {
                 ctx->token_scores = scores;
             }
-            if (ctx->verbosity >= 1) {
-                std::fprintf(stderr, "[irodori] tokenizer: %zu tokens, %zu scores, bos=%d, pad=%d\n", ctx->vocab.size(),
-                             ctx->token_scores.size(), ctx->bos_token_id, ctx->pad_token_id);
+            // Load BPE merges (correct tokenization for sarashina2.2)
+            auto merges = core_gguf::kv_str_array(meta, "tokenizer.ggml.merges");
+            if (!merges.empty()) {
+                ctx->merge_rank.reserve(merges.size());
+                for (size_t i = 0; i < merges.size(); i++) {
+                    ctx->merge_rank[merges[i]] = (int32_t)i;
+                }
+                ctx->use_bpe = true;
+                if (ctx->verbosity >= 1) {
+                    std::fprintf(stderr, "[irodori] tokenizer: %zu tokens, %zu BPE merges, bos=%d, pad=%d\n",
+                                 ctx->vocab.size(), merges.size(), ctx->bos_token_id, ctx->pad_token_id);
+                }
+            } else if (!ctx->token_scores.empty()) {
+                if (ctx->verbosity >= 1) {
+                    std::fprintf(stderr, "[irodori] tokenizer: %zu tokens, %zu scores (unigram), bos=%d, pad=%d\n",
+                                 ctx->vocab.size(), ctx->token_scores.size(), ctx->bos_token_id, ctx->pad_token_id);
+                }
+            } else {
+                if (ctx->verbosity >= 1) {
+                    std::fprintf(stderr, "[irodori] WARNING: tokenizer has vocab but no scores/merges — "
+                                         "reconvert GGUF with updated converter\n");
+                }
             }
         } else {
             if (ctx->verbosity >= 1) {

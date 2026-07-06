@@ -302,8 +302,8 @@ def map_top_level(state: dict, writer: GGUFWriter):
 
 # ── Tokenizer ─────────────────────────────────────���──────────────────
 
-def load_tokenizer_data(tokenizer_repo: str) -> tuple[list[str], list[float], int, int]:
-    """Load tokenizer vocab, scores, BOS and PAD IDs from HuggingFace repo."""
+def load_tokenizer_data(tokenizer_repo: str) -> tuple[list[str], list[float], list[str], int, int]:
+    """Load tokenizer vocab, scores, BPE merges, BOS and PAD IDs from HuggingFace repo."""
     try:
         from transformers import AutoTokenizer
     except ImportError:
@@ -312,23 +312,75 @@ def load_tokenizer_data(tokenizer_repo: str) -> tuple[list[str], list[float], in
     tok = AutoTokenizer.from_pretrained(tokenizer_repo, use_fast=True)
     vocab_size = len(tok)
 
-    # Try to get SentencePiece model for scores
+    # Extract tokenizer model info from the fast tokenizer backend
+    bt = tok.backend_tokenizer
+    tj = json.loads(bt.to_str())
+    model_info = tj.get("model", {})
+    model_type = model_info.get("type", "")
+    print(f"  Tokenizer model type: {model_type}")
+
     scores = [0.0] * vocab_size
-    try:
-        import sentencepiece as spm
-        sp_model = None
-        # Try to find the sp model file
-        if hasattr(tok, 'vocab_file') and tok.vocab_file:
-            sp_model = spm.SentencePieceProcessor()
-            sp_model.Load(tok.vocab_file)
-        elif hasattr(tok, 'sp_model') and tok.sp_model:
-            sp_model = tok.sp_model
-        if sp_model:
-            for i in range(min(vocab_size, sp_model.GetPieceSize())):
-                scores[i] = sp_model.GetScore(i)
-            print(f"  Loaded {sp_model.GetPieceSize()} SentencePiece scores")
-    except Exception as e:
-        print(f"  WARNING: could not load SP scores: {e}")
+    merges = []
+
+    if model_type == "Unigram":
+        # Unigram: extract scores directly from tokenizer.json vocab
+        hf_vocab = model_info.get("vocab", [])
+        for i, entry in enumerate(hf_vocab):
+            if i < vocab_size and isinstance(entry, list) and len(entry) >= 2:
+                scores[i] = float(entry[1])
+        print(f"  Loaded {len(hf_vocab)} Unigram scores from fast tokenizer")
+    elif model_type == "BPE":
+        # BPE: extract merges from tokenizer.json
+        raw_merges = model_info.get("merges", [])
+        for m in raw_merges:
+            if isinstance(m, list):
+                merges.append(" ".join(m))
+            else:
+                merges.append(str(m))
+        print(f"  Loaded {len(merges)} BPE merges from fast tokenizer")
+        # Also try to load SP scores for backward compat
+        try:
+            import sentencepiece as spm
+            sp_model = None
+            if hasattr(tok, 'vocab_file') and tok.vocab_file:
+                sp_model = spm.SentencePieceProcessor()
+                sp_model.Load(tok.vocab_file)
+            if sp_model:
+                for i in range(min(vocab_size, sp_model.GetPieceSize())):
+                    scores[i] = sp_model.GetScore(i)
+                print(f"  Loaded {sp_model.GetPieceSize()} SentencePiece scores")
+        except Exception as e:
+            print(f"  WARNING: could not load SP scores: {e}")
+    else:
+        # Fallback: try raw SentencePiece model
+        try:
+            import sentencepiece as spm
+            sp_model = None
+            if hasattr(tok, 'vocab_file') and tok.vocab_file:
+                sp_model = spm.SentencePieceProcessor()
+                sp_model.Load(tok.vocab_file)
+            if sp_model:
+                for i in range(min(vocab_size, sp_model.GetPieceSize())):
+                    scores[i] = sp_model.GetScore(i)
+                print(f"  Loaded {sp_model.GetPieceSize()} SentencePiece scores")
+        except Exception as e:
+            print(f"  WARNING: could not load SP scores: {e}")
+
+    # Extract normalizer info for the C++ runtime
+    normalizer = tj.get("normalizer")
+    has_prepend_space = False
+    if normalizer:
+        # Check for ▁ prepend pattern in the normalizer sequence
+        norms = normalizer.get("normalizers", [normalizer])
+        for n in norms:
+            if n.get("type") == "Replace":
+                pattern = n.get("pattern", {})
+                content = n.get("content", "")
+                regex = pattern.get("Regex", "")
+                if content == "\u2581" and "^" in regex:
+                    has_prepend_space = True
+    if has_prepend_space:
+        print(f"  Normalizer: prepend ▁ at start of text")
 
     vocab = []
     for i in range(vocab_size):
@@ -349,7 +401,7 @@ def load_tokenizer_data(tokenizer_repo: str) -> tuple[list[str], list[float], in
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else (
         tok.eos_token_id if tok.eos_token_id is not None else -1)
 
-    return vocab, scores, bos_id, pad_id, sp_model_path
+    return vocab, scores, merges, bos_id, pad_id, sp_model_path
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -359,8 +411,8 @@ def main():
     parser.add_argument("--checkpoint", type=str, help="Path to .safetensors checkpoint")
     parser.add_argument("--hf-repo", type=str, help="HuggingFace repo ID (downloads automatically)")
     parser.add_argument("--output", type=str, required=True, help="Output GGUF path")
-    parser.add_argument("--tokenizer-repo", type=str, default="sbintuitions/sarashina2.2-0.5b",
-                        help="Tokenizer HF repo")
+    parser.add_argument("--tokenizer-repo", type=str, default=None,
+                        help="Tokenizer HF repo (auto-detected from checkpoint metadata if omitted)")
     parser.add_argument("--no-vocab", action="store_true",
                         help="Skip embedding tokenizer vocab (saves space)")
     parser.add_argument("--dtype", type=str, default="f16", choices=["f16", "f32"],
@@ -430,12 +482,18 @@ def main():
         elif isinstance(v, str):
             writer.add_string(f"irodori.{k}", v)
 
-    # Write tokenizer vocab + scores
+    # Write tokenizer vocab + scores + BPE merges
     if not args.no_vocab:
-        print(f"Loading tokenizer: {args.tokenizer_repo}")
-        vocab, scores, bos_id, pad_id, sp_model_path = load_tokenizer_data(args.tokenizer_repo)
+        tokenizer_repo = args.tokenizer_repo
+        if tokenizer_repo is None:
+            # Auto-detect from checkpoint metadata
+            tokenizer_repo = (config or {}).get("text_tokenizer_repo", "sbintuitions/sarashina2.2-0.5b")
+        print(f"Loading tokenizer: {tokenizer_repo}")
+        vocab, scores, merges, bos_id, pad_id, sp_model_path = load_tokenizer_data(tokenizer_repo)
         writer.add_array("tokenizer.ggml.tokens", vocab)
         writer.add_array("tokenizer.ggml.scores", [float(s) for s in scores])
+        if merges:
+            writer.add_array("tokenizer.ggml.merges", merges)
         writer.add_uint32("tokenizer.ggml.bos_token_id", bos_id if bos_id >= 0 else 0)
         writer.add_uint32("tokenizer.ggml.pad_token_id", pad_id if pad_id >= 0 else 0)
         writer.add_uint32(f"irodori.tokenizer.vocab_size", len(vocab))
@@ -446,7 +504,7 @@ def main():
             sp_arr = np.frombuffer(sp_model_data, dtype=np.int8)
             writer.add_tensor("tokenizer.ggml.raw_model", sp_arr)
             print(f"  embedded tokenizer.model as tensor ({len(sp_model_data)} bytes)")
-        print(f"  vocab_size={len(vocab)}, bos_id={bos_id}, pad_id={pad_id}")
+        print(f"  vocab_size={len(vocab)}, merges={len(merges)}, bos_id={bos_id}, pad_id={pad_id}")
 
     # Write model weights
     print("Converting text encoder...")
