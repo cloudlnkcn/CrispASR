@@ -7066,8 +7066,9 @@ fbank 0.08 s + subsample 0.16 s + **encoder 11.3 s** + decoder ~0.5 s/step
 (beam=3, ~16 s) = 0.3× RT. Root cause of the CPU-only encoder: it relied on
 the sched auto-copying CPU weights to GPU, which ggml removed → silent
 regression. Fix: CRISPASR_FIRERED_ENC_GPU=1 split-loads enc.* to GPU —
-transcript-identical, encoder 2.3× on Metal, 2.1× on Vulkan/MoltenVK. OPEN:
-CUDA A/B on Kaggle, then flip default. Decoder beam path DONE (bc8a599a):
+transcript-identical, encoder 2.3× on Metal, 2.1× on Vulkan/MoltenVK. CUDA A/B
+PASSED on Kaggle P100 (transcript-identical, enc 12.93→5.88 s, 2.2×) —
+default FLIPPED (ffa4afa0); CRISPASR_FIRERED_ENC_CPU=1 opts out. Decoder beam path DONE (bc8a599a):
 the beam loop was dequantizing all decoder weights to F32 and running
 scalar dots (8× the bytes of greedy's Q4_K kernels); now batched through
 ggml_matmat on the quantized weights — beam=3 16.8 s → 3.1 s (~70 ms/step,
