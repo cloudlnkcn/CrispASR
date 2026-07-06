@@ -42,8 +42,11 @@ void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps);
 void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed);
 
 // Transcribe raw 24kHz mono PCM audio.
+// `context` is optional free-form hotword/metadata text spliced into the
+// prompt (NULL or empty/whitespace-only for the default prompt); matches
+// `context_info` in microsoft/VibeVoice's vibevoice_asr_processor.py.
 // Returns malloc'd UTF-8 string, caller frees with free().
-char* vibevoice_transcribe(struct vibevoice_context* ctx, const float* samples, int n_samples);
+char* vibevoice_transcribe(struct vibevoice_context* ctx, const float* samples, int n_samples, const char* context);
 
 // Variant that additionally returns per-emitted-token ids and softmax
 // probabilities. Free with vibevoice_result_free.
@@ -55,7 +58,7 @@ struct vibevoice_result {
 };
 
 struct vibevoice_result* vibevoice_transcribe_with_probs(struct vibevoice_context* ctx, const float* samples,
-                                                         int n_samples);
+                                                         int n_samples, const char* context);
 void vibevoice_result_free(struct vibevoice_result* r);
 
 // Token-id → vocab piece (raw, with Qwen2/GPT-2 byte-level BPE markers

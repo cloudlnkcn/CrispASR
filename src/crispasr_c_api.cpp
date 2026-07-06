@@ -4934,7 +4934,8 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         };
 
         const std::vector<float> pcm24 = resample_16k_to_24k(pcm, n_samples);
-        vibevoice_result* vr = vibevoice_transcribe_with_probs(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size());
+        vibevoice_result* vr =
+            vibevoice_transcribe_with_probs(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size(), nullptr);
         if (!vr || !vr->text) {
             if (vr)
                 vibevoice_result_free(vr);
