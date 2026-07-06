@@ -7157,3 +7157,28 @@ kernels compile-time guarded + runtime dispatched, so no special flags.
   glint repo (Contents r/w on CrispASR); without it the daily cron
   covers it. First sync pulled the AAC psy-shaping upstream commit
   (30fb4fcd, aac_psy.cpp auto-added to the source list).
+
+## §226 irodori-tts GPU + codec GGUF fix (DONE 864ebe2e / HF refresh)
+
+User-requested GPU enablement for the Irodori-TTS RF-DiT backend (all stages
+were already single-backend gallocr ggml graphs, but the backend hardcoded
+CPU). Now honors use_gpu (CLI adapter wired; session ABI already passed it);
+codec follows the compute backend except on Vulkan (CPU per TADA #192);
+CRISPASR_IRODORI_CPU / _CODEC_GPU / _CODEC_CPU override.
+
+Blocking baseline bug found+fixed on the way: the published
+dacvae-ja-32dim-f16.gguf predated the converter's wm_model final-conv export
+— missing pre.1.{weight,bias} (Conv 96→1) made the C++ decoder skip the
+final conv and die at GGML_ASSERT(nelements==ne0) on the 1-D reshape.
+Re-converted (converter on main was already correct) and re-uploaded to
+cstr/irodori-tts-GGUF, so `-m auto` users get the fix without a rebuild.
+
+M1 verify (seed 42, JA): CPU↔Metal waveform cos=0.999389, same RMS/ASR
+reading; 73.4 s → 31.4 s per 2 s synthesis (2.3×; CPU idle on GPU run).
+
+OPEN (upstream/parallel session): baseline generation QUALITY is still WIP —
+both CPU and GPU produce the same garbled JA speech (parity holds; the
+divergence is upstream of the backend split, likely DiT/ODE math vs the
+Python reference). Perf follow-up: ~120 DiT graph evals (40 ODE steps ×
+CFG) rebuild graph+gallocr per eval — cacheable, but mind the #215 cached-
+cgraph UAF pattern.
