@@ -2942,8 +2942,13 @@ core infrastructure.
 #### LID
 
 **ECAPA-TDNN LID** (`ecapa_lid.cpp`):
-- Has: GPU for Conv1d trunk, mel filterbank in GGUF, 15s audio cap
-- Gap: ASP + FC layers scalar CPU (9216×T dominant), BN not pre-folded
+- Has: GPU for Conv1d trunk, mel filterbank in GGUF, 15s audio cap; ASP + FC
+  head in-graph (§224, titanet-style). Inverse-default: in-graph WITHOUT
+  Accelerate (scalar head was ~3.0 s of a 4.5 s detect → in-graph removes it);
+  WITH Accelerate the GEMM head (57 ms) stays default.
+  CRISPASR_ECAPA_ASP_GGML=1 / CRISPASR_ECAPA_ASP_CPU=1 force either way.
+- Gap: trunk graph ~1.3 s dominates on M1 (profile Metal residency); BN not
+  pre-folded
 
 **Silero LID** (`silero_lid.cpp`):
 - Has: ggml-graph forward (§224, default): CPU frontend (log-mag precision) +
