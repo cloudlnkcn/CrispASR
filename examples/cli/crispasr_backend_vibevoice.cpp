@@ -90,6 +90,7 @@ public:
         cp.verbosity = p.no_prints ? 0 : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
         cp.tts_steps = p.tts_steps;
+        cp.cfg_scale = p.tts_cfg_scale;
         ctx_ = vibevoice_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {
             fprintf(stderr, "crispasr[vibevoice]: failed to load model '%s'\n", p.model.c_str());
@@ -137,6 +138,7 @@ public:
         if (ctx_) {
             vibevoice_set_tts_steps(ctx_, params.tts_steps);
             vibevoice_set_seed(ctx_, (uint32_t)params.seed);
+            vibevoice_set_cfg_scale(ctx_, params.tts_cfg_scale);
         }
         // Voice resolution order:
         //   1. Bare-name in --voice-dir: <voice-dir>/<name>.gguf

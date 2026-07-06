@@ -23,6 +23,12 @@ struct vibevoice_context_params {
     bool use_gpu;
     int tts_steps;   // DPM-Solver++ inference steps (default 20, min 4)
     uint32_t seed;   // RNG seed for TTS diffusion noise (0 = env/default)
+    float cfg_scale; // TTS CFG guidance scale; 0 = model default (1.3 base,
+                     // 3.0 realtime; upstream's realtime demo uses 1.5).
+                     // Spontaneous BGM onsets are a documented model
+                     // behavior (microsoft/VibeVoice FAQ, issue #171) —
+                     // lowering cfg and/or changing --seed are the levers
+                     // to re-roll them away.
     bool flash_attn; // PLAN #89 plumbing — σ-VAE encoder + Qwen2.5
                      // talker SA blocks.
 };
@@ -40,6 +46,9 @@ void vibevoice_free(struct vibevoice_context* ctx);
 // burning latency for inaudible quality gain.
 void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps);
 void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed);
+// CFG guidance scale for TTS synthesis (read per synthesize call).
+// scale <= 0 restores the model default (1.3 base / 3.0 realtime).
+void vibevoice_set_cfg_scale(struct vibevoice_context* ctx, float scale);
 
 // Transcribe raw 24kHz mono PCM audio.
 // Returns malloc'd UTF-8 string, caller frees with free().

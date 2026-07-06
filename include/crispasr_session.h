@@ -83,21 +83,18 @@ CRISPASR_SESSION_API void crispasr_session_set_progress_callback(crispasr_sessio
 /// committed during transcription. The segment text and timing are
 /// passed directly — the callback must copy any data it needs (the
 /// pointers are valid only for the duration of the call).
-typedef void (*crispasr_segment_callback)(
-    const char* text,       // segment text (UTF-8, null-terminated)
-    int64_t t0_cs,          // start time in centiseconds
-    int64_t t1_cs,          // end time in centiseconds
-    int segment_index,      // 0-based segment index within this transcription
-    void* user_data         // opaque pointer from registration
+typedef void (*crispasr_segment_callback)(const char* text,  // segment text (UTF-8, null-terminated)
+                                          int64_t t0_cs,     // start time in centiseconds
+                                          int64_t t1_cs,     // end time in centiseconds
+                                          int segment_index, // 0-based segment index within this transcription
+                                          void* user_data    // opaque pointer from registration
 );
 
 /// Register a per-segment streaming callback on the session.
 /// Pass NULL to clear. The callback is invoked on the transcription
 /// thread — it must be fast and non-blocking.
-CRISPASR_SESSION_API void crispasr_session_set_segment_callback(
-    crispasr_session* s,
-    crispasr_segment_callback cb,
-    void* user_data);
+CRISPASR_SESSION_API void crispasr_session_set_segment_callback(crispasr_session* s, crispasr_segment_callback cb,
+                                                                void* user_data);
 
 /// Number of streamed segments available for polling (Dart FFI path).
 CRISPASR_SESSION_API int crispasr_get_streamed_segment_count(void);
@@ -348,6 +345,7 @@ CRISPASR_SESSION_API int crispasr_session_set_ask(crispasr_session* s, const cha
 CRISPASR_SESSION_API int crispasr_session_set_temperature(crispasr_session* s, float temperature, uint64_t seed);
 CRISPASR_SESSION_API int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed);
 CRISPASR_SESSION_API int crispasr_session_set_tts_steps(crispasr_session* s, int steps);
+CRISPASR_SESSION_API int crispasr_session_set_tts_cfg_scale(crispasr_session* s, float scale);
 CRISPASR_SESSION_API int crispasr_session_set_tts_num_candidates(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_g2p_dict(crispasr_session* s, const char* source);
 CRISPASR_SESSION_API int crispasr_session_set_top_p(crispasr_session* s, float top_p);

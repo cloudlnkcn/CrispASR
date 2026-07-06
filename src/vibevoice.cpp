@@ -192,6 +192,7 @@ extern "C" struct vibevoice_context_params vibevoice_context_default_params(void
     p.use_gpu = true;
     p.tts_steps = 20;
     p.seed = 0;
+    p.cfg_scale = 0.0f;
     p.flash_attn = true;
     return p;
 }
@@ -392,6 +393,11 @@ extern "C" void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps
 extern "C" void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed) {
     if (ctx)
         ctx->params.seed = seed;
+}
+
+extern "C" void vibevoice_set_cfg_scale(struct vibevoice_context* ctx, float scale) {
+    if (ctx)
+        ctx->params.cfg_scale = scale > 0.0f ? scale : 0.0f;
 }
 
 extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
@@ -2239,6 +2245,11 @@ static bool backend_needs_fresh_pred_graph(ggml_backend_t b) {
     const char* override_str = std::getenv("CRISPASR_VIBEVOICE_REUSE_PRED_GRAPH");
     if (override_str && (override_str[0] == '1' || override_str[0] == 't' || override_str[0] == 'T'))
         return false;
+    // =0 forces rebuild-each-call even on CPU — the other half of the A/B:
+    // measures what the pred-graph cache is actually worth on a backend
+    // where it is on by default.
+    if (override_str && (override_str[0] == '0' || override_str[0] == 'f' || override_str[0] == 'F'))
+        return true;
     const char* name = ggml_backend_name(b);
     if (!name)
         return false;
@@ -4655,8 +4666,19 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         }
     }
 
-    // Use 1.3 for Base models (prevents static drift), 3.0 for Realtime models
+    // Use 1.3 for Base models (prevents static drift), 3.0 for Realtime models.
+    // Overridable via --tts-cfg-scale / vibevoice_set_cfg_scale() /
+    // VIBEVOICE_TTS_CFG_SCALE (params win over env). Upstream's realtime demo
+    // defaults to 1.5; spontaneous BGM onsets (documented VibeVoice behavior,
+    // issue #171) can often be re-rolled away with a different cfg or --seed.
     float cfg_scale = is_base_model ? 1.3f : 3.0f;
+    if (ctx->params.cfg_scale > 0.0f) {
+        cfg_scale = ctx->params.cfg_scale;
+    } else if (const char* ce = getenv("VIBEVOICE_TTS_CFG_SCALE")) {
+        float v = (float)atof(ce);
+        if (v > 0.0f)
+            cfg_scale = v;
+    }
 
     std::vector<float> all_latents;
     mt19937_state rng;

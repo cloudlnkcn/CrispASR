@@ -554,6 +554,12 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         // Also drive the native-knob path (f5 ode_steps, chatterbox cfm_steps),
         // which reads tts_num_steps; previously only vibevoice honoured this.
         params.tts_num_steps = params.tts_steps;
+    } else if (arg == "--tts-cfg-scale") {
+        params.tts_cfg_scale = std::stof(ARGV_NEXT);
+        if (params.tts_cfg_scale < 0.0f)
+            params.tts_cfg_scale = 0.0f;
+        if (params.tts_cfg_scale > 10.0f)
+            params.tts_cfg_scale = 10.0f;
     } else if (arg == "--codec-model") {
         params.tts_codec_model = ARGV_NEXT;
         std::string auto_base;
@@ -1204,6 +1210,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.chat_n_gpu_layers);
     fprintf(stderr, "             --tts-steps N            [%-7d] DPM-Solver++ steps (10-20, vibevoice only)\n",
             params.tts_steps);
+    fprintf(stderr,
+            "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale (vibevoice/chatterbox/f5/tada; "
+            "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
+            "default");
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
     fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",

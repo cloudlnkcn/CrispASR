@@ -8135,6 +8135,24 @@ CA_EXPORT int crispasr_session_set_tts_steps(crispasr_session* s, int steps) {
     return touched > 0 ? 0 : -2;
 }
 
+// TTS CFG guidance scale. Honoured by vibevoice (0 = model default:
+// 1.3 base / 3.0 realtime; upstream's realtime demo uses 1.5).
+// Spontaneous BGM onsets are documented VibeVoice model behavior —
+// lowering cfg or changing the seed re-rolls them. Other TTS
+// backends no-op (rc=-2).
+CA_EXPORT int crispasr_session_set_tts_cfg_scale(crispasr_session* s, float scale) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx) {
+        vibevoice_set_cfg_scale((vibevoice_context*)s->vibevoice_ctx, scale);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
 // Number of flow-matching timing candidates ranked per token (TADA). Higher
 // = more reliable multilingual timing, higher cost. Returns 0 on success,
 // -1 if session is null, -2 if no backend supports it.
