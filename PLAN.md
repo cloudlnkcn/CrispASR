@@ -7073,3 +7073,30 @@ scalar dots (8× the bytes of greedy's Q4_K kernels); now batched through
 ggml_matmat on the quantized weights — beam=3 16.8 s → 3.1 s (~70 ms/step,
 ≈1.5× greedy as expected), transcript-identical en+zh; F32 fallback gated
 CRISPASR_FIRERED_BEAM_F32=1. Full 11 s-jfk pipeline: 36 s → ~8.5 s (M1).
+
+**§224e disease sweep (2026-07-06)** — audited all runtimes for the three
+disease classes cured this week (scalar forward / F32-dequant matmul / silent
+CPU-pinning after ggml removed sched auto-copy of CPU weights):
+- **ecapa_lid — CURED (e20599ee):** ASP+FC head was scalar on non-Apple
+  (~3.0 s of a 4.5 s detect; ecapa is the recommended --lid-backend). Head now
+  in-graph (titanet ASP recipe), inverse-default (Accelerate GEMM head, 57 ms,
+  stays default on Apple). Verified en/zh identical on Metal + Vulkan.
+  Remaining: trunk graph ~1.3 s on M1 — profile Metal residency.
+- **mimo_tokenizer — OPEN (disease 3):** GPU backend init'd, ALL weights
+  loaded to backend_cpu, comment still says "encoder forward graph picks
+  per-op" → encoder graphs silently CPU-pinned. Fix = firered-style
+  load_weights_split; needs the mimo GGUF + parity check.
+- **pocket_tts — OPEN (disease 3):** same silent CPU-pinning (comment claims
+  "sched auto-copies to GPU for graph ops"). Harder: 32 eager
+  tensor_f32_data readers (flow head + AR loop) require per-tensor CPU/GPU
+  classification before split-loading; validate with TTS→ASR roundtrip.
+- **openvoice2 — OPEN (disease 1):** WaveNet (16 layers, bulk of voice
+  conversion) is hand-rolled conv, Accelerate on Apple / scalar elsewhere
+  (§176d note). Titanet-class cure; opt-in feature, measure first.
+- **firered_vad — OPEN (disease 1, low):** 8 DFSMN blocks scalar; small
+  model, opt-in --vad backend.
+- **chatterbox_campplus — OPEN (disease 1, low):** x-vector embed scalar;
+  once per voice-clone synthesis.
+- Healthy: mimo_asr (proper split-load with embed carve-out), fireredpunc,
+  ecapa trunk, firered_vad/titanet weight READS (tensor_get, device-safe),
+  lid_cld3/lid_fasttext (tiny text models).
