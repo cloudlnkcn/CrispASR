@@ -27,6 +27,10 @@
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/sentencepiece.h"
 
+#ifdef IRODORI_HAVE_SENTENCEPIECE
+#include <sentencepiece_processor.h>
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -222,6 +226,9 @@ struct irodori_tts_context {
     std::vector<float> token_scores;
     int bos_token_id = -1;
     int pad_token_id = -1;
+#ifdef IRODORI_HAVE_SENTENCEPIECE
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> sp_processor;
+#endif
 
     // Reference latent (speaker conditioning)
     std::vector<float> ref_latent; // (T_ref * latent_dim)
@@ -826,13 +833,24 @@ static std::vector<int32_t> tokenize_text(const irodori_tts_context* ctx, const 
         tokens.push_back(ctx->bos_token_id);
     }
 
-    if (!ctx->token_to_id.empty() && !ctx->token_scores.empty()) {
-        // Use SentencePiece Viterbi tokenizer from core/sentencepiece.h
+#ifdef IRODORI_HAVE_SENTENCEPIECE
+    if (ctx->sp_processor) {
+        // Prepend ▁ to match HuggingFace LlamaTokenizer behavior
+        // (the SP model has add_dummy_prefix=False but HF forces it)
+        std::string sp_text = std::string("\xE2\x96\x81") + text; // ▁ + text
+        std::vector<int> sp_ids;
+        ctx->sp_processor->Encode(sp_text, &sp_ids);
+        for (int id : sp_ids)
+            tokens.push_back(id);
+    } else
+#endif
+        if (!ctx->token_to_id.empty() && !ctx->token_scores.empty()) {
+        // Fallback: custom Viterbi tokenizer (may not match HF exactly)
         core_spm::Config cfg;
         cfg.unk_id = 0;
         cfg.utf8_aligned = true;
         cfg.merge_consecutive_unk = true;
-        auto sp_tokens = core_spm::tokenize(text, ctx->token_to_id, ctx->token_scores, cfg, true);
+        auto sp_tokens = core_spm::tokenize(text, ctx->token_to_id, ctx->token_scores, cfg, false);
         tokens.insert(tokens.end(), sp_tokens.begin(), sp_tokens.end());
     } else {
         // Byte-level fallback (works but suboptimal)
@@ -993,6 +1011,9 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
         }
     }
 
+    // SP model will be loaded from the tensor in pass 2 (after weight loading)
+    // See below after load_weights_from_map.
+
     core_gguf::free_metadata(meta);
 
     if (ctx->verbosity >= 1) {
@@ -1028,6 +1049,28 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
     // Keep weight context + buffer alive (tensors reference both)
     ctx->w_ctx = wl.ctx;
     ctx->buf_weights = wl.buf;
+
+    // Try to load embedded SentencePiece model from tensor
+#ifdef IRODORI_HAVE_SENTENCEPIECE
+    {
+        ggml_tensor* sp_tensor = core_gguf::try_get(ts, "tokenizer.ggml.raw_model");
+        if (sp_tensor && sp_tensor->type == GGML_TYPE_I8) {
+            size_t n = ggml_nelements(sp_tensor);
+            std::string sp_data(n, '\0');
+            ggml_backend_tensor_get(sp_tensor, sp_data.data(), 0, n);
+            auto sp = std::make_unique<sentencepiece::SentencePieceProcessor>();
+            auto status = sp->LoadFromSerializedProto(sp_data);
+            if (status.ok()) {
+                ctx->sp_processor = std::move(sp);
+                if (ctx->verbosity >= 1) {
+                    std::fprintf(stderr, "[irodori] SentencePiece model loaded from GGUF (%zu bytes)\n", n);
+                }
+            } else if (ctx->verbosity >= 1) {
+                std::fprintf(stderr, "[irodori] WARNING: SP model tensor load failed\n");
+            }
+        }
+    }
+#endif
 
     // Set BOS token: prefer GGUF tokenizer value, fall back to sarashina2.2 default (1)
     if (ctx->bos_token_id < 0) {

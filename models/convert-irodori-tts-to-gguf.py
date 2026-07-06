@@ -340,11 +340,16 @@ def load_tokenizer_data(tokenizer_repo: str) -> tuple[list[str], list[float], in
         except Exception:
             vocab.append(f"<unk_{i}>")
 
+    # Also get the raw tokenizer.model path for embedding
+    sp_model_path = getattr(tok, 'vocab_file', None)
+    if sp_model_path and not Path(sp_model_path).exists():
+        sp_model_path = None
+
     bos_id = tok.bos_token_id if tok.bos_token_id is not None else -1
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else (
         tok.eos_token_id if tok.eos_token_id is not None else -1)
 
-    return vocab, scores, bos_id, pad_id
+    return vocab, scores, bos_id, pad_id, sp_model_path
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -428,12 +433,19 @@ def main():
     # Write tokenizer vocab + scores
     if not args.no_vocab:
         print(f"Loading tokenizer: {args.tokenizer_repo}")
-        vocab, scores, bos_id, pad_id = load_tokenizer_data(args.tokenizer_repo)
+        vocab, scores, bos_id, pad_id, sp_model_path = load_tokenizer_data(args.tokenizer_repo)
         writer.add_array("tokenizer.ggml.tokens", vocab)
         writer.add_array("tokenizer.ggml.scores", [float(s) for s in scores])
         writer.add_uint32("tokenizer.ggml.bos_token_id", bos_id if bos_id >= 0 else 0)
         writer.add_uint32("tokenizer.ggml.pad_token_id", pad_id if pad_id >= 0 else 0)
         writer.add_uint32(f"irodori.tokenizer.vocab_size", len(vocab))
+        # Embed raw tokenizer.model as a tensor for exact SP tokenization in C++
+        if sp_model_path:
+            with open(sp_model_path, "rb") as f:
+                sp_model_data = f.read()
+            sp_arr = np.frombuffer(sp_model_data, dtype=np.int8)
+            writer.add_tensor("tokenizer.ggml.raw_model", sp_arr)
+            print(f"  embedded tokenizer.model as tensor ({len(sp_model_data)} bytes)")
         print(f"  vocab_size={len(vocab)}, bos_id={bos_id}, pad_id={pad_id}")
 
     # Write model weights
