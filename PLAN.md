@@ -7190,3 +7190,73 @@ divergence is upstream of the backend split, likely DiT/ODE math vs the
 Python reference). Perf follow-up: ~120 DiT graph evals (40 ODE steps ×
 CFG) rebuild graph+gallocr per eval — cacheable, but mind the #215 cached-
 cgraph UAF pattern.
+
+## §227 starling comparison — CUDA decode-loop optimization options (ANALYSIS / OPEN)
+
+Context: sims1253/starling (CUDA-graph inference for ASR, RTX 5090, bf16)
+benchmarks CrispASR as an external engine and overlaps our model fleet
+(granite-speech, parakeet-tdt-v3, MOSS-Transcribe, qwen3-asr, ARK-ASR-3B,
+higgs-audio-v3-stt, cohere-transcribe — several via OUR cstr/* GGUF
+conversions). Repo cloned to ~/code/starling; read 2026-07-06. Their claim:
+stock transformers decode is launch-bound (GPU ~10% busy) → capturing decode
+steps + multi-step token loops into CUDA graphs gives 27–1180× vs 3–66×
+stock, byte-identical output, WER-verified on Open ASR Leaderboard repro.
+
+### Benchmark-fairness action (cheap, reputational)
+
+Their CrispASR adapter (benchmarks/engines.py:722, scripts/
+bench_qwen3_crispasr.py) times ONE FULL CLI SUBPROCESS PER CLIP — including
+process start + multi-GB F16 GGUF disk load + CUDA weight upload on EVERY
+rep — while starling/stock numbers exclude model load and use warm reps.
+Cold-start seconds get labeled as engine speed on short clips. No crispasr
+numbers are published in their repo yet (engine silently skipped without the
+author-local ~/asr-bench install), so the columns could appear any time.
+- [ ] Contact author: benchmark `crispasr-server` (resident model — matches
+      their own server mode) or parse our stderr phase timings; offer setup
+      help. Alternatively contribute a resident-mode adapter PR to starling.
+- [ ] Consider a documented "benchmarking CrispASR" recipe in docs/ (server
+      mode, warm reps, phase-timing flags) so third-party benchers measure
+      transcribe time, not cold start.
+
+### Optimization options extracted (ordered by evidence)
+
+0. **GATE EVERYTHING on a decode-utilization profile.** One Kaggle T4/P100
+   run: GPU-busy% during granite/qwen3-asr AR decode (nvidia-smi dmon or
+   nsys). If ggml decode is already 60%+ busy, options 2–4 are duds like the
+   CPU/Metal analogs (§210 Metal ICB ceiling 1.8%; vibevoice CPU cache A/B
+   0%, byte-identical). If ~10–20% busy (starling's stock baseline), proceed.
+1. **Keep per-step graphs capture-friendly (mostly done, free).** ggml-cuda
+   already captures stable per-step graphs into CUDA graphs. Capture keys on
+   the split graph — alternating different graphs on one sched (and shape
+   churn like the "graph has different number of nodes → reserving" respam)
+   defeats both the gallocr AND capture. The #171 per-purpose dedicated
+   scheds (pred head, per-KV-path LM steps) already improved this; audit
+   other AR backends for the same pattern where a decode loop shares a sched
+   with helper graphs (EOS classifiers, connectors).
+2. **Multi-step token-loop unroll (the real starling edge; CUDA-only).**
+   Unroll K greedy decode steps into ONE graph: in-graph GGML_OP_ARGMAX →
+   get_rows embedding feedback → static per-step KV positions; host sync
+   drops from per-token to per-K-tokens; EOS checked per block (≤K−1 wasted
+   steps); byte-exact for greedy. Topology is stable per (n_past bucket, K)
+   → single capture replay per block. Substantial engineering and EXACTLY
+   the cached-graph minefield of #171/#184/#220 — invariant applies: one
+   graph per sched, or last-allocated-only. Do not start before option 0
+   numbers exist.
+3. **Self-speculative draft from CTC head (granite only).** starling drafts
+   from granite's encoder CTC head and verifies with the LLM — no extra
+   model. We already have granite CTC infrastructure. Their caveat: batched
+   spec at B≥16 LOSES (0.76×, lock-step rewind waste); B=1 spec is the win.
+4. **Fused RMSNorm/SwiGLU steps** — ggml-cuda already fuses some of this;
+   only worth auditing if option 0 shows launch-bound decode with capture ON.
+
+### Anti-options (their negative results transfer or confirm ours)
+
+- INT8 weight-only quant on CUDA decode: SLOWER for them (launch-bound, not
+  bandwidth-bound) — matches our ONNX-int8-10×-slower-on-CUDA-EP datapoint.
+  Quant remains a CPU/Metal bandwidth win, not a CUDA decode win.
+- Graph caching per shape without eviction: their parakeet/ark RTFx is
+  DEPRESSED by per-clip capture cost at high shape diversity (their own
+  footnote) — shape-bucketed graph caches hurt there too; mirrors our
+  vibevoice/chatterbox cache-A/B duds.
+- torch.compile-style encoder fusion: not byte-exact for them (fp32 upcast +
+  BatchNorm amplification) — reinforces our decoded-output A/B mandate.
