@@ -371,11 +371,13 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
     // (CPU-buffer weights now pin their ops to CPU), which silently made the
     // whole encoder CPU-only (11.3s for 11s audio on M1). Split-loading
     // enc.* onto the GPU backend restores encoder offload; the sched routes
-    // encoder ops to follow weight residency. Opt-in via
-    // CRISPASR_FIRERED_ENC_GPU=1 until verified on CUDA/Vulkan.
+    // encoder ops to follow weight residency. Default ON with use_gpu —
+    // verified transcript-identical with the encoder >2x faster on Metal
+    // (2.3x), Vulkan/MoltenVK (2.1x) and CUDA P100 (2.2x, Kaggle §224).
+    // CRISPASR_FIRERED_ENC_CPU=1 restores CPU-resident encoder weights.
     const bool enc_gpu = params.use_gpu && ctx->backend != ctx->backend_cpu && [] {
-        const char* e = std::getenv("CRISPASR_FIRERED_ENC_GPU");
-        return e && *e && *e != '0';
+        const char* e = std::getenv("CRISPASR_FIRERED_ENC_CPU");
+        return !(e && *e && *e != '0');
     }();
     if (params.verbosity >= 1)
         fprintf(stderr, "firered_asr: loading weights to %s (Q4_K SIMD decoder)...\n",
