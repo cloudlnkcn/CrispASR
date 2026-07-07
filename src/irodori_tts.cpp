@@ -1880,6 +1880,101 @@ static std::vector<float> run_speaker_encoder(irodori_tts_context* ctx) {
     return result;
 }
 
+// Duration predictor (token_sum_adarn_zero architecture): predicts the total
+// number of DAC-VAE latent frames for the utterance. Per token: RMSNorm →
+// AdaLN-Zero (shift/scale/gate from silu(speaker_vec)) → SwiGLU → tanh(gate)-
+// gated residual, ×N; then out_norm → out_proj → softplus per token, summed.
+// The model returns log1p(total_frames), so total_frames == the raw sum.
+// spk_vec: speaker_state[:,0] (768) when cloning, else the learned null_speaker.
+// Returns total_frames (>0), or -1 on failure / no predictor.
+static float run_duration_predictor(irodori_tts_context* ctx, const float* text_state_data, int T_text,
+                                    const float* spk_vec_data) {
+    const auto& hp = ctx->hparams;
+    const auto& w = ctx->weights;
+    if (!hp.use_duration_predictor || !w.dur_input_proj_w || !w.dur_out_proj_w)
+        return -1.0f;
+    const int Dh = hp.duration_hidden_dim; // 1024
+    const int Dt = hp.text_dim;            // 512
+    const int Dsp = hp.speaker_dim;        // 768
+
+    const int n_tensors = 512 + hp.duration_layers * 40;
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_tensors, false);
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* g = ggml_init(ip);
+
+    ggml_tensor* ts_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, Dt, T_text);
+    ggml_set_name(ts_in, "dur_text_state");
+    ggml_set_input(ts_in);
+    ggml_tensor* spk_in = ggml_new_tensor_1d(g, GGML_TYPE_F32, Dsp);
+    ggml_set_name(spk_in, "dur_spk_vec");
+    ggml_set_input(spk_in);
+
+    // h = input_proj(text_state) → (Dh, T)
+    ggml_tensor* h = mul_mat_f32(g, w.dur_input_proj_w, ts_in);
+    h = ggml_add(g, h, w.dur_input_proj_b);
+    ggml_tensor* sm = ggml_silu(g, spk_in); // silu(cond) once; reused per block
+
+    for (int i = 0; i < hp.duration_layers; i++) {
+        const auto& blk = w.dur_blocks[i];
+        ggml_tensor* hn = rms_norm(g, h, blk.norm, hp.norm_eps); // (Dh, T)
+        // modulation: (shift, scale, gate) = mod(silu(spk)) chunked
+        ggml_tensor* mod = mul_mat_f32(g, blk.mod_w, sm); // (3*Dh, 1)
+        mod = ggml_add(g, mod, blk.mod_b);
+        ggml_tensor* shift = ggml_view_1d(g, mod, Dh, 0);
+        ggml_tensor* scale = ggml_view_1d(g, mod, Dh, (size_t)Dh * sizeof(float));
+        ggml_tensor* gate = ggml_view_1d(g, mod, Dh, (size_t)2 * Dh * sizeof(float));
+        // hm = hn*(1+scale)+shift  (broadcast (Dh) over (Dh,T))
+        ggml_tensor* hm = ggml_add(g, hn, ggml_mul(g, hn, scale));
+        hm = ggml_add(g, hm, shift);
+        // SwiGLU: w2(silu(w1 hm) * w3 hm)
+        ggml_tensor* gate_proj = mul_mat_f32(g, blk.mlp_w1, hm);
+        ggml_tensor* up_proj = mul_mat_f32(g, blk.mlp_w3, hm);
+        ggml_tensor* mlp = ggml_mul(g, ggml_silu(g, gate_proj), up_proj);
+        mlp = mul_mat_f32(g, blk.mlp_w2, mlp);
+        // gated residual
+        h = ggml_add(g, h, ggml_mul(g, mlp, ggml_tanh(g, gate)));
+    }
+    h = rms_norm(g, h, w.dur_out_norm, hp.norm_eps);
+    ggml_tensor* logits = mul_mat_f32(g, w.dur_out_proj_w, h); // (1, T)
+    logits = ggml_add(g, logits, w.dur_out_proj_b);
+    ggml_set_name(logits, "dur_logits");
+    ggml_set_output(logits);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(g, n_tensors, false);
+    ggml_build_forward_expand(gf, logits);
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
+        ggml_free(g);
+        return -1.0f;
+    }
+    ggml_backend_tensor_set(ts_in, text_state_data, 0, (size_t)Dt * T_text * sizeof(float));
+    // null_speaker fallback when no reference is attended.
+    std::vector<float> spk_tmp;
+    const float* spk_src = spk_vec_data;
+    if (!spk_src) {
+        spk_tmp.resize(Dsp);
+        if (w.dur_null_speaker)
+            ggml_backend_tensor_get(w.dur_null_speaker, spk_tmp.data(), 0, (size_t)Dsp * sizeof(float));
+        spk_src = spk_tmp.data();
+    }
+    ggml_backend_tensor_set(spk_in, spk_src, 0, (size_t)Dsp * sizeof(float));
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    std::vector<float> lg(T_text);
+    ggml_backend_tensor_get(logits, lg.data(), 0, (size_t)T_text * sizeof(float));
+    ggml_gallocr_free(galloc);
+    ggml_free(g);
+
+    // softplus per token, summed (numerically stable).
+    double total = 0.0;
+    for (int i = 0; i < T_text; i++) {
+        float x = lg[i];
+        total += (double)std::max(x, 0.0f) + std::log1p(std::exp(-std::fabs(x)));
+    }
+    return (float)total;
+}
+
 // Run one DiT forward pass: x_t + timestep + text_state + spk_state → velocity prediction.
 // Returns velocity as CPU-side array (T_latent × patched_latent_dim).
 static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float* x_t_data, int T_latent,
@@ -2086,24 +2181,11 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         IRODORI_DBG(" %d", token_ids[i]);
     IRODORI_DBG("\n");
 
-    // Determine output length (heuristic: ~6.3 frames per token, or override)
+    // Output length is determined after text + speaker encoding, from the
+    // model's duration predictor (below) — the old ~6.3-frames/token heuristic
+    // under-allocated kanji-heavy text (variable mora per token) and truncated
+    // clauses (#221). CRISPASR_IRODORI_T_LATENT still forces an exact count.
     const char* t_lat_override = std::getenv("CRISPASR_IRODORI_T_LATENT");
-    int latent_steps;
-    if (t_lat_override && std::atoi(t_lat_override) > 0) {
-        latent_steps = std::atoi(t_lat_override);
-    } else {
-        float frames_per_token = 6.3f;
-        latent_steps = (int)(T_text * frames_per_token * ctx->duration_scale / ctx->speed);
-    }
-    int max_steps = (int)(ctx->max_seconds * hp.sample_rate / hp.codec_hop_length);
-    latent_steps = std::min(latent_steps, max_steps);
-    latent_steps = std::max(latent_steps, 1);
-    int patched_steps = latent_steps / std::max(hp.latent_patch_size, 1);
-
-    if (ctx->verbosity >= 1) {
-        std::fprintf(stderr, "[irodori] synthesize: %d tokens → %d latent frames (%.2f sec)\n", T_text, latent_steps,
-                     (float)latent_steps * hp.codec_hop_length / hp.sample_rate);
-    }
 
     // ── Step 1: Encode text ──
     IRODORI_DBG("[irodori] encoding text...\n");
@@ -2152,6 +2234,33 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         } else {
             std::fprintf(stderr, "[irodori] WARNING: speaker encoder failed; using neutral voice\n");
         }
+    }
+
+    // ── Determine output length ──
+    // Priority: explicit override → duration predictor → frames/token fallback.
+    // The predictor conditions on the same speaker vector (first speaker-encoder
+    // frame when cloning, else null_speaker) as the reference pipeline.
+    int latent_steps = 0;
+    const char* dur_src = "duration-predictor";
+    if (t_lat_override && std::atoi(t_lat_override) > 0) {
+        latent_steps = std::atoi(t_lat_override);
+        dur_src = "override";
+    } else {
+        const float* spk_vec = attend_speaker ? spk_state.data() : nullptr; // spk_state[:,0]
+        float frames = run_duration_predictor(ctx, text_state.data(), T_text, spk_vec);
+        if (frames > 0.0f) {
+            latent_steps = (int)std::lround(frames * ctx->duration_scale / ctx->speed);
+        } else {
+            latent_steps = (int)(T_text * 6.3f * ctx->duration_scale / ctx->speed);
+            dur_src = "frames/token fallback";
+        }
+    }
+    const int max_steps = (int)(ctx->max_seconds * hp.sample_rate / hp.codec_hop_length);
+    latent_steps = std::max(1, std::min(latent_steps, max_steps));
+    const int patched_steps = latent_steps / std::max(hp.latent_patch_size, 1);
+    if (ctx->verbosity >= 1) {
+        std::fprintf(stderr, "[irodori] synthesize: %d tokens → %d latent frames (%.2f sec) [%s]\n", T_text,
+                     latent_steps, (float)latent_steps * hp.codec_hop_length / hp.sample_rate, dur_src);
     }
 
     // ── Step 3: Euler RF ODE solver ──
