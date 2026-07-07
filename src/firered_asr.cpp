@@ -894,6 +894,59 @@ static void cpu_softmax_rows(float* x, int rows, int cols) {
     }
 }
 
+template <typename ScoreFn>
+static inline void cpu_online_softmax_accumulate(
+    int T,
+    int hd,
+    const float* __restrict V,
+    int stride_v,
+    float* __restrict out,
+    ScoreFn&& score_fn)
+{
+    // Online softmax update.
+    //
+    // Equivalent to:
+    //
+    //   softmax(score) * V
+    //
+    // but avoids storing the entire T-sized attention matrix.
+    //
+    // m tracks the maximum score seen so far.
+    // l tracks the normalized exponential sum.
+    float m = -INFINITY;
+    float l = 0.0f;
+    std::fill_n(out, hd, 0.0f);
+    for (int t = 0; t < T; t++) {
+        const float* __restrict v = V + t * stride_v;
+
+        float s = score_fn(t);
+        float m_new = (s > m) ? s : m;
+        float exp_scale = expf(m - m_new);
+        float e = expf(s - m_new);
+
+        // If a new maximum is found, previous accumulated values
+        // must be rescaled. Otherwise exp_scale == 1 and the
+        // multiplication can be skipped.
+        if (m_new > m) {
+            for (int dd = 0; dd < hd; dd++) {
+                out[dd] = out[dd] * exp_scale + e * v[dd];
+            }
+        } else {
+            for (int dd = 0; dd < hd; dd++) {
+                out[dd] += e * v[dd];
+            }
+        }
+
+        l = l * exp_scale + e;
+        m = m_new;
+    }
+
+    float inv_l = 1.0f / l;
+    for (int dd = 0; dd < hd; dd++) {
+        out[dd] *= inv_l;
+    }
+}
+
 static void firered_debug_dump_vec(const char* name, const std::vector<float>& v, int max_items) {
     fprintf(stderr, "firered_asr[%s]: [", name);
     int n = (int)v.size() < max_items ? (int)v.size() : max_items;
@@ -1333,36 +1386,61 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
         // This is the SAME layout as my cpu_encoder used: row-major [T, d]
         {
             float scale = 1.0f / sqrtf((float)hd);
-            auto& bu = biases[li].bu;
-            auto& bv = biases[li].bv;
             std::vector<float> attn_out(T * d, 0.0f);
 
-            for (int h = 0; h < nh; h++) {
-                std::vector<float> scores(T * T);
-                for (int tq = 0; tq < T; tq++) {
-                    for (int tk = 0; tk < T; tk++) {
-                        double content = 0, position = 0;
-                        int pos_idx = T - 1 - tq + tk;
+#pragma omp parallel
+            {
+                std::vector<float> acc(hd);
+                std::vector<float> qbu(hd);
+                std::vector<float> qbv(hd);
+
+#pragma omp for collapse(2) schedule(static)
+                for (int h = 0; h < nh; h++) {
+                    const float* __restrict buh = biases[li].bu.data() + h * hd;
+                    const float* __restrict bvh = biases[li].bv.data() + h * hd;
+                    for (int tq = 0; tq < T; tq++) {
+                        // Precompute query + biases once
+                        // q is fixed for this query position tq.
+                        // These are loop-invariant terms:
+                        //
+                        //   (q + bu) * k
+                        //   (q + bv) * p
+                        //
+                        // Originally these additions happened inside the tk loop.
+                        // Hoisting them removes 2*hd additions per key timestep.
+                        const float* __restrict q = Q_buf.data() + h * hd + tq * d;
                         for (int dd = 0; dd < hd; dd++) {
-                            float q_val = Q_buf[tq * d + h * hd + dd];
-                            float k_val = K_buf[tk * d + h * hd + dd];
-                            content += (q_val + bu[h * hd + dd]) * k_val;
-                            if (pos_idx >= 0 && pos_idx < T_pe) {
-                                float p_val = P_buf[pos_idx * d + h * hd + dd];
-                                position += (q_val + bv[h * hd + dd]) * p_val;
-                            }
+                            qbu[dd] = q[dd] + buh[dd];
+                            qbv[dd] = q[dd] + bvh[dd];
                         }
-                        scores[tq * T + tk] = (float)((content + position) * scale);
+                        std::fill(acc.begin(), acc.end(), 0.0f);
+
+                        cpu_online_softmax_accumulate(
+                            T,
+                            hd,
+                            V_buf.data() + h * hd,
+                            d,
+                            attn_out.data() + tq * d + h * hd,
+                            [&](int tk) -> float {
+                                // Compute attention score:
+                                //
+                                // score = ((q+bu)K + (q+bv)P) / sqrt(head_dim)
+                                //
+                                // Keep the two terms separate because the model has both
+                                // content attention and relative-position attention.
+                                float content = cpu_dot(qbu.data(), K_buf.data() + h * hd + tk * d, hd);
+
+                                float position = 0.0f;
+                                int pos_idx = T - 1 - tq + tk;
+                                if ((unsigned)pos_idx < (unsigned)T_pe) {
+                                    position = cpu_dot(qbv.data(),P_buf.data() + h * hd + pos_idx * d , hd);
+                                }
+
+                                return (content + position) * scale;
+                            }
+                        );
                     }
                 }
-                cpu_softmax_rows(scores.data(), T, T);
-                for (int tq = 0; tq < T; tq++)
-                    for (int dd = 0; dd < hd; dd++) {
-                        double s = 0;
-                        for (int tk = 0; tk < T; tk++)
-                            s += scores[tq * T + tk] * V_buf[tk * d + h * hd + dd];
-                        attn_out[tq * d + h * hd + dd] = (float)s;
-                    }
             }
 
             // Graph B: FC output projection + residual + conv + FFN2 + LN
@@ -2369,22 +2447,22 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                            d, d);
 
                 // Per-beam cross-attention scoring (shared K_enc/V_enc)
-                for (int a = 0; a < n_active; a++) {
-                    float* Qx = Qx_batch.data() + a * d;
-                    float* attn_out = xattn_out_batch.data() + a * d;
-                    memset(attn_out, 0, d * sizeof(float));
-                    for (int h = 0; h < nh_dec; h++) {
-                        std::vector<float> scores(T_sub);
-                        for (int t = 0; t < T_sub; t++)
-                            scores[t] = cpu_dot(Qx + h * hd_dec, K_enc[li].data() + t * d + h * hd_dec, hd_dec) *
-                                        inv_sqrt_hd_dec;
-                        cpu_softmax_rows(scores.data(), 1, T_sub);
-                        for (int dd = 0; dd < hd_dec; dd++) {
-                            double s = 0;
-                            for (int t = 0; t < T_sub; t++)
-                                s += scores[t] * V_enc[li][t * d + h * hd_dec + dd];
-                            attn_out[h * hd_dec + dd] = (float)s;
-                        }
+#pragma omp parallel for collapse(2) schedule(static)
+                for (int a = 0; a < n_active; ++a) {
+                    for (int h = 0; h < nh_dec; ++h) {
+                        cpu_online_softmax_accumulate(
+                            T_sub,
+                            hd_dec,
+                            V_enc[li].data() + h * hd_dec,
+                            d,
+                            xattn_out_batch.data() + a * d + h * hd_dec,
+                            [&](int t) -> float {
+                                return cpu_dot(Qx_batch.data() + a * d + h * hd_dec, 
+                                               K_enc[li].data() + t * d + h * hd_dec, 
+                                               hd_dec) * 
+                                       inv_sqrt_hd_dec;
+                            }
+                        );
                     }
                 }
 
