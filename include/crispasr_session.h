@@ -275,6 +275,16 @@ CRISPASR_SESSION_API int crispasr_session_is_custom_voice(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_is_voice_design(crispasr_session* s);
 CRISPASR_SESSION_API float* crispasr_session_synthesize_raw(crispasr_session* s, const char* text, int* out_n_samples);
 CRISPASR_SESSION_API float* crispasr_session_synthesize(crispasr_session* s, const char* text, int* out_n_samples);
+
+// Streaming synthesis: fires `cb` once per sentence chunk with that chunk's
+// watermarked PCM (backend-native sample rate, same as synthesize) as it is
+// produced. The PCM is owned by the call and freed after `cb` returns — copy
+// it if you need to keep it. `is_final` is 1 on the last chunk. Returns 0 on
+// success, -1 on bad args.
+typedef void (*crispasr_pcm_stream_cb)(const float* pcm, int n_samples, int is_final, void* user_data);
+CRISPASR_SESSION_API int crispasr_session_synthesize_streaming(crispasr_session* s, const char* text,
+                                                               crispasr_pcm_stream_cb cb, void* user_data);
+
 CRISPASR_SESSION_API void crispasr_pcm_free(float* pcm);
 CRISPASR_SESSION_API float* crispasr_session_speech_to_speech(crispasr_session* s, const float* in_samples,
                                                               int n_in_samples, char** out_text, int* out_n_samples);

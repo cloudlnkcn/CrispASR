@@ -7030,6 +7030,60 @@ CA_EXPORT void crispasr_pcm_free(float* pcm) {
     free(pcm);
 }
 
+// Streaming synthesis: split `text` into sentence chunks and fire `cb` with the
+// watermarked PCM of each chunk as it is produced — progressive delivery for
+// embedders, without buffering the whole clip. Sample rate is the same as
+// crispasr_session_synthesize (backend-native; caller-known). The PCM passed to
+// `cb` is owned by this call (freed after `cb` returns); copy it if needed.
+// `is_final` is 1 on the last chunk. Returns 0 on success, -1 on bad args.
+CA_EXPORT int crispasr_session_synthesize_streaming(crispasr_session* s, const char* text, crispasr_pcm_stream_cb cb,
+                                                    void* user_data) {
+    if (!s || !text || !cb)
+        return -1;
+
+    // Sentence split on ASCII (. ! ? newline) and CJK (。！？) terminators; the
+    // terminator stays with its sentence; whitespace-only pieces are dropped.
+    const std::string t = text;
+    std::vector<std::string> chunks;
+    std::string cur;
+    auto flush = [&]() {
+        size_t a = cur.find_first_not_of(" \t\r\n");
+        size_t b = cur.find_last_not_of(" \t\r\n");
+        if (a != std::string::npos)
+            chunks.push_back(cur.substr(a, b - a + 1));
+        cur.clear();
+    };
+    for (size_t i = 0; i < t.size();) {
+        unsigned char c = (unsigned char)t[i];
+        size_t adv = 1;
+        bool term = (c == '.' || c == '!' || c == '?' || c == '\n');
+        if (!term && i + 2 < t.size()) {
+            unsigned char b1 = (unsigned char)t[i + 1], b2 = (unsigned char)t[i + 2];
+            if ((c == 0xE3 && b1 == 0x80 && b2 == 0x82) ||                 // 。
+                (c == 0xEF && b1 == 0xBC && (b2 == 0x81 || b2 == 0x9F))) { // ！ ？
+                term = true;
+                adv = 3;
+            }
+        }
+        cur.append(t, i, adv);
+        i += adv;
+        if (term)
+            flush();
+    }
+    flush();
+    if (chunks.empty())
+        return 0;
+
+    for (size_t i = 0; i < chunks.size(); i++) {
+        int n = 0;
+        float* pcm = crispasr_session_synthesize(s, chunks[i].c_str(), &n);
+        const int is_final = (i + 1 == chunks.size()) ? 1 : 0;
+        cb(pcm && n > 0 ? pcm : nullptr, pcm ? n : 0, is_final, user_data);
+        free(pcm);
+    }
+    return 0;
+}
+
 // =========================================================================
 // Speech-to-Speech — audio in → audio out via a single model pass.
 // =========================================================================
