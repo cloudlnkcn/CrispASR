@@ -17,6 +17,7 @@
 #include "firered_asr.h"
 
 #include "core/cpu_attention.h" // cpu_dot + cpu_online_softmax_accumulate (shared)
+#include "core/fastconformer.h" // core_conformer::rel_shift (ggml rel-pos attention)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
@@ -44,6 +45,19 @@ static bool firered_bench_enabled() {
     static int v = -1;
     if (v < 0) {
         const char* e = std::getenv("FIRERED_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// §229: run the conformer encoder rel-pos attention inside the ggml graph
+// (soft_max_ext path) instead of the hand-rolled CPU loops. Off by default —
+// the CPU path stays the reference; set CRISPASR_FIRERED_GGML_ATTN=1 to offload
+// the O(T²) encoder attention to the active backend (CUDA/Metal/Vulkan/CPU).
+static bool firered_ggml_attn_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("CRISPASR_FIRERED_GGML_ATTN");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1231,6 +1245,8 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
 
         // Graph A: FFN1 + Q/K/V/P projections
         std::vector<float> Q_buf(T * d), K_buf(T * d), V_buf(T * d), P_buf(T_pe * d);
+        std::vector<float> attn_out(T * d, 0.0f);
+        const bool ggml_attn = firered_ggml_attn_enabled();
         {
             size_t mem = ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(4096, false);
             std::vector<uint8_t> meta(mem);
@@ -1283,6 +1299,44 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
             ggml_set_name(p, "P");
             ggml_set_output(p);
 
+            // Optional in-graph rel-pos attention (CRISPASR_FIRERED_GGML_ATTN=1).
+            // Mirrors the CPU path exactly:
+            //   AC = (Q + bias_u)·Kᵀ            content term
+            //   BD = rel_shift((Q + bias_v)·Pᵀ) relative-position term
+            //   attn = softmax((AC + BD)·scale) · V
+            // rel_shift reproduces the CPU pos_idx = T-1-tq+tk (= T-1+k-q); see
+            // core/fastconformer.h. Runs on the active backend (GPU offload).
+            if (ggml_attn) {
+                const float attn_scale = 1.0f / sqrtf((float)hd);
+                // pos_bias_u/v are stored F16 in the GGUF; q is F32 → cast the
+                // biases so the broadcast add is a supported same-type op (CPU
+                // rejects f32+f16; CUDA asserts on the mismatched stride).
+                ggml_tensor* bu = ggml_cast(ctx0, b.mhsa.pos_bias_u, GGML_TYPE_F32);
+                ggml_tensor* bv = ggml_cast(ctx0, b.mhsa.pos_bias_v, GGML_TYPE_F32);
+                ggml_tensor* Qu = ggml_add(ctx0, q, ggml_reshape_1d(ctx0, bu, d));
+                ggml_tensor* Qv = ggml_add(ctx0, q, ggml_reshape_1d(ctx0, bv, d));
+                // → [head_dim, T, n_head]
+                Qu = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, Qu, hd, nh, T), 0, 2, 1, 3));
+                Qv = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, Qv, hd, nh, T), 0, 2, 1, 3));
+                ggml_tensor* Kh = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, k, hd, nh, T), 0, 2, 1, 3));
+                ggml_tensor* Rh =
+                    ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, p, hd, nh, T_pe), 0, 2, 1, 3));
+                ggml_tensor* AC = ggml_mul_mat(ctx0, Kh, Qu);              // [T_key, T_query, nh]
+                ggml_tensor* BD_raw = ggml_mul_mat(ctx0, Rh, Qv);          // [T_pe, T_query, nh]
+                ggml_tensor* BD = core_conformer::rel_shift(ctx0, BD_raw); // [T_key, T_query, nh]
+                ggml_tensor* scores = ggml_add(ctx0, AC, ggml_cont(ctx0, BD));
+                scores = ggml_soft_max_ext(ctx0, scores, nullptr, attn_scale, 0.0f);
+                // attn = Σ_key softmax · V  → [head_dim, T_query, nh]
+                ggml_tensor* Vh = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, v, hd, nh, T), 0, 2, 1, 3));
+                ggml_tensor* Vh2 = ggml_cont(ctx0, ggml_permute(ctx0, Vh, 1, 0, 2, 3)); // [T_key, head_dim, nh]
+                ggml_tensor* attn = ggml_mul_mat(ctx0, Vh2, scores);                    // [head_dim, T_query, nh]
+                attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));           // [head_dim, nh, T]
+                attn = ggml_reshape_2d(ctx0, attn, d, T);                               // [d, T] — same as Q layout
+                ggml_set_name(attn, "attn_out");
+                ggml_set_output(attn);
+                ggml_build_forward_expand(gf, attn);
+            }
+
             ggml_build_forward_expand(gf, q);
             ggml_build_forward_expand(gf, k);
             ggml_build_forward_expand(gf, v);
@@ -1301,77 +1355,87 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
             // Read outputs
             ggml_tensor* ffn1_t = ggml_graph_get_tensor(gf, "ffn1_out");
             ggml_backend_tensor_get(ffn1_t, x_buf.data(), 0, d * T * sizeof(float));
-            ggml_tensor* Q_t = ggml_graph_get_tensor(gf, "Q");
-            ggml_backend_tensor_get(Q_t, Q_buf.data(), 0, d * T * sizeof(float));
-            ggml_tensor* K_t = ggml_graph_get_tensor(gf, "K");
-            ggml_backend_tensor_get(K_t, K_buf.data(), 0, d * T * sizeof(float));
-            ggml_tensor* V_t = ggml_graph_get_tensor(gf, "V");
-            ggml_backend_tensor_get(V_t, V_buf.data(), 0, d * T * sizeof(float));
-            ggml_tensor* P_t = ggml_graph_get_tensor(gf, "P");
-            ggml_backend_tensor_get(P_t, P_buf.data(), 0, d * T_pe * sizeof(float));
+            if (ggml_attn) {
+                // Attention computed in-graph — read it straight into attn_out;
+                // Q/K/V/P stay resident and never round-trip to the CPU.
+                ggml_tensor* attn_t = ggml_graph_get_tensor(gf, "attn_out");
+                ggml_backend_tensor_get(attn_t, attn_out.data(), 0, d * T * sizeof(float));
+            } else {
+                ggml_tensor* Q_t = ggml_graph_get_tensor(gf, "Q");
+                ggml_backend_tensor_get(Q_t, Q_buf.data(), 0, d * T * sizeof(float));
+                ggml_tensor* K_t = ggml_graph_get_tensor(gf, "K");
+                ggml_backend_tensor_get(K_t, K_buf.data(), 0, d * T * sizeof(float));
+                ggml_tensor* V_t = ggml_graph_get_tensor(gf, "V");
+                ggml_backend_tensor_get(V_t, V_buf.data(), 0, d * T * sizeof(float));
+                ggml_tensor* P_t = ggml_graph_get_tensor(gf, "P");
+                ggml_backend_tensor_get(P_t, P_buf.data(), 0, d * T_pe * sizeof(float));
+            }
             ggml_free(ctx0);
         }
 
-        // CPU attention with rel_shift
+        // CPU attention with rel_shift (reference path; skipped when the
+        // attention ran in-graph above).
         // Q/K/V are [d, T] in ggml layout = column-major
         // In ggml: Q[i, t] = Q_buf[t * d + i] for i < d, t < T
         // = Q_buf[t*d + h*hd + dd] for head h, dim dd
         // This is the SAME layout as my cpu_encoder used: row-major [T, d]
         {
-            float scale = 1.0f / sqrtf((float)hd);
-            std::vector<float> attn_out(T * d, 0.0f);
+            if (!ggml_attn) {
+                float scale = 1.0f / sqrtf((float)hd);
 
 #pragma omp parallel
-            {
-                std::vector<float> qbu(hd);
-                std::vector<float> qbv(hd);
+                {
+                    std::vector<float> qbu(hd);
+                    std::vector<float> qbv(hd);
 
-                // NOTE: the two collapsed loops must be *perfectly* nested (no statements
-                // between the `h` and `tq` headers), otherwise GCC/Clang reject the
-                // `collapse(2)` clause. The per-head bias/query pointers are therefore
-                // derived inside the inner loop — they are pure pointer arithmetic and cost
-                // nothing.
+                    // NOTE: the two collapsed loops must be *perfectly* nested (no statements
+                    // between the `h` and `tq` headers), otherwise GCC/Clang reject the
+                    // `collapse(2)` clause. The per-head bias/query pointers are therefore
+                    // derived inside the inner loop — they are pure pointer arithmetic and cost
+                    // nothing.
 #pragma omp for collapse(2) schedule(static)
-                for (int h = 0; h < nh; h++) {
-                    for (int tq = 0; tq < T; tq++) {
-                        const float* __restrict buh = biases[li].bu.data() + h * hd;
-                        const float* __restrict bvh = biases[li].bv.data() + h * hd;
-                        // Precompute query + biases once
-                        // q is fixed for this query position tq.
-                        // These are loop-invariant terms:
-                        //
-                        //   (q + bu) * k
-                        //   (q + bv) * p
-                        //
-                        // Originally these additions happened inside the tk loop.
-                        // Hoisting them removes 2*hd additions per key timestep.
-                        const float* __restrict q = Q_buf.data() + h * hd + tq * d;
-                        for (int dd = 0; dd < hd; dd++) {
-                            qbu[dd] = q[dd] + buh[dd];
-                            qbv[dd] = q[dd] + bvh[dd];
+                    for (int h = 0; h < nh; h++) {
+                        for (int tq = 0; tq < T; tq++) {
+                            const float* __restrict buh = biases[li].bu.data() + h * hd;
+                            const float* __restrict bvh = biases[li].bv.data() + h * hd;
+                            // Precompute query + biases once
+                            // q is fixed for this query position tq.
+                            // These are loop-invariant terms:
+                            //
+                            //   (q + bu) * k
+                            //   (q + bv) * p
+                            //
+                            // Originally these additions happened inside the tk loop.
+                            // Hoisting them removes 2*hd additions per key timestep.
+                            const float* __restrict q = Q_buf.data() + h * hd + tq * d;
+                            for (int dd = 0; dd < hd; dd++) {
+                                qbu[dd] = q[dd] + buh[dd];
+                                qbv[dd] = q[dd] + bvh[dd];
+                            }
+
+                            cpu_online_softmax_accumulate(
+                                T, hd, V_buf.data() + h * hd, d, attn_out.data() + tq * d + h * hd,
+                                [&](int tk) -> float {
+                                    // Compute attention score:
+                                    //
+                                    // score = ((q+bu)K + (q+bv)P) / sqrt(head_dim)
+                                    //
+                                    // Keep the two terms separate because the model has both
+                                    // content attention and relative-position attention.
+                                    float content = cpu_dot(qbu.data(), K_buf.data() + h * hd + tk * d, hd);
+
+                                    float position = 0.0f;
+                                    int pos_idx = T - 1 - tq + tk;
+                                    if ((unsigned)pos_idx < (unsigned)T_pe) {
+                                        position = cpu_dot(qbv.data(), P_buf.data() + h * hd + pos_idx * d, hd);
+                                    }
+
+                                    return (content + position) * scale;
+                                });
                         }
-
-                        cpu_online_softmax_accumulate(
-                            T, hd, V_buf.data() + h * hd, d, attn_out.data() + tq * d + h * hd, [&](int tk) -> float {
-                                // Compute attention score:
-                                //
-                                // score = ((q+bu)K + (q+bv)P) / sqrt(head_dim)
-                                //
-                                // Keep the two terms separate because the model has both
-                                // content attention and relative-position attention.
-                                float content = cpu_dot(qbu.data(), K_buf.data() + h * hd + tk * d, hd);
-
-                                float position = 0.0f;
-                                int pos_idx = T - 1 - tq + tk;
-                                if ((unsigned)pos_idx < (unsigned)T_pe) {
-                                    position = cpu_dot(qbv.data(), P_buf.data() + h * hd + pos_idx * d, hd);
-                                }
-
-                                return (content + position) * scale;
-                            });
                     }
                 }
-            }
+            } // end if (!ggml_attn) — CPU reference attention
 
             // Graph B: FC output projection + residual + conv + FFN2 + LN
             {
