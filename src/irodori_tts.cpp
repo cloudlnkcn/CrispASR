@@ -1752,6 +1752,25 @@ int irodori_tts_set_reference_latent(struct irodori_tts_context* ctx, const floa
     return 0;
 }
 
+int irodori_tts_get_reference_latent(const struct irodori_tts_context* ctx, const float** out_latent, int* out_frames,
+                                     int* out_dim) {
+    if (!ctx || ctx->ref_latent_frames <= 0 || ctx->ref_latent.empty())
+        return -1;
+    if (out_latent)
+        *out_latent = ctx->ref_latent.data();
+    if (out_frames)
+        *out_frames = ctx->ref_latent_frames;
+    if (out_dim)
+        *out_dim = ctx->hparams.latent_dim * ctx->hparams.latent_patch_size;
+    return 0;
+}
+
+int irodori_tts_reference_latent_dim(const struct irodori_tts_context* ctx) {
+    if (!ctx)
+        return 0;
+    return ctx->hparams.latent_dim * ctx->hparams.latent_patch_size;
+}
+
 void irodori_tts_clear_reference(struct irodori_tts_context* ctx) {
     if (!ctx)
         return;

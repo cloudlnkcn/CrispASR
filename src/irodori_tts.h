@@ -54,6 +54,18 @@ int irodori_tts_set_reference(struct irodori_tts_context* ctx, const float* ref_
 // Returns 0 on success, -1 on failure.
 int irodori_tts_set_reference_latent(struct irodori_tts_context* ctx, const float* latent, int n_frames);
 
+// Get the currently-set reference latent (e.g. to cache it to disk after
+// encoding). Returns a borrowed pointer to the internal buffer (valid until
+// the reference is changed/cleared), the frame count, and the per-frame dim
+// (latent_dim * latent_patch_size, = 32). Returns 0 on success, -1 if no
+// reference is set. Do not free the returned pointer.
+int irodori_tts_get_reference_latent(const struct irodori_tts_context* ctx, const float** out_latent, int* out_frames,
+                                     int* out_dim);
+
+// Per-frame dimension of a reference latent (latent_dim * latent_patch_size).
+// Useful for validating a cached latent before irodori_tts_set_reference_latent.
+int irodori_tts_reference_latent_dim(const struct irodori_tts_context* ctx);
+
 // Clear reference (unconditional generation).
 void irodori_tts_clear_reference(struct irodori_tts_context* ctx);
 
