@@ -2180,6 +2180,66 @@ static std::vector<float> run_timestep_cond(irodori_tts_context* ctx, float t) {
     return cond;
 }
 
+// Decode one window of DAC-VAE latent (patched_latent_dim, T_win) → PCM
+// (T_win * hop samples). Empty on failure. Building one graph per window
+// bounds peak codec-decode memory (see irodori_tts_synthesize's overlap-save
+// loop). `latent` points at T_win contiguous frames in ggml (D,T) layout.
+static std::vector<float> decode_dac_window(irodori_tts_context* ctx, const float* latent, int T_win) {
+    const auto& dac = ctx->dac;
+    const auto& cfg = dac.config;
+    const int latent_d = ctx->hparams.patched_latent_dim();
+
+    const int n_dec_tensors = 4096;
+    size_t dec_ctx_size = n_dec_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_dec_tensors, false);
+    ggml_init_params ip = {dec_ctx_size, nullptr, true};
+    ggml_context* g = ggml_init(ip);
+
+    ggml_tensor* lat_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, latent_d, T_win);
+    ggml_set_name(lat_in, "latent_in");
+    ggml_set_input(lat_in);
+
+    ggml_tensor* h = lat_in;
+    if (ctx->codec_out_proj_w) {
+        h = core_dac::conv1d(g, h, ctx->codec_out_proj_w, ctx->codec_out_proj_b, 1);
+        h = ggml_cast(g, h, GGML_TYPE_F32);
+    }
+    if (dac.in_conv_w) {
+        h = core_dac::conv1d(g, h, dac.in_conv_w, dac.in_conv_b, 7);
+        h = ggml_cast(g, h, GGML_TYPE_F32);
+    }
+    for (int b = 0; b < cfg.n_decoder_blocks; b++) {
+        h = core_dac::dec_block(g, h, dac.blocks[b], cfg.upsampling_ratios[b]);
+        h = ggml_cont(g, h);
+        h = ggml_cast(g, h, GGML_TYPE_F32);
+    }
+    if (dac.out_snake_alpha)
+        h = core_dac::snake(g, h, dac.out_snake_alpha);
+    if (dac.out_conv_w) {
+        h = core_dac::conv1d(g, h, dac.out_conv_w, dac.out_conv_b, 7);
+        h = ggml_cast(g, h, GGML_TYPE_F32);
+    }
+    h = ggml_tanh(g, h);
+    const int T_pcm = (int)h->ne[1];
+    h = ggml_reshape_1d(g, h, T_pcm);
+    ggml_set_output(h);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(g, n_dec_tensors, false);
+    ggml_build_forward_expand(gf, h);
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->codec_backend));
+    std::vector<float> pcm;
+    if (ggml_gallocr_reserve(galloc, gf) && ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_backend_tensor_set(lat_in, latent, 0, (size_t)latent_d * T_win * sizeof(float));
+        ggml_backend_graph_compute(ctx->codec_backend, gf);
+        pcm.resize((size_t)h->ne[0]);
+        ggml_backend_tensor_get(h, pcm.data(), 0, pcm.size() * sizeof(float));
+    } else {
+        std::fprintf(stderr, "[irodori] ERROR: DAC-VAE decode graph alloc failed (T=%d)\n", T_win);
+    }
+    ggml_gallocr_free(galloc);
+    ggml_free(g);
+    return pcm;
+}
+
 // ── Main synthesize ─────────────────────────────────────────────────
 
 int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, float** pcm_out, int* sample_rate_out) {
@@ -2445,102 +2505,67 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
 
     IRODORI_DBG("[irodori] decoding latent (%d frames) with DAC-VAE...\n", patched_steps);
 
-    // Build DAC-VAE decode graph:
-    //   latent (latent_d, T) → out_proj Conv1d(32→1024, k=1) → DAC decoder → Tanh → PCM
-    {
-        const auto& dac = ctx->dac;
-        const auto& cfg = dac.config;
-        int T = patched_steps;
+    // DAC-VAE decode with overlap-save chunking. One graph over the whole
+    // latent peaks codec memory at O(T·hop); for long outputs we decode
+    // overlapping windows of `chunk` frames with `ctx_frames` of context on
+    // each side and keep only the center, bounding peak memory to
+    // O((chunk+2·ctx)·hop). The context covers the decoder's receptive field so
+    // the seams are ~exact (validated: chunked vs whole cos≈1.0). Short outputs
+    // (T ≤ chunk+2·ctx) decode in a single graph — unchanged from before.
+    const int hop = hp.codec_hop_length;
+    const int T = patched_steps;
+    int chunk = 400;     // ~16 s at 1920 hop / 48 kHz
+    int ctx_frames = 32; // ≫ the decoder's latent-frame receptive field
+    if (const char* e = std::getenv("CRISPASR_IRODORI_DECODE_CHUNK"))
+        chunk = std::atoi(e); // 0 → never chunk
+    if (const char* e = std::getenv("CRISPASR_IRODORI_DECODE_CTX"))
+        ctx_frames = std::max(0, std::atoi(e));
+    const bool chunked = chunk > 0 && T > chunk + 2 * ctx_frames;
 
-        const int n_dec_tensors = 4096;
-        size_t dec_ctx_size = n_dec_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_dec_tensors, false);
-        ggml_init_params ip = {dec_ctx_size, nullptr, true};
-        ggml_context* g = ggml_init(ip);
-
-        // Input: latent (latent_d, T) in ggml layout
-        ggml_tensor* lat_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, latent_d, T);
-        ggml_set_name(lat_in, "latent_in");
-        ggml_set_input(lat_in);
-
-        // out_proj: Conv1d(codebook_dim → hidden, k=1)
-        ggml_tensor* h = lat_in;
-        if (ctx->codec_out_proj_w) {
-            h = core_dac::conv1d(g, h, ctx->codec_out_proj_w, ctx->codec_out_proj_b, 1);
-            h = ggml_cast(g, h, GGML_TYPE_F32);
+    std::vector<float> pcm;
+    if (!chunked) {
+        pcm = decode_dac_window(ctx, x_t.data(), T);
+    } else {
+        pcm.reserve((size_t)T * hop);
+        for (int start = 0; start < T; start += chunk) {
+            const int end = std::min(start + chunk, T);
+            const int w0 = std::max(0, start - ctx_frames);
+            const int w1 = std::min(T, end + ctx_frames);
+            std::vector<float> win = decode_dac_window(ctx, x_t.data() + (size_t)w0 * latent_d, w1 - w0);
+            if (win.empty()) {
+                pcm.clear();
+                break;
+            }
+            // Keep only the center [start,end): PCM [(start-w0)·hop, (end-w0)·hop).
+            const size_t lo = (size_t)(start - w0) * hop;
+            const size_t hi = std::min(win.size(), (size_t)(end - w0) * hop);
+            if (lo < hi)
+                pcm.insert(pcm.end(), win.begin() + lo, win.begin() + hi);
         }
-
-        // in_conv: Conv1d(hidden → decoder_dim, k=7)
-        if (dac.in_conv_w) {
-            h = core_dac::conv1d(g, h, dac.in_conv_w, dac.in_conv_b, 7);
-            h = ggml_cast(g, h, GGML_TYPE_F32);
-        }
-
-        // 4 decoder blocks: Snake → ConvTranspose1d(stride) → 3× ResUnit(d=1,3,9)
-        for (int b = 0; b < cfg.n_decoder_blocks; b++) {
-            h = core_dac::dec_block(g, h, dac.blocks[b], cfg.upsampling_ratios[b]);
-            h = ggml_cont(g, h);
-            h = ggml_cast(g, h, GGML_TYPE_F32);
-        }
-
-        // Final: Snake(out_ch) → Conv1d(out_ch → 1, k=7) → Tanh
-        if (dac.out_snake_alpha) {
-            h = core_dac::snake(g, h, dac.out_snake_alpha);
-        }
-        if (dac.out_conv_w) {
-            h = core_dac::conv1d(g, h, dac.out_conv_w, dac.out_conv_b, 7);
-            h = ggml_cast(g, h, GGML_TYPE_F32);
-        }
-        h = ggml_tanh(g, h);
-
-        // Flatten to 1D PCM
-        int T_pcm = (int)h->ne[1]; // after all upsampling
-        h = ggml_reshape_1d(g, h, T_pcm);
-        ggml_set_name(h, "pcm_out");
-        ggml_set_output(h);
-
-        ggml_cgraph* gf = ggml_new_graph_custom(g, n_dec_tensors, false);
-        ggml_build_forward_expand(gf, h);
-
-        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->codec_backend));
-        if (!ggml_gallocr_reserve(galloc, gf) || !ggml_gallocr_alloc_graph(galloc, gf)) {
-            std::fprintf(stderr, "[irodori] ERROR: DAC-VAE decode graph alloc failed\n");
-            ggml_gallocr_free(galloc);
-            ggml_free(g);
-            // Fallback: output silence
-            int n_pcm = latent_steps * hp.codec_hop_length;
-            float* out = (float*)std::malloc(n_pcm * sizeof(float));
-            if (out)
-                std::memset(out, 0, n_pcm * sizeof(float));
-            *pcm_out = out;
-            return out ? n_pcm : 0;
-        }
-
-        // Set latent input (x_t after ODE is in ggml (D, T) layout)
-        ggml_backend_tensor_set(lat_in, x_t.data(), 0, x_t.size() * sizeof(float));
-
-        ggml_backend_graph_compute(ctx->codec_backend, gf);
-
-        // Read PCM output
-        int n_pcm = (int)h->ne[0];
-        float* out = (float*)std::malloc(n_pcm * sizeof(float));
-        if (!out) {
-            ggml_gallocr_free(galloc);
-            ggml_free(g);
-            return 0;
-        }
-        ggml_backend_tensor_get(h, out, 0, n_pcm * sizeof(float));
-
-        ggml_gallocr_free(galloc);
-        ggml_free(g);
-
-        if (ctx->verbosity >= 1) {
-            std::fprintf(stderr, "[irodori] output: %d samples (%.2f sec @ %d Hz)\n", n_pcm,
-                         (float)n_pcm / hp.sample_rate, hp.sample_rate);
-        }
-
-        *pcm_out = out;
-        return n_pcm;
     }
+
+    if (pcm.empty()) {
+        // Fallback: silence
+        int n_pcm = latent_steps * hop;
+        float* out = (float*)std::malloc((size_t)n_pcm * sizeof(float));
+        if (out)
+            std::memset(out, 0, (size_t)n_pcm * sizeof(float));
+        *pcm_out = out;
+        return out ? n_pcm : 0;
+    }
+
+    int n_pcm = (int)pcm.size();
+    float* out = (float*)std::malloc((size_t)n_pcm * sizeof(float));
+    if (!out)
+        return 0;
+    std::memcpy(out, pcm.data(), (size_t)n_pcm * sizeof(float));
+
+    if (ctx->verbosity >= 1) {
+        std::fprintf(stderr, "[irodori] output: %d samples (%.2f sec @ %d Hz)%s\n", n_pcm,
+                     (float)n_pcm / hp.sample_rate, hp.sample_rate, chunked ? " [chunked decode]" : "");
+    }
+    *pcm_out = out;
+    return n_pcm;
 }
 
 void irodori_tts_set_seed(struct irodori_tts_context* ctx, int seed) {
