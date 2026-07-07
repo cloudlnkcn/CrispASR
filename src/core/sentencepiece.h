@@ -145,16 +145,38 @@ static inline std::vector<int32_t> tokenize(const std::string& text,
                     piece_at[j] = tid;
                     prev_pos[j] = i;
                 }
-            } else if (j == i + 1) {
-                // Single-byte fallback: heavy penalty so Viterbi only
-                // picks it when nothing else covers the byte.
-                float cand = dp[i] + cfg.unk_penalty;
-                if (cand > dp[j]) {
-                    dp[j] = cand;
-                    piece_at[j] = cfg.unk_id;
-                    prev_pos[j] = i;
-                }
             }
+        }
+
+        // Unknown fallback: advance one whole codepoint as <unk> (heavy
+        // penalty so Viterbi only takes it when no piece covers the span).
+        //
+        // In utf8_aligned mode a single-byte edge (i → i+1) is illegal when
+        // s[i] is a multi-byte lead: position i+1 is a continuation byte, so
+        // the alignment guard above skips it and NO edge leaves i. An OOV
+        // multi-byte codepoint (e.g. an emoji outside the vocab) would then
+        // leave every later position unreachable and the backtrack returns
+        // nothing — the whole string collapses to just the BOS. Stepping the
+        // full codepoint keeps the DP connected and yields one <unk> per OOV
+        // char. In byte mode (utf8_aligned=false) cp_len is always 1, so this
+        // reproduces the original single-byte fallback exactly.
+        int cp_len = 1;
+        if (cfg.utf8_aligned) {
+            unsigned char lead = (unsigned char)s[i];
+            if ((lead & 0xE0) == 0xC0)
+                cp_len = 2;
+            else if ((lead & 0xF0) == 0xE0)
+                cp_len = 3;
+            else if ((lead & 0xF8) == 0xF0)
+                cp_len = 4;
+            cp_len = std::min(cp_len, n - i);
+        }
+        const int fj = i + cp_len;
+        const float unk_cand = dp[i] + cfg.unk_penalty;
+        if (unk_cand > dp[fj]) {
+            dp[fj] = unk_cand;
+            piece_at[fj] = cfg.unk_id;
+            prev_pos[fj] = i;
         }
     }
 
