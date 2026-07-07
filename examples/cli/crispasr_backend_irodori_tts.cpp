@@ -9,6 +9,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
+#include "crispasr_tts_ref_cache.h"
 #include "whisper_params.h"
 
 #include "core/wav_reader.h"
@@ -31,57 +32,8 @@ static bool file_exists(const std::string& path) {
     return stat(path.c_str(), &st) == 0;
 }
 
-// ── Reference-latent cache ──────────────────────────────────────────
-// Encoding a (possibly long) reference is slow; cache the encoded latent
-// next to the voice file as "<voice>.iro32latent" so repeated runs reuse it
-// (#221). Format: magic "IRL1", uint32 frames, uint32 dim, then frames*dim
-// float32 (row-major, matching irodori_tts_get_reference_latent).
-static const char kLatentMagic[4] = {'I', 'R', 'L', '1'};
-
-static bool file_mtime(const std::string& path, time_t& out) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0)
-        return false;
-    out = st.st_mtime;
-    return true;
-}
-
-// Load a latent cache if present, well-formed, matches `expect_dim`, and is
-// at least as new as `voice_path`. Returns frames (>0) on success, else 0.
-static int load_latent_cache(const std::string& cache_path, const std::string& voice_path, int expect_dim,
-                             std::vector<float>& out) {
-    time_t ct = 0, vt = 0;
-    if (!file_mtime(cache_path, ct))
-        return 0;
-    if (file_mtime(voice_path, vt) && ct < vt)
-        return 0; // stale — voice changed after the cache was written
-    FILE* f = std::fopen(cache_path.c_str(), "rb");
-    if (!f)
-        return 0;
-    char magic[4];
-    uint32_t frames = 0, dim = 0;
-    bool ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, kLatentMagic, 4) == 0 &&
-              std::fread(&frames, sizeof(uint32_t), 1, f) == 1 && std::fread(&dim, sizeof(uint32_t), 1, f) == 1 &&
-              frames > 0 && dim == (uint32_t)expect_dim;
-    if (ok) {
-        out.resize((size_t)frames * dim);
-        ok = std::fread(out.data(), sizeof(float), out.size(), f) == out.size();
-    }
-    std::fclose(f);
-    return ok ? (int)frames : 0;
-}
-
-static void save_latent_cache(const std::string& cache_path, const float* latent, int frames, int dim) {
-    FILE* f = std::fopen(cache_path.c_str(), "wb");
-    if (!f)
-        return;
-    uint32_t fr = (uint32_t)frames, dm = (uint32_t)dim;
-    std::fwrite(kLatentMagic, 1, 4, f);
-    std::fwrite(&fr, sizeof(uint32_t), 1, f);
-    std::fwrite(&dm, sizeof(uint32_t), 1, f);
-    std::fwrite(latent, sizeof(float), (size_t)frames * dim, f);
-    std::fclose(f);
-}
+// Reference-latent cache tag (see crispasr_tts_ref_cache.h).
+static constexpr const char* kIrodoriCacheTag = "irodori-latent";
 
 // Look for dacvae GGUF next to the model.
 static std::string discover_dacvae(const std::string& model_path) {
@@ -206,19 +158,23 @@ private:
 
         // Reference-latent cache: encoding is slow, so reuse "<voice>.iro32latent"
         // when it exists and is at least as new as the voice file. Disable with
-        // CRISPASR_IRODORI_LATENT_CACHE=0.
-        const char* cache_env = std::getenv("CRISPASR_IRODORI_LATENT_CACHE");
-        const bool cache_enabled = !(cache_env && std::strcmp(cache_env, "0") == 0);
+        // CRISPASR_TTS_REF_CACHE=0 (or the legacy CRISPASR_IRODORI_LATENT_CACHE=0).
+        const char* legacy_env = std::getenv("CRISPASR_IRODORI_LATENT_CACHE");
+        const bool cache_enabled =
+            !crispasr_ref_cache::disabled() && !(legacy_env && std::strcmp(legacy_env, "0") == 0);
         const int expect_dim = irodori_tts_reference_latent_dim(ctx_);
-        const std::string cache_path = p.tts_voice + ".iro32latent";
+        const std::string cache_path = crispasr_ref_cache::path_for(p.tts_voice, ".iro32latent");
 
         if (cache_enabled && expect_dim > 0) {
+            std::vector<uint32_t> shape;
             std::vector<float> lat;
-            int frames = load_latent_cache(cache_path, p.tts_voice, expect_dim, lat);
-            if (frames > 0 && irodori_tts_set_reference_latent(ctx_, lat.data(), frames) == 0) {
+            if (crispasr_ref_cache::load_floats(cache_path, p.tts_voice, kIrodoriCacheTag, shape, lat) &&
+                shape.size() == 2 && shape[1] == (uint32_t)expect_dim && shape[0] > 0 &&
+                lat.size() == (size_t)shape[0] * shape[1] &&
+                irodori_tts_set_reference_latent(ctx_, lat.data(), (int)shape[0]) == 0) {
                 if (!p.no_prints) {
-                    std::fprintf(stderr, "crispasr[irodori-tts]: using cached reference latent '%s' (%d frames)\n",
-                                 cache_path.c_str(), frames);
+                    std::fprintf(stderr, "crispasr[irodori-tts]: using cached reference latent '%s' (%u frames)\n",
+                                 cache_path.c_str(), shape[0]);
                 }
                 return;
             }
@@ -252,7 +208,8 @@ private:
             const float* lat = nullptr;
             int frames = 0, dim = 0;
             if (irodori_tts_get_reference_latent(ctx_, &lat, &frames, &dim) == 0 && frames > 0) {
-                save_latent_cache(cache_path, lat, frames, dim);
+                crispasr_ref_cache::save_floats(cache_path, kIrodoriCacheTag, {(uint32_t)frames, (uint32_t)dim}, lat,
+                                                (size_t)frames * dim);
                 if (!p.no_prints) {
                     std::fprintf(stderr, "crispasr[irodori-tts]: cached reference latent → '%s' (%d frames)\n",
                                  cache_path.c_str(), frames);
