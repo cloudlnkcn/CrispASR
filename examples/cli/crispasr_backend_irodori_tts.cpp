@@ -160,17 +160,13 @@ private:
             // same request; a fixed voice path won't become readable mid-run.
             return;
         }
-        // irodori_tts_set_reference resamples to 48 kHz internally; pass the
-        // native rate through so it can do so. NOTE: the runtime currently
-        // ships only the DAC-VAE decoder — the encoder (audio → latent) is
-        // not ported yet, so set_reference returns -1 and cloning falls back
-        // to the default voice. This wiring is forward-compatible: it starts
-        // cloning automatically once the encoder lands.
+        // irodori_tts_set_reference resamples to 48 kHz, loudness-normalizes,
+        // and runs the DAC-VAE encoder to produce the speaker latent. It fails
+        // (-1) only when the loaded codec GGUF has no encoder tensors — set_reference
+        // prints the actionable message in that case, so just fall back quietly.
         if (irodori_tts_set_reference(ctx_, pcm.data(), (int)pcm.size(), sr) != 0) {
-            std::fprintf(stderr, "crispasr[irodori-tts]: voice cloning from reference audio is not yet supported "
-                                 "(DAC-VAE encoder not ported); using the default voice.\n");
             irodori_tts_clear_reference(ctx_);
-            // Keep ref_path_ set: warn once per distinct voice, not per chunk.
+            // Keep ref_path_ set: don't retry (and re-warn) for every chunk.
             return;
         }
         if (!p.no_prints) {

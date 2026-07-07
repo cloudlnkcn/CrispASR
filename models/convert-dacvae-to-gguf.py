@@ -218,6 +218,52 @@ def main():
             write_tensor(writer, gguf_name, to_f32(tval))
         print(f"  wm {gguf_name}: {list(tval.shape)}")
 
+    # ── Encoder (voice cloning: reference audio → 32-dim latent) ──
+    # Mirror of the decoder; DACVAE.encode deterministic path is
+    #   z = encoder(pad(audio));  mean = quantizer.in_proj(z)[:codebook_dim]
+    # The encoder is a stack of NormConv1d (pad_mode="none" ⇒ symmetric
+    # padding (k-stride)*dil//2 baked into the conv) + Snake1d, with 4
+    # EncoderBlocks (3 ResidualUnits d=1,3,9 → Snake → strided downsample).
+    encoder_rates = [int(r) for r in model.encoder_rates]
+    encoder_dim = int(model.encoder_dim)
+    writer.add_uint32("dacvae.has_encoder", 1)
+    writer.add_uint32("dacvae.encoder_dim", encoder_dim)
+    writer.add_array("dacvae.encoder_rates", encoder_rates)
+    print(f"  encoder: dim={encoder_dim} rates={encoder_rates}")
+
+    def emit_conv(state_prefix, gguf_base):
+        w, b = get_conv_weight(state_prefix)
+        write_tensor(writer, f"{gguf_base}.w", to_f16(w))
+        if b is not None:
+            write_tensor(writer, f"{gguf_base}.b", to_f32(b))
+        print(f"  enc {gguf_base}: {list(w.shape)}")
+
+    def emit_alpha(state_key, gguf_name):
+        write_tensor(writer, gguf_name, to_f32(state[state_key]))
+
+    # block.0: input conv (1 → encoder_dim, k=7)
+    emit_conv("encoder.block.0", "dacvae.enc.in_conv")
+    # block.1..N: EncoderBlocks
+    for i, _stride in enumerate(encoder_rates):
+        bp = f"encoder.block.{i + 1}.block"
+        # 3 ResidualUnits (dilation 1, 3, 9)
+        for r in range(3):
+            rp = f"{bp}.{r}.block"
+            emit_alpha(f"{rp}.0.alpha", f"dacvae.enc.blk{i}.res{r}.alpha0")
+            emit_conv(f"{rp}.1", f"dacvae.enc.blk{i}.res{r}.conv0")
+            emit_alpha(f"{rp}.2.alpha", f"dacvae.enc.blk{i}.res{r}.alpha1")
+            emit_conv(f"{rp}.3", f"dacvae.enc.blk{i}.res{r}.conv1")
+        # Snake + strided downsample conv
+        emit_alpha(f"{bp}.3.alpha", f"dacvae.enc.blk{i}.down_snake.alpha")
+        emit_conv(f"{bp}.4", f"dacvae.enc.blk{i}.down")
+    # Final Snake + conv (encoder_final_dim → encoder_final_dim, k=3)
+    n_enc = len(encoder_rates)
+    emit_alpha(f"encoder.block.{n_enc + 1}.alpha", "dacvae.enc.out_snake.alpha")
+    emit_conv(f"encoder.block.{n_enc + 2}", "dacvae.enc.out_conv")
+    # VAE bottleneck in_proj: NormConv1d(latent_dim → 2*codebook_dim, k=1);
+    # deterministic encode takes the first codebook_dim channels (the mean).
+    emit_conv("quantizer.in_proj", "dacvae.enc.in_proj")
+
     # Finalize
     writer.write_header_to_file()
     writer.write_kv_data_to_file()

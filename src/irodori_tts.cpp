@@ -21,6 +21,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include "core/audio_resample.h"
 #include "core/dac_decoder.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
@@ -204,6 +205,40 @@ struct irodori_weights {
     ggml_tensor* dur_out_proj_b = nullptr;
 };
 
+// ── DAC-VAE encoder (reference audio → 32-dim latent, voice cloning) ──
+// Mirror of the decoder; deterministic encode is
+//   z = encoder(pad(audio)); mean = in_proj(z)[:codebook_dim].
+struct irodori_dacvae_encoder {
+    bool loaded = false;
+    int encoder_dim = 64;
+    std::vector<int> rates; // downsample strides, e.g. {2,8,10,12}
+
+    ggml_tensor* in_conv_w = nullptr; // Conv1d(1 → encoder_dim, k=7)
+    ggml_tensor* in_conv_b = nullptr;
+
+    struct ResUnit { // Snake→Conv(k7,dil)→Snake→Conv(k1)→+x
+        ggml_tensor* alpha0 = nullptr;
+        ggml_tensor* conv0_w = nullptr;
+        ggml_tensor* conv0_b = nullptr;
+        ggml_tensor* alpha1 = nullptr;
+        ggml_tensor* conv1_w = nullptr;
+        ggml_tensor* conv1_b = nullptr;
+    };
+    struct Block { // 3 ResUnits (dil 1,3,9) → Snake → strided downsample conv
+        ResUnit res[3];
+        ggml_tensor* down_snake_alpha = nullptr;
+        ggml_tensor* down_w = nullptr; // Conv1d(c → 2c, k=2*stride, stride)
+        ggml_tensor* down_b = nullptr;
+    };
+    std::vector<Block> blocks;
+
+    ggml_tensor* out_snake_alpha = nullptr; // final Snake
+    ggml_tensor* out_conv_w = nullptr;      // Conv1d(C → C, k=3)
+    ggml_tensor* out_conv_b = nullptr;
+    ggml_tensor* in_proj_w = nullptr; // VAEBottleneck.in_proj Conv1d(C → 2*codebook_dim, k=1)
+    ggml_tensor* in_proj_b = nullptr;
+};
+
 // ── Context ─────────────────────────────────────────────────────────
 
 struct irodori_tts_context {
@@ -246,6 +281,8 @@ struct irodori_tts_context {
     ggml_tensor* codec_out_proj_b = nullptr;
     // DAC decoder weights (reusing core_dac structure with DACVAE config)
     core_dac::DacWeights dac;
+    // DAC-VAE encoder weights (voice cloning: reference audio → latent)
+    irodori_dacvae_encoder enc;
 
     // Runtime params
     int seed = 0;
@@ -1357,6 +1394,60 @@ int irodori_tts_set_codec_path(struct irodori_tts_context* ctx, const char* code
     dac.out_conv_w = try_get("dacvae.wm_model.encoder_block.pre.1.weight");
     dac.out_conv_b = try_get("dacvae.wm_model.encoder_block.pre.1.bias");
 
+    // ── Encoder (optional; present in newer GGUFs) — voice cloning ──
+    // Reference audio → 32-dim latent. Guarded by try_get so codec GGUFs
+    // without encoder tensors still load (cloning just stays disabled).
+    if (try_get("dacvae.enc.in_conv.w")) {
+        auto& enc = ctx->enc;
+        {
+            gguf_context* m2 = core_gguf::open_metadata(codec_gguf_path);
+            if (m2) {
+                enc.encoder_dim = core_gguf::kv_i32(m2, "dacvae.encoder_dim", 64);
+                core_gguf::free_metadata(m2);
+            }
+        }
+        // Semantic-DACVAE-Japanese-32dim downsample strides (hop 1920 = ∏).
+        enc.rates = {2, 8, 10, 12};
+
+        enc.in_conv_w = get("dacvae.enc.in_conv.w");
+        enc.in_conv_b = try_get("dacvae.enc.in_conv.b");
+        enc.blocks.resize(enc.rates.size());
+        char buf[128];
+        for (size_t i = 0; i < enc.rates.size(); i++) {
+            auto& blk = enc.blocks[i];
+            for (int r = 0; r < 3; r++) {
+                auto& ru = blk.res[r];
+                snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.res%d.alpha0", i, r);
+                ru.alpha0 = get(buf);
+                snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.res%d.conv0.w", i, r);
+                ru.conv0_w = get(buf);
+                snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.res%d.conv0.b", i, r);
+                ru.conv0_b = try_get(buf);
+                snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.res%d.alpha1", i, r);
+                ru.alpha1 = get(buf);
+                snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.res%d.conv1.w", i, r);
+                ru.conv1_w = get(buf);
+                snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.res%d.conv1.b", i, r);
+                ru.conv1_b = try_get(buf);
+            }
+            snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.down_snake.alpha", i);
+            blk.down_snake_alpha = get(buf);
+            snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.down.w", i);
+            blk.down_w = get(buf);
+            snprintf(buf, sizeof(buf), "dacvae.enc.blk%zu.down.b", i);
+            blk.down_b = try_get(buf);
+        }
+        enc.out_snake_alpha = get("dacvae.enc.out_snake.alpha");
+        enc.out_conv_w = get("dacvae.enc.out_conv.w");
+        enc.out_conv_b = try_get("dacvae.enc.out_conv.b");
+        enc.in_proj_w = get("dacvae.enc.in_proj.w");
+        enc.in_proj_b = try_get("dacvae.enc.in_proj.b");
+        enc.loaded = true;
+        if (ctx->verbosity >= 1) {
+            std::fprintf(stderr, "[irodori] DAC-VAE encoder loaded (voice cloning enabled)\n");
+        }
+    }
+
     ctx->codec_ctx = wl.ctx;
     ctx->codec_buf = wl.buf;
     ctx->has_codec = true;
@@ -1367,16 +1458,252 @@ int irodori_tts_set_codec_path(struct irodori_tts_context* ctx, const char* code
     return 0;
 }
 
+// Strided downsample conv (encoder). x:(Cin,T) w:(K,Cin,Cout) k=2*stride,
+// pad=stride/2 (SAME-none). Returns (Cout, T/stride).
+static ggml_tensor* enc_downsample_conv(ggml_context* g, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride) {
+    const int Cout = (int)w->ne[2];
+    ggml_tensor* y = ggml_cont(g, ggml_transpose(g, x));                         // (T, Cin)
+    y = ggml_conv_1d(g, w, y, /*stride=*/stride, /*pad=*/stride / 2, /*dil=*/1); // (T_out, Cout, 1)
+    const int Tout = (int)y->ne[0];
+    y = ggml_reshape_2d(g, y, Tout, Cout);
+    y = ggml_cont(g, ggml_transpose(g, y)); // (Cout, T_out)
+    if (b)
+        y = ggml_add(g, y, b);
+    return y;
+}
+
+// Encoder ResidualUnit: Snake→Conv(k7,dil)→Snake→Conv(k1)→+x (all SAME).
+static ggml_tensor* enc_res_unit(ggml_context* g, ggml_tensor* x, const irodori_dacvae_encoder::ResUnit& u, int dil) {
+    ggml_tensor* y = core_dac::snake(g, x, u.alpha0);
+    y = core_dac::conv1d(g, y, u.conv0_w, u.conv0_b, 7, dil);
+    y = core_dac::snake(g, y, u.alpha1);
+    y = core_dac::conv1d(g, y, u.conv1_w, u.conv1_b, 1);
+    return ggml_add(g, x, y);
+}
+
+// Run the DAC-VAE encoder on a 48 kHz mono waveform (already loudness-
+// normalized and reflect-padded to a multiple of the hop). Produces the
+// deterministic latent mean: (T_latent, codebook_dim) row-major.
+// Returns 0 on success.
+static int run_dacvae_encoder(irodori_tts_context* ctx, const float* wave, int n_samples,
+                              std::vector<float>& out_latent, int& out_frames) {
+    const auto& enc = ctx->enc;
+    if (!enc.loaded)
+        return -1;
+    const int codebook_dim = ctx->hparams.latent_dim; // 32
+
+    const int n_tensors = 4096;
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_tensors, false);
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* g = ggml_init(ip);
+
+    // Input waveform as (Cin=1, T)
+    ggml_tensor* wav_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, 1, n_samples);
+    ggml_set_name(wav_in, "wav_in");
+    ggml_set_input(wav_in);
+
+    ggml_tensor* h = core_dac::conv1d(g, wav_in, enc.in_conv_w, enc.in_conv_b, 7); // (64, T)
+    h = ggml_cast(g, h, GGML_TYPE_F32);
+    for (size_t i = 0; i < enc.blocks.size(); i++) {
+        const auto& blk = enc.blocks[i];
+        h = enc_res_unit(g, h, blk.res[0], 1);
+        h = enc_res_unit(g, h, blk.res[1], 3);
+        h = enc_res_unit(g, h, blk.res[2], 9);
+        h = core_dac::snake(g, h, blk.down_snake_alpha);
+        h = enc_downsample_conv(g, h, blk.down_w, blk.down_b, enc.rates[i]);
+        h = ggml_cont(g, h);
+        h = ggml_cast(g, h, GGML_TYPE_F32);
+    }
+    h = core_dac::snake(g, h, enc.out_snake_alpha);
+    h = core_dac::conv1d(g, h, enc.out_conv_w, enc.out_conv_b, 3); // (1024, T)
+    h = ggml_cast(g, h, GGML_TYPE_F32);
+    h = core_dac::conv1d(g, h, enc.in_proj_w, enc.in_proj_b, 1); // (2*codebook_dim, T)
+    h = ggml_cast(g, h, GGML_TYPE_F32);
+
+    const int T = (int)h->ne[1];
+    // mean = first codebook_dim channels (chunk(2)[0]). Channels are ne[0].
+    ggml_tensor* mean = ggml_view_2d(g, h, codebook_dim, T, h->nb[1], 0);
+    mean = ggml_cont(g, mean); // (codebook_dim, T) contiguous == (T, codebook_dim) row-major
+    ggml_set_name(mean, "ref_mean");
+    ggml_set_output(mean);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(g, n_tensors, false);
+    ggml_build_forward_expand(gf, mean);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->codec_backend));
+    if (!ggml_gallocr_reserve(galloc, gf) || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        std::fprintf(stderr, "[irodori] ERROR: encoder graph alloc failed\n");
+        ggml_gallocr_free(galloc);
+        ggml_free(g);
+        return -1;
+    }
+    ggml_backend_tensor_set(wav_in, wave, 0, (size_t)n_samples * sizeof(float));
+    ggml_backend_graph_compute(ctx->codec_backend, gf);
+
+    out_frames = T;
+    out_latent.resize((size_t)T * codebook_dim);
+    ggml_backend_tensor_get(mean, out_latent.data(), 0, out_latent.size() * sizeof(float));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(g);
+    return 0;
+}
+
+// ── ITU-R BS.1770-4 integrated loudness (K-weighting + gated) ────────
+// Matches audiotools' AudioSignal.loudness() closely enough to reproduce
+// the -16 LUFS reference-normalization gain used by irodori_tts/codec.py.
+static double bs1770_integrated_loudness(const float* x, int n, int sr) {
+    if (n <= 0 || sr <= 0)
+        return -70.0;
+    // Stage-1 shelving + stage-2 highpass biquads (per BS.1770-4, coeffs
+    // are defined at 48 kHz; audiotools resamples filters — we run at the
+    // signal's rate using the standard bilinear-derived 48k coefficients,
+    // which is what pyloudnorm/audiotools use for 48 kHz reference audio).
+    // Pre-filter (high-shelf):
+    const double b0s = 1.53512485958697, b1s = -2.69169618940638, b2s = 1.19839281085285;
+    const double a1s = -1.69065929318241, a2s = 0.73248077421585;
+    // Highpass (RLB):
+    const double b0h = 1.0, b1h = -2.0, b2h = 1.0;
+    const double a1h = -1.99004745483398, a2h = 0.99007225036621;
+    std::vector<double> y(n);
+    {
+        double z1 = 0, z2 = 0; // shelf
+        for (int i = 0; i < n; i++) {
+            double in = x[i];
+            double out = b0s * in + z1;
+            z1 = b1s * in - a1s * out + z2;
+            z2 = b2s * in - a2s * out;
+            y[i] = out;
+        }
+        double w1 = 0, w2 = 0; // highpass
+        for (int i = 0; i < n; i++) {
+            double in = y[i];
+            double out = b0h * in + w1;
+            w1 = b1h * in - a1h * out + w2;
+            w2 = b2h * in - a2h * out;
+            y[i] = out;
+        }
+    }
+    // 400 ms blocks, 75% overlap (100 ms hops); mean-square per block.
+    const int blk = (int)(0.4 * sr);
+    const int hop = (int)(0.1 * sr);
+    if (n < blk)
+        return -70.0;
+    std::vector<double> loud;
+    std::vector<double> ms;
+    for (int start = 0; start + blk <= n; start += hop) {
+        double s = 0;
+        for (int i = start; i < start + blk; i++)
+            s += y[i] * y[i];
+        double meansq = s / blk;
+        ms.push_back(meansq);
+        loud.push_back(-0.691 + 10.0 * std::log10(meansq + 1e-12));
+    }
+    // Absolute gate at -70 LUFS, then relative gate at (mean-10 LUFS).
+    auto gated_mean = [&](double thr) -> double {
+        double acc = 0;
+        int cnt = 0;
+        for (size_t i = 0; i < loud.size(); i++)
+            if (loud[i] > thr) {
+                acc += ms[i];
+                cnt++;
+            }
+        return cnt ? acc / cnt : 0.0;
+    };
+    // First pass: absolute gate.
+    double abs_ms = 0;
+    int abs_cnt = 0;
+    for (size_t i = 0; i < loud.size(); i++)
+        if (loud[i] > -70.0) {
+            abs_ms += ms[i];
+            abs_cnt++;
+        }
+    if (!abs_cnt)
+        return -70.0;
+    double rel_thr = -0.691 + 10.0 * std::log10(abs_ms / abs_cnt + 1e-12) - 10.0;
+    double final_ms = gated_mean(rel_thr);
+    return -0.691 + 10.0 * std::log10(final_ms + 1e-12);
+}
+
 int irodori_tts_set_reference(struct irodori_tts_context* ctx, const float* ref_pcm, int n_samples, int sample_rate) {
     if (!ctx || !ref_pcm || n_samples <= 0 || sample_rate <= 0)
         return -1;
+    if (!ctx->enc.loaded) {
+        std::fprintf(stderr, "[irodori] voice cloning requires an encoder-enabled DAC-VAE codec GGUF "
+                             "(re-download the codec: it must contain dacvae.enc.* tensors).\n");
+        return -1;
+    }
 
-    // TODO: Encode reference audio through DAC-VAE encoder.
-    // For now, this requires pre-encoded latents via irodori_tts_set_reference_latent().
-    // The DAC-VAE encoder needs to be ported or called externally.
-    std::fprintf(stderr, "[irodori] WARNING: raw PCM reference not yet supported. "
-                         "Use irodori_tts_set_reference_latent() with pre-encoded DAC-VAE latents.\n");
-    return -1;
+    const int SR = ctx->hparams.sample_rate;       // 48000
+    const int hop = ctx->hparams.codec_hop_length; // 1920
+
+    // 1) Resample to the codec rate.
+    std::vector<float> wav;
+    if (sample_rate != SR) {
+        wav = core_audio::resample_polyphase(ref_pcm, n_samples, sample_rate, SR);
+    } else {
+        wav.assign(ref_pcm, ref_pcm + n_samples);
+    }
+
+    // Debug: feed an already-normalized waveform straight through (isolates
+    // the encoder graph from resample/LUFS for parity testing).
+    const char* dbg = std::getenv("CRISPASR_IRODORI_ENC_PRENORM");
+
+    if (!dbg) {
+        // 2) Loudness-normalize to -16 LUFS (codec default), then peak-limit.
+        double loud = bs1770_integrated_loudness(wav.data(), (int)wav.size(), SR);
+        if (loud > -70.0) {
+            double gain = std::pow(10.0, (-16.0 - loud) / 20.0);
+            for (auto& s : wav)
+                s = (float)(s * gain);
+        }
+        // ensure_max_of_audio: scale down if peak exceeds 1.0.
+        float peak = 0.0f;
+        for (float s : wav)
+            peak = std::max(peak, std::fabs(s));
+        if (peak > 1.0f) {
+            float inv = 1.0f / peak;
+            for (auto& s : wav)
+                s *= inv;
+        }
+        if (ctx->verbosity >= 1)
+            std::fprintf(stderr, "[irodori] reference loudness %.2f LUFS → -16 LUFS (peak %.3f)\n", loud, peak);
+    }
+
+    // 3) Reflect-pad to a multiple of the hop (DACVAE._pad).
+    int rem = (int)wav.size() % hop;
+    if (rem != 0) {
+        int pad = hop - rem;
+        size_t base = wav.size();
+        wav.resize(base + pad);
+        for (int i = 0; i < pad; i++) // reflect (no edge repeat): x[-2], x[-3], ...
+            wav[base + i] = wav[base - 2 - i];
+    }
+
+    // 4) Encode → latent mean (T, 32).
+    std::vector<float> latent;
+    int frames = 0;
+    if (run_dacvae_encoder(ctx, wav.data(), (int)wav.size(), latent, frames) != 0 || frames <= 0) {
+        std::fprintf(stderr, "[irodori] reference encode failed.\n");
+        return -1;
+    }
+    ctx->ref_latent = std::move(latent);
+    ctx->ref_latent_frames = frames;
+
+    // Optional: dump the latent for parity checks.
+    if (const char* out = std::getenv("CRISPASR_IRODORI_ENC_DUMP")) {
+        FILE* f = std::fopen(out, "wb");
+        if (f) {
+            std::fwrite(ctx->ref_latent.data(), sizeof(float), ctx->ref_latent.size(), f);
+            std::fclose(f);
+            std::fprintf(stderr, "[irodori] dumped ref latent (%d, %d) → %s\n", frames, ctx->hparams.latent_dim, out);
+        }
+    }
+
+    if (ctx->verbosity >= 1)
+        std::fprintf(stderr, "[irodori] reference encoded: %d latent frames (%.2f sec)\n", frames,
+                     (float)frames * hop / SR);
+    return 0;
 }
 
 int irodori_tts_set_reference_latent(struct irodori_tts_context* ctx, const float* latent, int n_frames) {
@@ -1462,12 +1789,70 @@ static std::vector<float> run_text_encoder(irodori_tts_context* ctx, const int32
     return result;
 }
 
+// Run the speaker (reference-latent) encoder on ctx->ref_latent → speaker
+// state (speaker_dim, T_ref) as a CPU-side array. Empty on failure.
+static std::vector<float> run_speaker_encoder(irodori_tts_context* ctx) {
+    const auto& hp = ctx->hparams;
+    const int T_ref = ctx->ref_latent_frames;
+    if (T_ref <= 0 || ctx->ref_latent.empty())
+        return {};
+    const int latent_pd = hp.patched_latent_dim(); // 32
+
+    const int n_tensors = 512 + hp.speaker_layers * 80;
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_tensors, false);
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* g = ggml_init(ip);
+
+    // ref_latent is (T_ref, latent_pd) row-major == ggml (latent_pd, T_ref)
+    ggml_tensor* latent_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, latent_pd, T_ref);
+    ggml_set_name(latent_in, "ref_latent");
+    ggml_set_input(latent_in);
+
+    ggml_tensor* mask_f = ggml_new_tensor_2d(g, GGML_TYPE_F32, 1, T_ref);
+    ggml_set_name(mask_f, "spk_mask_f");
+    ggml_set_input(mask_f);
+
+    ggml_tensor* pos = ggml_new_tensor_1d(g, GGML_TYPE_I32, T_ref);
+    ggml_set_name(pos, "spk_pos");
+    ggml_set_input(pos);
+
+    ggml_tensor* out = build_speaker_encoder_graph(g, ctx, latent_in, mask_f, pos, T_ref);
+    ggml_set_name(out, "spk_state");
+    ggml_set_output(out);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(g, n_tensors, false);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
+        ggml_free(g);
+        return {};
+    }
+    ggml_backend_tensor_set(latent_in, ctx->ref_latent.data(), 0, ctx->ref_latent.size() * sizeof(float));
+    std::vector<float> mask_data(T_ref, 1.0f);
+    ggml_backend_tensor_set(mask_f, mask_data.data(), 0, T_ref * sizeof(float));
+    std::vector<int32_t> pos_data(T_ref);
+    for (int i = 0; i < T_ref; i++)
+        pos_data[i] = i;
+    ggml_backend_tensor_set(pos, pos_data.data(), 0, T_ref * sizeof(int32_t));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    std::vector<float> result((size_t)T_ref * hp.speaker_dim);
+    ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(g);
+    return result;
+}
+
 // Run one DiT forward pass: x_t + timestep + text_state + spk_state → velocity prediction.
 // Returns velocity as CPU-side array (T_latent × patched_latent_dim).
 static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float* x_t_data, int T_latent,
                                           const float* cond_embed_data, // (model_dim*3,)
                                           const float* text_state_data, int T_text, const float* spk_state_data,
-                                          int T_ref) {
+                                          int T_ref, bool attend_speaker = false) {
     const auto& hp = ctx->hparams;
     const auto& w = ctx->weights;
     const int D = hp.model_dim;
@@ -1578,7 +1963,10 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
         for (int q = 0; q < T_latent; q++) {
             for (int k = 0; k < T_kv; k++) {
                 bool is_speaker = (k >= T_latent + T_text);
-                mask_data[q * T_kv + k] = is_speaker ? neginf_f16 : zero_f16;
+                // Mask speaker positions only for unconditional generation;
+                // with a real reference (attend_speaker) they carry the voice.
+                bool masked = is_speaker && !attend_speaker;
+                mask_data[q * T_kv + k] = masked ? neginf_f16 : zero_f16;
             }
         }
         ggml_backend_tensor_set(attn_mask_in, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
@@ -1717,8 +2105,21 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
     // but MUST include it in KV so attention shape matches Python.
     int T_ref = 1;
     std::vector<float> spk_state(T_ref * hp.speaker_dim, 0.0f);
-    bool spk_mask_all_false = true; // all speaker positions masked out
-    // TODO: when ref_latent is set, run speaker encoder and set spk_mask_all_false=false
+    bool attend_speaker = false; // false → unconditional (speaker KV masked)
+
+    // Voice cloning: when a reference latent is set, run the speaker encoder
+    // and let the DiT attend to it (see run_dit_forward's attn mask).
+    if (ctx->ref_latent_frames > 0 && !ctx->ref_latent.empty()) {
+        std::vector<float> spk = run_speaker_encoder(ctx);
+        if (!spk.empty()) {
+            spk_state = std::move(spk);
+            T_ref = ctx->ref_latent_frames;
+            attend_speaker = true;
+            IRODORI_DBG("[irodori] speaker conditioning active (%d ref frames)\n", T_ref);
+        } else {
+            std::fprintf(stderr, "[irodori] WARNING: speaker encoder failed; using neutral voice\n");
+        }
+    }
 
     // ── Step 3: Euler RF ODE solver ──
     IRODORI_DBG("[irodori] ODE solver: %d steps\n", ctx->ode_steps);
@@ -1770,7 +2171,7 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         IRODORI_DBG("[irodori]   step %d: running DiT forward...\n", step);
         // DiT forward: conditioned pass
         auto v_cond = run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
-                                      spk_state.empty() ? nullptr : spk_state.data(), T_ref);
+                                      spk_state.empty() ? nullptr : spk_state.data(), T_ref, attend_speaker);
         if (v_cond.empty()) {
             std::fprintf(stderr, "[irodori] DiT forward failed at step %d\n", step);
             return 0;
@@ -1801,8 +2202,9 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         if (use_cfg) {
             // Unconditioned pass: zero text state
             std::vector<float> text_uncond(T_text * hp.text_dim, 0.0f);
-            auto v_uncond = run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(),
-                                            T_text, spk_state.empty() ? nullptr : spk_state.data(), T_ref);
+            auto v_uncond =
+                run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(), T_text,
+                                spk_state.empty() ? nullptr : spk_state.data(), T_ref, attend_speaker);
             if (!v_uncond.empty()) {
                 for (size_t i = 0; i < x_t.size(); i++) {
                     float v = v_cond[i] + cfg_text * (v_cond[i] - v_uncond[i]);
