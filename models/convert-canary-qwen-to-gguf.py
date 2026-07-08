@@ -447,8 +447,11 @@ def convert(input_dir: Path, out_path: Path) -> None:
         writer.add_token_merges(merges)
 
     # Mel filterbank + Hann window (baked, same as canary)
+    # compute_mel_filters returns (n_freqs, n_mels) but core_mel expects
+    # MelsFreqs layout = (n_mels, n_freqs). Transpose before writing.
     mel_fb = compute_mel_filters(sr=sample_rate, n_fft=n_fft, n_mels=n_mels)
-    print(f"  mel_filters shape: {mel_fb.shape}")
+    mel_fb = np.ascontiguousarray(mel_fb.T)  # (n_freqs, n_mels) → (n_mels, n_freqs)
+    print(f"  mel_filters shape: {mel_fb.shape}  (MelsFreqs layout)")
     writer.add_tensor("preprocessor.fb", mel_fb)
 
     win = np.ascontiguousarray(
