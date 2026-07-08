@@ -36,6 +36,10 @@
 #include <sys/stat.h>
 #include <vector>
 
+#ifdef _WIN32
+#include <direct.h> // _mkdir
+#endif
+
 namespace crispasr_ref_cache {
 
 inline const char kMagic[4] = {'C', 'R', 'C', '1'};
@@ -144,17 +148,30 @@ inline uint64_t fnv1a(const void* data, size_t n) {
     return h;
 }
 
-// Cache directory: CRISPASR_TTS_REF_CACHE_DIR, else <TMPDIR>/crispasr-tts-refcache.
+// Cache directory: CRISPASR_TTS_REF_CACHE_DIR, else <temp>/crispasr-tts-refcache.
 inline std::string cache_dir() {
     if (const char* d = std::getenv("CRISPASR_TTS_REF_CACHE_DIR"))
         if (*d)
             return d;
     const char* tmp = std::getenv("TMPDIR");
+#ifdef _WIN32
+    if (!(tmp && *tmp))
+        tmp = std::getenv("TEMP");
+    if (!(tmp && *tmp))
+        tmp = std::getenv("TMP");
+    std::string base = (tmp && *tmp) ? tmp : ".";
+#else
     std::string base = (tmp && *tmp) ? tmp : "/tmp";
-    if (!base.empty() && base.back() == '/')
+#endif
+    while (!base.empty() && (base.back() == '/' || base.back() == '\\'))
         base.pop_back();
     std::string dir = base + "/crispasr-tts-refcache";
-    ::mkdir(dir.c_str(), 0700); // best-effort; ignored if it exists
+    // best-effort; ignored if it exists
+#ifdef _WIN32
+    _mkdir(dir.c_str());
+#else
+    ::mkdir(dir.c_str(), 0700);
+#endif
     return dir;
 }
 
