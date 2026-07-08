@@ -33,6 +33,7 @@
 #include "core/fft.h"
 #include "core/gguf_loader.h"
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -53,6 +54,32 @@
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h> // vDSP_conv, vvsinf, vDSP_vsq — Step C-1
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `INDEXTTS_VOC_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool indextts_voc_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("INDEXTTS_VOC_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct indextts_voc_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit indextts_voc_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~indextts_voc_bench_stage() {
+        if (!indextts_voc_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  indextts_voc_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 namespace {
 
@@ -1334,7 +1361,7 @@ extern "C" struct indextts_voc_context* indextts_voc_init(const char* path, int 
     // site. The auto-CPU fallback only applies to the legacy map_custom1 path.
     const bool aa_blocks_gpu = c->use_aa && !aa_use_native() && !aa_use_opvariant() && !force_gpu_with_aa;
     const bool effective_use_gpu = use_gpu && !aa_blocks_gpu;
-    c->backend = effective_use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = effective_use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         c->backend = c->backend_cpu;
     }
@@ -1427,8 +1454,14 @@ extern "C" float* indextts_voc_generate(struct indextts_voc_context* ctx, const 
                 (float)T_audio / hp.sampling_rate);
     }
 
+    indextts_voc_bench_stage _bs_total("generate");
+
     // Build graph
-    ggml_cgraph* gf = build_bigvgan_graph(ctx, T_in);
+    ggml_cgraph* gf;
+    {
+        indextts_voc_bench_stage _bs("graph_build");
+        gf = build_bigvgan_graph(ctx, T_in);
+    }
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1460,6 +1493,7 @@ extern "C" float* indextts_voc_generate(struct indextts_voc_context* ctx, const 
     }
 
     // Compute
+    indextts_voc_bench_stage _bs_compute("compute");
     auto t0 = std::chrono::high_resolution_clock::now();
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "indextts-voc: BigVGAN compute failed\n");

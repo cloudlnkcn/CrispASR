@@ -325,7 +325,7 @@ class RegistryEntry {
 }
 
 /// Look up the canonical GGUF for a backend (whisper, parakeet, canary,
-/// voxtral, voxtral4b, granite, qwen3, cohere, wav2vec2). Returns null
+/// voxtral, voxtral4b, granite, qwen3, cohere, nemotron, wav2vec2). Returns null
 /// on miss.
 RegistryEntry? registryLookup(String backend, {DynamicLibrary? lib}) =>
     _registryCall('crispasr_registry_lookup_abi', backend, lib);
@@ -2154,6 +2154,58 @@ class CrispasrSession {
     }
   }
 
+  /// Chunked-encode transcribe (issue #208).
+  ///
+  /// Forces the Parakeet backend through its bounded overlapping-window
+  /// long-form path regardless of length, so long files transcribe in bounded
+  /// time and don't drop sections. Inert (== [transcribe]) on non-Parakeet
+  /// backends. [chunkSeconds] <= 0 keeps the per-model default window;
+  /// [overlapSeconds] < 0 keeps the default overlap.
+  ///
+  /// Poll [getTranscriptionProgress] (0..100) from a UI isolate/timer to render
+  /// a progress bar — it now tracks the chunked windows. Falls back to
+  /// [transcribe] if the loaded libcrispasr predates the chunked entry point.
+  List<SessionSegment> transcribeChunked(
+    Float32List pcm, {
+    int chunkSeconds = 0,
+    int overlapSeconds = -1,
+    String? language,
+  }) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (pcm.isEmpty) return const [];
+    if (!_lib.providesSymbol('crispasr_session_transcribe_chunked_lang')) {
+      return transcribe(pcm, language: language); // old dylib
+    }
+
+    final samples = calloc<Float>(pcm.length);
+    for (var i = 0; i < pcm.length; i++) {
+      samples[i] = pcm[i];
+    }
+    final langPtr = (language != null && language.isNotEmpty) ? language.toNativeUtf8() : nullptr;
+
+    final fn = _lib.lookupFunction<
+        Pointer<Void> Function(Pointer<Void>, Pointer<Float>, Int32, Int32, Int32, Pointer<Utf8>),
+        Pointer<Void> Function(Pointer<Void>, Pointer<Float>, int, int, int, Pointer<Utf8>)>(
+      'crispasr_session_transcribe_chunked_lang',
+    );
+    final res = fn(_handle, samples, pcm.length, chunkSeconds, overlapSeconds, langPtr);
+    calloc.free(samples);
+    if (langPtr != nullptr) calloc.free(langPtr);
+    if (res == nullptr) {
+      throw Exception('crispasr_session_transcribe_chunked returned null');
+    }
+
+    try {
+      return _readSegments(res);
+    } finally {
+      final freeFn =
+          _lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>(
+        'crispasr_session_result_free',
+      );
+      freeFn(res);
+    }
+  }
+
   /// Transcribe with Silero VAD segmentation + crispasr-style stitching.
   ///
   /// Runs VAD on [pcm], merges short / overlong speech slices into usable
@@ -2342,7 +2394,7 @@ class CrispasrSession {
   }
 
   // ---------------------------------------------------------------------------
-  // TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, and others)
+  // TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, dots-tts, and others)
   // ---------------------------------------------------------------------------
 
   /// Load a separate codec GGUF (qwen3-tts only; no-op for other backends).
@@ -2800,6 +2852,24 @@ class CrispasrSession {
     }
   }
 
+  /// Number of flow-matching timing candidates ranked per token (TADA).
+  /// Higher = more reliable multilingual timing, slower. Returns silently
+  /// on backends that don't rank timing candidates (rc=-2 soft no-op).
+  void setTtsNumCandidates(int n) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_num_candidates')) {
+      // Older libcrispasr without the symbol — silent no-op.
+      return;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>(
+        'crispasr_session_set_tts_num_candidates');
+    final rc = fn(_handle, n);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setTtsNumCandidates failed (rc=$rc)');
+    }
+  }
+
   /// Top-p nucleus sampling threshold (0.0..1.0). Honoured by
   /// chatterbox; other backends no-op.
   void setTopP(double topP) {
@@ -2809,6 +2879,28 @@ class CrispasrSession {
         int Function(Pointer<Void>, double)>('crispasr_session_set_top_p');
     final rc = fn(_handle, topP);
     if (rc != 0 && rc != -2) throw Exception('setTopP failed (rc=$rc)');
+  }
+
+  /// Top-k sampling cutoff (0 = disabled). Honoured by TADA; other
+  /// backends no-op.
+  void setTopK(int topK) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_top_k')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_top_k');
+    final rc = fn(_handle, topK);
+    if (rc != 0 && rc != -2) throw Exception('setTopK failed (rc=$rc)');
+  }
+
+  /// Enable/disable sampling (false = greedy). Honoured by TADA; other
+  /// backends no-op.
+  void setDoSample(bool enable) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_do_sample')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_do_sample');
+    final rc = fn(_handle, enable ? 1 : 0);
+    if (rc != 0 && rc != -2) throw Exception('setDoSample failed (rc=$rc)');
   }
 
   /// Min-p sampling threshold (0.0..1.0). Honoured by chatterbox.
@@ -2843,6 +2935,16 @@ class CrispasrSession {
         int Function(Pointer<Void>, double)>('crispasr_session_set_cfg_weight');
     final rc = fn(_handle, cfg);
     if (rc != 0 && rc != -2) throw Exception('setCfgWeight failed (rc=$rc)');
+  }
+
+  /// TADA flow-matching noise temperature (Python noise_temp, default 0.9).
+  void setTtsNoiseTemp(double noiseTemp) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_noise_temp')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+        int Function(Pointer<Void>, double)>('crispasr_session_set_tts_noise_temp');
+    final rc = fn(_handle, noiseTemp);
+    if (rc != 0 && rc != -2) throw Exception('setTtsNoiseTemp failed (rc=$rc)');
   }
 
   /// Emotion-exaggeration scalar (chatterbox). 0.5 default.
@@ -3180,7 +3282,8 @@ class CrispasrSession {
 
   /// Synthesise [text] to 24 kHz mono float32 PCM.
   ///
-  /// Requires a TTS-capable backend (vibevoice, qwen3-tts, kokoro, orpheus).
+  /// Requires a TTS-capable backend (vibevoice, qwen3-tts, kokoro, orpheus,
+  /// bananamind-tts, chatterbox, fastpitch, melotts, piper, and others).
   /// For qwen3-tts call [setCodecPath] and one of: [setVoice] (Base),
   /// [setSpeakerName] (CustomVoice), [setInstruct] (VoiceDesign). Branch
   /// via [isVoiceDesign] / [isCustomVoice]. For orpheus call
@@ -4310,9 +4413,10 @@ class CrispasrWatermark {
 // ---------------------------------------------------------------------------
 
 /// Poll the global transcription progress (0–100). Returns -1 when no
-/// transcription is active. The C layer updates this via an atomic int
-/// from the whisper_progress_callback — no function pointers needed on
-/// the Dart side.
+/// transcription is active. The C layer updates this via an atomic int —
+/// fed by the whisper progress callback and, since issue #208, by the
+/// Parakeet chunked long-form windows ([CrispasrSession.transcribeChunked]) —
+/// so no function pointers are needed on the Dart side.
 int getTranscriptionProgress({String? libPath}) {
   final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
   if (!lib.providesSymbol('crispasr_get_progress')) return -1;
@@ -4328,6 +4432,73 @@ void resetTranscriptionProgress({String? libPath}) {
   if (!lib.providesSymbol('crispasr_reset_progress')) return;
   final fn = lib.lookupFunction<Void Function(), void Function()>(
       'crispasr_reset_progress');
+  fn();
+}
+
+// ---------------------------------------------------------------------------
+// Streamed-segment polling (per-segment streaming callback, Dart side)
+// ---------------------------------------------------------------------------
+
+/// Number of new segments available for polling. Returns 0 when the C
+/// symbol is absent (pre-streaming builds) or the buffer is empty.
+int getStreamedSegmentCount({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_get_streamed_segment_count')) return 0;
+  final fn = lib.lookupFunction<Int32 Function(), int Function()>(
+      'crispasr_get_streamed_segment_count');
+  return fn();
+}
+
+/// Drain all buffered streamed segments. Returns an empty list when the C
+/// symbol is absent or no segments have been committed since the last drain.
+/// The returned result is freed automatically after reading.
+List<SessionSegment> drainStreamedSegments({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_drain_streamed_segments')) return const [];
+  final drain = lib.lookupFunction<Pointer<Void> Function(), Pointer<Void> Function()>(
+      'crispasr_drain_streamed_segments');
+  final res = drain();
+  if (res == nullptr) return const [];
+
+  // Read segments using the same accessors as CrispasrSession._readSegments.
+  final nSegs = lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>(
+      'crispasr_session_result_n_segments')(res);
+  final segText = lib.lookupFunction<
+      Pointer<Utf8> Function(Pointer<Void>, Int32),
+      Pointer<Utf8> Function(Pointer<Void>, int)>(
+    'crispasr_session_result_segment_text',
+  );
+  final segT0 = lib.lookupFunction<
+      Int64 Function(Pointer<Void>, Int32),
+      int Function(Pointer<Void>, int)>('crispasr_session_result_segment_t0');
+  final segT1 = lib.lookupFunction<
+      Int64 Function(Pointer<Void>, Int32),
+      int Function(Pointer<Void>, int)>('crispasr_session_result_segment_t1');
+
+  final out = <SessionSegment>[];
+  for (var i = 0; i < nSegs; i++) {
+    final tp = segText(res, i);
+    final text = tp == nullptr ? '' : tp.toDartString();
+    final t0 = segT0(res, i) / 100.0;
+    final t1 = segT1(res, i) / 100.0;
+    out.add(SessionSegment(text: text.trim(), start: t0, end: t1));
+  }
+
+  // Free the result.
+  final free = lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>(
+      'crispasr_session_result_free');
+  free(res);
+
+  return out;
+}
+
+/// Reset the streamed-segment buffer. Call before starting a new
+/// transcription to discard stale segments from the previous run.
+void resetStreamedSegments({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_reset_streamed_segments')) return;
+  final fn = lib.lookupFunction<Void Function(), void Function()>(
+      'crispasr_reset_streamed_segments');
   fn();
 }
 

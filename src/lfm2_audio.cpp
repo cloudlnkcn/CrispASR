@@ -10,12 +10,15 @@
 // DRY: reuses core/gguf_loader.h, core/mel.h, core/fastconformer.h, core/attention.h
 
 #include "lfm2_audio.h"
+#include "core/win_compat.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
+
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "core/fastconformer.h"
 #include "core/gguf_loader.h"
@@ -26,6 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +37,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `LFM2_AUDIO_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool lfm2_audio_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("LFM2_AUDIO_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct lfm2_audio_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit lfm2_audio_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~lfm2_audio_bench_stage() {
+        if (!lfm2_audio_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  lfm2_audio_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -178,6 +208,7 @@ struct lfm2_audio_context {
     bool use_gpu = false;
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
 
     // Compute buffers: large for prefill, small for decode steps
     std::vector<uint8_t> compute_meta; // 256 MB for prefill (T >> 1)
@@ -546,9 +577,17 @@ lfm2_audio_context* lfm2_audio_init_from_file(const char* path_model, lfm2_audio
     auto* ctx = new lfm2_audio_context();
     ctx->n_threads = params.n_threads;
     ctx->verbosity = params.verbosity;
+    // GPU is correct as of §206 (the backbone now computes directly on the active
+    // backend via gallocr — see backbone_step / run_lfm). `CRISPASR_LFM2_AUDIO_CPU=1`
+    // forces CPU (the AR decode loop is dispatch-bound and can be faster on CPU).
+    if (params.use_gpu) {
+        const char* e = std::getenv("CRISPASR_LFM2_AUDIO_CPU");
+        if (e && *e && *e != '0')
+            params.use_gpu = false;
+    }
     ctx->use_gpu = params.use_gpu;
     // Initialize backend: GPU if available and requested, else CPU
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -608,6 +647,8 @@ void lfm2_audio_free(lfm2_audio_context* ctx) {
         ggml_backend_buffer_free(ctx->detok.buf);
     if (ctx->detok.ctx)
         ggml_free(ctx->detok.ctx);
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
@@ -629,6 +670,14 @@ int lfm2_audio_n_mels(lfm2_audio_context* ctx) {
 
 int lfm2_audio_sample_rate(lfm2_audio_context* ctx) {
     return ctx ? (int)ctx->model.hparams.sample_rate : 0;
+}
+
+void lfm2_audio_set_beam_size(lfm2_audio_context* ctx, int beam_size) {
+    (void)ctx;
+    (void)beam_size;
+    // §167h stub: beam decode requires KV + conv state snapshot/restore
+    // (core_beam_decode::run_with_probs_branched). Implementation deferred
+    // to Kaggle session where model + GPU are available.
 }
 
 int lfm2_audio_test_load(lfm2_audio_context* ctx) {
@@ -709,10 +758,15 @@ float* lfm2_audio_run_encoder(lfm2_audio_context* ctx, const float* mel, int T_m
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
     ggml_build_forward_expand(gf, out);
 
-    // Allocate via gallocr
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        ggml_gallocr_free(galloc);
+    // Allocate via sched
+    if (!ctx->sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    }
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "lfm2_audio: sched alloc encoder graph failed\n");
         ggml_free(ctx0);
         return nullptr;
     }
@@ -721,7 +775,11 @@ float* lfm2_audio_run_encoder(lfm2_audio_context* ctx, const float* mel, int T_m
     ggml_backend_tensor_set(mel_t, mel, 0, sizeof(float) * n_mels * T_mel);
     ggml_backend_tensor_set(pos_t, pos_vec.data(), 0, sizeof(float) * d * (2 * T_enc - 1));
 
-    ggml_backend_graph_compute(ctx->backend, gf);
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "lfm2_audio: encoder graph compute failed\n");
+        ggml_free(ctx0);
+        return nullptr;
+    }
 
     float* result = (float*)malloc(sizeof(float) * T_enc * d);
     if (result)
@@ -731,7 +789,6 @@ float* lfm2_audio_run_encoder(lfm2_audio_context* ctx, const float* mel, int T_m
         *out_T_enc = T_enc;
     if (out_d_model)
         *out_d_model = d;
-    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return result;
 }
@@ -745,8 +802,8 @@ static ggml_tensor* lfm2_gqa_attention(ggml_context* ctx, ggml_tensor* x, const 
                                        ggml_tensor* rope_freqs, int hidden, int n_heads, int n_kv_heads, int head_dim,
                                        int T);
 static ggml_tensor* lfm2_build_layer(ggml_context* ctx, ggml_tensor* x, const lfm2_layer_weights& w,
-                                     ggml_tensor* rope_freqs, int hidden, int n_heads, int n_kv_heads, int head_dim,
-                                     int T, float norm_eps);
+                                     ggml_tensor* positions, ggml_tensor* mask, int hidden, int n_heads, int n_kv_heads,
+                                     int head_dim, int T, float norm_eps);
 
 // ===========================================================================
 // Transcribe: full ASR pipeline
@@ -776,21 +833,7 @@ static const std::vector<int32_t> kPrefixEn = {1,   6,     24131, 708, 8173, 119
 // <|im_end|>\n
 static const std::vector<int32_t> kSuffix = {7, 708};
 
-// GPT-2 byte decoder: reverse of bytes_to_unicode()
-// Maps unicode codepoints back to raw bytes.
-static const std::vector<int>& byte_decoder() {
-    static std::vector<int> bd(512, -1);
-    static bool init = false;
-    if (init)
-        return bd;
-    const auto& be = core_bpe::byte_encoder();
-    for (int b = 0; b < 256; b++)
-        bd[be[b]] = b;
-    init = true;
-    return bd;
-}
-
-// Decode a BPE token to raw UTF-8 bytes using the GPT-2 byte_decoder
+// Decode a BPE token to raw UTF-8 bytes using core_bpe (§175 DRY).
 static std::string decode_token(const lfm2_audio_model& model, int32_t id) {
     if (id < 0 || id >= (int32_t)model.vocab.size())
         return "";
@@ -798,116 +841,57 @@ static std::string decode_token(const lfm2_audio_model& model, int32_t id) {
     // Skip special tokens (they start with < and end with >)
     if (!piece.empty() && piece[0] == '<' && piece.back() == '>')
         return "";
-    const auto& bd = byte_decoder();
-    std::string result;
-    // Iterate over UTF-8 codepoints in the piece
-    size_t i = 0;
-    while (i < piece.size()) {
-        uint32_t cp = 0;
-        int len = 1;
-        uint8_t c = (uint8_t)piece[i];
-        if (c < 0x80) {
-            cp = c;
-            len = 1;
-        } else if ((c & 0xE0) == 0xC0) {
-            cp = c & 0x1F;
-            len = 2;
-        } else if ((c & 0xF0) == 0xE0) {
-            cp = c & 0x0F;
-            len = 3;
-        } else if ((c & 0xF8) == 0xF0) {
-            cp = c & 0x07;
-            len = 4;
-        }
-        for (int j = 1; j < len && i + j < piece.size(); j++)
-            cp = (cp << 6) | ((uint8_t)piece[i + j] & 0x3F);
-        i += len;
-        // Map codepoint back to byte via the GPT-2 byte_decoder
-        if (cp < (uint32_t)bd.size() && bd[cp] >= 0) {
-            result += (char)(uint8_t)bd[cp];
-        } else {
-            // Codepoint not in the byte_decoder — pass through as UTF-8
-            if (cp < 0x80) {
-                result += (char)cp;
-            } else if (cp < 0x800) {
-                result += (char)(0xC0 | (cp >> 6));
-                result += (char)(0x80 | (cp & 0x3F));
-            } else if (cp < 0x10000) {
-                result += (char)(0xE0 | (cp >> 12));
-                result += (char)(0x80 | ((cp >> 6) & 0x3F));
-                result += (char)(0x80 | (cp & 0x3F));
-            }
-        }
-    }
-    return result;
+    return core_bpe::token_bytes_to_utf8(piece);
 }
 
-// Build a ggml graph that runs one LFM backbone forward pass on the full
-// input sequence and returns logits over the text vocabulary at position T-1.
-// This is the non-cached prefill+decode step.
-static std::vector<float> lfm2_run_backbone_logits(lfm2_audio_context* ctx, const float* embeddings, int T,
-                                                   int hidden) {
-    auto& model = ctx->model;
-    auto& hp = model.hparams;
-    const int n_heads = (int)hp.lfm_n_heads;
-    const int n_kv = (int)hp.lfm_n_kv_heads;
-    const int hd = (int)hp.lfm_head_dim;
-    const float norm_eps = 1e-5f;
 
-    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), false};
-    ggml_context* ctx0 = ggml_init(ip);
-    if (!ctx0)
-        return {};
-
-    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden, T);
-    memcpy(x->data, embeddings, sizeof(float) * T * hidden);
-
-    // Run all LFM2 layers
-    for (uint32_t i = 0; i < hp.lfm_n_layers; i++) {
-        x = lfm2_build_layer(ctx0, x, model.lfm_layers[i], nullptr, hidden, n_heads, n_kv, hd, T, norm_eps);
-    }
-
-    // Final RMSNorm
-    x = lfm2_rms_norm(ctx0, x, model.lfm_embedding_norm_w, norm_eps);
-
-    // Extract last position: (hidden, T) → view column T-1 → (hidden,)
-    ggml_tensor* last = ggml_view_1d(ctx0, x, hidden, (int64_t)(T - 1) * hidden * sizeof(float));
-
-    // Text logits: embed_tokens^T @ last_hidden → (vocab_size,)
-    ggml_tensor* logits = ggml_mul_mat(ctx0, model.lfm_embed_tokens_w, last);
-
-    ggml_tensor* out = ggml_dup(ctx0, logits);
-    ggml_set_name(out, "logits");
-
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
-    ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(ctx0, gf, ctx->n_threads);
-
-    int vocab_size = (int)out->ne[0];
-    std::vector<float> result(vocab_size);
-    memcpy(result.data(), out->data, sizeof(float) * vocab_size);
-
-    ggml_free(ctx0);
-    return result;
-}
-
-// Embed a sequence of token IDs using lfm.embed_tokens
-static std::vector<float> lfm2_embed_tokens(lfm2_audio_context* ctx, const std::vector<int32_t>& tokens) {
+// Embed a sequence of token IDs using lfm.embed_tokens.
+// GPU-safe: uses gallocr to run ggml_get_rows on whatever backend holds the
+// weights (CPU or CUDA), avoiding the CPU-only ggml_graph_compute_with_ctx
+// that would dereference a GPU pointer and segfault.
+static std::vector<float> lfm2_embed_tokens(lfm2_audio_context* ctx, const int32_t* ids, int n) {
     auto& model = ctx->model;
     const int hidden = (int)model.hparams.lfm_hidden_size;
-    const int n_tok = (int)tokens.size();
+    if (n <= 0 || !ids)
+        return {};
 
-    // embed_tokens weight: (hidden, vocab_size) in ggml → row i = embedding for token i
-    std::vector<float> emb(n_tok * hidden);
-    for (int i = 0; i < n_tok; i++) {
-        int32_t id = tokens[i];
-        // Read row `id` from the embedding matrix
-        ggml_backend_tensor_get(model.lfm_embed_tokens_w, emb.data() + i * hidden,
-                                (size_t)id * hidden * ggml_type_size(model.lfm_embed_tokens_w->type) /
-                                    ggml_blck_size(model.lfm_embed_tokens_w->type),
-                                hidden * sizeof(float));
+    const size_t meta_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+    std::vector<uint8_t> meta(meta_size);
+    ggml_init_params ip = {meta_size, meta.data(), true};
+    ggml_context* c = ggml_init(ip);
+    if (!c)
+        return {};
+
+    ggml_tensor* id_t = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
+    ggml_set_name(id_t, "ids");
+    ggml_set_input(id_t);
+
+    ggml_tensor* emb = ggml_get_rows(c, model.lfm_embed_tokens_w, id_t);
+    ggml_tensor* out = ggml_dup(c, emb);
+    ggml_set_name(out, "emb_out");
+
+    ggml_cgraph* gf = ggml_new_graph(c);
+    ggml_build_forward_expand(gf, out);
+    ggml_free(c);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        return {};
     }
-    return emb;
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "ids"), ids, 0, (size_t)n * sizeof(int32_t));
+
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(galloc);
+        return {};
+    }
+
+    std::vector<float> result((size_t)n * hidden);
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "emb_out"), result.data(), 0, result.size() * sizeof(float));
+    ggml_gallocr_free(galloc);
+    return result;
 }
 
 // ===========================================================================
@@ -1101,10 +1085,17 @@ static Lfm2StepResult lfm2_backbone_step(lfm2_audio_context* ctx, const float* e
     ggml_build_forward_expand(gf, out);
     ggml_build_forward_expand(gf, hid_snap);
 
-    // Allocate graph via gallocr — only allocates what's needed
+    // Allocate + compute directly on ctx->backend via gallocr (NOT the
+    // scheduler). The backbone's leading op (RMSNorm) is weight-less, so the
+    // scheduler would place it and the leaf input on the CPU backend and then
+    // feed the next op a miscomputed cross-backend copy of the activation —
+    // corrupting the whole backbone on GPU. Single-backend direct compute keeps
+    // inputs + activations on the GPU. See HISTORY §206.
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        ggml_gallocr_free(galloc);
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        fprintf(stderr, "lfm2_audio: backbone gallocr alloc failed\n");
+        if (galloc)
+            ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return {};
     }
@@ -1142,7 +1133,12 @@ static Lfm2StepResult lfm2_backbone_step(lfm2_audio_context* ctx, const float* e
         }
     }
 
-    ggml_backend_graph_compute(ctx->backend, gf);
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "lfm2_audio: backbone graph compute failed\n");
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return {};
+    }
 
     int vocab_size = (int)out->ne[0];
     Lfm2StepResult result;
@@ -1200,19 +1196,33 @@ char* lfm2_audio_transcribe(lfm2_audio_context* ctx, const float* samples, int n
     if (max_tokens <= 0)
         max_tokens = 512;
 
+    lfm2_audio_bench_stage _b_total("total");
+
     // Step 1: mel → encoder → adapter
     int T_mel = 0;
-    auto mel = lfm2_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    std::vector<float> mel;
+    {
+        lfm2_audio_bench_stage _b("mel");
+        mel = lfm2_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    }
     if (mel.empty())
         return nullptr;
 
     int T_enc = 0, d_model = 0;
-    float* enc = lfm2_audio_run_encoder(ctx, mel.data(), T_mel, (int)hp.n_mels, &T_enc, &d_model);
+    float* enc = nullptr;
+    {
+        lfm2_audio_bench_stage _b("encoder");
+        enc = lfm2_audio_run_encoder(ctx, mel.data(), T_mel, (int)hp.n_mels, &T_enc, &d_model);
+    }
     if (!enc)
         return nullptr;
 
     int adapter_hidden = 0;
-    float* adapted = lfm2_audio_run_adapter(ctx, enc, T_enc, d_model, &adapter_hidden);
+    float* adapted = nullptr;
+    {
+        lfm2_audio_bench_stage _b("adapter");
+        adapted = lfm2_audio_run_adapter(ctx, enc, T_enc, d_model, &adapter_hidden);
+    }
     free(enc);
     if (!adapted)
         return nullptr;
@@ -1229,37 +1239,8 @@ char* lfm2_audio_transcribe(lfm2_audio_context* ctx, const float* samples, int n
     }
     const auto& prefix_ids = *prefix_ids_ptr;
 
-    // For the embed_tokens lookup, we need F32 data. The weight is likely F16.
-    // Use a simple CPU dequant via ggml_backend_tensor_get_f32 pattern.
-    // Actually, ggml_backend_tensor_get gives raw bytes; for F16 we need to convert.
-    // Simpler: build a tiny ggml graph that does the embedding lookup.
-    auto embed_text = [&](const std::vector<int32_t>& ids) -> std::vector<float> {
-        const int n = (int)ids.size();
-        const size_t mem = 16 * 1024 * 1024;
-        std::vector<uint8_t> buf(mem);
-        ggml_init_params ip = {mem, buf.data(), false};
-        ggml_context* c = ggml_init(ip);
-        if (!c)
-            return {};
-
-        ggml_tensor* id_t = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
-        memcpy(id_t->data, ids.data(), n * sizeof(int32_t));
-
-        ggml_tensor* emb = ggml_get_rows(c, model.lfm_embed_tokens_w, id_t);
-        ggml_tensor* out = ggml_dup(c, emb);
-
-        ggml_cgraph* gf = ggml_new_graph(c);
-        ggml_build_forward_expand(gf, out);
-        ggml_graph_compute_with_ctx(c, gf, 1);
-
-        std::vector<float> result(n * hidden);
-        memcpy(result.data(), out->data, sizeof(float) * n * hidden);
-        ggml_free(c);
-        return result;
-    };
-
-    auto prefix_emb = embed_text(prefix_ids);
-    auto suffix_emb = embed_text(kSuffix);
+    auto prefix_emb = lfm2_embed_tokens(ctx, prefix_ids.data(), (int)prefix_ids.size());
+    auto suffix_emb = lfm2_embed_tokens(ctx, kSuffix.data(), (int)kSuffix.size());
 
     // Step 3: Assemble full input sequence
     // Layout: [prefix_text_emb | audio_adapter_emb | suffix_text_emb]
@@ -1299,6 +1280,7 @@ char* lfm2_audio_transcribe(lfm2_audio_context* ctx, const float* samples, int n
     // return logits from the last position.
 
     // Phase A: Prefill — run full context through backbone
+    lfm2_audio_bench_stage _b_prefill_and_decode("prefill+decode");
     auto step_result = lfm2_backbone_step(ctx, context_emb.data(), T_context);
     auto logits = step_result.logits;
     if (!logits.empty() && ctx->verbosity >= 1) {
@@ -1344,7 +1326,8 @@ char* lfm2_audio_transcribe(lfm2_audio_context* ctx, const float* samples, int n
             fprintf(stderr, "  [%d] token=%d piece=%s\n", step, best_id, piece.c_str());
 
         // Phase B: Decode — embed the new token and run single-token step
-        auto new_emb = embed_text({best_id});
+        int32_t bid = best_id;
+        auto new_emb = lfm2_embed_tokens(ctx, &bid, 1);
         if (new_emb.empty())
             break;
         {
@@ -1405,14 +1388,23 @@ float* lfm2_audio_run_adapter(lfm2_audio_context* ctx, const float* encoder_out,
     ggml_cgraph* gf = ggml_new_graph(ctx0);
     ggml_build_forward_expand(gf, out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        ggml_gallocr_free(galloc);
+    if (!ctx->sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    }
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "lfm2_audio: sched alloc adapter graph failed\n");
         ggml_free(ctx0);
         return nullptr;
     }
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "adapter_in"), encoder_out, 0, sizeof(float) * T_enc * d_model);
-    ggml_backend_graph_compute(ctx->backend, gf);
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "lfm2_audio: adapter graph compute failed\n");
+        ggml_free(ctx0);
+        return nullptr;
+    }
 
     float* result = (float*)malloc(sizeof(float) * T_enc * hidden);
     if (result)
@@ -1420,7 +1412,6 @@ float* lfm2_audio_run_adapter(lfm2_audio_context* ctx, const float* encoder_out,
 
     if (out_hidden_size)
         *out_hidden_size = hidden;
-    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return result;
 }
@@ -1463,25 +1454,15 @@ static ggml_tensor* lfm2_short_conv(ggml_context* ctx, ggml_tensor* x, const lfm
     // Bx = B * x_inner (element-wise)
     ggml_tensor* Bx = ggml_mul(ctx, ggml_cont(ctx, B_part), ggml_cont(ctx, x_inner));
 
-    // Causal depthwise conv1d: kernel=3, pad_left=K-1=2 (causal)
-    // Uses ggml_conv_1d_dw which maps to im2col+mul_mat — has CUDA support.
-    // conv_w: (hidden, 1, K) in GGUF = ne[0]=K, ne[1]=1, ne[2]=hidden
-    // Bx: (hidden, T) = ne[0]=hidden, ne[1]=T
-    // conv_1d_dw expects: a=(K, 1, C), b=(T, C) → result=(T_out, C)
-    // With p0=K-1 (causal left-pad), T_out = T + 2*(K-1) - K + 1 = T + K - 1
-    // Take first T frames for causal output.
+    // Causal depthwise conv1d: kernel=3, pad_left=K-1=2 (causal) via ggml_conv_1d_dw.
     const int K = 3;
     ggml_tensor* conv_w = ggml_cast(ctx, w.conv_conv_w, GGML_TYPE_F32);
-    // Bx is (hidden, T). conv_1d_dw wants (T, hidden) input.
     ggml_tensor* Bx_t = ggml_cont(ctx, ggml_transpose(ctx, Bx)); // (T, hidden)
     ggml_tensor* conv_out = ggml_conv_1d_dw(ctx, conv_w, Bx_t, /*stride=*/1, /*pad=*/K - 1, /*dilation=*/1);
-    // conv_out: (T_out, hidden) where T_out = T + K - 1. Take first T.
     int T_conv = (int)conv_out->ne[0];
-    if (T_conv > T) {
+    if (T_conv > T)
         conv_out = ggml_view_2d(ctx, conv_out, T, hidden, conv_out->nb[1], 0);
-    }
-    // Transpose back to (hidden, T)
-    conv_out = ggml_cont(ctx, ggml_transpose(ctx, conv_out));
+    conv_out = ggml_cont(ctx, ggml_transpose(ctx, conv_out)); // (hidden, T)
 
     // y = C * conv_out (element-wise)
     ggml_tensor* y = ggml_mul(ctx, ggml_cont(ctx, C_part), ggml_cont(ctx, conv_out));
@@ -1498,9 +1479,10 @@ static ggml_tensor* lfm2_short_conv(ggml_context* ctx, ggml_tensor* x, const lfm
 //   Causal self-attention with GQA
 //   out = out_proj(attn_output)
 static ggml_tensor* lfm2_gqa_attention(ggml_context* ctx, ggml_tensor* x, const lfm2_layer_weights& w,
-                                       ggml_tensor* rope_freqs, int hidden, int n_heads, int n_kv_heads, int head_dim,
-                                       int T) {
-    // x: (hidden, T)
+                                       ggml_tensor* positions, ggml_tensor* mask, int hidden, int n_heads,
+                                       int n_kv_heads, int head_dim, int T) {
+    // x: (hidden, T). positions (I32, T) and mask (F16, T×T causal) are graph
+    // inputs filled by the caller — must NOT write ->data here (no_alloc graph).
 
     // Q, K, V projections
     ggml_tensor* Q = ggml_mul_mat(ctx, w.attn_q_proj_w, x); // (hidden, T) = (n_heads*hd, T)
@@ -1518,14 +1500,6 @@ static ggml_tensor* lfm2_gqa_attention(ggml_context* ctx, ggml_tensor* x, const 
     K = ggml_rms_norm(ctx, K, 1e-5f);
     K = ggml_mul(ctx, K, w.attn_k_ln_w);
 
-    // Create positions tensor [0, 1, 2, ..., T-1]
-    ggml_tensor* positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
-    {
-        int32_t* pos = (int32_t*)positions->data;
-        for (int i = 0; i < T; i++)
-            pos[i] = i;
-    }
-
     // RoPE — LFM2 uses the standard HF rotate_half pattern.
     // ggml GGML_ROPE_TYPE_NEOX matches: split into halves, rotate, recombine.
     Q = ggml_rope_ext(ctx, Q, positions, /*freq_override=*/nullptr, head_dim, GGML_ROPE_TYPE_NEOX, 0, 1000000.0f, 1.0f,
@@ -1538,18 +1512,8 @@ static ggml_tensor* lfm2_gqa_attention(ggml_context* ctx, ggml_tensor* x, const 
     K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
     V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
 
-    // Causal self-attention with explicit causal mask
+    // Causal self-attention with the caller-provided causal mask (T×T F16).
     const float scale = 1.0f / sqrtf((float)head_dim);
-    // Build causal mask: (T, T) F16 with 0 for allowed and -inf for forbidden
-    ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, T, T);
-    {
-        ggml_fp16_t* m = (ggml_fp16_t*)mask->data;
-        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
-        const ggml_fp16_t neginf = ggml_fp32_to_fp16(-INFINITY);
-        for (int i = 0; i < T; i++)
-            for (int j = 0; j < T; j++)
-                m[i * T + j] = (j <= i) ? zero : neginf;
-    }
     ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, mask, scale, 0.0f, 0.0f);
     // attn: (head_dim, T, n_heads) → reshape to (hidden, T)
     attn = ggml_reshape_2d(ctx, attn, hidden, T);
@@ -1560,15 +1524,15 @@ static ggml_tensor* lfm2_gqa_attention(ggml_context* ctx, ggml_tensor* x, const 
 
 // Build one LFM2 decoder layer: RMSNorm → operator → residual → RMSNorm → SwiGLU → residual
 static ggml_tensor* lfm2_build_layer(ggml_context* ctx, ggml_tensor* x, const lfm2_layer_weights& w,
-                                     ggml_tensor* rope_freqs, int hidden, int n_heads, int n_kv_heads, int head_dim,
-                                     int T, float norm_eps) {
+                                     ggml_tensor* positions, ggml_tensor* mask, int hidden, int n_heads, int n_kv_heads,
+                                     int head_dim, int T, float norm_eps) {
     ggml_tensor* residual = x;
 
     // RMSNorm → operator
     ggml_tensor* h = lfm2_rms_norm(ctx, x, w.operator_norm_w, norm_eps);
 
     if (w.is_attention) {
-        h = lfm2_gqa_attention(ctx, h, w, rope_freqs, hidden, n_heads, n_kv_heads, head_dim, T);
+        h = lfm2_gqa_attention(ctx, h, w, positions, mask, hidden, n_heads, n_kv_heads, head_dim, T);
     } else {
         h = lfm2_short_conv(ctx, h, w, hidden, T);
     }
@@ -1639,17 +1603,28 @@ float* lfm2_audio_run_lfm(lfm2_audio_context* ctx, const float* samples, int n_s
     // (simplified: no text tokens for now — just audio)
     const int T = T_enc; // just audio frames for now
 
-    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), false};
+    // Build with no_alloc so the graph runs on ctx->backend via the scheduler
+    // (GPU when use_gpu). The legacy ggml_graph_compute_with_ctx path computed on
+    // the CPU regardless of backend, so it could neither run on the GPU nor expose
+    // GPU-specific divergence in the diff harness.
+    ggml_init_params ip = {2048 * ggml_tensor_overhead() + ggml_graph_overhead_custom(65536, false), nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0) {
         free(adapted);
         return nullptr;
     }
 
-    // Input: adapted audio embeddings (T, hidden) → (hidden, T) in ggml
+    // Input: adapted audio embeddings (T, hidden) → (hidden, T) in ggml.
     ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden, T);
-    memcpy(x->data, adapted, sizeof(float) * T * hidden);
-    free(adapted);
+    ggml_set_name(x, "ao_in");
+    ggml_set_input(x);
+    // Shared RoPE positions + causal mask for all attention layers (graph inputs).
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "ao_pos");
+    ggml_set_input(positions);
+    ggml_tensor* mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
+    ggml_set_name(mask, "ao_mask");
+    ggml_set_input(mask);
 
     // Verify critical LFM weights are loaded
     for (uint32_t i = 0; i < hp.lfm_n_layers; i++) {
@@ -1677,13 +1652,13 @@ float* lfm2_audio_run_lfm(lfm2_audio_context* ctx, const float* samples, int n_s
     bool do_snaps = (std::getenv("LFM2_SNAP_LAYERS") != nullptr);
 
     for (uint32_t i = 0; i < hp.lfm_n_layers; i++) {
-        x = lfm2_build_layer(ctx0, x, model.lfm_layers[i], /*rope_freqs=*/nullptr, hidden, n_heads, n_kv, hd, T,
-                             norm_eps);
+        x = lfm2_build_layer(ctx0, x, model.lfm_layers[i], positions, mask, hidden, n_heads, n_kv, hd, T, norm_eps);
         if (do_snaps) {
             layer_snaps[i] = ggml_dup(ctx0, x);
             char name[32];
             snprintf(name, sizeof(name), "lfm_ao_layer_%u", i);
             ggml_set_name(layer_snaps[i], name);
+            ggml_set_output(layer_snaps[i]);
         }
     }
 
@@ -1692,6 +1667,7 @@ float* lfm2_audio_run_lfm(lfm2_audio_context* ctx, const float* samples, int n_s
 
     ggml_tensor* out = ggml_dup(ctx0, x);
     ggml_set_name(out, "lfm_output");
+    ggml_set_output(out);
 
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
     for (auto* snap : layer_snaps)
@@ -1699,23 +1675,70 @@ float* lfm2_audio_run_lfm(lfm2_audio_context* ctx, const float* samples, int n_s
             ggml_build_forward_expand(gf, snap);
     ggml_build_forward_expand(gf, out);
 
-    ggml_graph_compute_with_ctx(ctx0, gf, ctx->n_threads);
+    // Allocate + compute directly on ctx->backend via gallocr — NOT the
+    // scheduler. The whole LFM backbone is supported on the active backend, and
+    // its leading op (RMSNorm) is weight-less: ggml_backend_sched would assign
+    // that op and the leaf input to the CPU backend, then feed the next
+    // (weight-using) op a *miscomputed* cross-backend copy of the activation,
+    // corrupting the entire backbone on GPU (CPU stays correct). Computing the
+    // single-backend graph directly keeps inputs + activations on the GPU and
+    // sidesteps that copy entirely. See HISTORY §206.
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        fprintf(stderr, "lfm2-audio: run_lfm gallocr alloc failed\n");
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        free(adapted);
+        ggml_free(ctx0);
+        return nullptr;
+    }
+
+    // Fill graph inputs.
+    ggml_backend_tensor_set(x, adapted, 0, sizeof(float) * T * hidden);
+    free(adapted);
+    // positions/mask are only allocated by the scheduler when an attention layer
+    // references them; skip the upload if the graph has none (e.g. conv-only).
+    if (positions->buffer) {
+        std::vector<int32_t> pos(T);
+        for (int i = 0; i < T; i++)
+            pos[i] = i;
+        ggml_backend_tensor_set(positions, pos.data(), 0, T * sizeof(int32_t));
+    }
+    if (mask->buffer) {
+        std::vector<ggml_fp16_t> m((size_t)T * T);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), neginf = ggml_fp32_to_fp16(-INFINITY);
+        for (int i = 0; i < T; i++)
+            for (int j = 0; j < T; j++)
+                m[(size_t)i * T + j] = (j <= i) ? zero : neginf;
+        ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(ggml_fp16_t));
+    }
+
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "lfm2-audio: run_lfm compute failed\n");
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return nullptr;
+    }
 
     float* result = (float*)malloc(sizeof(float) * T * hidden);
     if (result)
-        memcpy(result, out->data, sizeof(float) * T * hidden);
+        ggml_backend_tensor_get(out, result, 0, sizeof(float) * T * hidden);
 
-    // Invoke staged callback for per-layer snapshots
+    // Invoke staged callback for per-layer snapshots (read BEFORE freeing galloc,
+    // whose buffer backs the snapshot tensors).
     if (do_snaps && ctx->lfm_stage_cb) {
+        std::vector<float> snap_buf((size_t)T * hidden);
         for (uint32_t i = 0; i < hp.lfm_n_layers; i++) {
             if (layer_snaps[i]) {
+                ggml_backend_tensor_get(layer_snaps[i], snap_buf.data(), 0, sizeof(float) * T * hidden);
                 char name[32];
                 snprintf(name, sizeof(name), "lfm_ao_layer_%u", i);
-                ctx->lfm_stage_cb(name, (const float*)layer_snaps[i]->data, T, hidden, ctx->lfm_stage_ud);
+                ctx->lfm_stage_cb(name, snap_buf.data(), T, hidden, ctx->lfm_stage_ud);
             }
         }
     }
 
+    ggml_gallocr_free(galloc);
     if (out_T)
         *out_T = T;
     if (out_hidden_size)
@@ -2063,38 +2086,58 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
 
 // Helper: embed audio codes via audio_embedding and sum across codebooks.
 // Returns (hidden,) float vector = sum_c audio_embd[code_c + c * audio_vocab].
+// GPU-safe: uses gallocr to handle GPU-resident weights.
 static std::vector<float> lfm2_embed_audio_codes(lfm2_audio_context* ctx, const std::vector<int32_t>& codes) {
     auto& model = ctx->model;
     const int hidden = (int)model.hparams.lfm_hidden_size;
     const int codebooks = (int)model.hparams.codebooks;
     const int audio_vocab = (int)model.hparams.audio_vocab_size;
 
-    const size_t mem = 16 * 1024 * 1024;
-    std::vector<uint8_t> buf(mem);
-    ggml_init_params ip = {mem, buf.data(), false};
+    // Build offset IDs: code_c + c * audio_vocab
+    std::vector<int32_t> offset_ids(codebooks);
+    for (int i = 0; i < codebooks; i++)
+        offset_ids[i] = codes[i] + i * audio_vocab;
+
+    const size_t meta_size = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
+    std::vector<uint8_t> meta(meta_size);
+    ggml_init_params ip = {meta_size, meta.data(), true};
     ggml_context* c = ggml_init(ip);
     if (!c)
         return {};
 
     ggml_tensor* ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, codebooks);
-    {
-        int32_t* id = (int32_t*)ids->data;
-        for (int i = 0; i < codebooks; i++)
-            id[i] = codes[i] + i * audio_vocab;
-    }
+    ggml_set_name(ids, "ac_ids");
+    ggml_set_input(ids);
+
     ggml_tensor* emb = ggml_get_rows(c, model.audio_embd_embedding_w, ids);
     // emb: (hidden, codebooks). Sum over codebooks.
     ggml_tensor* summed = ggml_sum_rows(c, ggml_cont(c, ggml_transpose(c, emb)));
     summed = ggml_reshape_1d(c, summed, hidden);
     ggml_tensor* out = ggml_dup(c, summed);
+    ggml_set_name(out, "ac_out");
 
     ggml_cgraph* gf = ggml_new_graph(c);
     ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(c, gf, 1);
+    ggml_free(c);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        return {};
+    }
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "ac_ids"), offset_ids.data(), 0,
+                            (size_t)codebooks * sizeof(int32_t));
+
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(galloc);
+        return {};
+    }
 
     std::vector<float> result(hidden);
-    memcpy(result.data(), out->data, sizeof(float) * hidden);
-    ggml_free(c);
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "ac_out"), result.data(), 0, (size_t)hidden * sizeof(float));
+    ggml_gallocr_free(galloc);
     return result;
 }
 
@@ -2421,29 +2464,8 @@ float* lfm2_audio_synthesize(lfm2_audio_context* ctx, const char* text, const ch
     all_tokens.push_back(kTokenImEnd);
     all_tokens.push_back(kTokenNewline);
 
-    // Embed all tokens
-    auto embed_text = [&](const std::vector<int32_t>& ids) -> std::vector<float> {
-        const int n = (int)ids.size();
-        const size_t mem = 16 * 1024 * 1024;
-        std::vector<uint8_t> buf(mem);
-        ggml_init_params ip = {mem, buf.data(), false};
-        ggml_context* c = ggml_init(ip);
-        if (!c)
-            return {};
-        ggml_tensor* id_t = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
-        memcpy(id_t->data, ids.data(), n * sizeof(int32_t));
-        ggml_tensor* emb = ggml_get_rows(c, model.lfm_embed_tokens_w, id_t);
-        ggml_tensor* out = ggml_dup(c, emb);
-        ggml_cgraph* gf = ggml_new_graph(c);
-        ggml_build_forward_expand(gf, out);
-        ggml_graph_compute_with_ctx(c, gf, 1);
-        std::vector<float> result(n * hidden);
-        memcpy(result.data(), out->data, sizeof(float) * n * hidden);
-        ggml_free(c);
-        return result;
-    };
-
-    auto text_emb = embed_text(all_tokens);
+    // Embed all tokens (GPU-safe via gallocr)
+    auto text_emb = lfm2_embed_tokens(ctx, all_tokens.data(), (int)all_tokens.size());
     if (text_emb.empty())
         return nullptr;
 
@@ -2483,100 +2505,8 @@ float* lfm2_audio_synthesize(lfm2_audio_context* ctx, const char* text, const ch
     bool text_done = false;
     std::vector<std::vector<int32_t>> all_codes;
 
-    // Single-token backbone step with KV+conv cache (same as ASR decode)
-    auto step1 = [&](const float* emb) -> std::pair<std::vector<float>, std::vector<float>> {
-        ggml_init_params ip = {ctx->decode_meta.size(), ctx->decode_meta.data(), false};
-        ggml_context* c = ggml_init(ip);
-        if (!c)
-            return {};
-        ggml_tensor* x = ggml_new_tensor_2d(c, GGML_TYPE_F32, hidden, 1);
-        memcpy(x->data, emb, sizeof(float) * hidden);
-        ggml_tensor* pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
-        *(int32_t*)pos->data = ctx->kv_n_past;
-        ggml_cgraph* gf = ggml_new_graph_custom(c, 65536, false);
-        int ai = 0, ci = 0;
-        for (uint32_t il = 0; il < hp.lfm_n_layers; il++) {
-            auto& w = model.lfm_layers[il];
-            ggml_tensor* res = x;
-            ggml_tensor* h = lfm2_rms_norm(c, x, w.operator_norm_w, 1e-5f);
-            if (w.is_attention) {
-                core_attn::KvSelfAttnParams kvp = {};
-                kvp.head_dim = (int)hp.lfm_head_dim;
-                kvp.n_heads = (int)hp.lfm_n_heads;
-                kvp.n_kv_heads = (int)hp.lfm_n_kv_heads;
-                kvp.n_kv_grp = kvp.n_heads / kvp.n_kv_heads;
-                kvp.rope_type = GGML_ROPE_TYPE_NEOX;
-                kvp.rope_theta = hp.lfm_rope_theta;
-                kvp.attn_scale = 1.0f / sqrtf((float)hp.lfm_head_dim);
-                kvp.qk_norm_eps = 1e-5f;
-                kvp.gqa_mode = core_attn::GQA_NATIVE;
-                h = core_attn::kv_self_attn(c, gf, h, w.attn_q_proj_w, w.attn_k_proj_w, w.attn_v_proj_w,
-                                            w.attn_out_proj_w, w.attn_q_ln_w, w.attn_k_ln_w, pos, nullptr, ctx->kv_k,
-                                            ctx->kv_v, ai, ctx->kv_n_past, kvp);
-                ai++;
-            } else {
-                const int K = (int)hp.lfm_conv_kernel;
-                ggml_tensor* bc = ggml_mul_mat(c, w.conv_in_proj_w, h);
-                ggml_tensor* Bp = ggml_view_1d(c, bc, hidden, 0);
-                ggml_tensor* Cp = ggml_view_1d(c, bc, hidden, hidden * sizeof(float));
-                ggml_tensor* xp = ggml_view_1d(c, bc, hidden, 2 * hidden * sizeof(float));
-                ggml_tensor* Bx = ggml_mul(c, ggml_cont(c, Bp), ggml_cont(c, xp));
-                ggml_tensor* cached = ggml_new_tensor_2d(c, GGML_TYPE_F32, hidden, K - 1);
-                memcpy(cached->data, ctx->conv_states[ci].data(), sizeof(float) * hidden * (K - 1));
-                ggml_tensor* Bxf = ggml_concat(c, cached, ggml_reshape_2d(c, Bx, hidden, 1), 1);
-                ggml_tensor* cw = ggml_cast(c, w.conv_conv_w, GGML_TYPE_F32);
-                ggml_tensor* Bt = ggml_cont(c, ggml_transpose(c, Bxf)); // (K, hidden)
-                ggml_tensor* cr = ggml_conv_1d_dw(c, cw, Bt, /*stride=*/1, /*pad=*/K - 1, /*dilation=*/1);
-                // cr: (2K-1, hidden). Take position K-1 (causal), transpose to (hidden, 1).
-                cr = ggml_cont(c, ggml_transpose(c, cr)); // (hidden, 2K-1)
-                ggml_tensor* co = ggml_cont(c, ggml_view_2d(c, cr, hidden, 1, hidden * sizeof(float),
-                                                            (int64_t)(K - 1) * hidden * sizeof(float)));
-                ggml_tensor* y = ggml_mul(c, ggml_reshape_2d(c, ggml_cont(c, Cp), hidden, 1), co);
-                h = ggml_mul_mat(c, w.conv_out_proj_w, y);
-                ggml_tensor* snap = ggml_dup(c, Bx);
-                char sn[16];
-                snprintf(sn, sizeof(sn), "cs_%d", ci);
-                ggml_set_name(snap, sn);
-                ggml_build_forward_expand(gf, snap);
-                ci++;
-            }
-            x = ggml_add(c, res, h);
-            res = x;
-            h = lfm2_rms_norm(c, x, w.ffn_norm_w, 1e-5f);
-            h = lfm2_swiglu_ffn(c, h, w.ff_w1, w.ff_w2, w.ff_w3);
-            x = ggml_add(c, res, h);
-        }
-        x = lfm2_rms_norm(c, x, model.lfm_embedding_norm_w, 1e-5f);
-        ggml_tensor* lg = ggml_dup(c, ggml_mul_mat(c, model.lfm_embed_tokens_w, x));
-        ggml_tensor* hd = ggml_dup(c, x);
-        ggml_set_name(lg, "lg");
-        ggml_set_name(hd, "hd");
-        ggml_build_forward_expand(gf, lg);
-        ggml_build_forward_expand(gf, hd);
-        ggml_graph_compute_with_ctx(c, gf, ctx->n_threads);
-        // Update conv states
-        ci = 0;
-        for (uint32_t il = 0; il < hp.lfm_n_layers; il++) {
-            if (model.lfm_layers[il].is_attention)
-                continue;
-            char sn[16];
-            snprintf(sn, sizeof(sn), "cs_%d", ci);
-            ggml_tensor* s = ggml_graph_get_tensor(gf, sn);
-            if (s) {
-                auto& st = ctx->conv_states[ci];
-                memmove(st.data(), st.data() + hidden, sizeof(float) * hidden * ((int)hp.lfm_conv_kernel - 2));
-                memcpy(st.data() + hidden * ((int)hp.lfm_conv_kernel - 2), s->data, sizeof(float) * hidden);
-            }
-            ci++;
-        }
-        ctx->kv_n_past++;
-        std::vector<float> rlg((int)lg->ne[0]);
-        memcpy(rlg.data(), lg->data, sizeof(float) * rlg.size());
-        std::vector<float> rhd(hidden);
-        memcpy(rhd.data(), hd->data, sizeof(float) * hidden);
-        ggml_free(c);
-        return {rlg, rhd};
-    };
+    // Decode loop uses the GPU-safe lfm2_backbone_step + lfm2_embed_tokens
+    // instead of the old CPU-only step1/embed_text lambdas.
 
     for (int step = 0; step < 1000; step++) {
         mod_left--;
@@ -2589,14 +2519,15 @@ float* lfm2_audio_synthesize(lfm2_audio_context* ctx, const char* text, const ch
                 cur_mod = MOD_AUDIO;
                 mod_left = n_audio;
             }
-            auto tok_emb = embed_text({cur_token});
+            int32_t tid = cur_token;
+            auto tok_emb = lfm2_embed_tokens(ctx, &tid, 1);
             if (tok_emb.empty())
                 break;
-            auto [lg, hd] = step1(tok_emb.data());
-            if (lg.empty())
+            auto sr = lfm2_backbone_step(ctx, tok_emb.data(), 1);
+            if (sr.logits.empty())
                 break;
-            cur_token = argmax(lg);
-            cur_hidden = hd;
+            cur_token = argmax(sr.logits);
+            cur_hidden = sr.hidden;
         } else {
             auto codes = lfm2_depthformer_sample_frame(ctx, cur_hidden.data());
             if (codes.empty())
@@ -2614,11 +2545,11 @@ float* lfm2_audio_synthesize(lfm2_audio_context* ctx, const char* text, const ch
             auto ae = lfm2_embed_audio_codes(ctx, codes);
             if (ae.empty())
                 break;
-            auto [lg, hd] = step1(ae.data());
-            if (lg.empty())
+            auto sr = lfm2_backbone_step(ctx, ae.data(), 1);
+            if (sr.logits.empty())
                 break;
-            cur_token = argmax(lg);
-            cur_hidden = hd;
+            cur_token = argmax(sr.logits);
+            cur_hidden = sr.hidden;
         }
     }
 
@@ -2730,29 +2661,9 @@ float* lfm2_audio_speech_to_speech(lfm2_audio_context* ctx, const float* in_samp
                                                     3304, 810, 14052, 523, 7,    708,  6,   6423, 708};
     static const std::vector<int32_t> kS2SSuffix = {7, 708, 6, 64015, 708}; // <|im_end|>\n<|im_start|>assistant\n
 
-    // Embed text tokens
-    auto embed_text_fn = [&](const std::vector<int32_t>& ids) -> std::vector<float> {
-        const int n = (int)ids.size();
-        const size_t mem = 16 * 1024 * 1024;
-        std::vector<uint8_t> buf(mem);
-        ggml_context* c = ggml_init({mem, buf.data(), false});
-        if (!c)
-            return {};
-        ggml_tensor* id_t = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
-        memcpy(id_t->data, ids.data(), n * sizeof(int32_t));
-        ggml_tensor* emb = ggml_get_rows(c, model.lfm_embed_tokens_w, id_t);
-        ggml_tensor* out = ggml_dup(c, emb);
-        ggml_cgraph* gf = ggml_new_graph(c);
-        ggml_build_forward_expand(gf, out);
-        ggml_graph_compute_with_ctx(c, gf, 1);
-        std::vector<float> result(n * hidden);
-        memcpy(result.data(), out->data, sizeof(float) * n * hidden);
-        ggml_free(c);
-        return result;
-    };
-
-    auto prefix_emb = embed_text_fn(kS2SPrefix);
-    auto suffix_emb = embed_text_fn(kS2SSuffix);
+    // Embed text tokens (GPU-safe via gallocr)
+    auto prefix_emb = lfm2_embed_tokens(ctx, kS2SPrefix.data(), (int)kS2SPrefix.size());
+    auto suffix_emb = lfm2_embed_tokens(ctx, kS2SSuffix.data(), (int)kS2SSuffix.size());
     if (prefix_emb.empty() || suffix_emb.empty()) {
         free(adapted);
         return nullptr;
@@ -2796,99 +2707,7 @@ float* lfm2_audio_speech_to_speech(lfm2_audio_context* ctx, const float* in_samp
     std::vector<std::vector<int32_t>> all_codes;
     std::string transcript;
 
-    // Reuse the same backbone step1 lambda from synthesize — duplicate the pattern
-    auto step1 = [&](const float* emb) -> std::pair<std::vector<float>, std::vector<float>> {
-        ggml_init_params ip = {ctx->decode_meta.size(), ctx->decode_meta.data(), false};
-        ggml_context* c = ggml_init(ip);
-        if (!c)
-            return {};
-        ggml_tensor* x = ggml_new_tensor_2d(c, GGML_TYPE_F32, hidden, 1);
-        memcpy(x->data, emb, sizeof(float) * hidden);
-        ggml_tensor* pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
-        *(int32_t*)pos->data = ctx->kv_n_past;
-        ggml_cgraph* gf = ggml_new_graph_custom(c, 65536, false);
-        int ai = 0, ci = 0;
-        for (uint32_t il = 0; il < hp.lfm_n_layers; il++) {
-            auto& w = model.lfm_layers[il];
-            ggml_tensor* res = x;
-            ggml_tensor* h = lfm2_rms_norm(c, x, w.operator_norm_w, 1e-5f);
-            if (w.is_attention) {
-                core_attn::KvSelfAttnParams kvp = {};
-                kvp.head_dim = (int)hp.lfm_head_dim;
-                kvp.n_heads = (int)hp.lfm_n_heads;
-                kvp.n_kv_heads = (int)hp.lfm_n_kv_heads;
-                kvp.n_kv_grp = kvp.n_heads / kvp.n_kv_heads;
-                kvp.rope_type = GGML_ROPE_TYPE_NEOX;
-                kvp.rope_theta = hp.lfm_rope_theta;
-                kvp.attn_scale = 1.0f / sqrtf((float)hp.lfm_head_dim);
-                kvp.qk_norm_eps = 1e-5f;
-                kvp.gqa_mode = core_attn::GQA_NATIVE;
-                h = core_attn::kv_self_attn(c, gf, h, w.attn_q_proj_w, w.attn_k_proj_w, w.attn_v_proj_w,
-                                            w.attn_out_proj_w, w.attn_q_ln_w, w.attn_k_ln_w, pos, nullptr, ctx->kv_k,
-                                            ctx->kv_v, ai, ctx->kv_n_past, kvp);
-                ai++;
-            } else {
-                const int K = (int)hp.lfm_conv_kernel;
-                ggml_tensor* bc = ggml_mul_mat(c, w.conv_in_proj_w, h);
-                ggml_tensor* Bp = ggml_view_1d(c, bc, hidden, 0);
-                ggml_tensor* Cp = ggml_view_1d(c, bc, hidden, hidden * sizeof(float));
-                ggml_tensor* xp = ggml_view_1d(c, bc, hidden, 2 * hidden * sizeof(float));
-                ggml_tensor* Bx = ggml_mul(c, ggml_cont(c, Bp), ggml_cont(c, xp));
-                ggml_tensor* cached = ggml_new_tensor_2d(c, GGML_TYPE_F32, hidden, K - 1);
-                memcpy(cached->data, ctx->conv_states[ci].data(), sizeof(float) * hidden * (K - 1));
-                ggml_tensor* Bxf = ggml_concat(c, cached, ggml_reshape_2d(c, Bx, hidden, 1), 1);
-                ggml_tensor* cw = ggml_cast(c, w.conv_conv_w, GGML_TYPE_F32);
-                ggml_tensor* Bt = ggml_cont(c, ggml_transpose(c, Bxf)); // (K, hidden)
-                ggml_tensor* cr = ggml_conv_1d_dw(c, cw, Bt, /*stride=*/1, /*pad=*/K - 1, /*dilation=*/1);
-                // cr: (2K-1, hidden). Take position K-1 (causal), transpose to (hidden, 1).
-                cr = ggml_cont(c, ggml_transpose(c, cr)); // (hidden, 2K-1)
-                ggml_tensor* co = ggml_cont(c, ggml_view_2d(c, cr, hidden, 1, hidden * sizeof(float),
-                                                            (int64_t)(K - 1) * hidden * sizeof(float)));
-                ggml_tensor* y = ggml_mul(c, ggml_reshape_2d(c, ggml_cont(c, Cp), hidden, 1), co);
-                h = ggml_mul_mat(c, w.conv_out_proj_w, y);
-                ggml_tensor* snap = ggml_dup(c, Bx);
-                char sn[16];
-                snprintf(sn, sizeof(sn), "cs_%d", ci);
-                ggml_set_name(snap, sn);
-                ggml_build_forward_expand(gf, snap);
-                ci++;
-            }
-            x = ggml_add(c, res, h);
-            res = x;
-            h = lfm2_rms_norm(c, x, w.ffn_norm_w, 1e-5f);
-            h = lfm2_swiglu_ffn(c, h, w.ff_w1, w.ff_w2, w.ff_w3);
-            x = ggml_add(c, res, h);
-        }
-        x = lfm2_rms_norm(c, x, model.lfm_embedding_norm_w, 1e-5f);
-        ggml_tensor* lg = ggml_dup(c, ggml_mul_mat(c, model.lfm_embed_tokens_w, x));
-        ggml_tensor* hd = ggml_dup(c, x);
-        ggml_set_name(lg, "lg");
-        ggml_set_name(hd, "hd");
-        ggml_build_forward_expand(gf, lg);
-        ggml_build_forward_expand(gf, hd);
-        ggml_graph_compute_with_ctx(c, gf, ctx->n_threads);
-        ci = 0;
-        for (uint32_t il = 0; il < hp.lfm_n_layers; il++) {
-            if (model.lfm_layers[il].is_attention)
-                continue;
-            char sn[16];
-            snprintf(sn, sizeof(sn), "cs_%d", ci);
-            ggml_tensor* s = ggml_graph_get_tensor(gf, sn);
-            if (s) {
-                auto& st = ctx->conv_states[ci];
-                memmove(st.data(), st.data() + hidden, sizeof(float) * hidden * ((int)hp.lfm_conv_kernel - 2));
-                memcpy(st.data() + hidden * ((int)hp.lfm_conv_kernel - 2), s->data, sizeof(float) * hidden);
-            }
-            ci++;
-        }
-        ctx->kv_n_past++;
-        std::vector<float> rlg((int)lg->ne[0]);
-        memcpy(rlg.data(), lg->data, sizeof(float) * rlg.size());
-        std::vector<float> rhd(hidden);
-        memcpy(rhd.data(), hd->data, sizeof(float) * hidden);
-        ggml_free(c);
-        return {rlg, rhd};
-    };
+    // S2S decode uses the GPU-safe lfm2_backbone_step + lfm2_embed_tokens.
 
     for (int step = 0; step < 1000; step++) {
         mod_left--;
@@ -2904,14 +2723,15 @@ float* lfm2_audio_speech_to_speech(lfm2_audio_context* ctx, const float* in_samp
             // Collect text for transcript
             std::string piece = decode_token(model, cur_token);
             transcript += piece;
-            auto te = embed_text_fn({cur_token});
+            int32_t tid = cur_token;
+            auto te = lfm2_embed_tokens(ctx, &tid, 1);
             if (te.empty())
                 break;
-            auto [lg, hd] = step1(te.data());
-            if (lg.empty())
+            auto sr = lfm2_backbone_step(ctx, te.data(), 1);
+            if (sr.logits.empty())
                 break;
-            cur_token = argmax(lg);
-            cur_hidden = hd;
+            cur_token = argmax(sr.logits);
+            cur_hidden = sr.hidden;
         } else {
             auto codes = lfm2_depthformer_sample_frame(ctx, cur_hidden.data());
             if (codes.empty())
@@ -2926,11 +2746,11 @@ float* lfm2_audio_speech_to_speech(lfm2_audio_context* ctx, const float* in_samp
             auto ae = lfm2_embed_audio_codes(ctx, codes);
             if (ae.empty())
                 break;
-            auto [lg, hd] = step1(ae.data());
-            if (lg.empty())
+            auto sr = lfm2_backbone_step(ctx, ae.data(), 1);
+            if (sr.logits.empty())
                 break;
-            cur_token = argmax(lg);
-            cur_hidden = hd;
+            cur_token = argmax(sr.logits);
+            cur_hidden = sr.hidden;
         }
     }
 

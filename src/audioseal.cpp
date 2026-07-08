@@ -16,6 +16,7 @@
 #include "audioseal.h"
 #include "core/conv.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -23,6 +24,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +33,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `AUDIOSEAL_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool audioseal_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("AUDIOSEAL_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct audioseal_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit audioseal_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~audioseal_bench_stage() {
+        if (!audioseal_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  audioseal_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 namespace {
 
@@ -222,6 +250,7 @@ struct audioseal_ctx {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
@@ -278,6 +307,8 @@ struct audioseal_ctx {
     std::vector<uint8_t> compute_meta;
 
     ~audioseal_ctx() {
+        if (sched)
+            ggml_backend_sched_free(sched);
         if (buf_perm)
             ggml_backend_buffer_free(buf_perm);
         if (ctx_perm)
@@ -631,7 +662,7 @@ struct audioseal_ctx* audioseal_init_from_file(const char* path, struct audiosea
 
     // Backend
     if (params.use_gpu) {
-        c->backend = ggml_backend_init_best();
+        c->backend = crispasr_init_gpu_backend();
     }
     if (!c->backend) {
         c->backend = ggml_backend_cpu_init();
@@ -700,6 +731,7 @@ uint32_t audioseal_nbits(const struct audioseal_ctx* ctx) {
 float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_samples, const uint8_t* message) {
     if (!ctx || !pcm || n_samples <= 0 || !ctx->has_generator)
         return nullptr;
+    audioseal_bench_stage _bs_total("embed_total");
 
     // Build compute graph
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
@@ -761,10 +793,14 @@ float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_sample
     ggml_build_forward_expand(gf, output);
 
     // Allocate + compute
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        fprintf(stderr, "audioseal: graph allocation failed\n");
-        ggml_gallocr_free(galloc);
+    if (!ctx->sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    }
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "audioseal: sched alloc graph failed\n");
         ggml_free(ctx0);
         return nullptr;
     }
@@ -783,10 +819,9 @@ float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_sample
         ggml_backend_tensor_set(msg_t, msg_indices.data(), 0, ctx->hp.nbits * sizeof(int32_t));
     }
 
-    ggml_status st = ggml_backend_graph_compute(ctx->backend, gf);
+    ggml_status st = ggml_backend_sched_graph_compute(ctx->sched, gf);
     if (st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "audioseal: graph compute failed (status %d)\n", (int)st);
-        ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return nullptr;
     }
@@ -826,7 +861,6 @@ float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_sample
         ggml_backend_tensor_get(out, result, 0, copy_bytes);
     }
 
-    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return result;
 }
@@ -834,6 +868,7 @@ float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_sample
 float* audioseal_detect(struct audioseal_ctx* ctx, const float* pcm, int n_samples, int* out_n, uint8_t* out_message) {
     if (!ctx || !pcm || n_samples <= 0 || !ctx->has_detector)
         return nullptr;
+    audioseal_bench_stage _bs_total("detect_total");
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -898,19 +933,23 @@ float* audioseal_detect(struct audioseal_ctx* ctx, const float* pcm, int n_sampl
     }
 
     // Allocate + compute
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        ggml_gallocr_free(galloc);
+    if (!ctx->sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    }
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "audioseal: sched alloc detect graph failed\n");
         ggml_free(ctx0);
         return nullptr;
     }
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "det_audio_in"), pcm, 0, (size_t)n_samples * sizeof(float));
 
-    ggml_status st = ggml_backend_graph_compute(ctx->backend, gf);
+    ggml_status st = ggml_backend_sched_graph_compute(ctx->sched, gf);
     if (st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "audioseal: detect graph compute failed (status %d)\n", (int)st);
-        ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return nullptr;
     }
@@ -937,7 +976,6 @@ float* audioseal_detect(struct audioseal_ctx* ctx, const float* pcm, int n_sampl
         }
     }
 
-    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return result;
 }

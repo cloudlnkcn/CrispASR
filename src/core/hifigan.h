@@ -108,8 +108,13 @@ static inline ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
 static inline ggml_tensor* conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight,
                                              ggml_tensor* w_perm, ggml_tensor* bias, int stride, int padding) {
     if (w_perm) {
+        // The HiFi-GAN forward() pipeline is time-major: every ggml_conv_1d here
+        // produces (T, C) (ne0=time, ne1=channel). The decomposed transpose-conv
+        // must therefore use the time-first variant — convt1d_decomp (channel-major)
+        // would mul_mat w_perm[IC,K*OC] against x whose ne0 is T, not IC, and abort
+        // on the shape check. Symmetric crop matches the old conv_transpose path.
         const int K = (int)weight->ne[0];
-        return core_convt::convt1d_decomp(ctx, x, w_perm, bias, stride, K, padding, padding);
+        return core_convt::convt1d_decomp_tf(ctx, x, w_perm, bias, stride, K, padding, padding);
     }
     // Old path — stable, works on CPU without the col2im op.
     ggml_tensor* y = ggml_conv_transpose_1d(ctx, weight, x, stride, 0 /*p0*/, 1);

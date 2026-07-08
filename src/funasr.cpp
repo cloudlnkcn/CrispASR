@@ -20,6 +20,7 @@
 #include "core/kaldi_fbank.h"
 #include "core/lfr.h"
 #include "core/sanm.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include <algorithm>
 #include <cassert>
@@ -246,6 +247,12 @@ struct funasr_context {
     ggml_backend_buffer_t fused_buf = nullptr;
 
     std::vector<uint8_t> compute_meta;
+
+    // §176s: cached encoder+adaptor graph — reused when T_lfr matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_lfr = 0;
 
     // KV cache for the LLM body — same layout as qwen3_asr.
     ggml_context* kv_ctx = nullptr;
@@ -582,13 +589,13 @@ static ggml_tensor* maybe_snap(ggml_context* ctx0, ggml_cgraph* gf, ggml_tensor*
     return t;
 }
 
-static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr) {
+static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr, ggml_context* arena_ctx = nullptr) {
     const auto& hp = ctx->model.hparams;
     const int D_in = (int)hp.input_size;
     const int D = (int)hp.d_model;
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // ---- inputs ----
@@ -724,7 +731,8 @@ static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr) 
 
     ggml_set_name(cur, "audio_adaptor_output");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -741,7 +749,24 @@ static std::vector<float> funasr_run_encoder_adaptor(funasr_context* ctx, const 
         compute_encoder_pe(ctx->model, T_lfr + 256);
     }
 
-    ggml_cgraph* gf = funasr_build_graph_features(ctx, T_lfr);
+    // §176s: reuse cached encoder graph when T_lfr matches previous call.
+    ggml_cgraph* gf;
+    if (ctx->cached_enc_gf && ctx->cached_enc_T_lfr == T_lfr) {
+        gf = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params ip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(ip);
+        gf = funasr_build_graph_features(ctx, T_lfr, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_lfr = T_lfr;
+    }
+
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         std::fprintf(stderr, "funasr: failed to alloc encoder graph\n");
@@ -1646,9 +1671,35 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
 
 // Get the inputs_embeds for an arbitrary token sequence via the model's
 // token_embd table (shared with output.weight thanks to Qwen3 tied embeddings).
+// For n==1 (the AR decode hot path), skip the graph and dequant one row
+// directly — eliminates graph-build + sched overhead per decode step (§176o).
+// Gated by CRISPASR_FUNASR_EMBED_FAST (default ON, set =0 to disable).
 static std::vector<float> funasr_embed_tokens(funasr_context* ctx, const std::vector<int32_t>& ids) {
     const int n = (int)ids.size();
     const int d = (int)ctx->model.hparams.llm_d_model;
+
+    // Fast path: single-token lookup avoids full graph build + sched alloc.
+    static int use_fast = -1;
+    if (use_fast < 0) {
+        const char* e = std::getenv("CRISPASR_FUNASR_EMBED_FAST");
+        use_fast = (!e || *e != '0') ? 1 : 0;
+    }
+    if (n == 1 && use_fast) {
+        const ggml_tensor* w = ctx->model.llm.token_embd_w;
+        if (w) {
+            const size_t row_bytes = ggml_row_size(w->type, d);
+            std::vector<uint8_t> raw(row_bytes);
+            ggml_backend_tensor_get(w, raw.data(), (size_t)ids[0] * row_bytes, row_bytes);
+            std::vector<float> result((size_t)d);
+            if (w->type == GGML_TYPE_F32) {
+                std::memcpy(result.data(), raw.data(), (size_t)d * sizeof(float));
+            } else {
+                ggml_get_type_traits(w->type)->to_float(raw.data(), result.data(), d);
+            }
+            return result;
+        }
+    }
+
     ggml_cgraph* gf = funasr_build_graph_embed(ctx, n);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1902,6 +1953,7 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     std::vector<int32_t> generated;
     std::vector<float> generated_probs;
     auto decode_t0 = std::chrono::steady_clock::now();
+    double decode_embed_ms = 0;
 
     if (ctx->beam_size > 1) {
         // Beam search via replay-from-prefix. Each beam step embeds
@@ -1959,7 +2011,17 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
             }
             generated.push_back(next_id);
             generated_probs.push_back(next_prob);
+            double t_emb0 =
+                funasr_bench_enabled()
+                    ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch())
+                          .count()
+                    : 0;
             std::vector<float> step_embed = funasr_embed_tokens(ctx, {next_id});
+            if (funasr_bench_enabled())
+                decode_embed_ms +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch())
+                        .count() -
+                    t_emb0;
             if (step_embed.empty())
                 break;
             logits = funasr_run_llm_step(ctx, step_embed.data(), 1, n_past);
@@ -1976,6 +2038,8 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
         const int n_steps = (int)generated.size();
         std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%d tokens, %.2f ms/tok)\n", "llm_decode_total", ms,
                      n_steps, n_steps > 0 ? ms / n_steps : 0.0);
+        std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%.2f ms/tok)\n", "decode_embed_only", decode_embed_ms,
+                     n_steps > 0 ? decode_embed_ms / n_steps : 0.0);
     }
     (void)d;
 
@@ -2016,7 +2080,7 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -2140,6 +2204,9 @@ extern "C" void funasr_set_language(funasr_context* ctx, const char* lang) {
 extern "C" void funasr_free(funasr_context* ctx) {
     if (!ctx)
         return;
+    // §176s: free cached encoder graph arena.
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->step_galloc)

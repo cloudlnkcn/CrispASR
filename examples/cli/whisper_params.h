@@ -150,6 +150,14 @@ struct whisper_params {
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
     std::string hotwords;         // comma-separated hotword list (PLAN #98)
     float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches
+    // Free-form hotword/context text injected into the vibevoice-asr prompt
+    // (only backend that reads this so far). Matches the `context_info` param
+    // in microsoft/VibeVoice's vibevoice_asr_processor.py.
+    std::string context;
+    // #205: granite-speech incremental decoding — seed the assistant turn with a
+    // previously-decoded transcript so the model continues from it instead of
+    // re-decoding (model-card `prefix_text`). Output is the continuation only.
+    std::string prefix_text;
     std::string lid_backend;
     std::string lid_model;
     // Post-ASR text LID: when set, after transcription completes, run
@@ -168,6 +176,12 @@ struct whisper_params {
     std::string enroll_speaker;     // enrollment mode: save embedding as this name
     std::string titanet_model;      // TitaNet GGUF path or "auto"
     float speaker_threshold = 0.7f; // cosine similarity threshold for matching
+    // The named-profile DB (--enroll-speaker / --speaker-db) persists
+    // voiceprints linked to real names and performs 1:N identification —
+    // biometric special-category data under GDPR Art. 9. It is OFF by
+    // default: the deployer must affirm a lawful basis + explicit consent
+    // via --speaker-db-consent before enrollment or matching will run.
+    bool speaker_db_consent = false;
 
     // Embedding-based diarization clustering (issue #107 P3). When set,
     // after --diarize-method pyannote runs, each speech segment is
@@ -189,6 +203,9 @@ struct whisper_params {
     // --ws-port: real-time WebSocket ASR streaming on a second port.
     //   -1 = disabled (default), 0 = server_port + 1, N = port N.
     int32_t server_ws_port = -1;
+    // --wyoming-port: Wyoming protocol (Home Assistant Assist) TCP server.
+    //   -1 = disabled (default), N = port N.
+    int32_t wyoming_port = -1;
     int32_t stream_step_ms = 3000;
     int32_t stream_length_ms = 10000;
     int32_t stream_keep_ms = 200;
@@ -269,6 +286,30 @@ struct whisper_params {
     std::string tts_instruct; // VoiceDesign: natural-language voice description
     bool tts_trim_silence = false;
 
+    // --make-ref: create a TADA voice reference GGUF from --voice <audio.wav>
+    // + --ref-text "transcript". Requires tada-encoder.gguf + tada-aligner-*.gguf.
+    bool make_ref = false;
+    std::string make_ref_output;  // output path (default: tada-ref-custom.gguf)
+    std::string make_ref_aligner; // aligner GGUF path (auto-discovered if empty)
+    std::string make_ref_encoder; // encoder GGUF path (auto-discovered if empty)
+
+    // Forced alignment / word timestamps via the TADA aligner (reuses the
+    // make-ref encoder+aligner). Input: --voice <audio> + --ref-text "<text>".
+    bool align = false;
+    std::string align_output;         // output path (default: stdout)
+    std::string align_format = "srt"; // srt | json | plain
+
+    // Issue #217: standalone CTC forced alignment mode.
+    // Input: audio file + text (--ref-text or --text-file).
+    // Runs the CTC aligner (canary-ctc / wav2vec2 / qwen3-fa) without
+    // requiring an ASR model or transcription step.
+    bool align_only = false;
+    std::string text_file; // path to .txt or .srt (text extracted, timestamps stripped)
+    // Output granularity: "word" = one entry per aligned word; "segment" =
+    // one entry per input SRT cue (or per non-empty .txt line), re-timed
+    // from the word alignment; "auto" = segment for .srt input, word otherwise.
+    std::string align_granularity = "auto"; // auto | word | segment
+
     // AudioSeal neural watermark model (optional upgrade from spread-spectrum).
     // When set, loads the GGUF and uses it for watermark embed/detect
     // instead of the built-in spread-spectrum watermark.
@@ -327,13 +368,28 @@ struct whisper_params {
     float tts_min_p = -1.0f;
     int tts_top_k = -1;
     float tts_repetition_penalty = -1.0f;
-    float tts_cfg_scale = -1.0f;    // chatterbox cfg_weight, f5 cfg_strength
-    int tts_num_steps = -1;         // chatterbox cfm_steps, f5 ode_steps
+    int tts_do_sample = -1;         // tada talker sampling: -1 unset, 0 greedy, 1 sample
+    int tts_num_candidates = -1;    // tada per-token flow-matching candidates (quality/speed)
+    float tts_cfg_scale = -1.0f;    // chatterbox cfg_weight, f5 cfg_strength, tada acoustic_cfg
+    int tts_num_steps = -1;         // chatterbox cfm_steps, f5 ode_steps, tada num_flow_matching_steps
     float tts_noise_scale = -1.0f;  // piper VITS variance
     float tts_noise_w = -1.0f;      // piper stochastic duration predictor
+    float tts_noise_temp = -1.0f;   // tada FM noise temperature (InferenceOptions.noise_temp)
     float tts_exaggeration = -1.0f; // chatterbox expressiveness
     int tts_speaker_id = -1;        // piper multi-speaker model
     int tts_max_speech_tokens = -1; // chatterbox max AR tokens
+
+    // CLI: --tts-play plays synthesised output on the local default speaker.
+    // --tts-play-device N selects a non-default device by index (-1 = default).
+    // Playback uses the same watermarked PCM that is written to --tts-output.
+    bool tts_play = false;
+    int tts_play_device = -1;
+
+    // --tts-stream: stream synthesized audio to stdout as raw signed-16-bit
+    // little-endian mono PCM (at the backend's sample rate), emitting each
+    // sentence chunk as it is produced instead of writing one WAV at the end.
+    // For piping into a player, e.g. `… --tts-stream | ffplay -f s16le -ar 48000 -`.
+    bool tts_stream = false;
 
     // G2P phonemizer dictionary source:
     //   ""           → auto (OLaPh MIT preferred, then open-dict-data CC-BY-SA)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Kaggle kernel: download orpheus-3b-base F16 GGUF, quantize to Q4_K, upload to HF.
+"""Kaggle kernel: download orpheus-3b-0.1-ft F16 GGUF, quantize to Q4_K, upload to HF.
 
 CPU-only (30 GB RAM is enough for the 6.2 GB F16 model).
-Downloads orpheus-3b-base-f16.gguf from cstr/orpheus-3b-base-GGUF,
+Downloads orpheus-3b-0.1-ft-f16.gguf from cstr/orpheus-3b-0.1-ft-GGUF,
 quantizes to Q4_K, uploads back to the same HF repo.
 
 Push: python -m kaggle kernels push -p tools/kaggle/orpheus-quantize
@@ -16,9 +16,9 @@ REPO = WORK / "CrispASR"
 TEMP = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else WORK
 BUILD = TEMP / "build"
 
-HF_REPO = "cstr/orpheus-3b-base-GGUF"
-F16_FILE = "orpheus-3b-base-f16.gguf"
-Q4K_FILE = "orpheus-3b-base-q4_k.gguf"
+HF_REPO = "cstr/orpheus-3b-0.1-ft-GGUF"
+F16_FILE = "orpheus-3b-0.1-ft-f16.gguf"
+Q4K_FILE = "orpheus-3b-0.1-ft-q4_k.gguf"
 
 # -- Phase 0: Clone repo --
 print("=== Phase 0: clone repo ===", flush=True)
@@ -99,7 +99,7 @@ if hf_token:
         path_or_fileobj=str(q4k_path),
         path_in_repo=Q4K_FILE,
         repo_id=HF_REPO, repo_type="model",
-        commit_message="Add Q4_K GGUF (orpheus-3b-base, crispasr-quantize)",
+        commit_message="Add Q4_K GGUF (orpheus-3b-0.1-ft, crispasr-quantize)",
     )
     print(f"  uploaded to https://huggingface.co/{HF_REPO}", flush=True)
 else:

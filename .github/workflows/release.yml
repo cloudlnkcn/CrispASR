@@ -16,6 +16,50 @@ permissions:
   contents: write
 
 jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Verify VERSION matches tag
+        run: |
+          tag_version="${{ inputs.tag || github.ref_name }}"
+          tag_version="${tag_version#v}"
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          echo "Tag: $tag_version  VERSION file: $file_version"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "::error::VERSION file ($file_version) does not match tag ($tag_version)"
+            exit 1
+          fi
+
+  # Releases must ship the current glint encoder: fail if the in-tree
+  # glint/ sync marker is behind github.com/CrispStrobe/glint main.
+  # Fix: run the "Sync glint" workflow (or tools/sync-glint.sh) and
+  # re-tag.
+  validate-glint-fresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Verify in-tree glint matches upstream main
+        run: |
+          synced="$(sed -n 's/.*Synced at upstream commit: `\([0-9a-f]*\)`.*/\1/p' glint/README.md)"
+          upstream="$(git ls-remote https://github.com/CrispStrobe/glint refs/heads/main | cut -f1)"
+          echo "in-tree: $synced  upstream main: $upstream"
+          if [ -z "$synced" ] || [ -z "$upstream" ]; then
+            echo "::error::could not read glint sync marker or upstream HEAD"
+            exit 1
+          fi
+          case "$upstream" in
+            "$synced"*) echo "glint is current" ;;
+            *) echo "::error::in-tree glint ($synced) is behind upstream main ($upstream); run the 'Sync glint' workflow and re-tag"
+               exit 1 ;;
+          esac
+
   build-linux:
     runs-on: ubuntu-22.04
     steps:
@@ -51,6 +95,41 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64.tar.gz
+          fail_on_unmatched_files: false
+
+  # ── WebAssembly build (browser: ASR + TTS, all backends) ─────────────────────
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup emsdk
+        uses: mymindstorm/setup-emsdk@v14
+
+      - name: Build WASM (all backends)
+        run: ./build-wasm.sh --clean
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-wasm
+          cp build-wasm/bin/libwhisper.js build-wasm/bin/libwhisper.wasm release/crispasr-wasm/
+          [ -f build-wasm/bin/libwhisper.worker.js ] && cp build-wasm/bin/libwhisper.worker.js release/crispasr-wasm/ || true
+          printf 'CrispASR WebAssembly: libwhisper.js (global whisper_factory) + libwhisper.wasm.\nMultithreaded -> host page must be cross-origin isolated (COOP/COEP).\nTTS: Module.ttsOpenExplicit(model,backend,threads) -> ttsSetVoice(voice,"") -> ttsSynthesize(text) => Float32Array @24kHz.\nLoad files via Module.FS_createDataFile("/models",name,bytes,true,true).\n' > release/crispasr-wasm/README.txt
+          cd release && tar czf crispasr-wasm.tar.gz crispasr-wasm/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-wasm
+          path: release/crispasr-wasm.tar.gz
+
+      - name: Attach crispasr-wasm.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-wasm.tar.gz
           fail_on_unmatched_files: false
 
   # ── Linux x86_64 CLI — AVX-512 + VNNI variant ────────────────────────────────
@@ -222,6 +301,145 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64-cuda13.tar.gz
+          fail_on_unmatched_files: false
+
+  # ── Linux x86_64 CLI — HIP/ROCm variant ─────────────────────────────────────
+  # Native AMD GPU path via HIP (ROCm). Covers RDNA2 (gfx1030/1035),
+  # RDNA3 (gfx1100/1101/1102), RDNA4 (gfx1201 — RX 9070 / R9700),
+  # and datacenter MI-series (gfx906/908/90a). Requires ROCm 6.3+ on the host
+  # (gfx1201 support was added in ROCm 6.3). Prefer this over Vulkan on Linux
+  # AMD: HIP has full flash-attention, tinyBLAS INT8 VNNI, and MFMA paths.
+  build-linux-x86_64-hip:
+    runs-on: ubuntu-22.04
+    container:
+      image: rocm/dev-ubuntu-22.04:6.3
+    steps:
+      - name: Install git
+        run: apt-get update -y && apt-get install -y git
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install deps
+        # The slim rocm/dev image ships the HIP compiler + runtime but NOT the
+        # math libraries; GGML_HIP needs hipBLAS/rocBLAS (and their cmake config
+        # files) or `find_package(hipblas)` fails at configure time (#196).
+        run: apt-get install -y cmake g++ hipblas-dev rocblas-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_HIP=ON \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DCMAKE_C_COMPILER=hipcc \
+            -DCMAKE_CXX_COMPILER=hipcc \
+            -DAMDGPU_TARGETS="gfx906;gfx908;gfx90a;gfx1030;gfx1035;gfx1100;gfx1101;gfx1102;gfx1201" \
+            -DGGML_NATIVE=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON \
+            -DCRISPASR_BUILD_SERVER=OFF
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-linux-x86_64-hip
+          cp build/bin/crispasr release/crispasr-linux-x86_64-hip/
+          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-hip/
+          cd release && tar czf crispasr-linux-x86_64-hip.tar.gz crispasr-linux-x86_64-hip/
+          ls -lh crispasr-linux-x86_64-hip.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-hip
+          path: release/crispasr-linux-x86_64-hip.tar.gz
+
+      - name: Attach crispasr-linux-x86_64-hip.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-linux-x86_64-hip.tar.gz
+          fail_on_unmatched_files: false
+
+  # ── Linux x86_64 shared libs — HIP/ROCm variant ──────────────────────────────
+  # Mirrors build-linux-x86_64-hip as a shared-lib tarball for downstream
+  # FFI consumers (Rust crispasr-sys, Dart, Python ctypes) that need AMD GPU
+  # acceleration without rebuilding from source.
+  build-libs-linux-x86_64-hip:
+    runs-on: ubuntu-22.04
+    container:
+      image: rocm/dev-ubuntu-22.04:6.3
+    steps:
+      - name: Install git
+        run: apt-get update -y && apt-get install -y git
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install deps
+        # See build-linux-x86_64-hip: the slim rocm/dev image lacks hipBLAS/
+        # rocBLAS, which GGML_HIP requires at configure time (#196).
+        run: apt-get install -y cmake g++ patchelf hipblas-dev rocblas-dev
+
+      - name: Build (shared libs, HIP)
+        run: |
+          cmake -S . -B build-libs \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_HIP=ON \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DCMAKE_C_COMPILER=hipcc \
+            -DCMAKE_CXX_COMPILER=hipcc \
+            -DAMDGPU_TARGETS="gfx906;gfx908;gfx90a;gfx1030;gfx1035;gfx1100;gfx1101;gfx1102;gfx1201" \
+            -DGGML_NATIVE=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=OFF \
+            -DCRISPASR_BUILD_SERVER=OFF
+          cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
+
+      - name: Package
+        # This job runs inside the rocm/dev-ubuntu-22.04 container, where GitHub
+        # Actions defaults `run:` to `sh` (dash). `set -o pipefail` is a bashism
+        # that dash rejects on line 1 ("Illegal option -o pipefail" → exit 2),
+        # which is what kept this HIP libs asset persistently failing to package
+        # even though the build succeeds. Pin bash (present in the image).
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=release/libcrispasr-linux-x86_64-hip
+          mkdir -p "$OUT/src" "$OUT/ggml/src" "$OUT/include" "$OUT/ggml/include"
+          cp -P build-libs/src/libcrispasr*.so* "$OUT/src/"
+          [ -e build-libs/src/libwhisper.so ] && cp -P build-libs/src/libwhisper.so* "$OUT/src/"
+          find build-libs/src -maxdepth 1 -name 'lib*.so*' \( -type f -o -type l \) \
+            ! -name 'libcrispasr*' ! -name 'libwhisper*' \
+            -exec cp -P {} "$OUT/src/" \;
+          find build-libs/ggml/src -name 'libggml*.so*' \( -type f -o -type l \) \
+            -exec cp -P {} "$OUT/ggml/src/" \;
+          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
+            [ -L "$f" ] && continue
+            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
+          done
+          cp include/crispasr.h "$OUT/include/"
+          cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
+          cp LICENSE "$OUT/"
+          cd release && tar czf libcrispasr-linux-x86_64-hip.tar.gz libcrispasr-linux-x86_64-hip/
+          ls -lh libcrispasr-linux-x86_64-hip.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcrispasr-linux-x86_64-hip
+          path: release/libcrispasr-linux-x86_64-hip.tar.gz
+
+      - name: Attach libcrispasr-linux-x86_64-hip.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/libcrispasr-linux-x86_64-hip.tar.gz
           fail_on_unmatched_files: false
 
   # ── Linux x86_64 CLI — Vulkan variant ──────────────────────────────────────
@@ -1457,10 +1675,15 @@ jobs:
   # to transient permission issues). softprops won't clobber files that
   # already exist on the release.
   publish:
-    needs: [build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
+    needs: [validate-version, build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-x86_64-hip, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-x86_64-hip, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -1481,6 +1704,14 @@ jobs:
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
           fail_on_unmatched_files: false
-          # Preserve existing release body (manually-curated notes)
-          # rather than letting auto-generation overwrite it.
           generate_release_notes: false
+
+      - name: Set release notes body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          NOTES="RELEASE_NOTES_${TAG}.md"
+          if [ -f "$NOTES" ]; then
+            gh release edit "$TAG" --notes-file "$NOTES"
+          fi

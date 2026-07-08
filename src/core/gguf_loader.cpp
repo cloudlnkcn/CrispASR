@@ -149,6 +149,21 @@ std::vector<std::string> kv_str_array(gguf_context* gctx, const char* key) {
     return out;
 }
 
+std::vector<float> kv_f32_array(gguf_context* gctx, const char* key) {
+    std::vector<float> out;
+    const int k = gguf_find_key(gctx, key);
+    if (k < 0)
+        return out;
+    if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_ARRAY)
+        return out;
+    if (gguf_get_arr_type(gctx, k) != GGUF_TYPE_FLOAT32)
+        return out;
+    const size_t n = gguf_get_arr_n(gctx, k);
+    const float* data = (const float*)gguf_get_arr_data(gctx, k);
+    out.assign(data, data + n);
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Pass 2: tensor allocation + weight data copy.
 // ---------------------------------------------------------------------------
@@ -976,12 +991,13 @@ void mmap_advise_random(ggml_backend_buffer_t buf) {
 // Tensor lookup helpers
 // ---------------------------------------------------------------------------
 
-ggml_tensor* try_get(const std::map<std::string, ggml_tensor*>& tensors, const char* name) {
+// Signatures use `core_gguf::tensor_map` (see gguf_loader.h cross-repo contract).
+ggml_tensor* try_get(const tensor_map& tensors, const char* name) {
     auto it = tensors.find(name);
     return it != tensors.end() ? it->second : nullptr;
 }
 
-ggml_tensor* require(const std::map<std::string, ggml_tensor*>& tensors, const char* name, const char* model_tag) {
+ggml_tensor* require(const tensor_map& tensors, const char* name, const char* model_tag) {
     auto it = tensors.find(name);
     if (it == tensors.end()) {
         fprintf(stderr, "%s: required tensor '%s' not found in GGUF\n", model_tag ? model_tag : "core_gguf", name);

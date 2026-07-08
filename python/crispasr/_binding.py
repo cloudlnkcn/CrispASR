@@ -10,7 +10,7 @@ import platform
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import numpy as np
 
@@ -1044,9 +1044,14 @@ class Session:
                 print(f"[{seg.start:.1f}-{seg.end:.1f}s] {seg.text}")
     """
 
+    # Progress callback signature: void(int processed, int total, void* ud).
+    # Held on the instance while a chunked call runs so it isn't GC'd.
+    _PROGRESS_CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+
     def __init__(self, model_path: str, lib_path: Optional[str] = None,
                  n_threads: int = 4, backend: Optional[str] = None):
         self._lib = ctypes.CDLL(lib_path or _find_lib())
+        self._progress_cb_holder = None
         self._setup_session_signatures()
 
         path_bytes = model_path.encode("utf-8")
@@ -1103,6 +1108,26 @@ class Session:
                 ctypes.c_char_p,
             ]
             lib.crispasr_session_transcribe_lang.restype = ctypes.c_void_p
+        # 0.10.3+ (issue #208): chunked-encode transcribe — forces the
+        # Parakeet backend through its bounded overlapping-window long-form
+        # path (inert on other backends). hasattr-guarded for old dylibs.
+        if hasattr(lib, "crispasr_session_transcribe_chunked_lang"):
+            lib.crispasr_session_transcribe_chunked_lang.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
+            ]
+            lib.crispasr_session_transcribe_chunked_lang.restype = ctypes.c_void_p
+        # 0.10.3+ (issue #208): long-form progress. crispasr_get_progress()
+        # polls 0..100 (-1 idle) and now tracks chunked windows; the callback
+        # setter fires cb(processed, total, ud) once per finished window.
+        if hasattr(lib, "crispasr_get_progress"):
+            lib.crispasr_get_progress.argtypes = []
+            lib.crispasr_get_progress.restype = ctypes.c_int
+        if hasattr(lib, "crispasr_session_set_progress_callback"):
+            lib.crispasr_session_set_progress_callback.argtypes = [
+                ctypes.c_void_p, Session._PROGRESS_CB_TYPE, ctypes.c_void_p,
+            ]
+            lib.crispasr_session_set_progress_callback.restype = None
         # 0.4.3+: VAD-driven session transcribe. hasattr-guarded so a
         # binding loaded against an older dylib still works for non-VAD
         # calls.
@@ -1204,7 +1229,10 @@ class Session:
         lib.crispasr_session_available_backends.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.crispasr_session_available_backends.restype = ctypes.c_int
         buf = ctypes.create_string_buffer(256)
-        lib.crispasr_session_available_backends(buf, 256)
+        needed = lib.crispasr_session_available_backends(buf, len(buf))
+        if needed >= len(buf):
+            buf = ctypes.create_string_buffer(needed + 1)
+            lib.crispasr_session_available_backends(buf, len(buf))
         csv = buf.value.decode("utf-8")
         return [s.strip() for s in csv.split(",") if s.strip()]
 
@@ -1262,6 +1290,95 @@ class Session:
             return out
         finally:
             self._lib.crispasr_session_result_free(res)
+
+    def transcribe_chunked(
+        self, pcm: np.ndarray,
+        chunk_seconds: int = 0, overlap_seconds: int = -1,
+        *,
+        sample_rate: int = 16000,
+        language: Optional[str] = None,
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> List[SessionSegment]:
+        """Chunked-encode transcribe (issue #208).
+
+        Forces the Parakeet backend through its bounded overlapping-window
+        long-form path regardless of length, so long files transcribe in
+        bounded time and don't drop sections. ``chunk_seconds <= 0`` keeps the
+        per-model default window; ``overlap_seconds < 0`` keeps the default
+        overlap. Inert (== :meth:`transcribe`) on non-Parakeet backends.
+
+        ``progress(processed_samples, total_samples)`` — if given — fires once
+        per finished window on the calling thread. You can also poll
+        :meth:`get_progress` (0..100) from another thread.
+        """
+        if not hasattr(self._lib, "crispasr_session_transcribe_chunked_lang"):
+            return self.transcribe(pcm, sample_rate, language=language)  # old dylib
+        if sample_rate != 16000:
+            ratio = 16000 / sample_rate
+            new_len = int(len(pcm) * ratio)
+            indices = np.linspace(0, len(pcm) - 1, new_len)
+            pcm = np.interp(indices, np.arange(len(pcm)), pcm).astype(np.float32)
+        pcm = np.asarray(pcm, dtype=np.float32)
+        samples_ptr = pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        lang_c = language.encode("utf-8") if language else None
+
+        registered = False
+        if progress is not None and hasattr(self._lib, "crispasr_session_set_progress_callback"):
+            def _trampoline(processed, total, _ud):
+                try:
+                    progress(processed, total)
+                except Exception as e:  # never let a Python exception cross the FFI boundary
+                    import sys
+                    sys.stderr.write(f"crispasr progress callback raised: {e}\n")
+            self._progress_cb_holder = Session._PROGRESS_CB_TYPE(_trampoline)
+            self._lib.crispasr_session_set_progress_callback(self._handle, self._progress_cb_holder, None)
+            registered = True
+
+        try:
+            res = self._lib.crispasr_session_transcribe_chunked_lang(
+                self._handle, samples_ptr, len(pcm), int(chunk_seconds), int(overlap_seconds), lang_c)
+        finally:
+            if registered:
+                self._lib.crispasr_session_set_progress_callback(self._handle, None, None)
+                self._progress_cb_holder = None
+        if not res:
+            raise RuntimeError(f"crispasr_session_transcribe_chunked failed for backend {self.backend!r}")
+
+        try:
+            n_seg = self._lib.crispasr_session_result_n_segments(res)
+            out: List[SessionSegment] = []
+            has_word_p = hasattr(self._lib, "crispasr_session_result_word_p")
+            for i in range(n_seg):
+                t = self._lib.crispasr_session_result_segment_text(res, i)
+                text = t.decode("utf-8") if t else ""
+                t0 = self._lib.crispasr_session_result_segment_t0(res, i) / 100.0
+                t1 = self._lib.crispasr_session_result_segment_t1(res, i) / 100.0
+                wn = self._lib.crispasr_session_result_n_words(res, i)
+                words: List[SessionWord] = []
+                for j in range(wn):
+                    wt = self._lib.crispasr_session_result_word_text(res, i, j)
+                    raw_p = self._lib.crispasr_session_result_word_p(res, i, j) if has_word_p else 1.0
+                    words.append(SessionWord(
+                        text=wt.decode("utf-8") if wt else "",
+                        start=self._lib.crispasr_session_result_word_t0(res, i, j) / 100.0,
+                        end=self._lib.crispasr_session_result_word_t1(res, i, j) / 100.0,
+                        confidence=1.0 if raw_p < 0 else raw_p,
+                    ))
+                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words))
+            return out
+        finally:
+            self._lib.crispasr_session_result_free(res)
+
+    def get_progress(self) -> int:
+        """Poll long-form transcription progress: 0..100, or -1 when idle.
+
+        Updated in lockstep with :meth:`transcribe_chunked` windows (issue
+        #208), so a UI thread can render a progress bar without a callback.
+        Returns -1 if the loaded libcrispasr predates the poll API.
+        """
+        if not hasattr(self._lib, "crispasr_get_progress"):
+            return -1
+        return int(self._lib.crispasr_get_progress())
 
     def transcribe_vad(
         self,
@@ -1377,7 +1494,7 @@ class Session:
             self._lib.crispasr_session_result_free(res)
 
     # ---------------------------------------------------------------------
-    # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio)
+    # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts)
     # ---------------------------------------------------------------------
 
     def set_codec_path(self, path: str) -> None:
@@ -1572,7 +1689,9 @@ class Session:
     def set_hotwords(self, hotwords: str, boost: float = 2.0) -> None:
         """Contextual biasing: comma-separated words/phrases to boost during
         decoding. Parakeet CTC/TDT use an Aho-Corasick trie; LLM backends inject
-        them into the prompt. Empty string clears."""
+        them into the prompt (vibevoice splices the raw string into its
+        "with extra info:" prompt slot, same as the CLI's --context). Empty
+        string clears."""
         if not hasattr(self._lib, "crispasr_session_set_hotwords"):
             raise RuntimeError("session-state API not present in this libcrispasr build")
         self._lib.crispasr_session_set_hotwords.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_float]
@@ -1605,7 +1724,7 @@ class Session:
 
     def set_temperature(self, temperature: float, seed: int = 0) -> None:
         """Set decoder temperature on backends that support runtime control
-        (canary, cohere, parakeet, moonshine). Other backends silently no-op.
+        (canary, cohere, parakeet, nemotron, moonshine). Other backends silently no-op.
 
         ``seed`` is the RNG seed for sampling; pass 0 for time-based.
         Returns silently when no backend in the session honours the
@@ -1671,6 +1790,21 @@ class Session:
         if rc != 0 and rc != -2:
             raise RuntimeError(f"set_tts_steps failed (rc={rc})")
 
+    def set_tts_num_candidates(self, n: int) -> None:
+        """Set the number of flow-matching timing candidates ranked per token.
+
+        Honoured by TADA, where more candidates give more reliable
+        multilingual timing at higher cost. Soft no-op (rc=-2) on backends
+        that don't rank timing candidates.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_tts_num_candidates"):
+            return
+        self._lib.crispasr_session_set_tts_num_candidates.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_tts_num_candidates.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_tts_num_candidates(self._handle, int(n))
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_tts_num_candidates failed (rc={rc})")
+
     def set_top_p(self, top_p: float) -> None:
         """Set the top-p nucleus-sampling threshold. Honoured by chatterbox."""
         if not hasattr(self._lib, "crispasr_session_set_top_p"):
@@ -1680,6 +1814,26 @@ class Session:
         rc = self._lib.crispasr_session_set_top_p(self._handle, float(top_p))
         if rc != 0 and rc != -2:
             raise RuntimeError(f"set_top_p failed (rc={rc})")
+
+    def set_top_k(self, top_k: int) -> None:
+        """Set the top-k sampling cutoff (0 = disabled). Honoured by TADA."""
+        if not hasattr(self._lib, "crispasr_session_set_top_k"):
+            return
+        self._lib.crispasr_session_set_top_k.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_top_k.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_top_k(self._handle, int(top_k))
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_top_k failed (rc={rc})")
+
+    def set_do_sample(self, enable: bool) -> None:
+        """Enable/disable sampling (False = greedy). Honoured by TADA."""
+        if not hasattr(self._lib, "crispasr_session_set_do_sample"):
+            return
+        self._lib.crispasr_session_set_do_sample.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_do_sample.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_do_sample(self._handle, 1 if enable else 0)
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_do_sample failed (rc={rc})")
 
     def set_min_p(self, min_p: float) -> None:
         """Set the min-p sampling threshold. Honoured by chatterbox."""
@@ -1710,6 +1864,16 @@ class Session:
         rc = self._lib.crispasr_session_set_cfg_weight(self._handle, float(cfg_weight))
         if rc != 0 and rc != -2:
             raise RuntimeError(f"set_cfg_weight failed (rc={rc})")
+
+    def set_tts_noise_temp(self, noise_temp: float) -> None:
+        """TADA flow-matching noise temperature (Python noise_temp, default 0.9)."""
+        if not hasattr(self._lib, "crispasr_session_set_tts_noise_temp"):
+            return
+        self._lib.crispasr_session_set_tts_noise_temp.argtypes = [ctypes.c_void_p, ctypes.c_float]
+        self._lib.crispasr_session_set_tts_noise_temp.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_tts_noise_temp(self._handle, float(noise_temp))
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_tts_noise_temp failed (rc={rc})")
 
     def set_exaggeration(self, exaggeration: float) -> None:
         """Set the emotion-exaggeration scalar (chatterbox). 0.5 is the upstream default."""
@@ -1838,9 +2002,11 @@ class Session:
         """Set a free-form prompt passed to the backend on the next transcribe/synthesize call.
 
         Supported by: granite, voxtral, qwen3-asr, glm-asr, gemma4-e2b,
-        mimo-asr, moss-audio, lfm2-audio, mini-omni2. For moss-audio this
-        enables audio understanding beyond ASR (e.g. "Describe the sounds
-        in this clip." or "What language is spoken?").
+        mimo-asr, moss-audio, lfm2-audio, mini-omni2, ark-asr. For moss-audio
+        this enables audio understanding beyond ASR (e.g. "Describe the sounds
+        in this clip." or "What language is spoken?"). For ark-asr it is a
+        best-effort language hint (the model is promptless / not instruction-
+        trained).
         """
         if not hasattr(self._lib, "crispasr_session_set_ask"):
             return
@@ -2084,9 +2250,10 @@ class Session:
 
         Works with any TTS-capable backend — ``vibevoice``, ``qwen3-tts``,
         ``kokoro``, ``orpheus``, ``chatterbox``, ``indextts``, ``voxcpm2-tts``,
-        ``csm``, ``dia``, ``fastpitch``, ``speecht5``, ``melotts``, ``piper``,
-        ``parler-tts``, ``outetts``, ``cosyvoice3-tts``, ``pocket-tts``,
-        ``f5-tts``, ``bark``, ``kugelaudio``, ``tada``, ``lfm2-audio``.
+        ``csm``, ``dia``, ``fastpitch``, ``bananamind-tts``, ``speecht5``,
+        ``melotts``, ``piper``, ``parler-tts``, ``outetts``, ``cosyvoice3-tts``,
+        ``pocket-tts``, ``f5-tts``, ``irodori-tts``, ``bark``, ``kugelaudio``, ``tada``,
+        ``lfm2-audio``.
         For qwen3-tts call :meth:`set_codec_path` and one of:
 
         * :meth:`set_voice` — Base variants (WAV + ref_text, or voice-pack GGUF)

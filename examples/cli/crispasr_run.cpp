@@ -9,10 +9,15 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
+#include "crispasr_gap_fill.h"
+#include "tada_encoder.h"
+
+#include <sys/stat.h>
 #include "crispasr_chunk_context_gate.h"
 #include "crispasr_lcs_dedup.h"
 #include "crispasr_long_audio_fallback.h"
 #include "crispasr_mic_cli.h"
+#include "crispasr_speaker.h"
 #include "crispasr_popen.h"
 #include "crispasr_vad_cli.h"
 #include "crispasr_output.h"
@@ -22,6 +27,7 @@
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_aligner_cli.h"
+#include "crispasr_aligner.h"
 #include "crispasr_lid_cli.h"
 #include "crispasr_lid.h" // crispasr_lid_free_cache()
 #include "crispasr_diarize_cli.h"
@@ -40,11 +46,14 @@
 #include "speaker_db.h"
 
 #include "crispasr_c2pa.h"
+#include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
 #include "crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
 #include "crispasr_wav_writer.h"
-#include "common-crispasr.h" // read_audio_data
+#include "crispasr_mp3_writer.h" // MP3 output via in-tree glint encoder
+#include "crispasr_aac_writer.h" // AAC-LC (ADTS) output via in-tree glint encoder
+#include "common-crispasr.h"     // read_audio_data
 
 #include <algorithm>
 #include <atomic>
@@ -65,6 +74,46 @@
 #include <vector>
 
 namespace {
+
+// Serialize synthesized (TTS/S2S) float32 PCM to `out_path` — WAV by
+// default, MP3 or AAC-LC/ADTS (in-tree glint encoder) when the path
+// ends in .mp3 / .aac. All carry AI-provenance metadata (WAV LIST/INFO
+// chunk, MP3/AAC ID3v2 TXXX tag). C2PA Content Credentials signing is
+// WAV-only; requesting it with a lossy output warns instead of
+// silently dropping the manifest. Returns 0 on success, 16 on failure
+// (caller's exit code).
+static int crispasr_write_synth_audio(const std::string& out_path, const float* pcm, int n_samples, int sample_rate,
+                                      const std::string& c2pa_cert, const std::string& c2pa_key) {
+    auto has_ext = [&](const char* lo, const char* up) {
+        return out_path.size() >= 4 &&
+               (out_path.compare(out_path.size() - 4, 4, lo) == 0 || out_path.compare(out_path.size() - 4, 4, up) == 0);
+    };
+    const bool is_mp3 = has_ext(".mp3", ".MP3");
+    const bool is_aac = has_ext(".aac", ".AAC");
+    std::string blob;
+    if (is_mp3 || is_aac) {
+        blob = is_mp3 ? crispasr_make_mp3(pcm, n_samples, sample_rate) : crispasr_make_aac(pcm, n_samples, sample_rate);
+        if (blob.empty()) {
+            fprintf(stderr, "crispasr: error: %s encoding failed for '%s'\n", is_mp3 ? "MP3" : "AAC", out_path.c_str());
+            return 16;
+        }
+        if (!c2pa_cert.empty() || !c2pa_key.empty())
+            fprintf(stderr, "crispasr: warning: C2PA signing is WAV-only; '%s' is written unsigned\n",
+                    out_path.c_str());
+    } else {
+        blob = crispasr_make_wav_int16(pcm, n_samples, sample_rate);
+        // C2PA Content Credentials signing (when available + configured)
+        crispasr_c2pa_sign_wav(blob, c2pa_cert, c2pa_key);
+    }
+    FILE* fout = fopen(out_path.c_str(), "wb");
+    if (!fout) {
+        fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
+        return 16;
+    }
+    fwrite(blob.data(), 1, blob.size(), fout);
+    fclose(fout);
+    return 0;
+}
 
 // Apply FireRedPunc punctuation restoration to all segments.
 static void apply_punc_model(fireredpunc_context* punc_ctx, std::vector<crispasr_segment>& segs) {
@@ -296,6 +345,18 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
     // Speaker enrollment mode: extract TitaNet embedding, save to DB, exit.
     if (!params.enroll_speaker.empty()) {
+        // Biometric consent gate. Enrollment persists a voiceprint linked
+        // to a real name — special-category data under GDPR Art. 9. Refuse
+        // unless the deployer has affirmed a lawful basis + explicit consent.
+        if (!params.speaker_db_consent) {
+            fprintf(stderr, "crispasr: error: --enroll-speaker requires --speaker-db-consent.\n"
+                            "  Enrollment stores a voiceprint linked to a real name (biometric data,\n"
+                            "  GDPR Art. 9 special category). Pass --speaker-db-consent only if you have\n"
+                            "  explicit consent from this person and a lawful basis to store it.\n"
+                            "  For privacy-clean stable speaker labels that identify no one, use\n"
+                            "  --diarize-speakers instead (no database, no names).\n");
+            return 25;
+        }
         std::string tmodel = params.titanet_model;
         if (tmodel.empty() || tmodel == "auto") {
             tmodel =
@@ -470,8 +531,18 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         }
     }
 
+    // Issue #89: backends with a bounded safe decode window (parakeet-ja,
+    // ~12 s) need VAD slices re-split at energy minima down to that cap —
+    // continuous speech merges into 40 s+ slices that decode sparse. An
+    // explicit --chunk-seconds keeps the user in charge of the split size.
+    int slice_chunk_seconds = effective_chunk_seconds;
+    const int vad_cap = backend.vad_slice_cap_seconds();
+    if (wants_vad && !params.chunk_seconds_explicit && vad_cap > 0 &&
+        (slice_chunk_seconds == 0 || slice_chunk_seconds > vad_cap)) {
+        slice_chunk_seconds = vad_cap;
+    }
     const auto slices =
-        crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, effective_chunk_seconds, params);
+        crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, slice_chunk_seconds, params);
 
     if (slices.empty()) {
         fprintf(stderr, "crispasr: warning: no speech detected in '%s'\n", fname_inp.c_str());
@@ -735,13 +806,31 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                     if (w.t0 >= left_cs && w.t0 < right_cs)
                         kept.push_back(std::move(w));
                 }
-                // Rebuild segment text from surviving words without
-                // inserting spaces (fixes the JA kana-spacing bug from
-                // 617cd02). The tokenizer already includes leading
-                // spaces in word text where appropriate (Latin style).
+                // Rebuild segment text from the surviving words. Two word
+                // conventions coexist: whisper/parakeet carry a leading space
+                // in word.text (" on"), while granite's [T:N]-parsed words do
+                // not ("on"). Insert a separating space only when the current
+                // word does not already start with one AND the boundary is not
+                // CJK (#205: granite long-audio text was concatenated to
+                // "previouslyonmccloud's" because the words lack leading
+                // spaces; the original no-space concat fixed JA kana-spacing,
+                // 617cd02, which the CJK guard preserves).
                 std::string rebuilt;
-                for (const auto& w : kept)
+                for (const auto& w : kept) {
+                    if (w.text.empty())
+                        continue;
+                    if (!rebuilt.empty()) {
+                        const unsigned char prev_last = (unsigned char)rebuilt.back();
+                        const unsigned char cur_first = (unsigned char)w.text[0];
+                        const bool already_spaced = (cur_first == ' ');
+                        // 3-byte+ UTF-8 lead bytes (>= 0xE0) cover CJK / kana /
+                        // hangul, which are written without inter-word spaces.
+                        const bool cjk_boundary = (prev_last >= 0xE0) || (cur_first >= 0xE0);
+                        if (!already_spaced && !cjk_boundary)
+                            rebuilt += ' ';
+                    }
                     rebuilt += w.text;
+                }
                 // Strip leading space if present (first word of segment
                 // may have a leading space from BPE convention).
                 if (!rebuilt.empty() && rebuilt[0] == ' ')
@@ -757,6 +846,13 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             segs.erase(
                 std::remove_if(segs.begin(), segs.end(), [](const crispasr_segment& s) { return s.text.empty(); }),
                 segs.end());
+        }
+
+        // Issue #89 gap-fill second pass (bounded-window backends only).
+        if (be.vad_slice_cap_seconds() > 0) {
+            const char* gf = getenv("CRISPASR_GAP_FILL");
+            if (!gf || atoi(gf) != 0)
+                crispasr_gap_fill_slice(be, params, samples.data(), (int)samples.size(), SR, sl, segs);
         }
 
         if (params.diarize && !segs.empty()) {
@@ -775,7 +871,20 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
         // Speaker identification: match diarized speakers against profile DB.
         // Also supports standalone speaker ID (without diarize) when --speaker-db is set.
-        if (!params.speaker_db.empty() && !segs.empty()) {
+        //
+        // Biometric consent gate (1:N named identification, GDPR Art. 9):
+        // skip entirely unless the deployer affirmed --speaker-db-consent.
+        // Warn once (the slice loop may run on multiple workers).
+        if (!params.speaker_db.empty() && !params.speaker_db_consent) {
+            static std::once_flag spk_consent_warn;
+            std::call_once(spk_consent_warn, [] {
+                fprintf(stderr, "crispasr: --speaker-db ignored: 1:N matching against named voiceprints is\n"
+                                "  biometric identification (GDPR Art. 9). Re-run with --speaker-db-consent to\n"
+                                "  affirm consent + a lawful basis. For privacy-clean stable speaker labels\n"
+                                "  that identify no one, use --diarize-speakers instead.\n");
+            });
+        }
+        if (!params.speaker_db.empty() && params.speaker_db_consent && !segs.empty()) {
             static titanet_context* spk_ctx = nullptr;
             static speaker_db* spk_db = nullptr;
             if (!spk_ctx) {
@@ -1090,6 +1199,102 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
 } // namespace
 
+// Resolve the TADA encoder + aligner GGUFs (make-ref-encoder/aligner flags, else
+// model dir → shared cache → auto-download from the model's HF repo, honouring
+// --language), load the voice audio at 24 kHz, and run the aligner+encoder
+// pipeline into `result`. Shared by --make-ref, --align, and query-time inline
+// .wav voice cloning. Returns 0 on success, non-zero (with a stderr message
+// prefixed by `label`) on failure.
+static int tada_run_aligner_pipeline(const whisper_params& params, const std::string& audio_path,
+                                     const std::string& transcript, const char* label, tada_encoder_result& result,
+                                     double* out_audio_seconds = nullptr) {
+    auto dir_of = [](const std::string& p) -> std::string {
+        auto sep = p.find_last_of("/\\");
+        return (sep == std::string::npos) ? "." : p.substr(0, sep);
+    };
+    const std::string aux_base = (params.backend == "tada-1b" || params.backend == "tada-tts-1b")
+                                     ? "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/"
+                                     : "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/";
+    auto resolve_aux = [&](const std::string& name) -> std::string {
+        std::string local = dir_of(params.model) + "/" + name;
+        struct stat st;
+        if (stat(local.c_str(), &st) == 0)
+            return local;
+        std::string cached = crispasr_cache::dir(params.cache_dir) + "/" + name;
+        if (crispasr_cache::file_present(cached))
+            return cached;
+        if (params.auto_download)
+            return crispasr_cache::ensure_cached_file(name, aux_base + name, params.no_prints, "crispasr",
+                                                      params.cache_dir);
+        return std::string();
+    };
+    std::string encoder_path = params.make_ref_encoder;
+    std::string aligner_path = params.make_ref_aligner;
+    if (encoder_path.empty())
+        encoder_path = resolve_aux("tada-encoder-f16.gguf");
+    if (aligner_path.empty()) {
+        const std::string lang = (params.language.empty() || params.language == "auto") ? "en" : params.language;
+        aligner_path = resolve_aux("tada-aligner-" + lang + ".gguf");
+        if (aligner_path.empty() && lang != "en")
+            aligner_path = resolve_aux("tada-aligner-en.gguf");
+    }
+    if (encoder_path.empty()) {
+        fprintf(stderr,
+                "crispasr[%s]: cannot find tada-encoder GGUF. Add --auto-download to fetch it, pass "
+                "--make-ref-encoder <path>, or place tada-encoder-f16.gguf next to the model.\n",
+                label);
+        return 20;
+    }
+    if (aligner_path.empty()) {
+        fprintf(stderr,
+                "crispasr[%s]: cannot find tada-aligner GGUF. Add --auto-download to fetch it, pass "
+                "--make-ref-aligner <path>, or place tada-aligner-en.gguf next to the model.\n",
+                label);
+        return 20;
+    }
+    fprintf(stderr, "crispasr[%s]: encoder=%s\n", label, encoder_path.c_str());
+    fprintf(stderr, "crispasr[%s]: aligner=%s\n", label, aligner_path.c_str());
+    fprintf(stderr, "crispasr[%s]: voice=%s text='%s'\n", label, audio_path.c_str(), transcript.c_str());
+
+    std::vector<float> ref_audio;
+    std::vector<std::vector<float>> stereo_dummy;
+    if (!read_audio_data(audio_path, ref_audio, stereo_dummy, false)) {
+        fprintf(stderr, "crispasr[%s]: failed to load audio '%s'\n", label, audio_path.c_str());
+        return 20;
+    }
+    // read_audio_data returns 16 kHz — resample to 24 kHz for the encoder.
+    int n_16k = (int)ref_audio.size();
+    int n_24k = (int)((int64_t)n_16k * 24000 / 16000);
+    std::vector<float> audio_24k(n_24k);
+    for (int i = 0; i < n_24k; i++) {
+        float src = (float)i * 16000.0f / 24000.0f;
+        int idx = (int)src;
+        float frac = src - idx;
+        if (idx + 1 < n_16k)
+            audio_24k[i] = ref_audio[idx] * (1.0f - frac) + ref_audio[idx + 1] * frac;
+        else if (idx < n_16k)
+            audio_24k[i] = ref_audio[idx];
+    }
+    fprintf(stderr, "crispasr[%s]: audio %.2fs @ 24kHz (%d samples)\n", label, n_24k / 24000.0f, n_24k);
+    if (out_audio_seconds)
+        *out_audio_seconds = (double)n_24k / 24000.0;
+
+    tada_encoder_params ep = tada_encoder_default_params();
+    ep.n_threads = params.n_threads;
+    ep.seed = params.seed;
+    ep.verbosity = params.no_prints ? 0 : 1;
+    tada_encoder_context* ectx = tada_encoder_init(encoder_path.c_str(), ep);
+    if (!ectx) {
+        fprintf(stderr, "crispasr[%s]: failed to load encoder '%s'\n", label, encoder_path.c_str());
+        return 20;
+    }
+    int rc = tada_encoder_encode(ectx, aligner_path.c_str(), audio_24k.data(), n_24k, transcript.c_str(), result);
+    tada_encoder_free(ectx);
+    if (rc != 0)
+        fprintf(stderr, "crispasr[%s]: encode failed (rc=%d)\n", label, rc);
+    return rc;
+}
+
 int crispasr_run_backend(const whisper_params& params_in) {
     whisper_params params = params_in;
 
@@ -1156,6 +1361,250 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
 
         crispasr_wm_dispatch::shutdown();
+        return 0;
+    }
+
+    // ── --align-only: standalone CTC forced alignment (issue #217) ─────────
+    // Runs the CTC aligner on user-provided text + audio without ASR.
+    // Accepts text from --ref-text or --text-file (.txt or .srt).
+    if (params.align_only) {
+        // Resolve aligner model.
+        std::string am = params.aligner_model;
+        if (am.empty() || am == "auto" || am == "default") {
+            am = crispasr_resolve_model_cli(am.empty() ? "auto" : am, "canary-ctc-aligner", params.no_prints,
+                                            params.cache_dir, params.auto_download);
+        } else {
+            const std::string resolved =
+                crispasr_resolve_model_cli(am, "", params.no_prints, params.cache_dir, params.auto_download);
+            if (!resolved.empty())
+                am = resolved;
+        }
+        if (am.empty()) {
+            fprintf(stderr, "crispasr[align-only]: no aligner model. Pass -am <path.gguf> "
+                            "or -am auto --auto-download.\n");
+            return 10;
+        }
+
+        // Validate output granularity.
+        const std::string& gran = params.align_granularity;
+        if (gran != "auto" && gran != "word" && gran != "segment") {
+            fprintf(stderr, "crispasr[align-only]: invalid --align-granularity '%s' (auto|word|segment)\n",
+                    gran.c_str());
+            return 10;
+        }
+
+        // Read transcript text as segments: SRT cues, non-empty .txt lines,
+        // or the --ref-text string as a single segment. The flat transcript
+        // fed to the aligner is the segments joined with spaces, so aligned
+        // words can be re-grouped per segment afterwards.
+        std::vector<std::string> segment_texts;
+        bool is_srt_input = false;
+        auto trim = [](std::string s) {
+            while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
+                s.erase(s.begin());
+            while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))
+                s.pop_back();
+            return s;
+        };
+        if (!params.text_file.empty()) {
+            FILE* tf = fopen(params.text_file.c_str(), "rb");
+            if (!tf) {
+                fprintf(stderr, "crispasr[align-only]: cannot open text file '%s'\n", params.text_file.c_str());
+                return 10;
+            }
+            fseek(tf, 0, SEEK_END);
+            long sz = ftell(tf);
+            fseek(tf, 0, SEEK_SET);
+            std::string raw(sz, '\0');
+            if ((long)fread(&raw[0], 1, sz, tf) != sz) {
+                fprintf(stderr, "crispasr[align-only]: short read from '%s'\n", params.text_file.c_str());
+                fclose(tf);
+                return 10;
+            }
+            fclose(tf);
+
+            // Detect .srt by extension: cue texts kept, timestamps/indices stripped.
+            const std::string& p = params.text_file;
+            is_srt_input = (p.size() >= 4 && (p.substr(p.size() - 4) == ".srt" || p.substr(p.size() - 4) == ".SRT"));
+            if (is_srt_input) {
+                for (auto& cue : crispasr_parse_srt_cues(raw))
+                    segment_texts.push_back(trim(std::move(cue)));
+            } else {
+                // Plain .txt: each non-empty line is one segment.
+                size_t i = 0;
+                while (i < raw.size()) {
+                    size_t nl = raw.find('\n', i);
+                    if (nl == std::string::npos)
+                        nl = raw.size();
+                    std::string line = raw.substr(i, nl - i);
+                    if (!line.empty() && line.back() == '\r')
+                        line.pop_back();
+                    i = nl + 1;
+                    line = trim(std::move(line));
+                    if (!line.empty())
+                        segment_texts.push_back(std::move(line));
+                }
+            }
+        } else if (!params.tts_ref_text.empty()) {
+            std::string t = trim(params.tts_ref_text);
+            if (!t.empty())
+                segment_texts.push_back(std::move(t));
+        } else {
+            fprintf(stderr, "crispasr[align-only]: requires --ref-text or --text-file.\n");
+            return 10;
+        }
+
+        std::string transcript;
+        for (const auto& s : segment_texts) {
+            if (!transcript.empty())
+                transcript += ' ';
+            transcript += s;
+        }
+
+        if (transcript.empty()) {
+            fprintf(stderr, "crispasr[align-only]: transcript is empty.\n");
+            return 10;
+        }
+
+        // segment output: explicit, or auto for .srt input (re-timed cues).
+        const bool segment_mode = gran == "segment" || (gran == "auto" && is_srt_input);
+
+        // Load audio.
+        if (params.fname_inp.empty()) {
+            fprintf(stderr, "crispasr[align-only]: requires an audio file (-f <audio.wav>).\n");
+            return 10;
+        }
+        std::vector<float> samples;
+        std::vector<std::vector<float>> stereo_dummy;
+        if (!read_audio_data(params.fname_inp[0], samples, stereo_dummy, false)) {
+            fprintf(stderr, "crispasr[align-only]: failed to load audio '%s'\n", params.fname_inp[0].c_str());
+            return 10;
+        }
+        if (!params.no_prints) {
+            fprintf(stderr, "crispasr[align-only]: aligner=%s\n", am.c_str());
+            fprintf(stderr, "crispasr[align-only]: audio=%.2fs (%d samples @ 16kHz)\n",
+                    (float)samples.size() / 16000.0f, (int)samples.size());
+            fprintf(stderr, "crispasr[align-only]: transcript='%.80s%s'\n", transcript.c_str(),
+                    transcript.size() > 80 ? "…" : "");
+        }
+
+        // Run alignment.
+        auto aligned = crispasr_align_words(am, transcript, samples.data(), (int)samples.size(), /*t_offset_cs=*/0,
+                                            params.n_threads);
+        if (aligned.empty()) {
+            fprintf(stderr, "crispasr[align-only]: alignment failed or produced no words.\n");
+            return 10;
+        }
+
+        // Group words back into the input segments when requested.
+        std::vector<CrispasrAlignedSegment> segments;
+        if (segment_mode) {
+            segments = crispasr_group_aligned_segments(segment_texts, aligned);
+            if (segments.empty()) {
+                fprintf(stderr, "crispasr[align-only]: segment grouping produced no segments.\n");
+                return 10;
+            }
+        }
+
+        // Format output.
+        const double clip_end = (double)samples.size() / 16000.0;
+        auto ts = [](double s, bool comma) -> std::string {
+            if (s < 0)
+                s = 0;
+            int h = (int)(s / 3600);
+            int m = (int)((s - h * 3600) / 60);
+            int sec = (int)(s - h * 3600 - m * 60);
+            int ms = (int)((s - (int)s) * 1000 + 0.5);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d%c%03d", h, m, sec, comma ? ',' : '.', ms);
+            return buf;
+        };
+        auto json_esc = [](const std::string& s) {
+            std::string esc;
+            for (char c : s) {
+                if (c == '"' || c == '\\')
+                    esc += '\\';
+                esc += c;
+            }
+            return esc;
+        };
+        std::string out;
+        const std::string& fmt = params.align_format;
+        if (fmt == "json") {
+            char num[96];
+            out = "[\n";
+            if (segment_mode) {
+                for (size_t i = 0; i < segments.size(); i++) {
+                    const auto& seg = segments[i];
+                    snprintf(num, sizeof(num), "\"start\": %.3f, \"end\": %.3f, \"words\": [", seg.t0_cs / 100.0,
+                             seg.t1_cs / 100.0);
+                    out += "  {\"text\": \"" + json_esc(seg.text) + "\", " + num;
+                    for (size_t w = seg.word_begin; w < seg.word_end; w++) {
+                        snprintf(num, sizeof(num), "\"start\": %.3f, \"end\": %.3f}", aligned[w].t0_cs / 100.0,
+                                 aligned[w].t1_cs / 100.0);
+                        out += std::string(w > seg.word_begin ? ", " : "") + "{\"word\": \"" +
+                               json_esc(aligned[w].text) + "\", " + num;
+                    }
+                    out += std::string("]}") + (i + 1 < segments.size() ? "," : "") + "\n";
+                }
+            } else {
+                for (size_t i = 0; i < aligned.size(); i++) {
+                    snprintf(num, sizeof(num), "\"start\": %.3f, \"end\": %.3f}%s\n", aligned[i].t0_cs / 100.0,
+                             aligned[i].t1_cs / 100.0, i + 1 < aligned.size() ? "," : "");
+                    out += "  {\"word\": \"" + json_esc(aligned[i].text) + "\", " + num;
+                }
+            }
+            out += "]\n";
+        } else if (fmt == "plain") {
+            if (segment_mode) {
+                for (auto& seg : segments)
+                    out += ts(seg.t0_cs / 100.0, false) + "\t" + seg.text + "\n";
+            } else {
+                for (auto& w : aligned)
+                    out += ts(w.t0_cs / 100.0, false) + "\t" + w.text + "\n";
+            }
+        } else { // srt (default)
+            if (segment_mode) {
+                for (size_t i = 0; i < segments.size(); i++) {
+                    double t0 = segments[i].t0_cs / 100.0;
+                    double t1 = segments[i].t1_cs / 100.0;
+                    if (t1 <= t0)
+                        t1 = (i + 1 < segments.size()) ? segments[i + 1].t0_cs / 100.0 : clip_end;
+                    out += std::to_string(i + 1) + "\n" + ts(t0, true) + " --> " + ts(t1, true) + "\n" +
+                           segments[i].text + "\n\n";
+                }
+            } else {
+                for (size_t i = 0; i < aligned.size(); i++) {
+                    double t0 = aligned[i].t0_cs / 100.0;
+                    double t1 = aligned[i].t1_cs / 100.0;
+                    if (t1 <= t0)
+                        t1 = (i + 1 < aligned.size()) ? aligned[i + 1].t0_cs / 100.0 : clip_end;
+                    out += std::to_string(i + 1) + "\n" + ts(t0, true) + " --> " + ts(t1, true) + "\n" +
+                           aligned[i].text + "\n\n";
+                }
+            }
+        }
+
+        if (params.align_output.empty()) {
+            fputs(out.c_str(), stdout);
+        } else {
+            FILE* f = fopen(params.align_output.c_str(), "wb");
+            if (!f) {
+                fprintf(stderr, "crispasr[align-only]: cannot write '%s'\n", params.align_output.c_str());
+                return 10;
+            }
+            fwrite(out.data(), 1, out.size(), f);
+            fclose(f);
+            if (!params.no_prints) {
+                if (segment_mode)
+                    fprintf(stderr, "crispasr[align-only]: %zu words in %zu segments → %s\n", aligned.size(),
+                            segments.size(), params.align_output.c_str());
+                else
+                    fprintf(stderr, "crispasr[align-only]: %zu words → %s\n", aligned.size(),
+                            params.align_output.c_str());
+            }
+        }
+        crispasr_aligner_free_cache();
         return 0;
     }
 
@@ -1376,6 +1825,51 @@ int crispasr_run_backend(const whisper_params& params_in) {
         params.aligner_model = resolved_aligner;
     }
 
+    // Query-time inline voice cloning for TADA: if the user asks to synthesize
+    // (--tts) with a .wav voice reference, bake the reference GGUF in-memory here
+    // (before the backend loads) and rewrite --voice to it, so the two-step
+    // "--make-ref then --voice ref.gguf" collapses to one command. Requires
+    // --ref-text (the transcript drives the alignment). #201 follow-up.
+    {
+        const bool is_tada = backend_name == "tada" || backend_name == "tada-tts" || backend_name == "tada-1b" ||
+                             backend_name == "tada-tts-1b" || backend_name == "tada-3b" || backend_name == "tada-3b-ml";
+        const std::string& v = params.tts_voice;
+        const bool voice_is_wav =
+            v.size() >= 4 && (v.substr(v.size() - 4) == ".wav" || v.substr(v.size() - 4) == ".WAV");
+        if (is_tada && !params.tts_text.empty() && voice_is_wav && !params.make_ref && !params.align) {
+            if (params.tts_ref_text.empty()) {
+                fprintf(stderr, "crispasr[tada]: cloning from a .wav needs --ref-text \"exact transcript of %s\".\n",
+                        v.c_str());
+                return 20;
+            }
+            tada_encoder_result result;
+            if (tada_run_aligner_pipeline(params, v, params.tts_ref_text, "tada-clone", result) != 0)
+                return 20;
+            // Bake to a temp ref GGUF in the cache dir, keyed so repeat runs reuse it.
+            std::string tmp = crispasr_cache::dir(params.cache_dir) + "/tada-inline-voice.gguf";
+            if (tada_encoder_write_ref_gguf(tmp.c_str(), result, params.tts_ref_text.c_str(),
+                                            params.language.empty() ? nullptr : params.language.c_str()) != 0) {
+                fprintf(stderr, "crispasr[tada-clone]: failed to write reference GGUF\n");
+                return 20;
+            }
+            // Guard against a silent write no-op (e.g. an unwritable/dangling cache
+            // dir): if the ref didn't actually land, fail loudly rather than
+            // synthesizing in the default voice.
+            struct stat rst;
+            if (stat(tmp.c_str(), &rst) != 0 || rst.st_size == 0) {
+                fprintf(stderr,
+                        "crispasr[tada-clone]: baked ref did not land at '%s' (cache dir unwritable?). "
+                        "Pass --cache-dir <writable-dir>.\n",
+                        tmp.c_str());
+                return 20;
+            }
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr[tada-clone]: baked voice ref (%d tokens) → %s\n", result.n_tokens,
+                        tmp.c_str());
+            params.tts_voice = tmp; // backend init() now sees a .gguf reference
+        }
+    }
+
     // Create and init the backend.
     std::unique_ptr<CrispasrBackend> backend = crispasr_create_backend(backend_name);
     if (!backend) {
@@ -1456,6 +1950,121 @@ int crispasr_run_backend(const whisper_params& params_in) {
         return 0;
     }
 
+    // ---- make-ref / align mode: TADA aligner pipeline ----
+    // --make-ref writes a voice reference GGUF; --align emits forced-alignment
+    // word timestamps. Both share the encoder+aligner resolution, audio load,
+    // and encode; they differ only in what they do with the result.
+    if (params.make_ref || params.align) {
+        const char* verb = params.make_ref ? "make-ref" : "align";
+        if (params.tts_voice.empty()) {
+            fprintf(stderr, "crispasr[%s]: requires --voice <audio.wav>\n", verb);
+            return 20;
+        }
+        if (params.tts_ref_text.empty()) {
+            fprintf(stderr, "crispasr[%s]: requires --ref-text \"transcript of the audio\"\n", verb);
+            return 20;
+        }
+
+        const std::string out_path = params.make_ref_output.empty() ? "tada-ref-custom.gguf" : params.make_ref_output;
+
+        tada_encoder_result result;
+        double audio_seconds = 0.0;
+        if (tada_run_aligner_pipeline(params, params.tts_voice, params.tts_ref_text, verb, result, &audio_seconds) != 0)
+            return 20;
+        int rc = 0;
+
+        // --align: emit forced-alignment word timestamps and exit.
+        if (params.align) {
+            const double fps = result.frame_rate > 0 ? (double)result.frame_rate : 50.0;
+            // Group BPE tokens into words: a token whose decoded text starts with
+            // a space (GPT-2 space marker) begins a new word.
+            struct Word {
+                std::string text;
+                double start;
+            };
+            std::vector<Word> words;
+            for (int i = 0; i < result.n_tokens; i++) {
+                const std::string& tk = i < (int)result.token_texts.size() ? result.token_texts[i] : std::string();
+                double t = (i < (int)result.token_positions.size() ? result.token_positions[i] : 0.0f) / fps;
+                bool new_word = words.empty() || (!tk.empty() && tk[0] == ' ');
+                if (new_word) {
+                    std::string w = tk;
+                    if (!w.empty() && w[0] == ' ')
+                        w.erase(0, 1);
+                    words.push_back({w, t});
+                } else {
+                    words.back().text += tk;
+                }
+            }
+            const double clip_end = audio_seconds;
+            auto ts = [](double s, bool comma) -> std::string {
+                if (s < 0)
+                    s = 0;
+                int h = (int)(s / 3600);
+                int m = (int)((s - h * 3600) / 60);
+                int sec = (int)(s - h * 3600 - m * 60);
+                int ms = (int)((s - (int)s) * 1000 + 0.5);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%02d:%02d:%02d%c%03d", h, m, sec, comma ? ',' : '.', ms);
+                return buf;
+            };
+            std::string out;
+            const std::string& fmt = params.align_format;
+            if (fmt == "json") {
+                out = "[\n";
+                for (size_t i = 0; i < words.size(); i++) {
+                    double end = (i + 1 < words.size()) ? words[i + 1].start : clip_end;
+                    std::string esc;
+                    for (char c : words[i].text) {
+                        if (c == '"' || c == '\\')
+                            esc += '\\';
+                        esc += c;
+                    }
+                    char line[256];
+                    snprintf(line, sizeof(line), "  {\"word\": \"%s\", \"start\": %.3f, \"end\": %.3f}%s\n",
+                             esc.c_str(), words[i].start, end, i + 1 < words.size() ? "," : "");
+                    out += line;
+                }
+                out += "]\n";
+            } else if (fmt == "plain") {
+                for (auto& w : words)
+                    out += ts(w.start, false) + "\t" + w.text + "\n";
+            } else { // srt (default)
+                for (size_t i = 0; i < words.size(); i++) {
+                    double end = (i + 1 < words.size()) ? words[i + 1].start : clip_end;
+                    out += std::to_string(i + 1) + "\n" + ts(words[i].start, true) + " --> " + ts(end, true) + "\n" +
+                           words[i].text + "\n\n";
+                }
+            }
+            if (params.align_output.empty()) {
+                fputs(out.c_str(), stdout);
+            } else {
+                FILE* f = fopen(params.align_output.c_str(), "wb");
+                if (!f) {
+                    fprintf(stderr, "crispasr[align]: cannot write '%s'\n", params.align_output.c_str());
+                    return 20;
+                }
+                fwrite(out.data(), 1, out.size(), f);
+                fclose(f);
+                fprintf(stderr, "crispasr[align]: %d tokens → %zu words → %s\n", result.n_tokens, words.size(),
+                        params.align_output.c_str());
+            }
+            return 0;
+        }
+
+        // --make-ref: write the voice reference GGUF.
+        fprintf(stderr, "crispasr[make-ref]: %d tokens × %d-d → %s\n", result.n_tokens, result.embed_dim,
+                out_path.c_str());
+        rc = tada_encoder_write_ref_gguf(out_path.c_str(), result, params.tts_ref_text.c_str(),
+                                         params.language.empty() ? nullptr : params.language.c_str());
+        if (rc != 0) {
+            fprintf(stderr, "crispasr[make-ref]: failed to write GGUF (rc=%d)\n", rc);
+            return 20;
+        }
+        fprintf(stderr, "crispasr[make-ref]: saved %s\n", out_path.c_str());
+        return 0;
+    }
+
     // ---- TTS mode: synthesize speech from text ----
     if (!params.tts_text.empty()) {
         if (!(backend->capabilities() & CAP_TTS)) {
@@ -1493,16 +2102,94 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     params.tts_consent_attestation.c_str());
         }
 
-        auto audio = backend->synthesize(params.tts_text, params);
-        if (audio.empty()) {
-            fprintf(stderr, "crispasr: error: TTS synthesis failed\n");
-            return 15;
-        }
-
         // Sample rate of the synthesized PCM — backend-declared. Most TTS
         // backends emit 24 kHz; voxcpm2-tts emits 48 kHz. Hard-coding 24 kHz
         // here is why voxcpm2 output played at half-speed before this fix.
         const int sr_in = backend->tts_sample_rate();
+
+        // §218 (#182): sentence-chunk long input before synthesis — every TTS
+        // talker has a finite positional/training horizon (chatterbox base T3
+        // hard-caps at 2050 text positions; longer text was truncated). Split on
+        // sentence boundaries, synthesize each chunk within the model's healthy
+        // horizon, and concatenate with a 200 ms pause between chunks. The
+        // server `/v1/audio/speech` path already does this (#66); this brings the
+        // CLI `--tts` path to parity. Single-sentence input is a 1-element vector
+        // (one std::vector move of overhead). The policy wrapper keeps VibeVoice
+        // voice cloning single-shot (chunking breaks its continuous-prompt ICL).
+        // --tts-stream: emit each sentence chunk to stdout as raw s16le mono
+        // PCM as soon as it's synthesized (progressive playback), instead of
+        // concatenating into one WAV. Watermark is embedded per chunk; the
+        // spoken disclaimer (if voice-cloned) is emitted first. All logs stay
+        // on stderr so stdout is a clean PCM stream.
+        if (params.tts_stream) {
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: streaming TTS as s16le mono @ %d Hz to stdout\n", sr_in);
+            auto emit = [&](std::vector<float>& pcm) {
+                if (pcm.empty())
+                    return;
+                crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_in);
+                std::vector<int16_t> s16(pcm.size());
+                for (size_t i = 0; i < pcm.size(); i++) {
+                    float v = pcm[i] * 32767.0f;
+                    s16[i] = (int16_t)(v < -32768.0f ? -32768.0f : (v > 32767.0f ? 32767.0f : v));
+                }
+                fwrite(s16.data(), sizeof(int16_t), s16.size(), stdout);
+                fflush(stdout);
+            };
+            if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+                const auto& disc = crispasr_tts_get_disclaimer(backend.get(), params);
+                if (!disc.empty()) {
+                    std::vector<float> d(disc.begin(), disc.end());
+                    emit(d);
+                    std::vector<float> gap((size_t)sr_in / 5, 0.0f); // 200 ms
+                    emit(gap);
+                }
+            }
+            const std::vector<std::string> stream_chunks =
+                crispasr_tts_plan_chunks_for_backend(params.tts_text, backend->name());
+            bool any = false;
+            for (size_t ci = 0; ci < stream_chunks.size(); ci++) {
+                std::vector<float> c = backend->synthesize(stream_chunks[ci], params);
+                if (c.empty())
+                    continue;
+                if (any) {
+                    std::vector<float> gap((size_t)sr_in / 5, 0.0f); // 200 ms between chunks
+                    emit(gap);
+                }
+                emit(c);
+                any = true;
+            }
+            fflush(stdout);
+            crispasr_wm_dispatch::shutdown();
+            if (!any) {
+                fprintf(stderr, "crispasr: error: TTS synthesis failed\n");
+                return 15;
+            }
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: TTS stream complete\n");
+            return 0;
+        }
+
+        std::vector<float> audio;
+        {
+            const std::vector<std::string> chunks_txt =
+                crispasr_tts_plan_chunks_for_backend(params.tts_text, backend->name());
+            std::vector<std::vector<float>> chunk_pcm;
+            chunk_pcm.reserve(chunks_txt.size());
+            for (size_t ci = 0; ci < chunks_txt.size(); ci++) {
+                if (params.verbose && chunks_txt.size() > 1)
+                    fprintf(stderr, "crispasr[tts]: chunk %zu/%zu (%zu chars)\n", ci + 1, chunks_txt.size(),
+                            chunks_txt[ci].size());
+                std::vector<float> c = backend->synthesize(chunks_txt[ci], params);
+                if (!c.empty())
+                    chunk_pcm.push_back(std::move(c));
+            }
+            audio = crispasr_tts_concat_with_silence(chunk_pcm, sr_in / 5);
+        }
+        if (audio.empty()) {
+            fprintf(stderr, "crispasr: error: TTS synthesis failed\n");
+            return 15;
+        }
 
         // Prepend spoken AI-disclosure for voice-cloned output. The
         // disclaimer is synthesized with the neutral/default voice (not
@@ -1541,20 +2228,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Embed watermark (AudioSeal if loaded, otherwise spread-spectrum)
         crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_in);
 
-        // Write output WAV (backend-native sample rate, mono).
-        // crispasr_make_wav_int16 includes a LIST/INFO chunk with
-        // AI-provenance metadata (ISFT, ICMT).
+        // Write output audio (backend-native sample rate, mono) — WAV by
+        // default, MP3/AAC when --tts-output ends in .mp3/.aac.
         std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
-        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_in);
-        // C2PA Content Credentials signing (when available + configured)
-        crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
-        FILE* fout = fopen(out_path.c_str(), "wb");
-        if (!fout) {
-            fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
-            return 16;
-        }
-        fwrite(wav.data(), 1, wav.size(), fout);
-        fclose(fout);
+        if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_in, params.c2pa_cert,
+                                                params.c2pa_key))
+            return rc;
 
         // Post-embed watermark verification: re-detect on the in-memory
         // PCM (which has already been watermarked) and warn if confidence
@@ -1570,6 +2249,24 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (!params.no_prints)
             fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
                     audio.size(), sr_in, (double)audio.size() / (double)sr_in);
+
+        // --tts-play: play the watermarked PCM on the local speaker.
+        // Uses the same audio[] buffer (already watermarked at line above).
+        if (params.tts_play) {
+            crispasr_speaker* spk = crispasr_speaker_open(sr_in, 1, params.tts_play_device);
+            if (!spk) {
+                fprintf(stderr, "crispasr: warning: --tts-play: could not open playback device\n");
+            } else {
+                if (!params.no_prints)
+                    fprintf(stderr, "crispasr: playing on '%s'\n", crispasr_speaker_default_device_name());
+                if (crispasr_speaker_play(spk, audio.data(), (int)audio.size(), sr_in, 1) == 0)
+                    crispasr_speaker_wait(spk);
+                else
+                    fprintf(stderr, "crispasr: warning: --tts-play: playback failed\n");
+                crispasr_speaker_close(spk);
+            }
+        }
+
         crispasr_wm_dispatch::shutdown();
         return 0;
     }
@@ -1616,17 +2313,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Embed watermark
         crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_out);
 
-        // Write output WAV
+        // Write output audio — WAV by default, MP3/AAC when --s2s-output
+        // ends in .mp3/.aac.
         std::string out_path = params.s2s_output.empty() ? "s2s_output.wav" : params.s2s_output;
-        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_out);
-        crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
-        FILE* fout = fopen(out_path.c_str(), "wb");
-        if (!fout) {
-            fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
-            return 16;
-        }
-        fwrite(wav.data(), 1, wav.size(), fout);
-        fclose(fout);
+        if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_out, params.c2pa_cert,
+                                                params.c2pa_key))
+            return rc;
 
         if (!params.no_prints)
             fprintf(stderr, "crispasr: S2S output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),

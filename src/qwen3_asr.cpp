@@ -14,6 +14,7 @@
 
 #include "qwen3_asr.h"
 #include "../crisp_audio/include/crisp_audio.h"
+#include "crispasr_imatrix.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -29,11 +30,12 @@
 #endif
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <climits>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -42,6 +44,33 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `QWEN3_ASR_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool qwen3_asr_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("QWEN3_ASR_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct qwen3_asr_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit qwen3_asr_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~qwen3_asr_bench_stage() {
+        if (!qwen3_asr_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  qwen3_asr_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
 // ===========================================================================
 // Hyper-parameters
 // ===========================================================================
@@ -219,6 +248,13 @@ struct qwen3_asr_context {
     // qwen3_asr_compute_mel / qwen3_asr_run_encoder once `audio_ca` is open.
     crisp_audio_context* audio_ca = nullptr;
     std::string model_path; // remembered for lazy crisp_audio init
+
+    // §176s: cached encoder graph — reused when (T_chunk, num_chunks, T_chunk_out) match.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_chunk = 0;
+    int cached_enc_num_chunks = 0;
+    int cached_enc_T_chunk_out = 0;
 };
 
 // ===========================================================================
@@ -1076,6 +1112,7 @@ static void qwen3_asr_build_llm_body(qwen3_asr_context* ctx, ggml_context* ctx0,
 
     cur = ggml_rms_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
+
     cur = ggml_mul_mat(ctx0, m.llm.output_w, cur);
 
     ggml_set_name(cur, "logits");
@@ -1320,6 +1357,7 @@ extern "C" const char* qwen3_asr_token_text(qwen3_asr_context* ctx, int id) {
 // below, granite uses the same primitives, and any future GPT-2-family
 // model gets them for free.
 #include "core/bpe.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1432,8 +1470,8 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
         ctx->model_path = path;
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
-    // ggml_backend_init_best() picks the highest-priority available backend.
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    // crispasr_init_gpu_backend() picks the highest-priority available backend.
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -1522,6 +1560,7 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -1698,7 +1737,21 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
     // is ready when we add real per-chunk padding masking later.)
     std::vector<float> mask((size_t)N_padded * N_padded, 0.0f);
 
-    ggml_cgraph* gf = qwen3_asr_build_graph_encoder(ctx, chunk_T, num_chunks, T_chunk_out);
+    // §176s: reuse cached encoder graph when shape matches.
+    ggml_cgraph* gf;
+    if (ctx->cached_enc_gf && ctx->cached_enc_T_chunk == chunk_T && ctx->cached_enc_num_chunks == num_chunks &&
+        ctx->cached_enc_T_chunk_out == T_chunk_out) {
+        gf = ctx->cached_enc_gf;
+    } else {
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        std::swap(ctx->compute_meta, ctx->cached_enc_meta);
+        gf = qwen3_asr_build_graph_encoder(ctx, chunk_T, num_chunks, T_chunk_out);
+        std::swap(ctx->compute_meta, ctx->cached_enc_meta);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_chunk = chunk_T;
+        ctx->cached_enc_num_chunks = num_chunks;
+        ctx->cached_enc_T_chunk_out = T_chunk_out;
+    }
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "qwen3_asr: failed to alloc encoder graph\n");
@@ -1884,6 +1937,29 @@ extern "C" float* qwen3_asr_embed_tokens(qwen3_asr_context* ctx, const int32_t* 
         return nullptr;
     const int d = (int)ctx->model.hparams.llm_d_model;
 
+    // Fast path: single-token lookup avoids graph build + sched overhead.
+    // Gated by CRISPASR_QWEN3_ASR_EMBED_FAST (default ON).
+    static int use_fast = -1;
+    if (use_fast < 0) {
+        const char* e = std::getenv("CRISPASR_QWEN3_ASR_EMBED_FAST");
+        use_fast = (!e || *e != '0') ? 1 : 0;
+    }
+    if (n_tokens == 1 && use_fast && ctx->model.llm.token_embd_w) {
+        const ggml_tensor* w = ctx->model.llm.token_embd_w;
+        const size_t row_bytes = ggml_row_size(w->type, d);
+        float* result = (float*)malloc((size_t)d * sizeof(float));
+        if (!result)
+            return nullptr;
+        std::vector<uint8_t> raw(row_bytes);
+        ggml_backend_tensor_get(w, raw.data(), (size_t)input_ids[0] * row_bytes, row_bytes);
+        if (w->type == GGML_TYPE_F32) {
+            std::memcpy(result, raw.data(), (size_t)d * sizeof(float));
+        } else {
+            ggml_get_type_traits(w->type)->to_float(raw.data(), result, d);
+        }
+        return result;
+    }
+
     ggml_cgraph* gf = qwen3_asr_build_graph_embed(ctx, n_tokens);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -2038,7 +2114,11 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
 
     // 1. Mel
     int n_mels = 0, T_mel = 0;
-    float* mel = qwen3_asr_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
+    float* mel;
+    {
+        qwen3_asr_bench_stage _b("mel");
+        mel = qwen3_asr_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
+    }
     if (!mel) {
         fprintf(stderr, "qwen3_asr[align]: mel failed\n");
         return -2;
@@ -2046,7 +2126,11 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
 
     // 2. Audio encoder
     int N_enc = 0, pdim = 0;
-    float* audio_embeds = qwen3_asr_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &pdim);
+    float* audio_embeds;
+    {
+        qwen3_asr_bench_stage _b("encoder");
+        audio_embeds = qwen3_asr_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &pdim);
+    }
     free(mel);
     if (!audio_embeds) {
         fprintf(stderr, "qwen3_asr[align]: encoder failed\n");
@@ -2109,13 +2193,20 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
     free(audio_embeds);
 
     // 5. KV cache + aligner forward
-    if (!qwen3_asr_kv_init(ctx, /*max_ctx*/ std::max(4096, T_prompt + 16))) {
-        free(text_embeds);
-        fprintf(stderr, "qwen3_asr[align]: kv_init failed\n");
-        return -5;
+    {
+        qwen3_asr_bench_stage _b("kv_init");
+        if (!qwen3_asr_kv_init(ctx, /*max_ctx*/ std::max(4096, T_prompt + 16))) {
+            free(text_embeds);
+            fprintf(stderr, "qwen3_asr[align]: kv_init failed\n");
+            return -5;
+        }
     }
     int n_t_out = 0, H = 0;
-    float* logits = qwen3_asr_run_aligner(ctx, text_embeds, T_prompt, &n_t_out, &H);
+    float* logits;
+    {
+        qwen3_asr_bench_stage _b("aligner_forward");
+        logits = qwen3_asr_run_aligner(ctx, text_embeds, T_prompt, &n_t_out, &H);
+    }
     free(text_embeds);
     if (!logits) {
         fprintf(stderr, "qwen3_asr[align]: aligner forward failed\n");

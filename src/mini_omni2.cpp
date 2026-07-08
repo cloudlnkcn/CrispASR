@@ -21,6 +21,7 @@
 #include "core/gguf_loader.h"
 #include "core/mel.h"
 #include "core/snac.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -29,12 +30,39 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `MINI_OMNI2_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool mini_omni2_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("MINI_OMNI2_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct mini_omni2_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit mini_omni2_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~mini_omni2_bench_stage() {
+        if (!mini_omni2_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  mini_omni2_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // Model structures
@@ -183,7 +211,7 @@ extern "C" struct mini_omni2_context* mini_omni2_init_from_file(const char* path
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -1076,6 +1104,7 @@ extern "C" char* mini_omni2_transcribe(struct mini_omni2_context* ctx, const flo
         return nullptr;
 
     const auto& hp = ctx->model.hp;
+    mini_omni2_bench_stage _b_total("total");
 
     // 1. Pad to 30s and compute mel
     const int N30 = 480000;
@@ -1083,13 +1112,21 @@ extern "C" char* mini_omni2_transcribe(struct mini_omni2_context* ctx, const flo
     memcpy(audio.data(), samples, std::min(n_samples, N30) * sizeof(float));
 
     int n_mels = 0, T_mel = 0;
-    float* mel = mini_omni2_compute_mel(ctx, audio.data(), N30, &n_mels, &T_mel);
+    float* mel = nullptr;
+    {
+        mini_omni2_bench_stage _b("mel");
+        mel = mini_omni2_compute_mel(ctx, audio.data(), N30, &n_mels, &T_mel);
+    }
     if (!mel)
         return nullptr;
 
     // 2. Run encoder
     int T_enc = 0, enc_dim = 0;
-    float* enc = mini_omni2_run_encoder(ctx, mel, n_mels, T_mel, &T_enc, &enc_dim);
+    float* enc = nullptr;
+    {
+        mini_omni2_bench_stage _b("encoder");
+        enc = mini_omni2_run_encoder(ctx, mel, n_mels, T_mel, &T_enc, &enc_dim);
+    }
     free(mel);
     if (!enc)
         return nullptr;
@@ -1100,7 +1137,11 @@ extern "C" char* mini_omni2_transcribe(struct mini_omni2_context* ctx, const flo
 
     // 3. Run adapter
     int adap_T = 0, adap_dim = 0;
-    float* adapted = mini_omni2_run_adapter(ctx, enc, T_enc, enc_dim, &adap_T, &adap_dim);
+    float* adapted = nullptr;
+    {
+        mini_omni2_bench_stage _b("adapter");
+        adapted = mini_omni2_run_adapter(ctx, enc, T_enc, enc_dim, &adap_T, &adap_dim);
+    }
     free(enc);
     if (!adapted)
         return nullptr;
@@ -1155,6 +1196,7 @@ extern "C" char* mini_omni2_transcribe(struct mini_omni2_context* ctx, const flo
         avg_emb[i] /= 8.0f;
 
     // 5. KV cache + prefill + greedy decode
+    mini_omni2_bench_stage _b_decode("prefill+decode");
     if (!ctx->kv_ctx && !mini_omni2_kv_init(ctx, 4096)) {
         return nullptr;
     }

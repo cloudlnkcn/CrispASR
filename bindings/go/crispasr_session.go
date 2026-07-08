@@ -3,8 +3,9 @@ package whisper
 // Minimal TTS + S2S surface for the Go binding. Exposes the unified
 // CrispASR Session API for TTS-capable backends (kokoro, vibevoice,
 // qwen3-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
-// melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
-// cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio, ...)
+// bananamind-tts, melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
+// cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio,
+// dots-tts, ...)
 // and S2S-capable backends (lfm2-audio, mini-omni2), plus the kokoro
 // per-language model + voice resolver (PLAN #56 opt 2b).
 
@@ -36,10 +37,14 @@ int              crispasr_session_set_tts_seed(CrispasrSession* s, unsigned long
 int              crispasr_session_set_max_new_tokens(CrispasrSession* s, int max_new_tokens);
 int              crispasr_session_set_frequency_penalty(CrispasrSession* s, float penalty);
 int              crispasr_session_set_tts_steps(CrispasrSession* s, int steps);
+int              crispasr_session_set_tts_num_candidates(CrispasrSession* s, int n);
 int              crispasr_session_set_top_p(CrispasrSession* s, float top_p);
+int              crispasr_session_set_top_k(CrispasrSession* s, int top_k);
+int              crispasr_session_set_do_sample(CrispasrSession* s, int enable);
 int              crispasr_session_set_min_p(CrispasrSession* s, float min_p);
 int              crispasr_session_set_repetition_penalty(CrispasrSession* s, float r);
 int              crispasr_session_set_cfg_weight(CrispasrSession* s, float cfg_weight);
+int              crispasr_session_set_tts_noise_temp(CrispasrSession* s, float noise_temp);
 int              crispasr_session_set_exaggeration(CrispasrSession* s, float exaggeration);
 int              crispasr_session_set_max_speech_tokens(CrispasrSession* s, int n);
 int              crispasr_session_set_length_scale(CrispasrSession* s, float scale);
@@ -85,8 +90,12 @@ typedef struct crispasr_session_result crispasr_session_result;
 crispasr_session_result* crispasr_session_transcribe(CrispasrSession* s, const float* pcm, int n_samples);
 crispasr_session_result* crispasr_session_transcribe_lang(CrispasrSession* s, const float* pcm, int n_samples,
                                                           const char* language);
+crispasr_session_result* crispasr_session_transcribe_chunked_lang(CrispasrSession* s, const float* pcm, int n_samples,
+                                                                  int chunk_seconds, int overlap_seconds,
+                                                                  const char* language);
 crispasr_session_result* crispasr_session_transcribe_vad(CrispasrSession* s, const float* pcm, int n_samples,
                                                          int sample_rate, const char* vad_model_path, void* opts);
+int          crispasr_get_progress(void);
 int          crispasr_session_result_n_segments(crispasr_session_result* r);
 const char*  crispasr_session_result_segment_text(crispasr_session_result* r, int i);
 long long    crispasr_session_result_segment_t0(crispasr_session_result* r, int i);
@@ -244,6 +253,9 @@ int crispasr_lcs_dedup_prefix_count(const int* prev_tail_tokens, int n_prev,
                                     const int* curr_tokens, int n_curr, int min_lcs_length);
 
 // --- Direct Parakeet API ---
+// Note: nemotron, lfm2-audio, and other recent backends are accessed
+// via the Session API (Open → Transcribe → Close). Standalone wrappers
+// below are for backwards compatibility with early parakeet integrations.
 void* crispasr_parakeet_init(const char* model_path, int n_threads, int use_flash);
 void  crispasr_parakeet_free(void* ctx);
 void* crispasr_parakeet_transcribe(void* ctx, const float* pcm, int n_samples, const char* language);
@@ -481,11 +493,44 @@ func (s *CrispasrSession) SetTTSSteps(steps int) error {
 	return nil
 }
 
+// SetTTSNumCandidates sets the number of flow-matching timing candidates
+// ranked per token (TADA). Higher = more reliable multilingual timing at
+// higher cost. Other backends silently no-op.
+func (s *CrispasrSession) SetTTSNumCandidates(n int) error {
+	rc := C.crispasr_session_set_tts_num_candidates(s.handle, C.int(n))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_tts_num_candidates failed")
+	}
+	return nil
+}
+
 // SetTopP sets the top-p nucleus-sampling threshold. Honoured by chatterbox.
 func (s *CrispasrSession) SetTopP(topP float32) error {
 	rc := C.crispasr_session_set_top_p(s.handle, C.float(topP))
 	if rc != 0 && rc != -2 {
 		return errors.New("crispasr_session_set_top_p failed")
+	}
+	return nil
+}
+
+// SetTopK sets the top-k sampling cutoff (0 = disabled). Honoured by TADA.
+func (s *CrispasrSession) SetTopK(topK int) error {
+	rc := C.crispasr_session_set_top_k(s.handle, C.int(topK))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_top_k failed")
+	}
+	return nil
+}
+
+// SetDoSample enables/disables sampling (false = greedy). Honoured by TADA.
+func (s *CrispasrSession) SetDoSample(enable bool) error {
+	cEnable := C.int(0)
+	if enable {
+		cEnable = C.int(1)
+	}
+	rc := C.crispasr_session_set_do_sample(s.handle, cEnable)
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_do_sample failed")
 	}
 	return nil
 }
@@ -515,6 +560,16 @@ func (s *CrispasrSession) SetCFGWeight(cfgWeight float32) error {
 	rc := C.crispasr_session_set_cfg_weight(s.handle, C.float(cfgWeight))
 	if rc != 0 && rc != -2 {
 		return errors.New("crispasr_session_set_cfg_weight failed")
+	}
+	return nil
+}
+
+// SetTtsNoiseTemp sets the TADA flow-matching noise temperature
+// (Python noise_temp, default 0.9).
+func (s *CrispasrSession) SetTtsNoiseTemp(noiseTemp float32) error {
+	rc := C.crispasr_session_set_tts_noise_temp(s.handle, C.float(noiseTemp))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_tts_noise_temp failed")
 	}
 	return nil
 }
@@ -1003,6 +1058,41 @@ func (s *CrispasrSession) TranscribeLang(pcm []float32, lang string) (*Transcrib
 	}
 	defer C.crispasr_session_result_free(r)
 	return extractResult(r), nil
+}
+
+// TranscribeChunked runs chunked-encode ASR (issue #208): it forces the
+// Parakeet backend through its bounded overlapping-window long-form path so
+// long audio transcribes in bounded time without dropping sections. Inert
+// (== TranscribeLang) on non-Parakeet backends. chunkSeconds <= 0 keeps the
+// per-model default window; overlapSeconds < 0 keeps the default overlap.
+// Poll GetProgress() (0..100) from another goroutine to render progress.
+func (s *CrispasrSession) TranscribeChunked(pcm []float32, chunkSeconds, overlapSeconds int, lang string) (*TranscribeResult, error) {
+	if s.handle == nil {
+		return nil, errors.New("session is closed")
+	}
+	pcmPtr := (*C.float)(nil)
+	if len(pcm) > 0 {
+		pcmPtr = (*C.float)(unsafe.Pointer(&pcm[0]))
+	}
+	var clang *C.char
+	if lang != "" {
+		clang = C.CString(lang)
+		defer C.free(unsafe.Pointer(clang))
+	}
+	r := C.crispasr_session_transcribe_chunked_lang(s.handle, pcmPtr, C.int(len(pcm)),
+		C.int(chunkSeconds), C.int(overlapSeconds), clang)
+	if r == nil {
+		return nil, errors.New("chunked transcription failed")
+	}
+	defer C.crispasr_session_result_free(r)
+	return extractResult(r), nil
+}
+
+// GetProgress polls long-form (chunked) transcription progress: 0..100, or -1
+// when idle. Updated in lockstep with TranscribeChunked windows (issue #208),
+// so a UI goroutine can render a progress bar without a callback.
+func GetProgress() int {
+	return int(C.crispasr_get_progress())
 }
 
 // TranscribeVAD transcribes with VAD segmentation.

@@ -1,42 +1,29 @@
 #!/usr/bin/env python3
 """
-Convert HumeAI/tada-3b-ml HuggingFace safetensors → GGUF F16 for the
+Convert any HumeAI/tada-* HuggingFace safetensors → GGUF F16 for the
 CrispASR `tada-tts` backend.
 
-TADA-3B-ML is Llama-3.2-3B plus:
-  - acoustic_proj: Linear(512, 3072) — maps acoustic features to hidden_size
-  - time_start_embed: Embedding(1024, 3072) — time-before gray-code embed
-  - time_end_embed: Embedding(1024, 3072) — time-after gray-code embed
-  - acoustic_mask_emb: Embedding(2, 3072) — voiced/unvoiced mask
-  - bottleneck_proj: Linear(3072, bottleneck_dim) or Identity — for FM head
-  - prediction_head: VibeVoiceDiffusionHead — flow matching diffusion head
+Supports both TADA variants:
+  tada-3b-ml: Llama-3.2-3B backbone, num_time_classes=1024, head_layers=4
+  tada-1b:    Llama-3.2-1B backbone, num_time_classes=256,  head_layers=6,
+              tie_word_embeddings=True (lm_head shares embed_tokens weight)
 
-Architecture (from HumeAI/tada-3b-ml/config.json):
-  Llama-3.2-3B:
-    hidden_size          = 3072
-    num_hidden_layers    = 28
-    num_attention_heads  = 24
-    num_key_value_heads  = 8
-    head_dim             = 128
-    intermediate_size    = 8192
-    vocab_size           = 128256
-    rope_theta           = 500000
-    rms_norm_eps         = 1e-5
-
-  TADA-specific:
-    acoustic_dim         = 512
-    num_time_classes     = 1024 (num_time_bits = 10, time_dim = 20)
-    shift_acoustic       = 5
-    head_layers          = 4
-    head_ffn_ratio       = 3.0
-    bottleneck_dim       = None or int
-    acoustic_mean        = 0.0
-    acoustic_std         = 1.5
+Common TADA-specific layers (all variants):
+  - acoustic_proj: Linear(512, hidden_size)
+  - time_start_embed: Embedding(num_time_classes, hidden_size)
+  - time_end_embed: Embedding(num_time_classes, hidden_size)
+  - acoustic_mask_emb: Embedding(2, hidden_size)
+  - bottleneck_proj: Linear(hidden_size, bottleneck_dim) or Identity
+  - prediction_head: VibeVoiceDiffusionHead (flow matching)
 
 Usage:
     python models/convert-tada-to-gguf.py \\
         --input HumeAI/tada-3b-ml \\
         --output tada-tts-3b-ml-f16.gguf
+
+    python models/convert-tada-to-gguf.py \\
+        --input HumeAI/tada-1b \\
+        --output tada-tts-1b-f16.gguf
 """
 
 from __future__ import annotations
@@ -143,14 +130,17 @@ def map_tensor_name(hf_name: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert TADA-3B-ML to GGUF")
+    ap = argparse.ArgumentParser(description="Convert HumeAI TADA model to GGUF")
     ap.add_argument("--input", required=True,
-                    help="HF model ID (e.g. HumeAI/tada-3b-ml) or local dir")
+                    help="HF model ID (e.g. HumeAI/tada-3b-ml or HumeAI/tada-1b) or local dir")
     ap.add_argument("--output", required=True, help="Output GGUF path")
-    ap.add_argument("--outtype", default="f16", choices=["f32", "f16"])
+    ap.add_argument("--outtype", default="f16", choices=["f32", "f16", "bf16"])
     args = ap.parse_args()
 
     model_dir = load_model_dir(args.input)
+
+    # Derive a clean model name from the input (last path component, strip HumeAI/ prefix)
+    model_slug = Path(args.input).name.replace("_", "-").lower()
 
     with open(model_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -186,7 +176,9 @@ def main():
     fm_hidden = bottleneck_dim if bottleneck_dim is not None else d_model
     fm_latent = acoustic_dim + time_dim  # 532
 
-    print(f"\nTADA-3B-ML")
+    tie_word_embeddings = bool(cfg.get("tie_word_embeddings", False))
+
+    print(f"\n{model_slug.upper()}")
     print(f"  Talker:        {n_layers}L  hidden={d_model}  "
           f"heads={n_heads}/{n_kv_heads}  head_dim={head_dim}  "
           f"ff={ff_dim}  vocab={vocab_size}")
@@ -200,9 +192,17 @@ def main():
           f"hidden={fm_hidden}  latent={fm_latent}")
     print(f"  Shift:         {shift_acoustic}")
     print(f"  Bottleneck:    {bottleneck_dim}")
+    print(f"  Tied embeds:   {tie_word_embeddings}")
 
-    out_dtype = np.float16 if args.outtype == "f16" else np.float32
-    out_qt = GGMLQuantizationType.F16 if args.outtype == "f16" else GGMLQuantizationType.F32
+    if args.outtype == "f16":
+        out_dtype = np.float16
+        out_qt = GGMLQuantizationType.F16
+    elif args.outtype == "bf16":
+        out_dtype = None
+        out_qt = GGMLQuantizationType.BF16
+    else:
+        out_dtype = np.float32
+        out_qt = GGMLQuantizationType.F32
 
     st_files = sorted(model_dir.glob("*.safetensors"))
     if not st_files:
@@ -256,7 +256,7 @@ def main():
     out_path = Path(args.output)
     w = GGUFWriter(str(out_path), arch="tada-tts", use_temp_file=False)
 
-    w.add_name("tada-tts-3b-ml")
+    w.add_name(f"tada-tts-{model_slug}")
 
     def u32(k, v): w.add_uint32(k, int(v))
     def f32(k, v): w.add_float32(k, float(v))
@@ -305,6 +305,11 @@ def main():
         if gn is None:
             n_skipped += 1
             continue
+        # With tie_word_embeddings=True there is no lm_head.weight in the safetensors;
+        # the C++ runtime falls back to token_embd.weight automatically.
+        if tie_word_embeddings and hf_name == "lm_head.weight":
+            n_skipped += 1
+            continue
 
         # Verify it maps to our expected prefixes
         valid_prefixes = ("talker.", "tada.")
@@ -313,11 +318,19 @@ def main():
             n_skipped += 1
             continue
 
-        t = handles[name_to_idx[hf_name]].get_tensor(hf_name).to(torch.float32).numpy()
-        if t.ndim <= 1:
+        t_pt = handles[name_to_idx[hf_name]].get_tensor(hf_name)
+        if t_pt.ndim <= 1:
+            t = t_pt.to(torch.float32).numpy()
             t = np.ascontiguousarray(t.astype(np.float32))
             w.add_tensor(gn, t, raw_dtype=GGMLQuantizationType.F32)
+        elif args.outtype == "bf16":
+            if t_pt.dtype == torch.bfloat16:
+                t = np.ascontiguousarray(t_pt.view(torch.uint16).numpy())
+            else:
+                t = np.ascontiguousarray(t_pt.to(torch.bfloat16).view(torch.uint16).numpy())
+            w.add_tensor(gn, t, raw_dtype=out_qt)
         else:
+            t = t_pt.to(torch.float32).numpy()
             t = np.ascontiguousarray(t.astype(out_dtype))
             w.add_tensor(gn, t, raw_dtype=out_qt)
         n_mapped += 1

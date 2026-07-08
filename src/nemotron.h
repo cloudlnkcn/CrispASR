@@ -84,6 +84,10 @@ void nemotron_set_language(struct nemotron_context* ctx, const char* lang_code);
 void nemotron_set_temperature(struct nemotron_context* ctx, float temperature, uint64_t seed);
 void nemotron_set_beam_size(struct nemotron_context* ctx, int beam_size);
 
+// MAES (Modified Adaptive Expansion Search) beam decoding. Requires
+// beam_size > 1. enable=false disables (reverts to standard beam search).
+void nemotron_set_maes(struct nemotron_context* ctx, bool enable, int num_steps, float gamma, int beta);
+
 // Vocabulary helpers
 int nemotron_n_vocab(struct nemotron_context* ctx);
 int nemotron_blank_id(struct nemotron_context* ctx);
@@ -93,6 +97,14 @@ const char* nemotron_token_to_str(struct nemotron_context* ctx, int token_id);
 int nemotron_frame_dur_cs(struct nemotron_context* ctx);
 int nemotron_n_mels(struct nemotron_context* ctx);
 int nemotron_sample_rate(struct nemotron_context* ctx);
+
+// Per-token streaming callback. For RNN-T, fires once per emitted (non-blank) token.
+typedef void (*nemotron_token_cb)(int tok_id, float prob, void* userdata);
+
+// Like nemotron_transcribe() but fires cb for each non-blank token emitted by RNN-T.
+// Uses greedy RNN-T decode regardless of beam_size setting.
+void nemotron_transcribe_cb(struct nemotron_context* ctx, const float* samples, int n_samples, nemotron_token_cb cb,
+                            void* userdata);
 
 #ifdef __cplusplus
 }

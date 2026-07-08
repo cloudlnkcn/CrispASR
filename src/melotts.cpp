@@ -25,9 +25,11 @@
 
 #include "core/conv.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -35,7 +37,44 @@
 #include <map>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+static bool melotts_use_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (getenv("MELOTTS_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+#endif
+
+// ===========================================================================
+// Bench instrumentation — `MELOTTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool melotts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("MELOTTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct melotts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit melotts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~melotts_bench_stage() {
+        if (!melotts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  melotts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── JSON-lite helpers ─────────────────────────────────────────────
 // Parse JSON arrays/objects from GGUF metadata strings.
@@ -884,6 +923,9 @@ struct melotts_context {
     int n_threads;
     uint32_t seed;
     std::string dump_dir;
+
+    std::unordered_map<ggml_tensor*, std::vector<float>> weight_cache;
+    bool weight_cache_enabled = true;
 };
 
 // ── Diff harness ──────────────────────────────────────────────────
@@ -934,7 +976,17 @@ struct mini_graph {
 
 // ── Tensor read helper ────────────────────────────────────────────
 
+static melotts_context* g_melotts_ctx = nullptr;
+
 static void read_tensor_f32(ggml_tensor* t, std::vector<float>& out) {
+    if (g_melotts_ctx && g_melotts_ctx->weight_cache_enabled) {
+        auto it = g_melotts_ctx->weight_cache.find(t);
+        if (it != g_melotts_ctx->weight_cache.end()) {
+            out = it->second;
+            return;
+        }
+    }
+
     const int64_t n = ggml_nelements(t);
     out.resize(n);
     if (t->type == GGML_TYPE_F32) {
@@ -1005,18 +1057,40 @@ static void cpu_multihead_attention_relpos(const std::vector<float>& x, // (C, T
     }
 
     std::vector<float> Q(C * T), K(C * T), V(C * T);
-    for (int t = 0; t < T; t++) {
-        for (int co = 0; co < C; co++) {
-            float sq = bq[co], sk = bk[co], sv = bv[co];
-            for (int ci = 0; ci < C; ci++) {
-                float xv = x_in[t * C + ci];
-                sq += xv * wq[ci + co * C];
-                sk += xv * wk[ci + co * C];
-                sv += xv * wv[ci + co * C];
+#if defined(HAVE_ACCELERATE)
+    if (!melotts_use_scalar()) {
+        // Q/K/V[T,C] = x_in[T,C] @ w^T[C,C] + bias[C]
+        // Weight layout: w[ci + co*C] = column-major [C_in × C_out].
+        // CblasTrans on B makes BLAS read w as row-major [C_out × C_in]^T = [C_in × C_out].
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x_in.data(), C, wq.data(), C, 0.0f,
+                    Q.data(), C);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x_in.data(), C, wk.data(), C, 0.0f,
+                    K.data(), C);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x_in.data(), C, wv.data(), C, 0.0f,
+                    V.data(), C);
+        for (int t = 0; t < T; t++) {
+            for (int c = 0; c < C; c++) {
+                Q[t * C + c] += bq[c];
+                K[t * C + c] += bk[c];
+                V[t * C + c] += bv[c];
             }
-            Q[t * C + co] = sq;
-            K[t * C + co] = sk;
-            V[t * C + co] = sv;
+        }
+    } else
+#endif
+    {
+        for (int t = 0; t < T; t++) {
+            for (int co = 0; co < C; co++) {
+                float sq = bq[co], sk = bk[co], sv = bv[co];
+                for (int ci = 0; ci < C; ci++) {
+                    float xv = x_in[t * C + ci];
+                    sq += xv * wq[ci + co * C];
+                    sk += xv * wk[ci + co * C];
+                    sv += xv * wv[ci + co * C];
+                }
+                Q[t * C + co] = sq;
+                K[t * C + co] = sk;
+                V[t * C + co] = sv;
+            }
         }
     }
 
@@ -1033,22 +1107,34 @@ static void cpu_multihead_attention_relpos(const std::vector<float>& x, // (C, T
         int ch_off = h * D;
 
         std::vector<float> scores(T * T);
+#if defined(HAVE_ACCELERATE)
+        if (!melotts_use_scalar()) {
+            // scores[T,T] = inv_sqrt_d * Q_h[T,D] @ K_h[T,D]^T
+            // Q_h has non-contiguous rows (stride C instead of D); lda=C handles this.
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, T, D, inv_sqrt_d, Q.data() + ch_off, C,
+                        K.data() + ch_off, C, 0.0f, scores.data(), T);
+        } else
+#endif
+        {
+            for (int i = 0; i < T; i++) {
+                for (int j = 0; j < T; j++) {
+                    float s = 0;
+                    for (int d = 0; d < D; d++)
+                        s += Q[i * C + ch_off + d] * K[j * C + ch_off + d];
+                    scores[i * T + j] = s * inv_sqrt_d;
+                }
+            }
+        }
+
+        // Relative key bias — only 2W+1 positions, O(T*2W*D) << O(T²*D)
         for (int i = 0; i < T; i++) {
-            for (int j = 0; j < T; j++) {
-                float s = 0;
-                for (int d = 0; d < D; d++) {
-                    s += Q[i * C + ch_off + d] * K[j * C + ch_off + d];
-                }
-                s *= inv_sqrt_d;
+            int j0 = std::max(0, i - W), j1 = std::min(T, i + W + 1);
+            for (int j = j0; j < j1; j++) {
                 int r = j - i + W;
-                if (r >= 0 && r < n_rel) {
-                    float rel_s = 0;
-                    for (int d = 0; d < D; d++) {
-                        rel_s += Q[i * C + ch_off + d] * rel_k[d + r * D];
-                    }
-                    s += rel_s * inv_sqrt_d;
-                }
-                scores[i * T + j] = s;
+                float rel_s = 0;
+                for (int d = 0; d < D; d++)
+                    rel_s += Q[i * C + ch_off + d] * rel_k[d + r * D];
+                scores[i * T + j] += rel_s * inv_sqrt_d;
             }
         }
 
@@ -1067,19 +1153,39 @@ static void cpu_multihead_attention_relpos(const std::vector<float>& x, // (C, T
                 scores[i * T + j] /= sum_e;
         }
 
-        // Weighted sum with relative value bias
-        for (int i = 0; i < T; i++) {
-            for (int d = 0; d < D; d++) {
-                float s = 0;
-                for (int j = 0; j < T; j++) {
-                    float w_ij = scores[i * T + j];
-                    s += w_ij * V[j * C + ch_off + d];
+        // V accumulation: out_h[T,D] = scores[T,T] @ V_h[T,D] + rel_val_bias
+#if defined(HAVE_ACCELERATE)
+        if (!melotts_use_scalar()) {
+            std::vector<float> tmp(T * D, 0.0f);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, D, T, 1.0f, scores.data(), T, V.data() + ch_off,
+                        C, 0.0f, tmp.data(), D);
+            // Relative value bias — same 2W+1 window
+            for (int i = 0; i < T; i++) {
+                int j0 = std::max(0, i - W), j1 = std::min(T, i + W + 1);
+                for (int j = j0; j < j1; j++) {
                     int r = j - i + W;
-                    if (r >= 0 && r < n_rel) {
-                        s += w_ij * rel_v[d + r * D];
-                    }
+                    float w_ij = scores[i * T + j];
+                    for (int d = 0; d < D; d++)
+                        tmp[i * D + d] += w_ij * rel_v[d + r * D];
                 }
-                out[i * C + ch_off + d] = s;
+            }
+            for (int t = 0; t < T; t++)
+                std::memcpy(out.data() + t * C + ch_off, tmp.data() + t * D, D * sizeof(float));
+        } else
+#endif
+        {
+            for (int i = 0; i < T; i++) {
+                for (int d = 0; d < D; d++) {
+                    float s = 0;
+                    for (int j = 0; j < T; j++) {
+                        float w_ij = scores[i * T + j];
+                        s += w_ij * V[j * C + ch_off + d];
+                        int r = j - i + W;
+                        if (r >= 0 && r < n_rel)
+                            s += w_ij * rel_v[d + r * D];
+                    }
+                    out[i * C + ch_off + d] = s;
+                }
             }
         }
     }
@@ -2589,7 +2695,7 @@ struct melotts_context* melotts_init_from_file(const char* path_model, struct me
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
@@ -2634,6 +2740,36 @@ struct melotts_context* melotts_init_from_file(const char* path_model, struct me
                 "flow=%u blocks (tf=%u layers), ups=%u, sr=%u, speakers=%u)\n",
                 path_model, ctx->hp.hidden_channels, ctx->hp.n_layers_enc, ctx->hp.n_flow_blocks,
                 ctx->hp.n_layers_trans_flow, ctx->hp.n_upsample_stages, ctx->hp.sample_rate, ctx->hp.n_speakers);
+    }
+
+    // Pre-cache all weights as F32 (CRISPASR_MELOTTS_WEIGHT_CACHE, default ON).
+    {
+        const char* env = std::getenv("CRISPASR_MELOTTS_WEIGHT_CACHE");
+        ctx->weight_cache_enabled = (!env || *env != '0');
+    }
+    if (ctx->weight_cache_enabled && ctx->w_ctx) {
+        int n_cached = 0;
+        size_t bytes_cached = 0;
+        for (ggml_tensor* t = ggml_get_first_tensor(ctx->w_ctx); t; t = ggml_get_next_tensor(ctx->w_ctx, t)) {
+            const int64_t n = ggml_nelements(t);
+            std::vector<float> f32(n);
+            const size_t nbytes = ggml_nbytes(t);
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, f32.data(), 0, nbytes);
+            } else {
+                std::vector<uint8_t> raw(nbytes);
+                ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
+                const auto to_float = ggml_get_type_traits(t->type)->to_float;
+                if (to_float)
+                    to_float(raw.data(), f32.data(), n);
+            }
+            bytes_cached += n * sizeof(float);
+            ctx->weight_cache[t] = std::move(f32);
+            n_cached++;
+        }
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "melotts: cached %d tensors (%.1f MB F32) for fast CPU path\n", n_cached,
+                    (double)bytes_cached / (1024.0 * 1024.0));
     }
 
     return ctx;
@@ -2682,10 +2818,16 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
     if (!ctx || !text || !pcm_out)
         return 0;
 
+    g_melotts_ctx = ctx;
+    melotts_bench_stage _bs_synth("synthesize");
+
     // 1. Text processing (G2P)
     std::vector<int> phone_ids, tone_ids, lang_ids;
     std::vector<int> word2ph;
-    g2p_english(ctx->g2p, text, phone_ids, tone_ids, lang_ids, word2ph);
+    {
+        melotts_bench_stage _bs("g2p");
+        g2p_english(ctx->g2p, text, phone_ids, tone_ids, lang_ids, word2ph);
+    }
     int T = (int)phone_ids.size();
 
     if (ctx->verbosity >= 2) {
@@ -2774,18 +2916,25 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
 
     // 4. Text encoder
     std::vector<float> enc_out, enc_mean, enc_logvar;
-    text_encoder_forward(ctx, phone_ids, tone_ids, lang_ids, ja_bert_features, enc_out, enc_mean, enc_logvar);
+    {
+        melotts_bench_stage _bs("text_encoder");
+        text_encoder_forward(ctx, phone_ids, tone_ids, lang_ids, ja_bert_features, enc_out, enc_mean, enc_logvar);
+    }
 
     int C = (int)ctx->hp.inter_channels;
     if (enc_mean.empty()) {
         fprintf(stderr, "melotts: text encoder produced empty output\n");
+        g_melotts_ctx = nullptr;
         return 0;
     }
 
     // 4. Duration prediction (SDP + DP blend)
     std::vector<float> sdp_logw, dp_logw;
-    sdp_forward(ctx, enc_out, g_vec, T, ctx->noise_w, sdp_logw);
-    dp_forward(ctx, enc_out, g_vec, T, dp_logw);
+    {
+        melotts_bench_stage _bs("duration_predict");
+        sdp_forward(ctx, enc_out, g_vec, T, ctx->noise_w, sdp_logw);
+        dp_forward(ctx, enc_out, g_vec, T, dp_logw);
+    }
 
     // Blend
     std::vector<float> logw(T);
@@ -2824,13 +2973,21 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
     dump_stage(ctx, "z_p", z.data(), z.size());
 
     // 7. Flow inverse
-    flow_inverse(ctx, z, g_vec, T_latent);
+    {
+        melotts_bench_stage _bs("flow_inverse");
+        flow_inverse(ctx, z, g_vec, T_latent);
+    }
     dump_stage(ctx, "z_dec", z.data(), z.size());
 
     // 8. HiFi-GAN decode
     std::vector<float> pcm;
-    if (!hifigan_decode(ctx, z, g_vec, T_latent, pcm))
-        return 0;
+    {
+        melotts_bench_stage _bs("hifigan_decode");
+        if (!hifigan_decode(ctx, z, g_vec, T_latent, pcm)) {
+            g_melotts_ctx = nullptr;
+            return 0;
+        }
+    }
     dump_stage(ctx, "audio", pcm.data(), pcm.size());
 
     // 9. Return
@@ -2845,6 +3002,7 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
         fprintf(stderr, "melotts: synthesized %.2f s (%d samples @ %u Hz)\n", dur_sec, n_samples, ctx->hp.sample_rate);
     }
 
+    g_melotts_ctx = nullptr;
     return n_samples;
 }
 

@@ -36,6 +36,7 @@
 #include "core/conv.h"
 #include "core/gguf_loader.h"
 #include "core/lstm.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -45,6 +46,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +71,32 @@ bool env_bool(const char* k) {
     const char* v = std::getenv(k);
     return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
 }
+
+// ===========================================================================
+// Bench instrumentation — `KOKORO_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+bool kokoro_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("KOKORO_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct kokoro_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit kokoro_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~kokoro_bench_stage() {
+        if (!kokoro_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  kokoro_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // Hyperparameters read from `kokoro.*` and `kokoro.plbert.*` GGUF KV.
 struct kokoro_hp {
@@ -574,6 +602,7 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
 // Pad-wraps the raw ids before computing.
 static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                                   int* out_n) {
+    kokoro_bench_stage _b("text_enc");
     if (out_n)
         *out_n = 0;
     if (n_raw <= 0)
@@ -626,6 +655,7 @@ static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int
 // computing, so the output corresponds to L+2 tokens.
 static float* kokoro_run_bert(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                               int* out_n) {
+    kokoro_bench_stage _b("bert");
     if (out_n)
         *out_n = 0;
     if (n_raw <= 0) {
@@ -1099,6 +1129,7 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
 //   "durations"    → (L,) post-round, post-clamp(min=1), cast to float
 static float* kokoro_run_predictor(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                                    int* out_n) {
+    kokoro_bench_stage _b("predictor");
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -1405,6 +1436,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
 //   "f0_curve"  → (2*T_frames,)   (already squeezed from (1, 2*T_frames))
 //   "n_curve"   → (2*T_frames,)
 static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name, int* out_n) {
+    kokoro_bench_stage _b("f0n");
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -1650,6 +1682,7 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
 // decoder body, returning the named stage as malloc'd float[].
 static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                                       int* out_n) {
+    kokoro_bench_stage _b("decoder_body");
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -2277,6 +2310,7 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
 // same seed on the Python side.
 static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                                    int* out_n) {
+    kokoro_bench_stage _b("generator");
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -2396,6 +2430,7 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
 // ---------------------------------------------------------------------------
 
 static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, int* out_T_audio) {
+    kokoro_bench_stage _b("istft");
     const int n_fft = 20;
     const int hop = 5;
     const int n_bins = n_fft / 2 + 1;
@@ -2638,7 +2673,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
-    c->backend = params.use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend)
         c->backend = c->backend_cpu;
     c->gen_backend = params.gen_force_metal ? c->backend : c->backend_cpu;
@@ -2901,7 +2936,11 @@ extern "C" float* kokoro_synthesize_phonemes(struct kokoro_context* ctx, const c
         return nullptr;
 
     int n_ids = 0;
-    int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
+    int32_t* ids = nullptr;
+    {
+        kokoro_bench_stage _b("phoneme_tokenize");
+        ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
+    }
     if (!ids || n_ids == 0) {
         std::free(ids);
         fprintf(stderr, "kokoro: empty phoneme tokenisation for '%s'\n", phonemes);
@@ -2936,6 +2975,81 @@ std::mutex g_espeak_mu;
 bool g_espeak_inited = false;
 bool g_espeak_init_failed = false; // sticky — don't keep retrying
 std::string g_espeak_voice;
+
+// ---------------------------------------------------------------------------
+// MeCab-based kanji → kana preprocessor for Japanese (#56).
+// Uses dlopen to load libmecab at runtime — builds without MeCab still work,
+// the JA phonemizer just falls back to espeak (kana-only, kanji→English).
+// MeCab is BSD-3-Clause; mecab-ipadic is BSD-3-Clause + ICOT. MIT-clean.
+// ---------------------------------------------------------------------------
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
+static std::mutex g_mecab_mu;
+static bool g_mecab_tried = false;
+static bool g_mecab_ok = false;
+
+// MeCab C API (from mecab.h) — only the functions we need.
+typedef struct mecab_t mecab_t;
+typedef struct mecab_node_t {
+    // We only need surface + length + feature.
+    // The actual struct has more fields but we access them via the API.
+} mecab_node_t;
+
+// Function pointers loaded via dlopen
+static mecab_t* (*p_mecab_new2)(const char*) = nullptr;
+static const char* (*p_mecab_sparse_tostr)(mecab_t*, const char*) = nullptr;
+static void (*p_mecab_destroy)(mecab_t*) = nullptr;
+static mecab_t* g_mecab = nullptr;
+
+static bool mecab_init() {
+    if (g_mecab_tried)
+        return g_mecab_ok;
+    g_mecab_tried = true;
+#ifdef _WIN32
+    return false; // no dlopen on Windows
+#else
+    void* lib = dlopen("libmecab.so.2", RTLD_LAZY);
+    if (!lib)
+        lib = dlopen("libmecab.so", RTLD_LAZY);
+    if (!lib) {
+        if (getenv("CRISPASR_NEMOTRON_DEBUG") || getenv("CRISPASR_KOKORO_DEBUG"))
+            fprintf(stderr, "kokoro: libmecab not found — JA kanji→kana disabled\n");
+        return false;
+    }
+    p_mecab_new2 = (mecab_t * (*)(const char*)) dlsym(lib, "mecab_new2");
+    p_mecab_sparse_tostr = (const char* (*)(mecab_t*, const char*))dlsym(lib, "mecab_sparse_tostr");
+    p_mecab_destroy = (void (*)(mecab_t*))dlsym(lib, "mecab_destroy");
+    if (!p_mecab_new2 || !p_mecab_sparse_tostr || !p_mecab_destroy)
+        return false;
+    // Initialize with default dictionary + output reading
+    g_mecab = p_mecab_new2("-Oyomi");
+    if (!g_mecab) {
+        fprintf(stderr, "kokoro: mecab_new2 failed — check mecab dictionary\n");
+        return false;
+    }
+    g_mecab_ok = true;
+    fprintf(stderr, "kokoro: MeCab loaded — JA kanji→kana enabled\n");
+    return true;
+#endif
+}
+
+// Convert Japanese text (with kanji) to kana reading via MeCab.
+// Returns true if conversion was done; false means "leave text as-is".
+static bool kanji_to_kana(const std::string& text, std::string& kana) {
+    std::lock_guard<std::mutex> g(g_mecab_mu);
+    if (!mecab_init())
+        return false;
+    const char* result = p_mecab_sparse_tostr(g_mecab, text.c_str());
+    if (!result || !*result)
+        return false;
+    kana = result;
+    // MeCab -Oyomi output ends with newline — strip it
+    while (!kana.empty() && (kana.back() == '\n' || kana.back() == '\r'))
+        kana.pop_back();
+    return !kana.empty();
+}
 
 // Returns true on success and fills `out`. Returns false to signal "fall
 // back to popen" (init failed, voice switch failed, or no output).
@@ -3048,6 +3162,12 @@ static bool is_cmn_lang(const std::string& lang) {
     return lang == "cmn" || lang == "zh" || lang == "zh-cn" || lang == "zh_cn" || lang == "cmn-latn-pinyin";
 }
 
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
+static bool is_ja_lang(const std::string& lang) {
+    return lang == "ja" || lang == "ja-jp" || lang == "ja_jp";
+}
+#endif
+
 bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::string& text, std::string& out) {
     std::string key = lang;
     key.push_back('\0');
@@ -3055,34 +3175,80 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
     if (ctx->phon_cache.lookup(key, out))
         return true;
 
-    // §156 permissive G2P dicts — try builtin phonemizers first (no GPL dep).
-    // These auto-download IPA dicts from HuggingFace on first call.
-    bool builtin_ok = false;
-    if (lang == "en" || lang == "en-us" || lang == "en-gb")
-        builtin_ok = crispasr::phonemize_builtin_en(lang, text, out);
-    else if (lang == "de")
-        builtin_ok = crispasr::phonemize_builtin_de(lang, text, out);
-    else if (lang == "fr" || lang == "fr-fr")
-        builtin_ok = crispasr::phonemize_builtin_fr(lang, text, out);
-    else if (lang == "es" || lang == "es-es")
-        builtin_ok = crispasr::phonemize_builtin_es(lang, text, out);
-    if (builtin_ok && !out.empty()) {
-        if (is_cmn_lang(lang))
-            strip_cmn_tone_numbers(out);
-        ctx->phon_cache.insert(key, out);
-        return true;
-    }
-
-    // Fallback: espeak-ng (GPL) — linked, dlopen'd, or popen'd.
+    // §56 JA kanji→kana: convert kanji to kana via MeCab before espeak.
+    // espeak-ng's JA voice handles kana fine but falls back to English
+    // pronunciation for kanji (e.g. 日本語 → "Chinese letter"). MeCab
+    // converts kanji → katakana reading which espeak then IPA-phonemizes.
+    std::string effective_text = text;
+    // The JA kanji→kana pre-step (MeCab) is compiled under the same guard as
+    // espeak (both live in the espeak #if block above), and it only matters as a
+    // pre-step before espeak phonemization — so skip it cleanly on no-espeak
+    // builds where kanji_to_kana / is_ja_lang aren't compiled.
 #if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
-    if (phonemize_espeak_lib(lang, text, out)) {
-        if (is_cmn_lang(lang))
-            strip_cmn_tone_numbers(out);
-        ctx->phon_cache.insert(key, out);
-        return true;
+    if (is_ja_lang(lang)) {
+        std::string kana;
+        if (kanji_to_kana(text, kana)) {
+            effective_text = kana;
+        }
     }
 #endif
-    if (phonemize_popen(lang, text, out)) {
+
+    // §156 permissive G2P dicts — try builtin phonemizers first (no GPL dep).
+    // These auto-download IPA dicts from HuggingFace on first call.
+    //
+    // CRISPASR_KOKORO_G2P env var selects strategy (#216):
+    //   "builtin-first"  — builtin G2P, then espeak fallback (default)
+    //   "espeak-first"   — espeak first, then builtin fallback
+    //   "espeak-only"    — espeak only, no builtin
+    //   "builtin-only"   — builtin only, no espeak
+    static const char* g2p_strategy = std::getenv("CRISPASR_KOKORO_G2P");
+    static const bool espeak_first =
+        g2p_strategy && (strcmp(g2p_strategy, "espeak-first") == 0 || strcmp(g2p_strategy, "espeak-only") == 0);
+    static const bool skip_builtin = g2p_strategy && strcmp(g2p_strategy, "espeak-only") == 0;
+    static const bool skip_espeak = g2p_strategy && strcmp(g2p_strategy, "builtin-only") == 0;
+
+    // Lambda: try builtin phonemizers for the given language.
+    auto try_builtin = [&]() -> bool {
+        if (skip_builtin)
+            return false;
+        bool ok = false;
+        if (lang == "en" || lang == "en-us" || lang == "en-gb")
+            ok = crispasr::phonemize_builtin_en(lang, text, out);
+        else if (lang == "de")
+            ok = crispasr::phonemize_builtin_de(lang, text, out);
+        else if (lang == "fr" || lang == "fr-fr")
+            ok = crispasr::phonemize_builtin_fr(lang, text, out);
+        else if (lang == "es" || lang == "es-es")
+            ok = crispasr::phonemize_builtin_es(lang, text, out);
+        return ok && !out.empty();
+    };
+
+    // Lambda: try espeak phonemizers (lib then popen).
+    auto try_espeak = [&]() -> bool {
+        if (skip_espeak)
+            return false;
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
+        if (phonemize_espeak_lib(lang, effective_text, out)) {
+            crispasr::strip_espeak_lang_markers(out); // #169
+            return true;
+        }
+#endif
+        if (phonemize_popen(lang, effective_text, out)) {
+            crispasr::strip_espeak_lang_markers(out); // #169
+            return true;
+        }
+        return false;
+    };
+
+    // Apply the selected strategy.
+    bool ok = false;
+    if (espeak_first) {
+        ok = try_espeak() || try_builtin();
+    } else {
+        ok = try_builtin() || try_espeak();
+    }
+
+    if (ok && !out.empty()) {
         if (is_cmn_lang(lang))
             strip_cmn_tone_numbers(out);
         ctx->phon_cache.insert(key, out);
@@ -3177,9 +3343,12 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
     }
 
     std::string phonemes;
-    if (!phonemize_cached(ctx, ctx->espeak_lang, text, phonemes)) {
-        fprintf(stderr, "kokoro: phonemizer produced no output for '%s'\n", text);
-        return nullptr;
+    {
+        kokoro_bench_stage _b("phonemize");
+        if (!phonemize_cached(ctx, ctx->espeak_lang, text, phonemes)) {
+            fprintf(stderr, "kokoro: phonemizer produced no output for '%s'\n", text);
+            return nullptr;
+        }
     }
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "kokoro: phonemes: '%s'\n", phonemes.c_str());

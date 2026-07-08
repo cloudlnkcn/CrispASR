@@ -36,6 +36,7 @@
 #include "bark_tts.h"
 #include "core/gguf_loader.h"
 #include "core/wordpiece.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -59,6 +60,32 @@
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `BARK_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool bark_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BARK_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct bark_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit bark_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~bark_bench_stage() {
+        if (!bark_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  bark_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // Hyperparams for each GPT sub-model
 struct bark_gpt_hp {
@@ -1857,7 +1884,7 @@ struct bark_context* bark_init_from_file(const char* path_model, struct bark_con
     // Backend setup
     ctx->backend_cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
     if (ggml_backend_is_cpu(ctx->backend))
@@ -2280,14 +2307,22 @@ float* bark_synthesize(struct bark_context* ctx, const char* text, int* out_n_sa
     }
 
     // Stage 1: text -> semantic tokens
-    std::vector<int32_t> semantic = generate_text_semantic(ctx, text);
+    std::vector<int32_t> semantic;
+    {
+        bark_bench_stage _b("semantic");
+        semantic = generate_text_semantic(ctx, text);
+    }
     if (semantic.empty()) {
         fprintf(stderr, "bark: stage 1 produced no semantic tokens (not yet implemented)\n");
         return nullptr;
     }
 
     // Stage 2: semantic -> coarse codes (2 codebooks)
-    std::vector<int32_t> coarse = generate_coarse(ctx, semantic);
+    std::vector<int32_t> coarse;
+    {
+        bark_bench_stage _b("coarse");
+        coarse = generate_coarse(ctx, semantic);
+    }
     if (coarse.empty()) {
         fprintf(stderr, "bark: stage 2 produced no coarse codes\n");
         return nullptr;
@@ -2297,7 +2332,11 @@ float* bark_synthesize(struct bark_context* ctx, const char* text, int* out_n_sa
     int n_coarse_timesteps = (int)coarse.size() / (int)ctx->pp.n_coarse_codebooks;
 
     // Stage 3: coarse -> fine codes (8 codebooks)
-    std::vector<int32_t> fine = generate_fine(ctx, coarse.data(), (int)ctx->pp.n_coarse_codebooks, n_coarse_timesteps);
+    std::vector<int32_t> fine;
+    {
+        bark_bench_stage _b("fine");
+        fine = generate_fine(ctx, coarse.data(), (int)ctx->pp.n_coarse_codebooks, n_coarse_timesteps);
+    }
     if (fine.empty()) {
         fprintf(stderr, "bark: stage 3 produced no fine codes\n");
         return nullptr;
@@ -2305,7 +2344,11 @@ float* bark_synthesize(struct bark_context* ctx, const char* text, int* out_n_sa
 
     // Decode: fine codes -> PCM
     int n_fine_timesteps = (int)fine.size() / (int)ctx->pp.n_fine_codebooks;
-    std::vector<float> pcm = encodec_decode(ctx, fine.data(), (int)ctx->pp.n_fine_codebooks, n_fine_timesteps);
+    std::vector<float> pcm;
+    {
+        bark_bench_stage _b("encodec_decode");
+        pcm = encodec_decode(ctx, fine.data(), (int)ctx->pp.n_fine_codebooks, n_fine_timesteps);
+    }
     if (pcm.empty()) {
         fprintf(stderr, "bark: EnCodec decode produced no audio\n");
         return nullptr;

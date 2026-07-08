@@ -21,10 +21,16 @@
 #include "ggml-cpu.h"
 
 #include "core/conv.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
+
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +40,32 @@
 #include <string>
 #include <vector>
 
+// ===========================================================================
+// Bench instrumentation — `OPENVOICE2_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool openvoice2_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("OPENVOICE2_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct openvoice2_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit openvoice2_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~openvoice2_bench_stage() {
+        if (!openvoice2_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  openvoice2_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -41,19 +73,7 @@
 // ── Helpers ──────────────────────────────────────────────────────────
 
 static void read_f32(const ggml_tensor* t, std::vector<float>& out) {
-    int64_t n = ggml_nelements(t);
-    out.resize(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-        for (int64_t i = 0; i < n; i++)
-            out[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        fprintf(stderr, "openvoice2: unsupported tensor type %d for read_f32\n", t->type);
-        std::fill(out.begin(), out.end(), 0.0f);
-    }
+    out = core_cpu::to_f32(t); // F32/F16/quantized-safe
 }
 
 // Local conv1d_cf helper (channels-first conv1d via ggml)
@@ -518,6 +538,18 @@ static void stft_magnitude(const float* pcm, int n_samples, int fft_size, int ho
 // ── WaveNet forward ──────────────────────────────────────────────────
 // Gated dilated convolution with speaker conditioning.
 
+// OpenVoice2's WaveNet (16 layers, the bulk of voice conversion) runs as
+// hand-rolled CPU scalar convs. PLAN §176d: Accelerate cblas_sgemm. Set
+// OV2_FORCE_SCALAR=1 to validate scalar == GEMM or run on non-Apple.
+static bool ov2_use_scalar() {
+#if defined(HAVE_ACCELERATE)
+    static const bool fs = std::getenv("OV2_FORCE_SCALAR") != nullptr;
+    return fs;
+#else
+    return true;
+#endif
+}
+
 static void wavenet_forward(const ov2_wn_block& wn, int n_layers, int hidden, int T,
                             const std::vector<float>& x_in,   // (hidden, T)
                             const std::vector<float>& g_cond, // (2*hidden*n_layers, 1) or empty
@@ -538,21 +570,47 @@ static void wavenet_forward(const ov2_wn_block& wn, int n_layers, int hidden, in
         int k_size = (int)layer.in_w->ne[0];
         int dilation = 1; // OpenVoice2 uses dilation=1 for all WN layers
 
-        // Dilated conv1d: (hidden, T) -> (2*hidden, T)
+        // Dilated conv1d: (hidden, T) -> (2*hidden, T). conv_out is [T, out_ch].
         int pad = (k_size - 1) * dilation / 2;
         std::vector<float> conv_out(out_ch * T, 0.0f);
-        for (int t = 0; t < T; t++) {
-            for (int oc = 0; oc < out_ch; oc++) {
-                float sum = b_in[oc];
+#if defined(HAVE_ACCELERATE)
+        if (!ov2_use_scalar()) {
+            // im2col into colT[T, K] (K = hidden*k_size, k-index = ic*k_size+ki),
+            // then conv_out[T,out_ch] = colT[T,K] @ w_in[out_ch,K]^T + b_in.
+            const int K = hidden * k_size;
+            std::vector<float> colT((size_t)T * K, 0.0f);
+            for (int t = 0; t < T; t++) {
                 for (int ki = 0; ki < k_size; ki++) {
                     int ti = t + (ki - pad) * dilation;
-                    if (ti >= 0 && ti < T) {
-                        for (int ic = 0; ic < hidden; ic++) {
-                            sum += h[ti * hidden + ic] * w_in[ki + ic * k_size + oc * k_size * hidden];
+                    if (ti < 0 || ti >= T)
+                        continue;
+                    const float* hrow = h.data() + (size_t)ti * hidden;
+                    float* crow = colT.data() + (size_t)t * K;
+                    for (int ic = 0; ic < hidden; ic++)
+                        crow[ic * k_size + ki] = hrow[ic];
+                }
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, out_ch, K, 1.0f, colT.data(), K, w_in.data(), K,
+                        0.0f, conv_out.data(), out_ch);
+            for (int t = 0; t < T; t++)
+                for (int oc = 0; oc < out_ch; oc++)
+                    conv_out[t * out_ch + oc] += b_in[oc];
+        } else
+#endif
+        {
+            for (int t = 0; t < T; t++) {
+                for (int oc = 0; oc < out_ch; oc++) {
+                    float sum = b_in[oc];
+                    for (int ki = 0; ki < k_size; ki++) {
+                        int ti = t + (ki - pad) * dilation;
+                        if (ti >= 0 && ti < T) {
+                            for (int ic = 0; ic < hidden; ic++) {
+                                sum += h[ti * hidden + ic] * w_in[ki + ic * k_size + oc * k_size * hidden];
+                            }
                         }
                     }
+                    conv_out[t * out_ch + oc] = sum;
                 }
-                conv_out[t * out_ch + oc] = sum;
             }
         }
 
@@ -585,12 +643,24 @@ static void wavenet_forward(const ov2_wn_block& wn, int n_layers, int hidden, in
         int rs_out = (int)layer.res_skip_b->ne[0];
 
         std::vector<float> rs(rs_out * T, 0.0f);
-        for (int t = 0; t < T; t++) {
-            for (int oc = 0; oc < rs_out; oc++) {
-                float sum = b_rs[oc];
-                for (int ic = 0; ic < hidden; ic++)
-                    sum += gated[t * hidden + ic] * w_rs[ic + oc * hidden]; // k=1 conv
-                rs[t * rs_out + oc] = sum;
+#if defined(HAVE_ACCELERATE)
+        if (!ov2_use_scalar()) {
+            // rs[T,rs_out] = gated[T,hidden] @ w_rs[rs_out,hidden]^T + b_rs (k=1 conv)
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, rs_out, hidden, 1.0f, gated.data(), hidden,
+                        w_rs.data(), hidden, 0.0f, rs.data(), rs_out);
+            for (int t = 0; t < T; t++)
+                for (int oc = 0; oc < rs_out; oc++)
+                    rs[t * rs_out + oc] += b_rs[oc];
+        } else
+#endif
+        {
+            for (int t = 0; t < T; t++) {
+                for (int oc = 0; oc < rs_out; oc++) {
+                    float sum = b_rs[oc];
+                    for (int ic = 0; ic < hidden; ic++)
+                        sum += gated[t * hidden + ic] * w_rs[ic + oc * hidden]; // k=1 conv
+                    rs[t * rs_out + oc] = sum;
+                }
             }
         }
 
@@ -1124,10 +1194,15 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     const auto& hp = ctx->hp;
     int target_sr = hp.sample_rate; // 22050
 
+    openvoice2_bench_stage _bs_total("convert");
+
     // Resample to target sample rate
     std::vector<float> src_22k, ref_22k;
-    resample_linear(src_pcm, n_src, src_sr, target_sr, src_22k);
-    resample_linear(ref_pcm, n_ref, ref_sr, target_sr, ref_22k);
+    {
+        openvoice2_bench_stage _bs("resample");
+        resample_linear(src_pcm, n_src, src_sr, target_sr, src_22k);
+        resample_linear(ref_pcm, n_ref, ref_sr, target_sr, ref_22k);
+    }
 
     if (ctx->verbosity >= 1)
         fprintf(stderr, "openvoice2: src %d→%d samples, ref %d→%d samples\n", n_src, (int)src_22k.size(), n_ref,
@@ -1136,19 +1211,25 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     // 1. STFT of source and reference
     int T_src, T_ref;
     std::vector<float> src_spec, ref_spec;
-    stft_magnitude(src_22k.data(), (int)src_22k.size(), hp.filter_length, hp.hop_length, hp.win_length, src_spec,
-                   T_src);
-    stft_magnitude(ref_22k.data(), (int)ref_22k.size(), hp.filter_length, hp.hop_length, hp.win_length, ref_spec,
-                   T_ref);
+    {
+        openvoice2_bench_stage _bs("stft");
+        stft_magnitude(src_22k.data(), (int)src_22k.size(), hp.filter_length, hp.hop_length, hp.win_length, src_spec,
+                       T_src);
+        stft_magnitude(ref_22k.data(), (int)ref_22k.size(), hp.filter_length, hp.hop_length, hp.win_length, ref_spec,
+                       T_ref);
+    }
 
     if (ctx->verbosity >= 1)
         fprintf(stderr, "openvoice2: STFT — src T=%d, ref T=%d (%d bins)\n", T_src, T_ref, hp.spec_channels);
 
     // 2. Extract target speaker embedding from reference
     std::vector<float> target_se;
-    if (!ref_enc_forward(ctx, ref_spec, T_ref, target_se)) {
-        fprintf(stderr, "openvoice2: ref_enc failed\n");
-        return false;
+    {
+        openvoice2_bench_stage _bs("ref_enc");
+        if (!ref_enc_forward(ctx, ref_spec, T_ref, target_se)) {
+            fprintf(stderr, "openvoice2: ref_enc failed\n");
+            return false;
+        }
     }
 
     if (ctx->verbosity >= 1) {
@@ -1179,7 +1260,10 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     // 3. Posterior encoder: src_spec → z (with g=0 for zero_g)
     std::vector<float> g_zero(hp.gin_channels, 0.0f);
     std::vector<float> z;
-    enc_q_forward(ctx, src_spec, T_src, g_zero, z);
+    {
+        openvoice2_bench_stage _bs("enc_q");
+        enc_q_forward(ctx, src_spec, T_src, g_zero, z);
+    }
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "openvoice2: enc_q → z (%d × %d)\n", hp.inter_channels, T_src);
@@ -1209,7 +1293,10 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     }
 
     // 5. Flow forward: z → z_p (normalize with source voice)
-    flow_wavenet(ctx, z, T_src, src_se, /*reverse=*/false);
+    {
+        openvoice2_bench_stage _bs("flow_forward");
+        flow_wavenet(ctx, z, T_src, src_se, /*reverse=*/false);
+    }
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "openvoice2: flow forward (source → prior)\n");
@@ -1217,7 +1304,10 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     }
 
     // 6. Flow reverse: z_p → z_hat (denormalize with target voice)
-    flow_wavenet(ctx, z, T_src, target_se, /*reverse=*/true);
+    {
+        openvoice2_bench_stage _bs("flow_reverse");
+        flow_wavenet(ctx, z, T_src, target_se, /*reverse=*/true);
+    }
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "openvoice2: flow reverse (prior → target)\n");
@@ -1226,9 +1316,12 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
 
     // 7. HiFi-GAN decode: z_hat → audio (with g=0 for zero_g)
     std::vector<float> pcm;
-    if (!hifigan_decode_cpu(ctx, z, g_zero, T_src, pcm)) {
-        fprintf(stderr, "openvoice2: hifigan decode failed\n");
-        return false;
+    {
+        openvoice2_bench_stage _bs("hifigan_decode");
+        if (!hifigan_decode_cpu(ctx, z, g_zero, T_src, pcm)) {
+            fprintf(stderr, "openvoice2: hifigan decode failed\n");
+            return false;
+        }
     }
 
     // Peak-normalize output to fill ±0.95 range.

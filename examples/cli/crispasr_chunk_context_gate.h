@@ -35,12 +35,24 @@ namespace crispasr_chunk_context {
 // gemma4-e2b, glm-asr, and kyutai-stt blow past a 15 min wallclock on a
 // 5 min clip (LLM-decode retry loop on the over-long buffer). voxtral4b
 // is not affected — different model architecture despite the shared name.
-// All six were caught by the A/B sweep in tools/check-overlap-save-bug.sh.
+// granite-speech-4.1-2b-plus emits native [T:N] word timestamps that do not
+// align with the overlap-save slice boundaries, so the word-level trim drops
+// most of each slice — a 2.5 min clip collapsed to ~36 s of output, missing
+// whole passages (#205); the bare-slice path recovers them. moss-transcribe is
+// an LLM decoder (Qwen3-1.7B) that emits neither word nor token timestamps, so
+// the overlap-save trim falls back to segment-level filtering that keeps the
+// whole extended segment — the ±chunk_overlap acoustic context gets transcribed
+// twice and duplicates at every 30 s seam ("...of the fence. Don't move much to
+// the fence.", #218); the over-long (30 s + 2×3 s) buffer also pushes the
+// greedy decoder further out of its trained window and worsens the repeated-
+// phrase loops the same issue is about. The bare-slice path avoids both. The
+// blocked backends were caught by the A/B sweep in tools/check-overlap-save-bug.sh.
 inline bool backend_allows_chunk_context(const char* backend_name) {
     if (backend_name == nullptr) {
         return true;
     }
-    static const char* const kBlocked[] = {"cohere", "gemma4-e2b", "glm-asr", "kyutai-stt", "qwen3", "voxtral"};
+    static const char* const kBlocked[] = {"cohere",     "gemma4-e2b",      "glm-asr", "granite",
+                                           "kyutai-stt", "moss-transcribe", "qwen3",   "voxtral"};
     for (const char* b : kBlocked) {
         if (std::strcmp(backend_name, b) == 0) {
             return false;

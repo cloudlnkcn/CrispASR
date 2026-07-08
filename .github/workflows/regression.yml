@@ -62,6 +62,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - name: Run driver smoke test
         run: python tests/regression/test_driver_smoke.py
 
@@ -73,6 +75,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - name: Run no-model Python unit tests
         run: |
           python -m pytest tests/test_backend_config.py -v || \
@@ -90,8 +94,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - run: pip install huggingface_hub
       - run: python tests/regression/run_one.py --dry-run
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   # Tier 2: per-backend regression. Each entry of the matrix downloads
   # its pinned-revision GGUF + pinned-revision reference dump from HF,
@@ -122,6 +130,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         backend:
           # Full diff entry (GGUF + ref dump + crispasr-diff cosine checks)
@@ -138,13 +147,21 @@ jobs:
           # is hitting HF private-repo storage limit (403). Re-add once the
           # repo is made public or space is freed on the HF account.
           - granite-speech-4.1-2b
-          # Small ASR backends (<1 GB each, fit comfortably on GH free tier)
+          # Small/medium ASR backends (fit on GH free-tier 14 GB scratch)
           - wav2vec2-xlsr-en
           - hubert-large
           - data2vec-base
           - fastconformer-ctc-large
           - sensevoice-small
           - paraformer-zh
+          - nemotron-3.5-asr-streaming-0.6b
+          - parakeet-rnnt-0.6b
+          - qwen3-asr-0.6b
+          - omniasr-ctc-1b-v2
+          - kyutai-stt-1b
+          - funasr-nano
+          - mini-omni2
+          - omniasr-llm-300m
           # TTS->ASR roundtrip entries (manifest.tts_backends). Each
           # synthesises a fixed phrase via the TTS backend, transcribes
           # it back with parakeet, and asserts WER under the manifest's
@@ -165,6 +182,8 @@ jobs:
           # you add parakeet on top.
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install build + runtime deps
         run: |
@@ -186,6 +205,11 @@ jobs:
           # and stored in HF, not regenerated.
           python -m pip install --upgrade pip
           pip install huggingface_hub
+      - name: Authenticate HuggingFace (avoids 429 rate limit)
+        if: env.HF_TOKEN != ''
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential 2>/dev/null || true
 
       - name: Configure + build crispasr-cli (+ crispasr-diff for full-diff backends)
         run: |
@@ -208,6 +232,10 @@ jobs:
         env:
           BUILD_DIR: build-regression
           WORK_DIR: ${{ runner.temp }}/regression-${{ matrix.backend }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_ENABLE_HF_TRANSFER: "0"
+          HF_HUB_DOWNLOAD_TIMEOUT: "120"
         run: |
           mkdir -p "$WORK_DIR"
           tests/regression/run_one.py "${{ matrix.backend }}"

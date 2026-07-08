@@ -184,6 +184,22 @@ TEST_CASE("registry: companion_approx_size populated for chatterbox", "[unit][re
     REQUIRE(e.companion_approx_size != e.approx_size);
 }
 
+TEST_CASE("registry: chatterbox family keeps multilingual and finetunes separate", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+
+    REQUIRE(crispasr_registry_lookup("chatterbox", e));
+    REQUIRE(e.filename == "chatterbox-t3-q8_0.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
+
+    REQUIRE(crispasr_registry_lookup("kartoffelbox-turbo", e));
+    REQUIRE(e.filename.find("kartoffelbox-turbo-t3") != std::string::npos);
+    REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-f16.gguf");
+
+    REQUIRE(crispasr_registry_lookup("lahgtna-chatterbox", e));
+    REQUIRE(e.filename == "chatterbox-t3-f16.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
+}
+
 TEST_CASE("registry: companion_approx_size empty for backends without companion", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("whisper", e));
@@ -276,6 +292,16 @@ TEST_CASE("registry: cosyvoice3-tts has entry", "[unit][registry]") {
     REQUIRE(crispasr_registry_lookup("cosyvoice3-tts", e));
 }
 
+// The CLI / kaggle benchmark pass the short `--backend cosyvoice3` alias to
+// `-m auto`; the registry must resolve it to the canonical `cosyvoice3-tts`
+// entry via the `-tts`-suffix fallback (else `-m auto` fails instantly with
+// "no default model registered" — full-backend-sweep cosyvoice3 FAIL).
+TEST_CASE("registry: cosyvoice3 short alias resolves via -tts fallback", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("cosyvoice3", e));
+    REQUIRE(e.filename == "cosyvoice3-llm-q4_k.gguf");
+}
+
 TEST_CASE("registry: dia has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("dia", e));
@@ -329,6 +355,11 @@ TEST_CASE("registry: voxcpm2-tts has entry", "[unit][registry]") {
 TEST_CASE("registry: moss-audio has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("moss-audio", e));
+}
+
+TEST_CASE("registry: moss-transcribe has entry", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("moss-transcribe", e));
 }
 
 TEST_CASE("registry: sensevoice has entry", "[unit][registry]") {

@@ -88,7 +88,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `model` | Ignored (uses the loaded model) |
 | `language` | ISO-639-1 code (default: server's `-l` setting) |
 | `prompt` | Initial prompt / context |
-| `response_format` | `json` (default), `verbose_json`, `text`, `srt`, `vtt` |
+| `response_format` | `json` (default), `verbose_json`, `diarized_json`, `text`, `srt`, `vtt` |
 | `temperature` | Sampling temperature (default: 0.0) |
 | `seed` | RNG seed for sampling (`0` = non-deterministic) |
 | `max_tokens` | Generated-token cap for supported autoregressive ASR backends |
@@ -164,6 +164,47 @@ curl http://localhost:8080/v1/audio/transcriptions \
   -F "diarize_method=pyannote"
 ```
 
+### Diarized JSON format (#206)
+
+`response_format=diarized_json` returns OpenAI-compatible verbose JSON
+extended with per-segment speaker labels. Speaker strings are normalised
+to single letters (`A`, `B`, `C`, …). Each segment includes a `type`
+field for compatibility with transcription clients that expect the
+diarized schema.
+
+```bash
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@DIALOGUE.ogg" \
+  -F "response_format=diarized_json" \
+  -F "diarize=true" \
+  -F "diarize_method=pyannote"
+```
+
+Response structure:
+
+```json
+{
+  "task": "transcribe",
+  "language": "en",
+  "duration": 245.029,
+  "text": "Full transcript text...",
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.00,
+      "end": 26.10,
+      "text": "I'll tell you basically what this is about...",
+      "speaker": "A",
+      "type": "transcript.text.segment"
+    }
+  ]
+}
+```
+
+When `diarize` is not enabled, all segments default to speaker `"A"`.
+Word-level timestamps are included in each segment when the backend
+provides them.
+
 ### Translation example
 
 ```bash
@@ -215,12 +256,20 @@ curl http://localhost:8080/v1/audio/speech \
 |---|---|---|
 | `input` | (required) | Text to synthesize. Capped at `--tts-max-input-chars` (default 4096); set to 0 to disable the cap. Long input is automatically split on sentence boundaries before synthesis (see [long-form chunking](#long-form-chunking-for-v1audiospeech) below). |
 | `model` | (ignored) | Read but not validated — we serve whatever was loaded via `-m` or `POST /load`. Surfaced in the synth log line. |
-| `voice` | server's `--voice` | Passed through verbatim to the backend's `params.tts_voice`. Each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`). |
+| `voice` | server's `--voice` | Passed through verbatim to the backend's `params.tts_voice`. Each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`); tada as a `tada-ref-*.gguf` path/name. For **tada the voice is switched per request without a restart** (#201): naming a different reference reloads it; `default`/`auto`/omitted keeps the currently-loaded voice. A `.wav` is not yet accepted for tada (convert to a `tada-ref.gguf` first). |
 | `instructions` | empty | Voice-direction prose for backends that support it (qwen3-tts VoiceDesign). Silently ignored on other backends so OpenAI clients targeting `gpt-4o-mini-tts` don't see 4xx errors. |
 | `seed` | `0` | RNG seed for sampling. `0` = non-deterministic. Same-seed + same-text produces bit-identical audio on all sampling-capable TTS backends (qwen3-tts, chatterbox, vibevoice, orpheus). |
 | `temperature` | server's `--temperature` | Sampling temperature for AR TTS backends. `0` = greedy; backends apply their own default (e.g. 0.8 for qwen3-tts) when the global default of 0.0 is unchanged. |
 | `max_new_tokens` | server's `--max-new-tokens` | AR token generation cap. `<= 0` clears the override and uses the backend default. |
 | `frequency_penalty` | `0.0` | Opt-in repeated generated-token penalty for AR TTS backends. `0.0` disabled. |
+| `top_p` | backend default | Nucleus-sampling cutoff for AR TTS backends (tada, chatterbox). Applied per request; omit to keep the backend default. |
+| `top_k` | backend default | Top-k sampling cutoff (`0` = disabled). Honoured by tada. Per request. |
+| `repetition_penalty` | backend default | Talker repetition penalty (`1.0` = none). Honoured by tada, chatterbox. Per request. |
+| `do_sample` | backend default | `true`/`false` — enable/disable talker sampling (`false` = greedy). Honoured by tada. Per request. |
+| `num_candidates` | backend default | tada per-token flow-matching candidates: higher = more robust timing, lower = faster (`1` = single noise draw). Per request. |
+| `num_steps` | backend default | Flow-matching ODE steps. For tada this is the primary "quick and dirty" vs "slow and accurate" lever (Python `num_flow_matching_steps`, default 10): more steps = slower, higher acoustic fidelity. Also honoured by chatterbox/f5. Per request. |
+| `cfg_scale` | backend default | Classifier-free-guidance scale. For tada the acoustic CFG (Python `acoustic_cfg`, default 1.6). Also chatterbox/f5. Per request. |
+| `noise_temp` | backend default | tada flow-matching noise temperature (Python `noise_temp`, default 0.9). Per request. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), or `f32` (crispasr-specific raw float32 for downstream DSP). |
 | `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
@@ -416,6 +465,18 @@ JSON updates as audio accumulates:
 
 Whisper-only today. (Each connection opens its own streaming session.)
 
+### vLLM Realtime API (WebSocket)
+
+When `--ws-port` is enabled, the server also exposes a **vLLM Realtime API** compatible WebSocket endpoint on `ws_port + 1`. This endpoint accepts standard JSON-encoded `input_audio_buffer.append` events (base64 PCM16) and streams back `conversation.item.input_audio_transcription.delta` events incrementally.
+
+```bash
+crispasr --server -m qwen3-asr.gguf --backend qwen3-asr --ws-port 8081
+# → WS ws://127.0.0.1:8081 (Raw PCM)
+# → WS ws://127.0.0.1:8082/v1/realtime (vLLM Realtime API)
+```
+
+This endpoint supports backends with true token-level streaming (e.g. Qwen3) and buffers the audio in chunks until `input_audio_buffer.commit` is received.
+
 ## Docker Compose
 
 The repo includes a root-level
@@ -487,6 +548,50 @@ image will work.
 docker pull ghcr.io/crispstrobe/crispasr:main-cuda      # modern hosts
 docker pull ghcr.io/crispstrobe/crispasr:main-cuda-12   # legacy driver
 ```
+
+## Wyoming protocol (Home Assistant Assist)
+
+Pass `--wyoming-port N` to start a Wyoming peer-to-peer JSONL/TCP server
+alongside the HTTP API. One `crispasr-server` instance then replaces both
+`wyoming-faster-whisper` (STT) and `wyoming-piper` (TTS) in a Home Assistant
+Assist pipeline — no extra containers needed.
+
+```bash
+# Start server with Wyoming on port 10300 (HA default)
+crispasr-server -m model.gguf --port 8080 --wyoming-port 10300
+```
+
+### Wire format
+
+Each message is a JSON header line followed by an optional binary payload:
+
+```
+{"type":"...","data":{...},"payload_length":N}\n
+<N bytes of binary payload>
+```
+
+### Events handled
+
+| Incoming event | What CrispASR does |
+|---|---|
+| `describe` | Replies with `info` — advertises ASR + TTS capabilities |
+| `transcribe` + `audio-start` + `audio-chunk` + `audio-stop` | Buffers int16 PCM chunks, resamples to 16 kHz float32 via linear interpolation after `audio-stop`, runs `backend->transcribe()`, returns `transcript` |
+| `synthesize` | Calls `backend->synthesize()` under `model_mutex`, converts float32 → int16, streams back as `audio-start` / `audio-chunk*` / `audio-stop` at the model's native sample rate |
+
+HA handles resampling from the model's native rate (e.g. 24 kHz for vibevoice)
+to its playback device — no server-side downsampling needed.
+
+### HA integration
+
+In Home Assistant `configuration.yaml`:
+
+```yaml
+wyoming:
+  - uri: tcp://<host>:10300
+```
+
+The server advertises both STT and TTS under the same URI. HA will automatically
+use CrispASR for both directions once the integration is added.
 
 ## Hugging Face Space wrapper
 

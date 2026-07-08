@@ -17,6 +17,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_granite_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_granite_nle_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral4b_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_higgs_stt_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastconformer_ctc_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_wav2vec2_backend();
@@ -41,7 +42,9 @@ std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_ark_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_audio_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_moss_transcribe_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_funasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_paraformer_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_sensevoice_backend();
@@ -54,14 +57,18 @@ std::unique_ptr<CrispasrBackend> crispasr_make_outetts_backend();
 #endif
 std::unique_ptr<CrispasrBackend> crispasr_make_zonos_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_f5_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_irodori_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_bark_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_pocket_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_speecht5_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dia_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_dots_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parler_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastpitch_backend();
 // csm-tts (§135): sesame/csm-1b — Llama backbone + depth decoder + Mimi codec.
 std::unique_ptr<CrispasrBackend> crispasr_make_csm_tts_backend();
+// bananamind-tts: BananaMind-TTS-V2.1 Tacotron-lite + HiFi-GAN (en-us/de-de).
+std::unique_ptr<CrispasrBackend> crispasr_make_bananamind_tts_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -82,7 +89,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
         return crispasr_make_nemotron_backend();
-    if (name == "parakeet")
+    if (name == "parakeet" || name == "reazonspeech")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
@@ -100,10 +107,13 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_voxtral_backend();
     if (name == "voxtral4b")
         return crispasr_make_voxtral4b_backend();
+    if (name == "higgs-stt" || name == "higgs_stt" || name == "higgs-audio-v3-stt" || name == "higgs-audio-stt" ||
+        name == "higgsaudiostt")
+        return crispasr_make_higgs_stt_backend();
     if (name == "qwen3" || name == "qwen3-1.7b" || name == "qwen3_1.7b" || name == "qwen3_17b" || name == "mega-asr" ||
         name == "mega_asr" || name == "megaasr")
         return crispasr_make_qwen3_backend();
-    if (name == "fastconformer-ctc")
+    if (name == "fastconformer-ctc" || name == "fastconformer_ctc" || name == "canary-ctc" || name == "canary_ctc")
         return crispasr_make_fastconformer_ctc_backend();
     if (name == "wav2vec2" || name == "hubert" || name == "data2vec")
         return crispasr_make_wav2vec2_backend();
@@ -132,7 +142,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "kartoffelbox_turbo" || name == "lahgtna" || name == "lahgtna-chatterbox" ||
         name == "lahgtna-chatterbox-v1")
         return crispasr_make_chatterbox_backend();
-    if (name == "tada" || name == "tada-tts" || name == "tada-3b" || name == "tada-3b-ml")
+    if (name == "tada" || name == "tada-tts" || name == "tada-1b" || name == "tada-tts-1b" || name == "tada-3b" ||
+        name == "tada-3b-ml")
         return crispasr_make_tada_backend();
     if (name == "indextts" || name == "indextts-1.5" || name == "indextts1.5" || name == "index-tts")
         return crispasr_make_indextts_backend();
@@ -148,6 +159,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 #endif
     if (name == "f5-tts" || name == "f5_tts" || name == "f5tts" || name == "f5")
         return crispasr_make_f5_tts_backend();
+    if (name == "irodori-tts" || name == "irodori_tts" || name == "irodori")
+        return crispasr_make_irodori_tts_backend();
     if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket")
         return crispasr_make_pocket_tts_backend();
     if (name == "fastpitch" || name == "fastpitch-tts" || name == "fastpitch_tts")
@@ -178,8 +191,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_omniasr_backend();
     if (name == "mimo-asr" || name == "mimo_asr" || name == "mimoasr")
         return crispasr_make_mimo_asr_backend();
+    if (name == "ark-asr" || name == "ark_asr" || name == "arkasr" || name == "ark")
+        return crispasr_make_ark_asr_backend();
     if (name == "moss-audio" || name == "moss_audio" || name == "mossaudio")
         return crispasr_make_moss_audio_backend();
+    if (name == "moss-transcribe" || name == "moss_transcribe" || name == "mosstranscribe")
+        return crispasr_make_moss_transcribe_backend();
     if (name == "funasr" || name == "fun-asr" || name == "fun-asr-nano" || name == "fun-asr-mlt-nano")
         return crispasr_make_funasr_backend();
     if (name == "paraformer" || name == "paraformer-zh" || name == "paraformer-en")
@@ -192,12 +209,16 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_speecht5_backend();
     if (name == "dia" || name == "dia-tts" || name == "dia-1.6b" || name == "dia_tts")
         return crispasr_make_dia_backend();
+    if (name == "dots-tts" || name == "dots_tts" || name == "dots" || name == "dots.tts")
+        return crispasr_make_dots_tts_backend();
     if (name == "parler-tts" || name == "parler_tts" || name == "parler" || name == "parlertts")
         return crispasr_make_parler_tts_backend();
     if (name == "zonos" || name == "zonos-tts" || name == "zonos_tts")
         return crispasr_make_zonos_backend();
     if (name == "csm" || name == "csm-tts" || name == "csm_tts" || name == "sesame" || name == "sesame-csm")
         return crispasr_make_csm_tts_backend();
+    if (name == "bananamind" || name == "bananamind-tts" || name == "bananamind_tts" || name == "banana-tts")
+        return crispasr_make_bananamind_tts_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -208,6 +229,7 @@ std::vector<std::string> crispasr_list_backends() {
         "whisper",
         "nemotron",
         "parakeet",
+        "reazonspeech",
         "canary",
         "lfm2-audio",
         "mini-omni2",
@@ -221,6 +243,7 @@ std::vector<std::string> crispasr_list_backends() {
         "qwen3",
         "qwen3-1.7b",
         "mega-asr",
+        "higgs-stt",
         "fastconformer-ctc",
         "wav2vec2",
         "hubert",
@@ -241,6 +264,10 @@ std::vector<std::string> crispasr_list_backends() {
         "chatterbox-turbo",
         "kartoffelbox-turbo",
         "lahgtna-chatterbox",
+        "tada",
+        "tada-1b",
+        "tada-tts-1b",
+        "tada-3b-ml",
         "indextts",
         "f5-tts",
         "pocket-tts",
@@ -265,7 +292,9 @@ std::vector<std::string> crispasr_list_backends() {
         "omniasr-llm",
         "omniasr-llm-1b",
         "mimo-asr",
+        "ark-asr",
         "moss-audio",
+        "moss-transcribe",
         "funasr",
         "fun-asr-mlt-nano",
         "paraformer",
@@ -275,12 +304,14 @@ std::vector<std::string> crispasr_list_backends() {
         "speecht5",
         "dia",
         "dia-tts",
+        "dots-tts",
         "parler-tts",
         "zonos",
         "zonos-tts",
         "csm",
         "csm-tts",
         "sesame",
+        "bananamind-tts",
     };
 }
 
@@ -312,6 +343,7 @@ static constexpr feature_col kFeatures[] = {
     {"tts", CAP_TTS},
     {"s2s", CAP_S2S},
     {"voice-clone", CAP_VOICE_CLONING},
+    {"streaming", CAP_STREAMING},
 };
 
 void crispasr_print_backend_matrix() {
@@ -387,6 +419,7 @@ static constexpr cap_slug kCapSlugs[] = {
     {"tts", CAP_TTS},
     {"s2s", CAP_S2S},
     {"voice-cloning", CAP_VOICE_CLONING},
+    {"streaming", CAP_STREAMING},
 };
 
 void crispasr_print_backend_matrix_json() {
@@ -463,6 +496,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "voxtral4b";
     if (contains_ci("voxtral"))
         return "voxtral";
+    if (contains_ci("higgs") && (contains_ci("stt") || contains_ci("audio")))
+        return "higgs-stt";
     // Distinguish parakeet-CTC standalones (parakeet-ctc-0.6b /
     // parakeet-ctc-1.1b — same FastConformer encoder + CTC head as the
     // stt_en_fastconformer_ctc family) from parakeet-TDT (transducer)
@@ -473,6 +508,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     if (contains_ci("parakeet") && contains_ci("ctc") && !contains_ci("tdt"))
         return "fastconformer-ctc";
     if (contains_ci("parakeet"))
+        return "parakeet";
+    if (contains_ci("reazonspeech"))
         return "parakeet";
     // Check "fastconformer-ctc" / "stt_en_fc_ctc" style filenames before
     // the broader "canary" match so users who drop a NeMo standalone
@@ -489,10 +526,17 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "wav2vec2";
     if (contains_ci("vibevoice"))
         return "vibevoice";
+    if (contains_ci("ark-asr") || contains_ci("arkasr") || contains_ci("ark_asr"))
+        return "ark-asr";
     if (contains_ci("kugelaudio"))
         return "kugelaudio";
     if (contains_ci("fireredpunc"))
         return "fireredpunc";
+    // A canary-*-ctc filename is a FastConformer-CTC model (canary_ctc
+    // runtime), not the AED encoder-decoder "canary" backend — match the
+    // "ctc" qualifier before the broad canary catch-all below.
+    if (contains_ci("canary") && contains_ci("ctc"))
+        return "fastconformer-ctc";
     if (contains_ci("canary"))
         return "canary";
     if (contains_ci("lfm2-audio") || contains_ci("lfm2_audio"))
@@ -519,6 +563,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "pocket-tts";
     if (contains_ci("fastpitch"))
         return "fastpitch";
+    if (contains_ci("bananamind"))
+        return "bananamind-tts";
     if (contains_ci("melotts") || contains_ci("melo-tts") || contains_ci("melo_tts"))
         return "melotts";
     if (contains_ci("piper") && !contains_ci("piper-phonemize"))
@@ -569,6 +615,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "dia";
     if (contains_ci("dia-tts") || contains_ci("dia_tts"))
         return "dia";
+    if (contains_ci("dots-tts") || contains_ci("dots_tts") || contains_ci("dots.tts"))
+        return "dots-tts";
     if (contains_ci("csm") || contains_ci("sesame"))
         return "csm";
     if (contains_ci("parler") && contains_ci("tts"))
@@ -608,7 +656,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
             else if (a == "mini-omni2")
                 result = "mini-omni2";
             else if (a == "canary-ctc")
-                result = "canary";
+                // FastConformer-CTC standalones + canary CTC aligners run on the
+                // canary_ctc runtime (CTC greedy decode), NOT the AED "canary"
+                // encoder-decoder backend, which has no CTC head.
+                result = "fastconformer-ctc";
             else if (a == "cohere")
                 result = "cohere";
             else if (a == "cohere-transcribe")
@@ -627,20 +678,26 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "cosyvoice3-tts";
             else if (a == "fastpitch" || a == "fastpitch-tts" || a == "fastpitch_tts")
                 result = "fastpitch";
+            else if (a == "bananamind_tts" || a == "bananamind-tts")
+                result = "bananamind-tts";
             else if (a == "piper" || a == "piper-tts" || a == "piper_tts" || a == "vits")
                 result = "piper";
             else if (a == "melotts" || a == "melo-tts" || a == "melo_tts" || a == "vits2")
                 result = "melotts";
             else if (a == "f5-tts" || a == "f5_tts" || a == "f5tts")
                 result = "f5-tts";
+            else if (a == "irodori-tts" || a == "irodori_tts" || a == "irodori")
+                result = "irodori-tts";
             else if (a == "chatterbox" || a == "chatterbox_turbo" || a == "kartoffelbox")
                 result = "chatterbox";
-            else if (a == "tada" || a == "tada-tts" || a == "tada-3b-ml")
+            else if (a == "tada" || a == "tada-tts" || a == "tada-1b" || a == "tada-tts-1b" || a == "tada-3b-ml")
                 result = "tada";
             else if (a == "m2m100" || a == "m2m_100")
                 result = "m2m100";
             else if (a == "voxtral")
                 result = "voxtral";
+            else if (a == "higgs-stt" || a == "higgs_stt" || a == "higgs-audio-v3-stt")
+                result = "higgs-stt";
             else if (a == "voxtral4b" || a == "voxtral-4b" || a == "voxtral_4b")
                 result = "voxtral4b";
             else if (a == "granite-speech" || a == "granite_speech" || a == "granitespeech")
@@ -679,8 +736,12 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "fireredpunc";
             else if (a == "mimo_asr" || a == "mimo-asr")
                 result = "mimo-asr";
+            else if (a == "arkasr" || a == "ark-asr" || a == "ark_asr")
+                result = "ark-asr";
             else if (a == "moss_audio" || a == "moss-audio")
                 result = "moss-audio";
+            else if (a == "moss_transcribe" || a == "moss-transcribe")
+                result = "moss-transcribe";
             else if (a == "funasr" || a == "fun_asr" || a == "fun-asr")
                 result = "funasr";
             else if (a == "paraformer")
@@ -699,6 +760,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "bark";
             else if (a == "dia" || a == "dia-tts" || a == "dia_tts")
                 result = "dia";
+            else if (a == "dots-tts" || a == "dots_tts" || a == "dots.tts")
+                result = "dots-tts";
             else if (a == "csm" || a == "csm-tts" || a == "csm_tts")
                 result = "csm";
             else if (a == "parler-tts" || a == "parler_tts" || a == "parlertts")

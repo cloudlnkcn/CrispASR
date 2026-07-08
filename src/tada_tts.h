@@ -32,9 +32,18 @@ struct tada_context_params {
     int max_tokens; // max generation tokens (0 = 512 default)
     bool flash_attn;
     // FM solver params
-    int num_fm_steps;   // ODE steps (0 = 10 default)
-    float acoustic_cfg; // CFG scale for acoustic features (1.0 = no CFG)
-    float noise_temp;   // noise temperature (0.0 = deterministic)
+    int num_fm_steps;            // ODE steps (0 = 10 default)
+    float acoustic_cfg;          // CFG scale for acoustic features (1.0 = no CFG)
+    float noise_temp;            // noise temperature (0.0 = deterministic)
+    int num_acoustic_candidates; // FM candidates ranked by reconstruction (0/1 = single)
+    // Talker text-decoder sampling (matches upstream InferenceOptions). The
+    // `temperature` field above is the text temperature. Library default is
+    // greedy (text_do_sample=false) for diff-harness determinism; the CLI and
+    // C ABI enable sampling with the upstream defaults.
+    bool text_do_sample;           // false = greedy argmax
+    float text_top_p;              // nucleus threshold (upstream 0.9); <=0 or >=1 disables
+    int text_top_k;                // top-k cutoff (upstream 0 = disabled)
+    float text_repetition_penalty; // upstream 1.1; 1.0 = no penalty
 };
 
 struct tada_context;
@@ -57,10 +66,35 @@ void tada_set_seed(struct tada_context* ctx, uint64_t seed);
 // Set text sampling temperature.
 void tada_set_temperature(struct tada_context* ctx, float temp);
 
+// Set the number of flow-matching timing candidates ranked per token by
+// reconstruction likelihood (0/1 = single noise draw; higher = more
+// reliable multilingual timing at higher cost). See TADA_NUM_CANDIDATES.
+void tada_set_num_candidates(struct tada_context* ctx, int n);
+
+// Talker text-decoder sampling knobs (match upstream InferenceOptions).
+void tada_set_do_sample(struct tada_context* ctx, bool enable);
+void tada_set_top_p(struct tada_context* ctx, float top_p);
+void tada_set_top_k(struct tada_context* ctx, int top_k);
+void tada_set_repetition_penalty(struct tada_context* ctx, float penalty);
+
+// Acoustic flow-matching knobs (match upstream InferenceOptions). These trade
+// speed for fidelity — the reporter's "quick and dirty" vs "slow and accurate"
+// axis (#197). num_fm_steps is the primary quality lever (Python
+// num_flow_matching_steps, default 10; <=0 restores it).
+void tada_set_num_fm_steps(struct tada_context* ctx, int steps);
+void tada_set_acoustic_cfg(struct tada_context* ctx, float cfg);
+void tada_set_noise_temp(struct tada_context* ctx, float temp);
+
 // Synthesize text to 24 kHz mono PCM. Returns heap-allocated float array;
 // caller must free with tada_pcm_free(). *out_n_samples is set to the
 // number of float samples. Returns NULL on failure.
 float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_samples);
+
+// Debug/diff helper for generation stages. Returns a heap-allocated float32
+// array for the requested stage; caller frees with free(). Supported stages:
+// "text_tokens", "llm_embed", "llm_hidden_0", "fm_noise_0",
+// "fm_step_0_0", "fm_step_0_5", "fm_output_0".
+float* tada_extract_stage(struct tada_context* ctx, const char* text, const char* stage, int* out_n);
 
 void tada_pcm_free(float* pcm);
 void tada_free(struct tada_context* ctx);

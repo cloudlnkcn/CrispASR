@@ -72,6 +72,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -81,6 +82,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <memory>
 #include <cstdio>
@@ -127,6 +129,33 @@ const char* env_str(const char* k) {
     const char* v = std::getenv(k);
     return (v && *v) ? v : nullptr;
 }
+
+// ===========================================================================
+// Bench instrumentation — `QWEN3_TTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool qwen3_tts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("QWEN3_TTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct qwen3_tts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit qwen3_tts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~qwen3_tts_bench_stage() {
+        if (!qwen3_tts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  qwen3_tts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
 double now_ms() {
     using namespace std::chrono;
     return duration_cast<duration<double, std::milli>>(steady_clock::now().time_since_epoch()).count();
@@ -359,6 +388,13 @@ struct g3t_hp {
     std::vector<std::string> spk_names;
     std::vector<uint32_t> spk_token_ids;
     std::vector<uint32_t> spk_dialect_token_ids;
+
+    // Output-language table: parallel arrays mapping a language name
+    // ("English", "Chinese", …) to its codec_language_id token. Emitted by
+    // convert-qwen3-tts-to-gguf.py as qwen3tts.codec_language_names /
+    // qwen3tts.codec_language_ids. Drives qwen3_tts_set_language_by_name.
+    std::vector<std::string> codec_language_names;
+    std::vector<uint32_t> codec_language_ids;
 };
 
 struct g3t_layer {
@@ -638,6 +674,15 @@ struct qwen3_tts_context {
     ggml_tensor* talker_embd_cpu = nullptr;
     bool cp_cpu_pinned = false;
 
+    // Preferred 1.7B path: fold small_to_mtp INTO the code_pred graph as its
+    // first op so the projection runs on the same backend/kernel as the decoder
+    // (bit-consistent q8_0 realization — no separate per-step dispatch, no
+    // cross-backend precision shift). When true, run_code_pred_kv's input tensor
+    // is the raw (d_in) embedding and code_pred_generate_15 feeds it unprojected.
+    // Default ON for 1.7B; opt out with QWEN3_TTS_CP_MTP_NOFUSE=1. Disabled when
+    // code_pred is CPU-pinned (cp_cpu_pinned keeps the external projection).
+    bool cp_mtp_fused = false;
+
     // CPU-side embedding caches: raw quantized bytes copied from the Metal
     // weight tensors at init.  Used by the AR loop to dequantize embedding
     // rows directly on CPU, eliminating ~17 Metal command-buffer round-trips
@@ -717,6 +762,13 @@ struct qwen3_tts_context {
     ggml_cgraph* cp_t1_gf = nullptr;
     ggml_backend_sched_t cp_t1_sched = nullptr; // dedicated sched for O15 T=1 reuse
     bool cp_t1_allocated = false;               // true once cp_t1_sched has allocated cp_t1_gf
+    // Dedicated persistent arena for cp_t1_gf's tensor metadata. Without this
+    // the graph is built into the shared `compute_meta`, which intervening
+    // builds (notably the 1.7B small_to_mtp projection, run between code steps)
+    // overwrite — leaving cp_t1_gf's tensors dangling so a later reuse hits
+    // GGML_ASSERT in ggml_backend_tensor_set (#56; 1.7B-specific, not CUDA).
+    ggml_context* cp_t1_ctx = nullptr;
+    std::vector<uint8_t> cp_t1_compute_meta;
 
     // Step-0 graph cache (PLAN #52 step 4 follow-on). The first cp_pred call
     // per frame is T=2 with lm_head[0]; the existing cp_t1_gf cache only
@@ -791,6 +843,35 @@ struct qwen3_tts_context {
     // style control). See issue #91.
     std::string runtime_cv_style_instruct;
 };
+
+static bool qwen3_tts_codec_use_gpu_by_default(const qwen3_tts_context* c) {
+    if (!c || !c->backend || c->backend == c->backend_cpu) {
+        return false;
+    }
+    // All GPU backends are safe: the CONV_TRANSPOSE_1D hang that originally
+    // forced the codec to CPU on Metal (and crashed CUDA/HIP in #155) was
+    // fixed in f8fc8b8e, and the op itself was replaced by mul_mat+col2im_1d
+    // in 5f600f25 — no backend has a transposed-conv problem any more.
+    return true;
+}
+
+static bool qwen3_tts_codec_backend_is_cuda(const qwen3_tts_context* c) {
+    if (!c || !c->backend || c->backend == c->backend_cpu) {
+        return false;
+    }
+    std::string name = ggml_backend_name(c->backend);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+    return name.find("cuda") != std::string::npos;
+}
+
+static bool qwen3_tts_codec_decode_uses_cuda(const qwen3_tts_context* c) {
+    const bool force_cpu = std::getenv("QWEN3_TTS_CODEC_CPU") != nullptr;
+    if (force_cpu || !qwen3_tts_codec_backend_is_cuda(c)) {
+        return false;
+    }
+    return std::getenv("QWEN3_TTS_CODEC_FORCE_METAL") != nullptr || std::getenv("QWEN3_TTS_CODEC_GPU") != nullptr ||
+           qwen3_tts_codec_use_gpu_by_default(c);
+}
 
 // ---------------------------------------------------------------------------
 // Loader helpers
@@ -1076,9 +1157,21 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
     }
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
 
-    ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
+    // Fused small_to_mtp (1.7B): the graph receives the RAW (d_in) embedding
+    // and projects it here on the same backend as the decoder, eliminating the
+    // per-step external projection dispatch. Plain pass-through otherwise.
+    const bool fuse = c->cp_mtp_fused && c->code_pred.small_to_mtp_w;
+    const int d_in = fuse ? (int)c->code_pred.small_to_mtp_w->ne[0] : d;
+    ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_in, T);
     ggml_set_name(embeds, "inputs_embeds");
     ggml_set_input(embeds);
+    ggml_tensor* embeds_proj = embeds;
+    if (fuse) {
+        embeds_proj = ggml_mul_mat(ctx0, c->code_pred.small_to_mtp_w, embeds); // (d, T)
+        if (c->code_pred.small_to_mtp_b) {
+            embeds_proj = ggml_add(ctx0, embeds_proj, c->code_pred.small_to_mtp_b);
+        }
+    }
 
     ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
     ggml_set_name(positions, "positions");
@@ -1095,10 +1188,10 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
     }
 
     const core_attn::KvSelfAttnParams kvp = {
-        n_q, n_kv, hd, n_kv_grp, (int)hp.max_pos, theta, 32.0f, 1.0f, attn_scale, eps, core_attn::GQA_MANUAL_CONT,
+        n_q, n_kv, hd, n_kv_grp, (int)hp.max_pos, theta, 32.0f, 1.0f, attn_scale, eps, core_attn::GQA_NATIVE,
     };
 
-    ggml_tensor* cur = embeds;
+    ggml_tensor* cur = embeds_proj;
     for (uint32_t il = 0; il < hp.cp_n_layers; il++) {
         const auto& b = c->code_pred.blocks[il];
         ggml_tensor* residual = cur;
@@ -1229,7 +1322,7 @@ ggml_cgraph* build_graph_talker_kv(qwen3_tts_context* c, int n_past, int n_token
         /*rope_beta_slow*/ 1.0f,
         /*attn_scale*/ attn_scale,
         /*qk_norm_eps*/ eps,
-        /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
+        /*gqa_mode*/ core_attn::GQA_NATIVE,
     };
 
     // Bucketed mode: pin K/V cache write index to runtime `positions` (via
@@ -1774,6 +1867,9 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     const auto& hp = c->hp;
     const int d = (int)hp.cp_d_model;
     const int vocab = (int)hp.cp_vocab_size;
+    // When the projection is fused into the graph, the caller passes raw
+    // (d_in) embeddings; otherwise it passes already-projected (d) ones.
+    const int d_in_eff = (c->cp_mtp_fused && c->code_pred.small_to_mtp_w) ? (int)c->code_pred.small_to_mtp_w->ne[0] : d;
 
     // Default OFF — see #56: ggml_set_rows-based reuse asserts on CUDA.
     const bool o15 = env_bool_default("QWEN3_TTS_O15", false);
@@ -1834,7 +1930,7 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
             }
             const double t_alloc = bench_s0 ? now_ms() : 0.0;
             ggml_backend_tensor_set(ggml_graph_get_tensor(s0_gf, "inputs_embeds"), embeds, 0,
-                                    (size_t)d * 2 * sizeof(float));
+                                    (size_t)d_in_eff * 2 * sizeof(float));
             ggml_backend_tensor_set(ggml_graph_get_tensor(s0_gf, "positions"), positions.data(), 0,
                                     positions.size() * sizeof(int32_t));
             ggml_backend_tensor_set(ggml_graph_get_tensor(s0_gf, "causal_mask"), mask.data(), 0,
@@ -1878,13 +1974,35 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     ggml_cgraph* gf;
     if (can_skip) {
         gf = c->cp_t1_gf;
+    } else if (use_slot) {
+        if (!c->cp_t1_gf) {
+            // First T=1 build: into a dedicated persistent arena (cp_t1_ctx) so
+            // intervening compute_meta builds (notably the 1.7B small_to_mtp
+            // projection, run between code steps) can't clobber this cached
+            // graph's tensor metadata. The graph is n_past-invariant under O15
+            // (positions carries n_past; lm_head via cp_lm_head_slot), so it is
+            // built once and reused for all T=1 steps and frames.
+            c->cp_t1_compute_meta.assign(c->compute_meta.size(), 0);
+            ggml_init_params ip = {c->cp_t1_compute_meta.size(), c->cp_t1_compute_meta.data(), true};
+            c->cp_t1_ctx = ggml_init(ip);
+            if (!c->cp_t1_ctx) {
+                return nullptr;
+            }
+            gf = build_graph_code_pred_kv(c, n_past, n_tokens, lm_head, c->cp_t1_ctx);
+            if (!gf) {
+                ggml_free(c->cp_t1_ctx);
+                c->cp_t1_ctx = nullptr;
+                c->cp_t1_compute_meta.clear();
+                return nullptr;
+            }
+            c->cp_t1_gf = gf; // cache for all future T=1 steps and frames
+        } else {
+            gf = c->cp_t1_gf;
+        }
     } else {
         gf = build_graph_code_pred_kv(c, n_past, n_tokens, lm_head);
         if (!gf) {
             return nullptr;
-        }
-        if (use_slot) {
-            c->cp_t1_gf = gf; // cache for future skip_plan calls within this frame
         }
     }
 
@@ -1907,12 +2025,29 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     if (!use_slot && !code_pred_reserve_sched(c, sched)) {
         return nullptr;
     }
+    // The "skip reset+alloc on cache hit" optimisation reuses a previously
+    // allocated graph without re-allocating the scheduler. On CUDA this triggers
+    // an illegal memory access (#56). So by default we re-alloc each step — we
+    // still keep the larger O15 win (the graph itself is built exactly once, no
+    // per-step rebuild). The skip is opt-in via QWEN3_TTS_O15_SKIP_REALLOC=1.
+    //
+    // WARNING (verified on M1 Metal, 2026-06-20, qwen3-tts-0.6b): with the
+    // current ggml the skip is ALSO broken on Metal — the reused graph's named
+    // inputs (inputs_embeds/positions/causal_mask) resolve to nil buffers
+    // ("ggml_metal_buffer_get_id: tensor ... buffer is nil") and synthesis
+    // returns no audio (clean failure, no crash). This matches the ggml sched
+    // cross-backend tightening (no auto-copy / allocation across reuse). So the
+    // skip is currently unsafe on both CUDA and this Metal; it is left opt-in for
+    // CPU / older-ggml setups only. With the skip off, O15 on 0.6B Metal is
+    // ~5% slower than O15=0 (re-alloc cost > build-once saving at this size), so
+    // O15 stays default-OFF; its win is on CUDA 1.7B (the crash this PR fixes).
+    const bool skip_realloc = can_skip && c->cp_t1_allocated && env_bool("QWEN3_TTS_O15_SKIP_REALLOC");
     const double t_reset0 = bench ? now_ms() : 0.0;
-    if (!can_skip || !c->cp_t1_allocated) {
+    if (!skip_realloc) {
         ggml_backend_sched_reset(sched);
     }
     const double t_reset1 = bench ? now_ms() : 0.0;
-    if (!can_skip || !c->cp_t1_allocated) {
+    if (!skip_realloc) {
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             return nullptr;
         }
@@ -1922,7 +2057,7 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     }
     const double t_alloc1 = bench ? now_ms() : 0.0;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0,
-                            (size_t)d * n_tokens * sizeof(float));
+                            (size_t)d_in_eff * n_tokens * sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), positions.data(), 0,
                             positions.size() * sizeof(int32_t));
     if (need_mask) {
@@ -2009,8 +2144,17 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
     // outputs need to flow through `small_to_mtp_projection` (Linear with
     // bias) before the code predictor consumes them. 0.6B variants have
     // matched dims and no projection in the GGUF — fall through to memcpy.
-    std::vector<float> step0((size_t)2 * d);
-    if (cp.small_to_mtp_w) {
+    // Fused path: feed the RAW (d_in) past_hidden/last_id_hidden; the code_pred
+    // graph applies small_to_mtp internally (same backend → no extra dispatch,
+    // no precision shift). Non-fused: project here as before.
+    const int cp_d_in = cp.small_to_mtp_w ? (int)cp.small_to_mtp_w->ne[0] : d;
+    std::vector<float> step0;
+    if (c->cp_mtp_fused && cp.small_to_mtp_w) {
+        step0.resize((size_t)2 * cp_d_in);
+        std::memcpy(step0.data(), past_hidden_d, (size_t)cp_d_in * sizeof(float));
+        std::memcpy(step0.data() + cp_d_in, last_id_hidden_d, (size_t)cp_d_in * sizeof(float));
+    } else if (cp.small_to_mtp_w) {
+        step0.resize((size_t)2 * d);
         if (!apply_small_to_mtp(c, past_hidden_d, step0.data())) {
             return false;
         }
@@ -2018,6 +2162,7 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
             return false;
         }
     } else {
+        step0.resize((size_t)2 * d);
         std::memcpy(step0.data(), past_hidden_d, (size_t)d * sizeof(float));
         std::memcpy(step0.data() + d, last_id_hidden_d, (size_t)d * sizeof(float));
     }
@@ -2110,19 +2255,24 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
         if (!ok) {
             return false;
         }
-        if (cp.small_to_mtp_w) {
+        const float* cp_in;
+        if (c->cp_mtp_fused && cp.small_to_mtp_w) {
+            cp_in = emb_in_buf.data(); // raw (d_in); graph projects internally
+        } else if (cp.small_to_mtp_w) {
             if (!apply_small_to_mtp(c, emb_in_buf.data(), emb_buf.data())) {
                 return false;
             }
+            cp_in = emb_buf.data();
         } else {
             std::memcpy(emb_buf.data(), emb_in_buf.data(), (size_t)d * sizeof(float));
+            cp_in = emb_buf.data();
         }
-        if (dump_dir && frame_idx >= 0) {
+        if (dump_dir && frame_idx >= 0 && !(c->cp_mtp_fused && cp.small_to_mtp_w)) {
             char name[64];
             snprintf(name, sizeof(name), "cp_f%03d_step%02d_embed", frame_idx, i);
             dump_f32(dump_dir, name, emb_buf.data(), d);
         }
-        float* logits = run_code_pred_kv(c, emb_buf.data(), 1, n_past, cp.lm_head[i], /*skip_plan=*/i >= 2);
+        float* logits = run_code_pred_kv(c, cp_in, 1, n_past, cp.lm_head[i], /*skip_plan=*/i >= 2);
         if (!logits) {
             return false;
         }
@@ -3508,7 +3658,7 @@ static ggml_tensor* codec_dec_block(ggml_context* ctx, ggml_tensor* x, const g3t
 //   attn_mask: F16 [T, T] sliding-window causal mask (nullptr iff T==1).
 // Returns the graph output tensor name "pcm" of shape [T_out] F32.
 // ---------------------------------------------------------------------------
-static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T) {
+static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T, bool keep_stage_outputs = false) {
     const auto& codec = c->codec;
     const auto& hp = codec.hp;
     const int n_q = (int)hp.n_q;
@@ -3547,12 +3697,16 @@ static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T) {
 
     ggml_tensor* h = ggml_add(ctx0, emb_first, emb_rest); // [512, T]
     ggml_set_name(h, "codec_rvq_out");
-    ggml_set_output(h); // prevent gallocr from reusing this buffer
+    if (keep_stage_outputs) {
+        ggml_set_output(h);
+    }
 
     // ── Step 2: pre_conv ────────────────────────────────────────────────────
     h = codec_causal_conv1d(ctx0, h, codec.pre_conv_w, codec.pre_conv_b, 1, 1); // [1024, T]
     ggml_set_name(h, "codec_pre_conv_out");
-    ggml_set_output(h);
+    if (keep_stage_outputs) {
+        ggml_set_output(h);
+    }
 
     // ── Step 3: transformer ─────────────────────────────────────────────────
     // input_proj: [1024, T] → [512, T]
@@ -3607,7 +3761,9 @@ static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T) {
     h = ggml_mul(ctx0, h, codec.xfmr_norm_w);
     h = ggml_add(ctx0, ggml_mul_mat(ctx0, codec.xfmr_out_proj_w, h), codec.xfmr_out_proj_b);
     ggml_set_name(h, "codec_xfmr_out");
-    ggml_set_output(h);
+    if (keep_stage_outputs) {
+        ggml_set_output(h);
+    }
 
     // ── Step 4: ConvNeXt upsample (2 stages, each 2×) ──────────────────────
     for (int s = 0; s < 2; s++) {
@@ -3616,18 +3772,24 @@ static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T) {
         char uname[32];
         snprintf(uname, sizeof(uname), "codec_up%d_out", s);
         ggml_set_name(h, uname);
-        ggml_set_output(h);
+        if (keep_stage_outputs) {
+            ggml_set_output(h);
+        }
     }
 
     // ── Step 5: Decoder blocks ──────────────────────────────────────────────
     h = codec_causal_conv1d(ctx0, h, codec.in_conv_w, codec.in_conv_b, 1, 1); // [1536, 4T]
     ggml_set_name(h, "codec_in_conv_out");
-    ggml_set_output(h);
+    if (keep_stage_outputs) {
+        ggml_set_output(h);
+    }
     for (int b = 0; b < 4; b++) {
         h = codec_dec_block(ctx0, h, codec.blocks[b], hp.upsample_rates[b]);
         if (b == 0) {
             ggml_set_name(h, "codec_blk0_out");
-            ggml_set_output(h);
+            if (keep_stage_outputs) {
+                ggml_set_output(h);
+            }
         }
     }
 
@@ -3676,23 +3838,25 @@ static bool load_codec(qwen3_tts_context* c, const char* path) {
     hp.rms_norm_eps = core_gguf::kv_f32(meta, "qwen3tts_codec.dec.rms_norm_eps", hp.rms_norm_eps);
     core_gguf::free_metadata(meta);
 
-    // Pass 2: weights — pinned to CPU backend by default to dodge the M1
-    // Metal hang. Two override env vars route weights onto the main GPU
-    // backend instead:
-    //   QWEN3_TTS_CODEC_FORCE_METAL=1 — reproduces the M1 hang with per-op
-    //                                   tracing for instrumentation.
-    //   QWEN3_TTS_CODEC_GPU=1         — clean GPU path with no trace.
-    //                                   Use on CUDA / Vulkan where the
-    //                                   Metal hang does not apply. On
-    //                                   Jetson Orin AGX, codec on CPU is
-    //                                   ~50x slower than CUDA.
+    // Pass 2: weights — default to GPU on all GPU backends. Env overrides:
+    //   QWEN3_TTS_CODEC_FORCE_METAL=1 — force Metal GPU path with per-op
+    //                                   trace callback (instrumentation).
+    //   QWEN3_TTS_CODEC_GPU=1         — explicit GPU override (no-op when
+    //                                   GPU is already the default).
+    //   QWEN3_TTS_CODEC_CPU=1         — force CPU codec for A/B timing.
     const bool force_metal = std::getenv("QWEN3_TTS_CODEC_FORCE_METAL") != nullptr;
-    const bool codec_gpu = std::getenv("QWEN3_TTS_CODEC_GPU") != nullptr;
-    ggml_backend_t weight_backend = (force_metal || codec_gpu) ? c->backend : c->backend_cpu;
-    if ((force_metal || codec_gpu) && c->params.verbosity >= 0) {
-        fprintf(stderr, "qwen3_tts: codec: %s - loading weights onto %s\n",
-                force_metal ? "QWEN3_TTS_CODEC_FORCE_METAL=1" : "QWEN3_TTS_CODEC_GPU=1",
-                ggml_backend_name(weight_backend));
+    const bool force_gpu = std::getenv("QWEN3_TTS_CODEC_GPU") != nullptr;
+    const bool force_cpu = std::getenv("QWEN3_TTS_CODEC_CPU") != nullptr;
+    const bool default_gpu = qwen3_tts_codec_use_gpu_by_default(c);
+    const bool codec_gpu = force_metal || force_gpu || (!force_cpu && default_gpu);
+    ggml_backend_t weight_backend = codec_gpu ? c->backend : c->backend_cpu;
+    if (c->params.verbosity >= 1) {
+        const char* why =
+            force_metal
+                ? "QWEN3_TTS_CODEC_FORCE_METAL=1"
+                : (force_gpu ? "QWEN3_TTS_CODEC_GPU=1"
+                             : (force_cpu ? "QWEN3_TTS_CODEC_CPU=1" : (default_gpu ? "GPU default" : "CPU default")));
+        fprintf(stderr, "qwen3_tts: codec: %s - loading weights onto %s\n", why, ggml_backend_name(weight_backend));
     }
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, weight_backend, "codec", wl)) {
@@ -3897,15 +4061,18 @@ static bool codec_trace_eval_cb(struct ggml_tensor* t, bool ask, void* user_data
     return true;
 }
 
-// Returns the codec scheduler to use for compute. Defaults to the CPU-only
-// codec_sched. Two env vars route through the main GPU sched instead:
-//   QWEN3_TTS_CODEC_FORCE_METAL=1 — reproduces the M1 crash with tracing
-//                                   (see codec_decode_codes trace path).
-//   QWEN3_TTS_CODEC_GPU=1         — clean GPU codec path, no tracing.
-//                                   Use on CUDA / Vulkan where the Metal
-//                                   hang does not apply.
+// Returns the codec scheduler to use for compute. Defaults to GPU on all GPU
+// backends (Metal included — the conv_transpose_1d hang was fixed in f8fc8b8e
+// and the op replaced by mul_mat+col2im_1d in 5f600f25). Env overrides:
+//   QWEN3_TTS_CODEC_FORCE_METAL=1 — force Metal GPU path with per-op tracing.
+//   QWEN3_TTS_CODEC_GPU=1         — explicit GPU override (usually no-op).
+//   QWEN3_TTS_CODEC_CPU=1         — force CPU codec for A/B timing.
 static ggml_backend_sched_t codec_pick_sched(qwen3_tts_context* c) {
-    if (std::getenv("QWEN3_TTS_CODEC_FORCE_METAL") || std::getenv("QWEN3_TTS_CODEC_GPU")) {
+    const bool force_metal = std::getenv("QWEN3_TTS_CODEC_FORCE_METAL") != nullptr;
+    const bool force_gpu = std::getenv("QWEN3_TTS_CODEC_GPU") != nullptr;
+    const bool force_cpu = std::getenv("QWEN3_TTS_CODEC_CPU") != nullptr;
+    const bool codec_gpu = force_metal || force_gpu || (!force_cpu && qwen3_tts_codec_use_gpu_by_default(c));
+    if (codec_gpu) {
         // Dedicated GPU scheduler — isolates codec memory pool from talker/main
         // to prevent VRAM fragmentation across repeated Python interop cycles.
         if (!c->codec_sched_gpu) {
@@ -3919,49 +4086,52 @@ static ggml_backend_sched_t codec_pick_sched(qwen3_tts_context* c) {
 }
 
 // ---------------------------------------------------------------------------
-// Execute codec decode: codes[T_codec × n_q] → malloc'd float32 PCM.
-// Input codes layout: [T_codec, n_q] row-major (T frames, each with n_q codes).
-// Output: [T_pcm] float32 @ 24 kHz, caller frees with free().
+// Decode ONE window of already-transposed codes_t[n_q, T_full].
+// Window = [window_start, window_start + window_len). Positions are ABSOLUTE
+// (window_start + i) so RoPE matches the full-sequence decode. The codec is
+// causal (sliding_window) with no rolling state, so a windowed decode with
+// enough left-context equals the matching slice of the full decode.
+// Output: malloc'd [1920 * window_len] float32 PCM @ 24 kHz.
 // ---------------------------------------------------------------------------
-static float* codec_decode_codes(qwen3_tts_context* c, const int32_t* codes, int T_codec, int* out_n_samples) {
+static float* codec_decode_window(qwen3_tts_context* c, const int32_t* codes_t, int n_q, int T_full, int window_start,
+                                  int window_len, int* out_n_samples) {
     if (out_n_samples) {
         *out_n_samples = 0;
     }
     const auto& codec = c->codec;
     const auto& hp = codec.hp;
-    const int n_q = (int)hp.n_q;
+    const int window = (int)hp.sliding_window;
 
-    // Transpose [T, n_q] → [n_q, T] so each codebook is a contiguous row.
-    std::vector<int32_t> codes_t((size_t)T_codec * n_q);
+    // Slice the window columns out of each codebook row → [n_q, window_len].
+    std::vector<int32_t> codes_w((size_t)window_len * n_q);
     for (int q = 0; q < n_q; q++) {
-        for (int t = 0; t < T_codec; t++) {
-            codes_t[(size_t)q * T_codec + t] = codes[(size_t)t * n_q + q];
+        for (int t = 0; t < window_len; t++) {
+            codes_w[(size_t)q * window_len + t] = codes_t[(size_t)q * T_full + window_start + t];
         }
     }
 
-    // Build sliding-window causal mask
-    const int window = (int)hp.sliding_window;
+    // Sliding-window causal mask [window_len × window_len].
     std::vector<ggml_fp16_t> mask_data;
-    if (T_codec > 1) {
+    if (window_len > 1) {
         const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t neginf_h = ggml_fp32_to_fp16(-INFINITY);
-        mask_data.assign((size_t)T_codec * T_codec, neginf_h);
-        for (int q = 0; q < T_codec; q++) {
+        mask_data.assign((size_t)window_len * window_len, neginf_h);
+        for (int q = 0; q < window_len; q++) {
             for (int k = 0; k <= q; k++) {
                 if ((q - k) < window) {
-                    mask_data[(size_t)q * T_codec + k] = zero_h;
+                    mask_data[(size_t)q * window_len + k] = zero_h;
                 }
             }
         }
     }
 
-    // Build positions [0..T-1]
-    std::vector<int32_t> pos(T_codec);
-    for (int i = 0; i < T_codec; i++) {
-        pos[i] = i;
+    // ABSOLUTE positions [window_start .. window_start + window_len - 1] (RoPE match).
+    std::vector<int32_t> pos(window_len);
+    for (int i = 0; i < window_len; i++) {
+        pos[i] = window_start + i;
     }
 
-    ggml_cgraph* gf = build_graph_codec_decode(c, T_codec);
+    ggml_cgraph* gf = build_graph_codec_decode(c, window_len);
     ggml_backend_sched_t sched = codec_pick_sched(c);
 
     ggml_backend_sched_reset(sched);
@@ -3970,10 +4140,10 @@ static float* codec_decode_codes(qwen3_tts_context* c, const int32_t* codes, int
         return nullptr;
     }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "codec_codes"), codes_t.data(), 0,
-                            codes_t.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "codec_codes"), codes_w.data(), 0,
+                            codes_w.size() * sizeof(int32_t));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "codec_positions"), pos.data(), 0, pos.size() * sizeof(int32_t));
-    if (T_codec > 1) {
+    if (window_len > 1) {
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "codec_mask"), mask_data.data(), 0,
                                 mask_data.size() * sizeof(ggml_fp16_t));
     }
@@ -3987,8 +4157,7 @@ static float* codec_decode_codes(qwen3_tts_context* c, const int32_t* codes, int
     if (std::getenv("QWEN3_TTS_CODEC_TRACE")) {
         ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
     }
-    // Sync GPU to drain the command queue before reading back; also prevents
-    // command-buffer pile-up across repeated Python interop cycles.
+    // Sync GPU to drain the command queue before reading back.
     {
         int n = ggml_backend_sched_get_n_backends(sched);
         if (n > 0)
@@ -4006,6 +4175,99 @@ static float* codec_decode_codes(qwen3_tts_context* c, const int32_t* codes, int
         return nullptr;
     }
     ggml_backend_tensor_get(out, pcm, 0, (size_t)n_samples * sizeof(float));
+    if (out_n_samples) {
+        *out_n_samples = n_samples;
+    }
+    return pcm;
+}
+
+// ---------------------------------------------------------------------------
+// Execute codec decode: codes[T_codec × n_q] → malloc'd float32 PCM.
+// Chunked decode (VRAM-constant): the codec is causal (sliding_window) with no
+// rolling state, so we decode in chunks of QWEN3_TTS_CODEC_CHUNK frames, each
+// prefixed with QWEN3_TTS_CODEC_CTX left-context frames whose PCM is discarded.
+// Peak VRAM depends on (ctx + chunk), not total length.
+// chunk <= 0 or T_codec <= chunk → single full-sequence pass (legacy path).
+// Env-tunable: QWEN3_TTS_CODEC_CHUNK (default 150), QWEN3_TTS_CODEC_CTX (default 128).
+// ---------------------------------------------------------------------------
+static float* codec_decode_codes(qwen3_tts_context* c, const int32_t* codes, int T_codec, int* out_n_samples) {
+    if (out_n_samples) {
+        *out_n_samples = 0;
+    }
+    const auto& codec = c->codec;
+    const auto& hp = codec.hp;
+    const int n_q = (int)hp.n_q;
+    const int window = (int)hp.sliding_window;
+
+    // Transpose [T, n_q] → [n_q, T] so each codebook is a contiguous row (once).
+    std::vector<int32_t> codes_t((size_t)T_codec * n_q);
+    for (int q = 0; q < n_q; q++) {
+        for (int t = 0; t < T_codec; t++) {
+            codes_t[(size_t)q * T_codec + t] = codes[(size_t)t * n_q + q];
+        }
+    }
+
+    // Chunk parameters (ENV-tunable). CUDA uses smaller windows by default:
+    // the decomposed transposed-conv path materializes large column tensors,
+    // and Win64 10 GiB cards can OOM even when the high-level decode is
+    // nominally chunked (GH #187).
+    const bool cuda_codec = qwen3_tts_codec_decode_uses_cuda(c);
+    const int cuda_chunk_cap = 64;
+    int chunk = cuda_codec ? cuda_chunk_cap : 150;
+    int ctx = cuda_codec ? std::max(window, 96) : 128;
+    if (const char* e = std::getenv("QWEN3_TTS_CODEC_CHUNK"))
+        chunk = atoi(e);
+    if (const char* e = std::getenv("QWEN3_TTS_CODEC_CTX"))
+        ctx = atoi(e);
+    if (ctx < window)
+        ctx = window; // left-context must cover the sliding window
+    if (cuda_codec && !std::getenv("QWEN3_TTS_CODEC_ALLOW_FULL")) {
+        if (chunk <= 0) {
+            chunk = cuda_chunk_cap;
+        } else if (chunk > cuda_chunk_cap) {
+            chunk = cuda_chunk_cap;
+        }
+        const int cuda_ctx_cap = std::max(window, 96);
+        if (ctx > cuda_ctx_cap) {
+            ctx = cuda_ctx_cap;
+        }
+    }
+    const int UP = 1920; // PCM samples per codec frame (24 kHz / 12.5 fps)
+
+    // Single-pass fallback: short sequence or chunking disabled.
+    if (chunk <= 0 || T_codec <= chunk) {
+        return codec_decode_window(c, codes_t.data(), n_q, T_codec, 0, T_codec, out_n_samples);
+    }
+
+    // Chunked: decode [window_start, chunk_end) per chunk, discard the left-context PCM.
+    if (c->params.verbosity >= 1) {
+        fprintf(stderr, "qwen3_tts: codec: chunked decode T=%d chunk=%d ctx=%d%s\n", T_codec, chunk, ctx,
+                cuda_codec ? " (CUDA cap)" : "");
+    }
+    std::vector<float> pcm_all;
+    pcm_all.reserve((size_t)T_codec * UP);
+    for (int chunk_start = 0; chunk_start < T_codec; chunk_start += chunk) {
+        const int chunk_end = std::min(chunk_start + chunk, T_codec);
+        const int window_start = std::max(0, chunk_start - ctx);
+        const int window_len = chunk_end - window_start;
+        int win_n = 0;
+        float* win_pcm = codec_decode_window(c, codes_t.data(), n_q, T_codec, window_start, window_len, &win_n);
+        if (!win_pcm) {
+            return nullptr;
+        }
+        const int discard = (chunk_start - window_start) * UP; // left-context samples to drop
+        if (discard >= 0 && discard <= win_n) {
+            pcm_all.insert(pcm_all.end(), win_pcm + discard, win_pcm + win_n);
+        }
+        free(win_pcm);
+    }
+
+    const int n_samples = (int)pcm_all.size();
+    float* pcm = (float*)malloc((size_t)n_samples * sizeof(float));
+    if (!pcm) {
+        return nullptr;
+    }
+    std::copy(pcm_all.begin(), pcm_all.end(), pcm);
     if (out_n_samples) {
         *out_n_samples = n_samples;
     }
@@ -4052,7 +4314,7 @@ static float* codec_extract_stage(qwen3_tts_context* c, const int32_t* codes, in
         pos[i] = i;
     }
 
-    ggml_cgraph* gf = build_graph_codec_decode(c, T_codec);
+    ggml_cgraph* gf = build_graph_codec_decode(c, T_codec, /*keep_stage_outputs=*/true);
     ggml_backend_sched_t sched = codec_pick_sched(c);
     ggml_backend_sched_reset(sched);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
@@ -4238,8 +4500,10 @@ static ggml_tensor* build_cenc_seanet(ggml_context* ctx, const g3t_cenc_seanet& 
 // Input: [T_enc, 512] from SEANet → converts to [512, T] internally.
 // Output: [T_enc, 512] (back-converted).
 // Mimi's encoder transformer uses CAUSAL attention with sliding window=250.
+// pos_in: optional i32 [T] tensor of ABSOLUTE positions (for chunked encoding).
+//         When null, positions 0..T-1 are derived from ggml_arange (full-sequence path).
 static ggml_tensor* build_cenc_transformer(ggml_context* ctx, const std::vector<g3t_cenc_xfmr_layer>& layers,
-                                           ggml_tensor* x) {
+                                           ggml_tensor* x, ggml_tensor* pos_in = nullptr) {
     // Transpose from SEANet [T, d] → [d, T] for ggml_norm (normalizes over ne[0]=d)
     x = ggml_cont(ctx, ggml_transpose(ctx, x)); // [d=512, T]
 
@@ -4249,7 +4513,7 @@ static ggml_tensor* build_cenc_transformer(ggml_context* ctx, const std::vector<
     const int T = (int)x->ne[1];
     const int d = (int)x->ne[0]; // 512
 
-    ggml_tensor* pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float)T, 1.0f), GGML_TYPE_I32);
+    ggml_tensor* pos = pos_in ? pos_in : ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float)T, 1.0f), GGML_TYPE_I32);
 
     // Causal sliding-window mask [T, T] F16 — set as input, filled at compute.
     ggml_tensor* causal_mask = nullptr;
@@ -4312,6 +4576,212 @@ static ggml_tensor* build_cenc_transformer(ggml_context* ctx, const std::vector<
     }
     // Back to [T, d] for the downsample conv
     return ggml_cont(ctx, ggml_transpose(ctx, x));
+}
+
+// Forward declarations for helpers defined further below.
+static std::vector<ggml_fp16_t> build_cenc_mask(int T_enc);
+static bool cenc_rvq_encode(qwen3_tts_context* c, const float* emb, int T, std::vector<int32_t>& out_codes);
+
+// ---------------------------------------------------------------------------
+// Chunked encoder sub-graphs (for long reference audio, T_enc > CENC_XFMR_THRESHOLD)
+// ---------------------------------------------------------------------------
+
+// Frames per output chunk; left-context kept for each chunk (= sliding_window).
+static const int CENC_XFMR_CHUNK = 500;
+static const int CENC_XFMR_CTX = 250;
+// Encoder uses the original full-graph path for T_enc ≤ this; chunked above.
+// 1500 frames ≈ 60 s reference audio; attention scratch at this size is ~144 MB
+// (1500² × 8 heads × 4 B), safe for any backend.  Long audio (11 min = 16500
+// frames) would need 8.7 GB of scratch and OOMs on CUDA.
+static const int CENC_XFMR_THRESHOLD = 1500;
+
+// SEANet only (no transformer, no downsample): PCM [n_samples] → [T_enc, 512].
+static ggml_cgraph* build_cenc_seanet_only_graph(qwen3_tts_context* c, int n_samples) {
+    size_t mem = c->cenc_compute_meta.size();
+    ggml_init_params ip = {mem, c->cenc_compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* pcm = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
+    ggml_set_name(pcm, "pcm_input");
+    ggml_set_input(pcm);
+
+    ggml_tensor* x = ggml_reshape_2d(ctx0, pcm, n_samples, 1); // [T, 1]
+    x = build_cenc_seanet(ctx0, c->cenc.seanet, x);            // → [T_enc, 512]
+    x = ggml_cont(ctx0, x);
+    ggml_set_name(x, "cenc_seanet_out");
+    ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Transformer chunk: inputs cenc_chunk_in [chunk_T, 512] + cenc_chunk_pos [chunk_T] i32
+// (absolute frame positions) → output cenc_chunk_out [chunk_T, 512].
+static ggml_cgraph* build_cenc_xfmr_chunk_graph(qwen3_tts_context* c, int chunk_T) {
+    size_t mem = c->cenc_compute_meta.size();
+    ggml_init_params ip = {mem, c->cenc_compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* x_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, chunk_T, 512);
+    ggml_set_name(x_in, "cenc_chunk_in");
+    ggml_set_input(x_in);
+
+    ggml_tensor* pos_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, chunk_T);
+    ggml_set_name(pos_in, "cenc_chunk_pos");
+    ggml_set_input(pos_in);
+
+    // build_cenc_transformer will use pos_in for RoPE and create "cenc_mask" input.
+    ggml_tensor* out = build_cenc_transformer(ctx0, c->cenc.xfmr_layers, x_in, pos_in);
+    out = ggml_cont(ctx0, out); // [chunk_T, 512]
+    ggml_set_name(out, "cenc_chunk_out");
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Downsample only: input cenc_ds_in [T_enc, 512] → enc_emb [512, T_frames].
+static ggml_cgraph* build_cenc_downsample_graph(qwen3_tts_context* c, int T_enc) {
+    size_t mem = c->cenc_compute_meta.size();
+    ggml_init_params ip = {mem, c->cenc_compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_enc, 512);
+    ggml_set_name(x, "cenc_ds_in");
+    ggml_set_input(x);
+
+    const auto& ce = c->cenc;
+    g3t_cenc_conv ds_conv = {ce.downsample.w, ce.downsample.b};
+    ggml_tensor* tmp = cenc_conv1d_ext(ctx0, x, ds_conv, 2, /*replicate*/ true); // [T_frames, 512]
+    tmp = ggml_cont(ctx0, ggml_transpose(ctx0, tmp));                            // [512, T_frames]
+    ggml_set_name(tmp, "enc_emb");
+    ggml_set_output(tmp);
+    ggml_build_forward_expand(gf, tmp);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Chunked encoder for T_enc > CENC_XFMR_THRESHOLD.
+// Splits the O(T²) transformer attention into chunks of CENC_XFMR_CHUNK frames,
+// each with CENC_XFMR_CTX frames of left-context (= sliding window).
+// SEANet runs once over full PCM (O(n)); transformer runs per chunk (O(chunk²));
+// downsample runs once over the concatenated output (O(n)).
+static bool run_cenc_chunked(qwen3_tts_context* c, const float* audio, int n_samples, std::vector<int32_t>& codes,
+                             int& T_frames) {
+    const int T_enc = n_samples / 960;
+    fprintf(stderr, "qwen3_tts: cenc: chunked encoder T_enc=%d (%.1fs ref audio, chunk=%d ctx=%d)\n", T_enc,
+            (float)n_samples / 24000.0f, CENC_XFMR_CHUNK, CENC_XFMR_CTX);
+
+    // ── Phase 1: SEANet over full PCM ──
+    // seanet_buf layout: ne=[T_enc, 512] → flat index [ch * T_enc + t]
+    std::vector<float> seanet_buf((size_t)512 * T_enc);
+    {
+        ggml_cgraph* gf = build_cenc_seanet_only_graph(c, n_samples);
+        ggml_backend_sched_reset(c->sched);
+        if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+            fprintf(stderr, "qwen3_tts: cenc: seanet alloc failed\n");
+            return false;
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pcm_input"), audio, 0, (size_t)n_samples * sizeof(float));
+        if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "qwen3_tts: cenc: seanet compute failed\n");
+            return false;
+        }
+        ggml_tensor* se_t = ggml_graph_get_tensor(gf, "cenc_seanet_out");
+        ggml_backend_tensor_get(se_t, seanet_buf.data(), 0, seanet_buf.size() * sizeof(float));
+    }
+
+    // ── Phase 2: Transformer in chunks ──
+    // xfmr_out layout: ne=[T_enc, 512] → flat index [ch * T_enc + t]
+    std::vector<float> xfmr_out((size_t)512 * T_enc);
+    {
+        int result_start = 0;
+        while (result_start < T_enc) {
+            const int ctx_T = std::min(result_start, CENC_XFMR_CTX);
+            const int ctx_start = result_start - ctx_T;
+            const int new_T = std::min(CENC_XFMR_CHUNK, T_enc - result_start);
+            const int chunk_T = ctx_T + new_T;
+
+            ggml_cgraph* gf = build_cenc_xfmr_chunk_graph(c, chunk_T);
+            ggml_backend_sched_reset(c->sched);
+            if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+                fprintf(stderr, "qwen3_tts: cenc: xfmr chunk alloc failed (chunk_T=%d)\n", chunk_T);
+                return false;
+            }
+
+            // Copy frames [ctx_start, ctx_start+chunk_T) from seanet_buf → chunk_in.
+            // Both buffers use ne=[T, 512] layout: data[ch * T + t].
+            {
+                std::vector<float> chunk_in((size_t)512 * chunk_T);
+                for (int ch = 0; ch < 512; ch++) {
+                    memcpy(&chunk_in[(size_t)ch * chunk_T], &seanet_buf[(size_t)ch * T_enc + ctx_start],
+                           (size_t)chunk_T * sizeof(float));
+                }
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cenc_chunk_in"), chunk_in.data(), 0,
+                                        chunk_in.size() * sizeof(float));
+            }
+
+            // Absolute positions for RoPE: ctx_start, ctx_start+1, …, ctx_start+chunk_T-1.
+            {
+                std::vector<int32_t> pos_vals(chunk_T);
+                for (int t = 0; t < chunk_T; t++) {
+                    pos_vals[t] = ctx_start + t;
+                }
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cenc_chunk_pos"), pos_vals.data(), 0,
+                                        pos_vals.size() * sizeof(int32_t));
+            }
+
+            // Causal mask for the chunk.
+            ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "cenc_mask");
+            if (mask_t && chunk_T > 1) {
+                auto mask = build_cenc_mask(chunk_T);
+                ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            }
+
+            if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "qwen3_tts: cenc: xfmr chunk compute failed (chunk_T=%d start=%d)\n", chunk_T,
+                        result_start);
+                return false;
+            }
+
+            // Read back chunk output and copy the new_T frames (skip ctx_T left-context).
+            {
+                std::vector<float> chunk_out((size_t)512 * chunk_T);
+                ggml_tensor* out_t = ggml_graph_get_tensor(gf, "cenc_chunk_out");
+                ggml_backend_tensor_get(out_t, chunk_out.data(), 0, chunk_out.size() * sizeof(float));
+                for (int ch = 0; ch < 512; ch++) {
+                    memcpy(&xfmr_out[(size_t)ch * T_enc + result_start], &chunk_out[(size_t)ch * chunk_T + ctx_T],
+                           (size_t)new_T * sizeof(float));
+                }
+            }
+
+            result_start += new_T;
+        }
+    }
+
+    // ── Phase 3: Downsample + RVQ ──
+    {
+        ggml_cgraph* gf = build_cenc_downsample_graph(c, T_enc);
+        ggml_backend_sched_reset(c->sched);
+        if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+            fprintf(stderr, "qwen3_tts: cenc: downsample alloc failed\n");
+            return false;
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cenc_ds_in"), xfmr_out.data(), 0,
+                                xfmr_out.size() * sizeof(float));
+        if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "qwen3_tts: cenc: downsample compute failed\n");
+            return false;
+        }
+        ggml_tensor* emb_t = ggml_graph_get_tensor(gf, "enc_emb");
+        T_frames = (int)emb_t->ne[1];
+        std::vector<float> emb((size_t)512 * T_frames);
+        ggml_backend_tensor_get(emb_t, emb.data(), 0, emb.size() * sizeof(float));
+        return cenc_rvq_encode(c, emb.data(), T_frames, codes);
+    }
 }
 
 // Build the SEANet→transformer→downsample graph and return downsampled embeddings.
@@ -4481,6 +4951,13 @@ static std::vector<ggml_fp16_t> build_cenc_mask(int T_enc) {
 // Run codec encoder: 24kHz PCM → codes [T_frames × 16] row-major.
 static bool run_cenc(qwen3_tts_context* c, const float* audio, int n_samples, std::vector<int32_t>& codes,
                      int& T_frames) {
+    // For long reference audio, the O(T²) transformer attention OOMs.
+    // Use the chunked path (SEANet + chunked transformer + downsample) above threshold.
+    const int T_enc = n_samples / 960;
+    if (T_enc > CENC_XFMR_THRESHOLD) {
+        return run_cenc_chunked(c, audio, n_samples, codes, T_frames);
+    }
+
     // Build and execute the SEANet+transformer+downsample graph
     ggml_cgraph* gf = build_cenc_graph(c, n_samples);
     ggml_backend_sched_reset(c->sched);
@@ -5004,7 +5481,7 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_codec_only(const char* codec
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
-    c->backend = params.use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         c->backend = c->backend_cpu;
     }
@@ -5105,6 +5582,18 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
             }
         }
 
+        // Output-language table (name → codec_language_id) for
+        // qwen3_tts_set_language_by_name. Optional — older GGUFs lack it.
+        hp.codec_language_names = core_gguf::kv_str_array(g, "qwen3tts.codec_language_names");
+        {
+            int64_t k = gguf_find_key(g, "qwen3tts.codec_language_ids");
+            if (k >= 0) {
+                int n = gguf_get_arr_n(g, k);
+                const auto* d = (const uint32_t*)gguf_get_arr_data(g, k);
+                hp.codec_language_ids.assign(d, d + n);
+            }
+        }
+
         auto tok = core_gguf::kv_str_array(g, "tokenizer.ggml.tokens");
         if (!tok.empty()) {
             c->vocab.id_to_token = std::move(tok);
@@ -5130,7 +5619,7 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
-    c->backend = params.use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         c->backend = c->backend_cpu;
     }
@@ -5236,6 +5725,21 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
         if (!copy_cp_weights_to_cpu(c, code_pred_cpu_copy_type_from_env(cp_be))) {
             fprintf(stderr, "qwen3_tts: code_pred CPU pin requested but copy failed; using main backend\n");
         }
+    }
+
+    // 1.7B default: fold small_to_mtp into the code_pred graph (#161). The 1.7B
+    // talker→code_pred bridge projection otherwise runs as 16 separate
+    // single-matmul GPU graphs per frame (2 at step-0 + 14 in the cb loop), each
+    // with its own sched_reset + alloc_graph + compute + readback — and on
+    // discrete-VRAM backends (CUDA) those tiny dispatches/sync dominate the
+    // code_pred wall. Folding runs the projection as the first op of the
+    // code_pred graph, same backend/kernel as the decoder: a bit-consistent
+    // q8_0 realization with no extra dispatch and no precision shift. Skipped
+    // when code_pred is CPU-pinned (cp_cpu_pinned keeps the external
+    // projection), or via QWEN3_TTS_CP_MTP_NOFUSE=1 for A/B bisection.
+    c->cp_mtp_fused = c->code_pred.small_to_mtp_w && !c->cp_cpu_pinned && !env_bool("QWEN3_TTS_CP_MTP_NOFUSE");
+    if (c->cp_mtp_fused && c->params.verbosity >= 1) {
+        fprintf(stderr, "qwen3_tts: small_to_mtp fused into code_pred graph (no per-step projection dispatch)\n");
     }
 
     // Eagerly reserve the code_pred scheduler with a clean (empty) scheduler
@@ -5651,6 +6155,33 @@ extern "C" int qwen3_tts_set_language(struct qwen3_tts_context* ctx, int codec_l
     return 0;
 }
 
+extern "C" int qwen3_tts_set_language_by_name(struct qwen3_tts_context* ctx, const char* name) {
+    if (!ctx || !name) {
+        return -1;
+    }
+    // "auto" (or empty) → -1 = no language hint (the "nothink" path).
+    std::string want = name;
+    std::transform(want.begin(), want.end(), want.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    if (want.empty() || want == "auto") {
+        ctx->language_id = -1;
+        return 0;
+    }
+    const auto& names = ctx->hp.codec_language_names;
+    const auto& ids = ctx->hp.codec_language_ids;
+    if (names.empty() || names.size() != ids.size()) {
+        return -2; // model has no language table (older GGUF)
+    }
+    for (size_t i = 0; i < names.size(); i++) {
+        std::string n = names[i];
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        if (n == want) {
+            ctx->language_id = (int)ids[i];
+            return 0;
+        }
+    }
+    return -3; // name not found in this model's table
+}
+
 extern "C" int qwen3_tts_is_custom_voice(struct qwen3_tts_context* ctx) {
     return (ctx && ctx->hp.tts_model_type == "custom_voice") ? 1 : 0;
 }
@@ -5871,16 +6402,32 @@ extern "C" float* qwen3_tts_run_code_pred_step(struct qwen3_tts_context* ctx, co
     return logits;
 }
 
-extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, const char* text, int* out_n_codes) {
-    if (out_n_codes) {
-        *out_n_codes = 0;
-    }
-    if (!ctx || !text) {
-        return nullptr;
+// Shared talker AR generation loop used by both qwen3_tts_synthesize_codes
+// (whole-clip) and qwen3_tts_synthesize_streaming (windowed). Builds the
+// prefill, runs the talker prefill, then the per-frame loop (1 talker step + 15
+// code_predictor steps), appending each 16-codebook frame to `all_codes`.
+//
+// `on_frame(frame)` is invoked once per completed frame — AFTER that frame's
+// codes are in `all_codes` and the next talker input has been built, but BEFORE
+// the talker forward for the following frame. That is exactly where the
+// streaming path decodes and emits a PCM window. Return false from on_frame to
+// stop early; the caller distinguishes an intentional early stop from a hard
+// failure via its own captured state.
+//
+// Returns false only on hard failure (allocation / inference error); true on
+// any normal termination (EOS / max_frames / kv-full / on_frame-stop).
+// *out_frames receives the number of frames produced. The non-streaming path
+// passes a no-op on_frame, so this loop is byte-identical to the previous
+// inline qwen3_tts_synthesize_codes body for the codes it produces.
+template <typename OnFrame>
+static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text, std::vector<int32_t>& all_codes,
+                                        int* out_frames, OnFrame on_frame) {
+    if (out_frames) {
+        *out_frames = 0;
     }
     if (ctx->vocab.id_to_token.empty()) {
         fprintf(stderr, "qwen3_tts: vocab empty — re-convert with the updated converter\n");
-        return nullptr;
+        return false;
     }
     const bool is_custom_voice = (ctx->hp.tts_model_type == "custom_voice");
     const bool is_voice_design = (ctx->hp.tts_model_type == "voice_design");
@@ -5888,13 +6435,13 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         // CustomVoice: need a fixed speaker selected via set_speaker_by_name.
         if ((int)ctx->runtime_spk_emb.size() != (int)ctx->hp.d_model) {
             fprintf(stderr, "qwen3_tts: no speaker — call qwen3_tts_set_speaker_by_name\n");
-            return nullptr;
+            return false;
         }
     } else if (is_voice_design) {
         // VoiceDesign: need a non-empty natural-language instruct.
         if (ctx->runtime_instruct.empty()) {
             fprintf(stderr, "qwen3_tts: VoiceDesign needs a voice description — call qwen3_tts_set_instruct\n");
-            return nullptr;
+            return false;
         }
     } else {
         // Base: need either a voice pack, a runtime voice prompt with ref_codes,
@@ -5902,7 +6449,7 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         if (ctx->vp_active < 0 && ctx->runtime_ref_codes.empty() &&
             !(ctx->xvec_only && (int)ctx->runtime_spk_emb.size() == (int)ctx->hp.d_model)) {
             fprintf(stderr, "qwen3_tts: no voice — call qwen3_tts_load_voice_pack or qwen3_tts_set_voice_prompt\n");
-            return nullptr;
+            return false;
         }
     }
 
@@ -5912,7 +6459,8 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
     const auto& hp = ctx->hp;
     const int d = (int)hp.d_model;
     const int n_groups = (int)hp.n_code_groups; // 16
-    int max_frames = ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps : 1500;
+    int max_frames =
+        ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps : (ctx->kv_max_ctx > 0 ? ctx->kv_max_ctx : 1500);
     if (const char* mf = getenv("QWEN3_TTS_MAX_FRAMES")) {
         const int v = std::atoi(mf);
         if (v > 0)
@@ -5934,11 +6482,11 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
     int T_pre = 0, M_trail = 0;
     if (is_custom_voice) {
         if (!build_customvoice_prefill_embeds(ctx, text, prefill, T_pre, trailing, M_trail)) {
-            return nullptr;
+            return false;
         }
     } else if (is_voice_design) {
         if (!build_voicedesign_prefill_embeds(ctx, ctx->runtime_instruct, text, prefill, T_pre, trailing, M_trail)) {
-            return nullptr;
+            return false;
         }
     } else {
         std::string ref_text;
@@ -5954,11 +6502,11 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
                 fprintf(
                     stderr,
                     "qwen3_tts: no ref_text — call qwen3_tts_set_voice_prompt with ref_text or load a voice pack\n");
-                return nullptr;
+                return false;
             }
         }
         if (!build_icl_prefill_embeds(ctx, text, ref_text, prefill, T_pre, trailing, M_trail)) {
-            return nullptr;
+            return false;
         }
     }
     if (bench) {
@@ -5976,7 +6524,7 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
     if (!logits || !past_hidden) {
         free(logits);
         free(past_hidden);
-        return nullptr;
+        return false;
     }
     if (bench) {
         fprintf(stderr, "qwen3_tts: talker_pre %7.1f ms\n", now_ms() - t1);
@@ -5998,10 +6546,10 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         fprintf(stderr, "qwen3_tts: cp_kv allocation failed\n");
         free(logits);
         free(past_hidden);
-        return nullptr;
+        return false;
     }
 
-    std::vector<int32_t> all_codes; // flattened (T_frames, 16)
+    all_codes.clear();
     all_codes.reserve((size_t)max_frames * n_groups);
 
     double t_loop = bench ? now_ms() : 0.0;
@@ -6058,13 +6606,13 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         if (embd_cache_enabled && ctx->token_embd_cache) {
             if (!ctx->token_embd_cache.get_row_into(cb0, last_id_hidden_buf.data())) {
                 free(past_hidden);
-                return nullptr;
+                return false;
             }
         } else {
             float* tmp = lookup_rows(ctx, ctx->talker.token_embd_w, &cb0, 1);
             if (!tmp) {
                 free(past_hidden);
-                return nullptr;
+                return false;
             }
             std::memcpy(last_id_hidden_buf.data(), tmp, (size_t)d * sizeof(float));
             free(tmp);
@@ -6077,7 +6625,7 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         const double t_cp = bench ? now_ms() : 0.0;
         if (!code_pred_generate_15(ctx, past_hidden, last_id_hidden_buf.data(), cb1_15, &rng, frame)) {
             free(past_hidden);
-            return nullptr;
+            return false;
         }
         if (bench) {
             t_loop_code_pred += now_ms() - t_cp;
@@ -6116,7 +6664,7 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
                     }
                 }
                 if (!ok) {
-                    return nullptr;
+                    return false;
                 }
                 for (int j = 0; j < d; j++) {
                     next_emb[j] += next_emb_row_buf[j];
@@ -6144,6 +6692,13 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
                     next_emb[1], next_emb[2], next_emb[3], s);
         }
 
+        // Per-frame hook: the streaming path decodes + emits a PCM window here.
+        // A false return means "stop now" (e.g. the streaming decode failed);
+        // the caller inspects its own state to tell stop-vs-failure apart.
+        if (!on_frame(frame)) {
+            break;
+        }
+
         // 6. Talker forward on the (1, d) input → next logits + hidden_last.
         if (n_past >= ctx->kv_max_ctx - 1) {
             fprintf(stderr, "qwen3_tts: talker kv cache full at frame %d (n_past=%d)\n", frame, n_past);
@@ -6157,7 +6712,7 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         if (!logits || !past_hidden) {
             free(logits);
             free(past_hidden);
-            return nullptr;
+            return false;
         }
         n_past += 1;
     }
@@ -6180,14 +6735,66 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         dump_i32(dump_dir, "generated_codes", all_codes.data(), all_codes.size());
     }
 
-    *out_n_codes = (int)all_codes.size();
+    if (out_frames) {
+        *out_frames = frame;
+    }
+    return true;
+}
+
+extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, const char* text, int* out_n_codes) {
+    if (out_n_codes) {
+        *out_n_codes = 0;
+    }
+    if (!ctx || !text) {
+        return nullptr;
+    }
+    std::vector<int32_t> all_codes;
+    int frames = 0;
+    // No-op per-frame hook: collect the whole clip, then return the codes.
+    if (!qwen3_tts_generate_codes_ar(ctx, text, all_codes, &frames, [](int) { return true; })) {
+        return nullptr;
+    }
+    if (out_n_codes) {
+        *out_n_codes = (int)all_codes.size();
+    }
     int32_t* out = (int32_t*)malloc(all_codes.size() * sizeof(int32_t));
+    if (!out) {
+        return nullptr;
+    }
     std::memcpy(out, all_codes.data(), all_codes.size() * sizeof(int32_t));
     return out;
 }
 
 extern "C" void qwen3_tts_codes_free(int32_t* codes) {
     free(codes);
+}
+
+// Free the length-dependent scratch compute buffers after each request so the
+// VRAM/RAM high-water-mark doesn't persist across requests. The codec's
+// codec_sched_gpu galloc buffer grows with sequence length (T_gen frames) and
+// was only freed at qwen3_tts_free. The main sched (talker/prefill/embed)
+// grows with Lk up to kv_max_ctx=4096. Both are pure scratch schedulers
+// (reset+alloc+compute per graph, no cached graph attached).
+static void qwen3_tts_reset_scratch_sched(qwen3_tts_context* c) {
+    if (!c)
+        return;
+    // Codec-decode scheduler (lazy-created in codec_pick_sched): free + nullptr
+    // so it's re-created fresh (small) on the next decode call.
+    if (c->codec_sched_gpu) {
+        ggml_backend_sched_free(c->codec_sched_gpu);
+        c->codec_sched_gpu = nullptr;
+    }
+    // Talker/prefill/embed scratch sched: not lazy → re-create with same
+    // backend list as at creation (qwen3_tts.cpp init: {backend, backend_cpu}).
+    if (c->sched) {
+        ggml_backend_sched_free(c->sched);
+        int n_be = 0;
+        ggml_backend_t backends[2];
+        backends[n_be++] = c->backend;
+        if (c->backend_cpu && c->backend_cpu != c->backend)
+            backends[n_be++] = c->backend_cpu;
+        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    }
 }
 
 extern "C" float* qwen3_tts_decode_codes(struct qwen3_tts_context* ctx, const int32_t* codes, int n_codes,
@@ -6282,9 +6889,15 @@ extern "C" float* qwen3_tts_synthesize(struct qwen3_tts_context* ctx, const char
         fprintf(stderr, "qwen3_tts: synthesize() requires the codec — call qwen3_tts_set_codec_path() first.\n");
         return nullptr;
     }
+    qwen3_tts_bench_stage _bs_synth("synthesize");
+
     const double t_total0 = now_ms();
     int n_codes = 0;
-    int32_t* codes = qwen3_tts_synthesize_codes(ctx, text, &n_codes);
+    int32_t* codes;
+    {
+        qwen3_tts_bench_stage _bs("synthesize_codes");
+        codes = qwen3_tts_synthesize_codes(ctx, text, &n_codes);
+    }
     const double t_codes = now_ms();
     if (!codes || n_codes <= 0) {
         free(codes);
@@ -6330,6 +6943,8 @@ extern "C" float* qwen3_tts_synthesize(struct qwen3_tts_context* ctx, const char
     // rolling state and the equivalence breaks).
     const char* skip_env = std::getenv("QWEN3_TTS_SKIP_REF_DECODE");
     const bool skip_ref = !skip_env || skip_env[0] != '0';
+
+    qwen3_tts_bench_stage _bs_codec("codec_decode");
 
     if (!ref_codes.empty() && !skip_ref) {
         std::vector<int32_t> codes_for_decode;
@@ -6377,7 +6992,168 @@ extern "C" float* qwen3_tts_synthesize(struct qwen3_tts_context* ctx, const char
                 "audio=%.1f s  rtf=%.3f\n",
                 code_ms, codec_ms, total_ms, dur, (total_ms / 1000.0) / dur);
     }
+    // Free the scratch compute buffers so the length-dependent galloc
+    // high-water-mark doesn't persist across requests (issue #183).
+    qwen3_tts_reset_scratch_sched(ctx);
     return pcm;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming synthesis. Mirrors qwen3_tts_synthesize_codes' AR loop verbatim
+// (same prefill, same per-frame talker + code_pred steps, same KV / past_hidden
+// flow), but decodes and emits PCM in windows as codes are produced instead of
+// returning the full clip only at the end. KV state is never reset between
+// chunks — only the codec decode is windowed.
+//
+// Windowing: the codec is a strictly-causal forward pass (sliding-window
+// attention, window=72; causal convs, left-pad only). codec_decode_codes(W)
+// where W = [left-context frames] + [new frames] reproduces the new frames'
+// PCM bit-for-bit (no right context needed); we discard the left-context
+// PCM as a pre-roll. See the equivalence note in qwen3_tts_synthesize.
+extern "C" float* qwen3_tts_synthesize_streaming(struct qwen3_tts_context* ctx, const char* text, int chunk_frames,
+                                                 int overlap_frames, qwen3_tts_pcm_callback cb, void* user_data,
+                                                 int* out_n_samples) {
+    if (out_n_samples) {
+        *out_n_samples = 0;
+    }
+    if (!ctx || !text) {
+        return nullptr;
+    }
+    if (!ctx->codec.loaded) {
+        fprintf(stderr,
+                "qwen3_tts: synthesize_streaming() requires the codec — call qwen3_tts_set_codec_path() first.\n");
+        return nullptr;
+    }
+    if (ctx->vocab.id_to_token.empty()) {
+        fprintf(stderr, "qwen3_tts: vocab empty — re-convert with the updated converter\n");
+        return nullptr;
+    }
+    if (chunk_frames <= 0) {
+        chunk_frames = 8;
+    }
+    if (overlap_frames < 0) {
+        // 96 > codec sliding-window (72) + causal upsample-conv receptive
+        // field, so the emitted window tail matches a whole-clip decode.
+        overlap_frames = 96;
+    }
+
+    const bool bench = env_bool("QWEN3_TTS_BENCH");
+    const auto& hp = ctx->hp;
+    const int n_groups = (int)hp.n_code_groups; // 16
+    const int n_q = (int)ctx->codec.hp.n_q;
+
+    // Streaming output state, shared with the per-frame emit hook below.
+    std::vector<int32_t> all_codes; // flattened (T_frames, 16)
+    std::vector<float> full_pcm;    // concatenated emitted PCM (return value)
+    int frames_emitted = 0;         // frames whose PCM has already been pushed
+    const int frame_samples = 1920; // 24 kHz / 12.5 Hz codec rate
+
+    // Decode the window [emit_lo .. n_frames) and emit the tail (frames
+    // [frames_emitted .. n_frames)), discarding the left-context pre-roll.
+    // Fires cb() with the emitted samples. Returns false on decode failure.
+    auto emit_window = [&](int n_frames, bool is_final) -> bool {
+        if (n_frames <= frames_emitted) {
+            if (is_final && cb) {
+                cb(nullptr, 0, 1, user_data); // signal end with empty final chunk
+            }
+            return true;
+        }
+        const int emit_lo = std::max(0, frames_emitted - overlap_frames);
+        const int pre_roll_frames = frames_emitted - emit_lo; // left context to discard
+        const int W = n_frames - emit_lo;
+        const int32_t* window_codes = all_codes.data() + (size_t)emit_lo * n_q;
+
+        int n_pcm = 0;
+        float* pcm = codec_decode_codes(ctx, window_codes, W, &n_pcm);
+        if (!pcm || n_pcm <= 0) {
+            free(pcm);
+            return false;
+        }
+        // Discard the pre-roll PCM (the left-context frames). The codec is
+        // strictly causal so the remaining samples equal the full-clip
+        // decode of frames [frames_emitted .. n_frames).
+        const int discard = std::min(n_pcm, pre_roll_frames * frame_samples);
+        const int n_emit = n_pcm - discard;
+        if (n_emit > 0) {
+            const float* emitted = pcm + discard;
+            full_pcm.insert(full_pcm.end(), emitted, emitted + n_emit);
+            if (cb) {
+                cb(emitted, n_emit, is_final ? 1 : 0, user_data);
+            }
+        } else if (is_final && cb) {
+            cb(nullptr, 0, 1, user_data);
+        }
+        free(pcm);
+        frames_emitted = n_frames;
+        return true;
+    };
+
+    // Per-frame hook driven by the shared AR loop: every chunk_frames new
+    // frames, decode + emit a window. Returns false to stop the loop on a
+    // decode failure (signalled to the caller via emit_failed).
+    double t0 = bench ? now_ms() : 0.0;
+    double t_codec = 0.0;
+    bool first_chunk_logged = false;
+    bool emit_failed = false;
+    auto on_frame = [&](int frame) -> bool {
+        if ((frame + 1) - frames_emitted >= chunk_frames) {
+            const double tc = bench ? now_ms() : 0.0;
+            if (!emit_window(frame + 1, /*is_final=*/false)) {
+                emit_failed = true;
+                return false;
+            }
+            if (bench) {
+                t_codec += now_ms() - tc;
+                if (!first_chunk_logged) {
+                    fprintf(stderr, "qwen3_tts: [stream] time-to-first-chunk %7.1f ms (%d frames)\n", now_ms() - t0,
+                            frame + 1);
+                    first_chunk_logged = true;
+                }
+            }
+        }
+        return true;
+    };
+
+    int frames = 0;
+    if (!qwen3_tts_generate_codes_ar(ctx, text, all_codes, &frames, on_frame)) {
+        return nullptr;
+    }
+    if (emit_failed) {
+        return nullptr;
+    }
+
+    // Final (possibly partial) chunk: emit any frames not yet pushed.
+    const int total_frames = (int)(all_codes.size() / n_groups);
+    {
+        const double tc = bench ? now_ms() : 0.0;
+        if (!emit_window(total_frames, /*is_final=*/true)) {
+            return nullptr;
+        }
+        if (bench) {
+            t_codec += now_ms() - tc;
+            fprintf(stderr, "qwen3_tts: [stream] codec %7.1f ms (final emit incl.)\n", t_codec);
+        }
+    }
+
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "qwen3_tts: [stream] produced %d frames × 16 codebooks → %zu samples\n", total_frames,
+                full_pcm.size());
+    }
+
+    if (full_pcm.empty()) {
+        return nullptr;
+    }
+    float* out = (float*)malloc(full_pcm.size() * sizeof(float));
+    if (!out) {
+        return nullptr;
+    }
+    std::memcpy(out, full_pcm.data(), full_pcm.size() * sizeof(float));
+    if (out_n_samples) {
+        *out_n_samples = (int)full_pcm.size();
+    }
+    // Free scratch compute buffers after streaming request (issue #183).
+    qwen3_tts_reset_scratch_sched(ctx);
+    return out;
 }
 
 extern "C" void qwen3_tts_pcm_free(float* pcm) {
@@ -6429,6 +7205,9 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
     }
     if (ctx->cp_step0_sched) {
         ggml_backend_sched_free(ctx->cp_step0_sched);
+    }
+    if (ctx->cp_t1_ctx) {
+        ggml_free(ctx->cp_t1_ctx);
     }
     if (ctx->cp_step0_ctx) {
         ggml_free(ctx->cp_step0_ctx);

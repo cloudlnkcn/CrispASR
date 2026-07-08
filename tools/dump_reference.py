@@ -92,7 +92,14 @@ import numpy as np
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
 REGISTERED_BACKENDS: Dict[str, str] = {
+    # dots.tts (rednote-hilab/dots.tts-soar) TTS: Qwen2.5-1.5B LLM +
+    # 18L DiT flow-matching head + 24L VAESemanticEncoder (PatchEncoder)
+    # + BigVGAN vocoder. The C++ diff branch ("dots-tts") validates the
+    # PatchEncoder decode_patch in isolation (penc_in_patch0 -> penc_out_patch0).
+    # Text comes from $DOTS_TEXT; the --audio arg is ignored (TTS).
+    "dots-tts":   "reference_backends.dots_tts_reference",
     "qwen3":      "reference_backends.qwen3",
+    "higgs-stt":  "reference_backends.higgs_stt",
     "voxtral":    "reference_backends.voxtral",
     "voxtral4b":  "reference_backends.voxtral4b",
     "granite":    "reference_backends.granite",
@@ -147,6 +154,9 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = the MiMo-V2.5-ASR HF snapshot. The audio-tokenizer path
     # is read from MIMO_TOKENIZER_DIR (or auto-derived from a sibling dir).
     "mimo-asr":   "reference_backends.mimo_asr",
+    # ARK-ASR-3B: Whisper-RoPE encoder + MLP adapter + Qwen2.5-3B decoder.
+    "arkasr":     "reference_backends.arkasr",
+    "ark-asr":    "reference_backends.arkasr",
     # Kokoro / StyleTTS2 (iSTFTNet). Text-driven; the audio arg is a
     # placeholder. Phonemes + voice come from KOKORO_PHONEMES / KOKORO_VOICE
     # env vars (see reference_backends/kokoro.py for the full list).
@@ -156,6 +166,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Driven by ORPHEUS_SNAC_T_SUPER (default 4) + ORPHEUS_SNAC_CODE
     # (default 0); see reference_backends/orpheus_snac.py.
     "orpheus":    "reference_backends.orpheus_snac",
+    # Orpheus talker (Llama-3.2-3B-FT): greedy codec-token stream for the
+    # AR-decode diff (§176b bucket). model_dir = the talker LM HF snapshot
+    # (e.g. unsloth/orpheus-3b-0.1-ft); audio arg unused. Driven by
+    # ORPHEUS_TEXT / ORPHEUS_SPEAKER; see reference_backends/orpheus_talker.py.
+    "orpheus-talker": "reference_backends.orpheus_talker",
     # Chatterbox TTS: T3 (Llama AR) → S3Gen (CFM) → HiFTGenerator.
     # model_dir = ResembleAI/chatterbox snapshot (or local with
     # t3_cfg.safetensors + s3gen.safetensors + ve.safetensors + conds.pt).
@@ -240,10 +255,18 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # dir. GitHub source (modeling code) expected at ref/moss_audio/github/
     # or via MOSS_AUDIO_GITHUB env. Prompt from MOSS_AUDIO_PROMPT env.
     "moss-audio":  "reference_backends.moss_audio",
+    # MOSS-Transcribe-preview-2B: Qwen3-Omni audio encoder + GatedMLP adapter +
+    # Qwen3-1.7B LM. Ships modeling+processing code (no GitHub clone needed).
+    # model_dir = OpenMOSS-Team/MOSS-Transcribe-preview-2B HF id or local dir.
+    "moss-transcribe": "reference_backends.moss_transcribe",
     # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
     # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
     # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
     "tada-tts":   "reference_backends.tada_tts",
+    # TADA encoder: Aligner + WavEncoder + LocalAttentionEncoder → voice reference.
+    # model_dir = HumeAI/tada-codec or local path. Audio arg is the reference audio.
+    # Text from TADA_ENCODER_TEXT, language from TADA_ENCODER_LANG env vars.
+    "tada-encoder": "reference_backends.tada_encoder",
     # Zyphra/Zonos-v0.1-transformer: GPT-style AR TTS with 9-codebook DAC.
     # model_dir = Zyphra/Zonos-v0.1-transformer HF id or local snapshot.
     # Audio arg is unused (text-driven). Text + seed from env vars:
@@ -258,11 +281,20 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = LiquidAI/LFM2.5-Audio-1.5B-JP HF id or local snapshot.
     # Prompt from LFM2_PROMPT env var (default "Perform ASR in japanese.").
     "lfm2-audio": "reference_backends.lfm2_audio",
+    # Nemotron-3.5-ASR-Streaming: Cache-Aware FastConformer + RNN-T.
+    # model_dir = nvidia/nemotron-3.5-asr-streaming-0.6b HF id or local .nemo.
+    # Captures mel, pre-encode, and full encoder output for diff regression.
+    "nemotron":   "reference_backends.nemotron",
     # gpt-omni/mini-omni2: Whisper-small encoder + SwiGLU adapter +
     # Qwen2-0.5B LLM. Custom litgpt framework (not HF). model_dir = cloned
     # repo with lit_model.pth + small.pt + model_config.yaml. Needs the
     # litgpt package on sys.path (set MINI_OMNI2_REPO or put it in model_dir).
     "mini-omni2": "reference_backends.mini_omni2",
+    # Irodori-TTS (Aratako/Irodori-TTS-500M-v3): RF-DiT flow matching TTS.
+    # model_dir = HF id or local .safetensors. Audio arg is unused (TTS).
+    # Text from IRODORI_TEST_TEXT env (default "こんにちは、世界。").
+    # Captures text_state, cond_embed, dit_block_0, v_pred_step0.
+    "irodori-tts": "reference_backends.irodori_tts",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

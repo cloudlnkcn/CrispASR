@@ -39,6 +39,12 @@ from pathlib import Path
 
 import numpy as np
 
+from chatterbox_paths import (
+    select_chatterbox_s3gen_checkpoint,
+    select_chatterbox_t3_checkpoint,
+    select_chatterbox_tokenizer,
+)
+
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
 except ImportError:
@@ -461,9 +467,25 @@ def write_t3_gguf(
 ):
     print(f"\n=== Writing T3 GGUF: {output_path} ===")
 
+    # ── Pre-load T3 to infer vocab size before writing hparams ──
+    t3_path = select_chatterbox_t3_checkpoint(model_dir)
+    if not t3_path.exists():
+        sys.exit(f"Missing T3 weights (tried t3_mtl*.safetensors and t3_cfg.safetensors in {model_dir})")
+    print(f"  T3 weights: {t3_path.name}")
+    t3_tensors = load_safetensors(t3_path)
+
+    # Infer text_vocab_size from the actual embedding (#170).
+    for emb_key in ["text_emb.weight", "text_embedding.weight"]:
+        if emb_key in t3_tensors:
+            actual_vocab = t3_tensors[emb_key].shape[0]
+            if actual_vocab != T3_HPARAMS["text_vocab_size"]:
+                print(f"  text_vocab_size: {T3_HPARAMS['text_vocab_size']} -> {actual_vocab} (from {emb_key})")
+                T3_HPARAMS["text_vocab_size"] = actual_vocab
+            break
+
     writer = GGUFWriter(str(output_path), "chatterbox")
 
-    # ── Hyperparameters ──
+    # ── Hyperparameters (after vocab inference) ──
     for k, v in T3_HPARAMS.items():
         key = f"chatterbox.t3.{k}"
         if isinstance(v, int):
@@ -493,10 +515,17 @@ def write_t3_gguf(
             for token, idx in vocab.items():
                 if idx < len(tokens):
                     tokens[idx] = token
+            expected_vocab = int(T3_HPARAMS["text_vocab_size"])
+            if len(tokens) != expected_vocab:
+                sys.exit(
+                    f"Tokenizer vocab size mismatch for {tokenizer_path.name}: "
+                    f"{len(tokens)} tokens vs T3 text_vocab_size={expected_vocab}. "
+                    "Use the tokenizer paired with the selected T3 checkpoint."
+                )
             writer.add_array("tokenizer.ggml.tokens", tokens)
             # Keep legacy field for older runtimes, but prefer tokenizer.ggml.tokens.
             writer.add_array("chatterbox.t3.text_tokens", tokens)
-            print(f"  Tokenizer: {len(tokens)} tokens from tokenizer.json")
+            print(f"  Tokenizer: {len(tokens)} tokens from {tokenizer_path.name}")
 
             merges = model.get('merges', [])
             if merges:
@@ -512,7 +541,7 @@ def write_t3_gguf(
 
     # ── Load and write precomputed conditioning ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
 
@@ -547,11 +576,7 @@ def write_t3_gguf(
                               raw_dtype=GGMLQuantizationType.F32)
         print(f"  Precomputed conds loaded")
 
-    # ── Load T3 weights ──
-    t3_path = model_dir / "t3_cfg.safetensors"
-    if not t3_path.exists():
-        sys.exit(f"Missing {t3_path}")
-    t3_tensors = load_safetensors(t3_path)
+    # T3 tensors already loaded above (pre-hparams vocab inference)
     n_t3 = 0
     for hf_name, tensor in sorted(t3_tensors.items()):
         gguf_name = map_t3_name(hf_name)
@@ -620,12 +645,30 @@ def write_turbo_t3_gguf(
         import json as _json
         with open(vocab_path, encoding="utf-8") as f:
             vocab = _json.load(f)
-        max_id = max(vocab.values())
+        # #181: the turbo tokenizer's special tokens (e.g. [laugh], [whispering],
+        # [angry] — the 19 emotion/style controls) live in added_tokens.json at
+        # ids past the base BPE vocab (50257..50275), NOT in vocab.json. The old
+        # path read only vocab.json (50257) while the T3 text embedding is 50276,
+        # so the embedded tokenizer was 19 short — a baked-in vocab mismatch that
+        # v0.8.0's loader rejected. Merge added_tokens.json so the tokens array
+        # covers the full text_vocab_size.
+        added = {}
+        added_path = model_dir / "added_tokens.json"
+        if added_path.exists():
+            with open(added_path, encoding="utf-8") as f:
+                added = _json.load(f)  # {token_str: id}
+        max_id = max([max(vocab.values())] + list(added.values()))
         tokens = [""] * (max_id + 1)
         for tok_str, tok_id in vocab.items():
             tokens[tok_id] = tok_str
+        for tok_str, tok_id in added.items():
+            if 0 <= tok_id < len(tokens):
+                tokens[tok_id] = tok_str
         writer.add_array("tokenizer.ggml.tokens", tokens)
-        print(f"  Tokenizer: {len(tokens)} tokens from vocab.json")
+        if added:
+            print(f"  Tokenizer: {len(tokens)} tokens from vocab.json + {len(added)} added_tokens.json")
+        else:
+            print(f"  Tokenizer: {len(tokens)} tokens from vocab.json")
 
         if merges_path.exists():
             merges = []
@@ -664,7 +707,7 @@ def write_turbo_t3_gguf(
 
     # ── Precomputed conditioning ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
 
@@ -835,7 +878,7 @@ def write_kartoffelbox_t3_gguf(
 
     # ── Precomputed conditioning (shared with turbo base) ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
         if t3_cond.get('speaker_emb') is not None:
@@ -878,7 +921,7 @@ def write_kartoffelbox_t3_gguf(
 def write_s3gen_gguf(
     model_dir: Path,
     output_path: Path,
-    s3gen_filename: str = "s3gen.safetensors",
+    s3gen_filename: str | None = None,
 ):
     print(f"\n=== Writing S3Gen GGUF: {output_path} ===")
 
@@ -895,7 +938,10 @@ def write_s3gen_gguf(
             writer.add_string(key, v)
 
     # ── Load S3Gen weights ──
-    s3gen_path = model_dir / s3gen_filename
+    if s3gen_filename is None:
+        s3gen_path = select_chatterbox_s3gen_checkpoint(model_dir)
+    else:
+        s3gen_path = model_dir / s3gen_filename
     if not s3gen_path.exists():
         sys.exit(f"Missing {s3gen_path}")
     s3gen_tensors = load_safetensors(s3gen_path)
@@ -986,7 +1032,7 @@ def main():
         return
 
     conds_path = model_dir / "conds.pt"
-    tokenizer_path = model_dir / "tokenizer.json"
+    tokenizer_path = select_chatterbox_tokenizer(model_dir)
 
     if not args.s3gen_only:
         write_t3_gguf(

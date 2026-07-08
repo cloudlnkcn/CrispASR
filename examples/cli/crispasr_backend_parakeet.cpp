@@ -32,22 +32,30 @@ public:
         // get nothing. With the cap absent, `-dl` correctly routes
         // through the whisper-tiny pre-step.
         //
-        // CAP_INTERNAL_CHUNKING intentionally NOT declared (2026-05-26,
-        // PLAN #114 follow-up). The backend's own
-        // `parakeet_transcribe_streamed` does handle long audio
-        // internally (chunked encode + concat + single TDT decode), but
-        // the empirical option matrix in PERFORMANCE.md shows that the
-        // dispatcher's chunk-30 + overlap-save + LCS-merge dedup path
-        // produces materially more content on long audio (v3+EN60:
-        // 520→755 chars +45 %; ja+JA60: 1674→1942 +16 %; v3+JA60:
-        // 605→660 +9 %). Without this flag the dispatcher's
-        // auto-chunk-at-30s fallback fires for audio > 30 s. Short audio
-        // (< 30 s) is unaffected — the dispatcher only auto-chunks past
-        // the threshold, so 11 s JFK still gets one backend call on the
-        // full audio.
-        return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
-               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS |
-               CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT;
+        uint32_t caps = CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
+                        CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_DIARIZE |
+                        CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT;
+        // CAP_INTERNAL_CHUNKING for non-JA models (2026-06-21): a single
+        // full-attention pass is byte-for-byte NeMo-exact and far better
+        // than the dispatcher's chunk-30 + overlap-save + LCS-merge, which
+        // leaves a duplicated phrase at every 30 s boundary because the LCS
+        // dedup is token-id-exact and adjacent chunks transcribe the overlap
+        // differently. Verified 100% word match vs nvidia/parakeet-tdt-0.6b-v3
+        // (30 s→5 min). With this flag the dispatcher hands us the whole clip;
+        // transcribe() runs single-pass up to a memory-safe cap and a
+        // silence-split single-pass longform beyond it. The JA model collapses
+        // on single-pass (#89), so it keeps the dispatcher's VAD/chunk path.
+        // Default: non-JA models advertise internal chunking so the dispatcher
+        // hands us the whole clip (transcribe() runs single-pass / longform).
+        // Override with CRISPASR_PARAKEET_INTERNAL_CHUNKING=0 to fall back to
+        // the dispatcher's chunk-30 + overlap-save + LCS-merge path (e.g. for
+        // A/B comparison), or =1 to force it on even for JA.
+        bool internal_chunking = !is_ja_model_;
+        if (const char* e = getenv("CRISPASR_PARAKEET_INTERNAL_CHUNKING"))
+            internal_chunking = atoi(e) != 0;
+        if (internal_chunking)
+            caps |= CAP_INTERNAL_CHUNKING;
+        return caps;
     }
 
     bool init(const whisper_params& p) override {
@@ -170,18 +178,55 @@ public:
         //       Default 2. Covers FastConformer's receptive field at the
         //       chunk boundary; overlap frames from later chunks are
         //       discarded before decode.
-        int stream_threshold_s = 0;
+        // ---- Long-audio path selection (model-dependent; all overridable) ----
+        //
+        // Default per model family, then env gates. JA (vocab<=4096) and DE/EN
+        // (v3 / multilingual) behave very differently, so the defaults differ:
+        //
+        //   non-JA: single full-attention pass is byte-for-byte NeMo-exact
+        //     (verified 100% word match vs nvidia/parakeet-tdt-0.6b-v3, 30 s→
+        //     5 min). Use it up to a memory-safe cap (full attention is O(T^2):
+        //     ~5 min safe on 16 GB, 28 min OOMs); past the cap, silence-split
+        //     into <=cap single-pass pieces and concatenate (no boundary dups).
+        //   JA: collapses on single-pass (#89), so single-pass is disabled
+        //     (threshold 0 → streamed) and CAP_INTERNAL_CHUNKING is NOT set, so
+        //     the dispatcher keeps driving it via VAD / 30 s chunking. Behaviour
+        //     is unchanged from before this routing change.
+        //
+        // Env gates (seconds / 0|1), so JA vs DE and per-machine memory can be
+        // tuned without a rebuild:
+        //   CRISPASR_PARAKEET_STREAM_THRESHOLD : single-pass cap. 0 disables
+        //       single-pass entirely (always streamed). Default JA=0, else 300.
+        //   CRISPASR_PARAKEET_LONGFORM         : 1 = silence-split single-pass
+        //       above the cap; 0 = fall back to the streamed path. Default
+        //       follows the model (non-JA=1, JA=0).
+        //   CRISPASR_PARAKEET_STREAM_CHUNK / _OVERLAP : streamed encoder window.
+        // CLI escape hatches (no env needed): --chunk-seconds N forces the
+        // dispatcher's N-second chunk+merge; --vad forces the VAD path.
+        // JA: single-pass is NeMo-exact and safe up to ~12 s (issue #89 —
+        // past that the encoder collapses on real speech); with the VAD
+        // slice cap at 12 s every slice decodes single-pass. Longer inputs
+        // (explicit --chunk-seconds 0) still stream.
+        int stream_threshold_s = is_ja_model_ ? 12 : 300;
+        bool longform_enabled = !is_ja_model_;
         int stream_chunk_s = 0; // 0 = let the C library pick per-model
         int stream_overlap_s = 2;
         if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD"))
             stream_threshold_s = std::max(0, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_LONGFORM"))
+            longform_enabled = atoi(e) != 0;
         if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
             stream_chunk_s = std::max(2, atoi(e));
         if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_OVERLAP"))
             stream_overlap_s = std::max(0, atoi(e));
 
+        const int SR = 16000;
+        if (longform_enabled && stream_threshold_s > 0 && n_samples > stream_threshold_s * SR) {
+            return transcribe_longform(samples, n_samples, t_offset_cs, stream_threshold_s * SR);
+        }
+
         parakeet_result* r;
-        const bool use_single_pass = stream_threshold_s > 0 && n_samples <= stream_threshold_s * 16000;
+        const bool use_single_pass = stream_threshold_s > 0 && n_samples <= stream_threshold_s * SR;
         if (use_single_pass) {
             r = parakeet_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
         } else {
@@ -190,12 +235,18 @@ public:
         if (!r)
             return out;
 
+        out.push_back(result_to_segment(r, t_offset_cs));
+        parakeet_result_free(r);
+        return out;
+    }
+
+    // Convert a parakeet_result into one crispasr_segment. Does NOT free r.
+    static crispasr_segment result_to_segment(const parakeet_result* r, int64_t fallback_t0_cs) {
         crispasr_segment seg;
-        seg.t0 = t_offset_cs;
-        seg.t1 = t_offset_cs;
+        seg.t0 = fallback_t0_cs;
+        seg.t1 = fallback_t0_cs;
         seg.text = r->text ? r->text : "";
 
-        // Words
         seg.words.reserve(r->n_words);
         for (int i = 0; i < r->n_words; i++) {
             const auto& w = r->words[i];
@@ -206,7 +257,6 @@ public:
             seg.words.push_back(std::move(cw));
         }
 
-        // Tokens (sub-word pieces with their own timing + softmax confidence)
         seg.tokens.reserve(r->n_tokens);
         for (int i = 0; i < r->n_tokens; i++) {
             const auto& t = r->tokens[i];
@@ -219,7 +269,6 @@ public:
             seg.tokens.push_back(std::move(ct));
         }
 
-        // Segment t0/t1 bracketed by first/last word when available.
         if (!seg.words.empty()) {
             seg.t0 = seg.words.front().t0;
             seg.t1 = seg.words.back().t1;
@@ -227,9 +276,102 @@ public:
             seg.t0 = seg.tokens.front().t0;
             seg.t1 = seg.tokens.back().t1;
         }
+        return seg;
+    }
 
-        parakeet_result_free(r);
-        out.push_back(std::move(seg));
+    // Find a silence cut near `target` within [target - window, target] by
+    // locating the lowest-RMS 100 ms frame. Returns the cut sample index.
+    // Keeps chunk boundaries off mid-word so single-pass pieces concatenate
+    // cleanly with no overlap/merge needed (PLAN #80b energy-minimum trick).
+    static int find_silence_cut(const float* s, int n, int target, int window, int sr) {
+        const int lo = std::max(1, target - window);
+        const int hi = std::min(n - 1, target);
+        if (hi <= lo)
+            return std::min(std::max(target, 1), n);
+        const int win = std::max(1, sr / 10); // 100 ms
+        double best = 1e30;
+        int best_pos = target;
+        for (int c = lo; c <= hi; c += win / 2) {
+            const int a = std::max(0, c - win / 2);
+            const int b = std::min(n, c + win / 2);
+            double e = 0.0;
+            for (int i = a; i < b; i++)
+                e += (double)s[i] * (double)s[i];
+            e /= std::max(1, b - a);
+            if (e < best) {
+                best = e;
+                best_pos = c;
+            }
+        }
+        return best_pos;
+    }
+
+    // Long-audio path for non-JA models: split the clip at silence into
+    // pieces no longer than `cap_samples`, transcribe each with the
+    // NeMo-exact single full-attention pass, and concatenate. Each piece is
+    // independent (cuts in silence), so there is no overlap-merge step and
+    // hence no boundary duplicates — and memory stays bounded by the cap.
+    std::vector<crispasr_segment> transcribe_longform(const float* samples, int n_samples, int64_t t_offset_cs,
+                                                      int cap_samples) {
+        std::vector<crispasr_segment> out;
+        const int SR = 16000;
+        const int search = 5 * SR; // search last 5 s of each window for silence
+        const int ctx = 2 * SR;    // ±2 s acoustic context around each piece
+        int pos = 0;
+        while (pos < n_samples) {
+            int end;
+            if (n_samples - pos <= cap_samples) {
+                end = n_samples;
+            } else {
+                end = find_silence_cut(samples, n_samples, pos + cap_samples, search, SR);
+                if (end <= pos)
+                    end = std::min(n_samples, pos + cap_samples); // safety: never stall
+            }
+            // Transcribe with context on both sides so boundary words aren't
+            // dropped for lack of encoder context, then commit only the
+            // [pos,end) core by word timestamp. Adjacent pieces share the
+            // single cut `end` (A keeps t0<end, B keeps t0>=end) → no gap,
+            // no overlap, no duplicates.
+            const int ext_s = std::max(0, pos - ctx);
+            const int ext_e = std::min(n_samples, end + ctx);
+            const int64_t ext_t0 = t_offset_cs + (int64_t)((double)ext_s / SR * 100.0);
+            const int64_t left_cs = (pos == 0) ? INT64_MIN : t_offset_cs + (int64_t)((double)pos / SR * 100.0);
+            const int64_t right_cs = (end == n_samples) ? INT64_MAX : t_offset_cs + (int64_t)((double)end / SR * 100.0);
+
+            parakeet_result* r = parakeet_transcribe_ex(ctx_, samples + ext_s, ext_e - ext_s, ext_t0);
+            if (r) {
+                crispasr_segment full = result_to_segment(r, ext_t0);
+                parakeet_result_free(r);
+
+                crispasr_segment seg;
+                seg.t0 = left_cs == INT64_MIN ? full.t0 : left_cs;
+                seg.t1 = seg.t0;
+                // parakeet word.text has the leading space dropped and
+                // punctuation attached, so re-join committed words with a
+                // single space (non-JA = space-delimited languages only).
+                std::string text;
+                for (auto& w : full.words) {
+                    if (w.t0 >= left_cs && w.t0 < right_cs) {
+                        if (!text.empty())
+                            text += ' ';
+                        text += w.text;
+                        seg.words.push_back(std::move(w));
+                    }
+                }
+                for (auto& tk : full.tokens) {
+                    if (tk.t0 >= left_cs && tk.t0 < right_cs)
+                        seg.tokens.push_back(std::move(tk));
+                }
+                seg.text = std::move(text);
+                if (!seg.words.empty()) {
+                    seg.t0 = seg.words.front().t0;
+                    seg.t1 = seg.words.back().t1;
+                }
+                if (!seg.text.empty() || !seg.words.empty())
+                    out.push_back(std::move(seg));
+            }
+            pos = end;
+        }
         return out;
     }
 
@@ -238,6 +380,20 @@ public:
         // (repetition loops). VAD gives silence-bounded segments matching
         // the ~10-15 s utterances the model was trained on.
         return is_ja_model_;
+    }
+
+    int vad_slice_cap_seconds() const override {
+        // Issue #89: on continuous speech (podcasts) VAD merges slices far
+        // past the JA encoder's ~12 s safe single-pass window and the
+        // decode goes sparse (56 % content recall on the reporter's clip).
+        // Capping slices at 12 s + single-pass per slice measured best
+        // (73-81 % vs whisper-large-v3 reference, NeMo's own long-form
+        // paths score 15-46 % on the same audio). Non-JA models are exact
+        // in single-pass and don't need a cap.
+        int cap = is_ja_model_ ? 12 : 0;
+        if (const char* e = getenv("CRISPASR_PARAKEET_VAD_SLICE_CAP"))
+            cap = std::max(0, atoi(e));
+        return cap;
     }
 
     void shutdown() override {

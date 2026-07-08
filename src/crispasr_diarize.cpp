@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string>
 
 namespace {
 
@@ -180,18 +182,51 @@ void apply_vad_turns(std::vector<CrispasrDiarizeSegment>& segs) {
 // globally. For reliable multi-speaker diarization on long-form audio
 // today, use --diarize-method sherpa (full segmentation + embedding +
 // clustering pipeline).
+// §176e: static cache for pyannote segmentation context. Avoids init/free
+// per diarize call — same pattern as Silero VAD (#132) and MarbleNet/EncDec.
+static std::mutex g_pyannote_cache_mtx;
+static pyannote_seg_context* g_pyannote_cache_ctx = nullptr;
+static std::string g_pyannote_cache_path;
+static int g_pyannote_cache_threads = 0;
+
+static pyannote_seg_context* pyannote_get_cached_locked(const char* path, int n_threads) {
+    if (g_pyannote_cache_ctx && g_pyannote_cache_path == path && g_pyannote_cache_threads == n_threads)
+        return g_pyannote_cache_ctx;
+    if (g_pyannote_cache_ctx) {
+        pyannote_seg_free(g_pyannote_cache_ctx);
+        g_pyannote_cache_ctx = nullptr;
+        g_pyannote_cache_path.clear();
+    }
+    g_pyannote_cache_ctx = pyannote_seg_init(path, n_threads);
+    if (g_pyannote_cache_ctx) {
+        g_pyannote_cache_path = path;
+        g_pyannote_cache_threads = n_threads;
+    }
+    return g_pyannote_cache_ctx;
+}
+
+void crispasr_diarize_free_pyannote_cache() {
+    std::lock_guard<std::mutex> lock(g_pyannote_cache_mtx);
+    if (g_pyannote_cache_ctx) {
+        pyannote_seg_free(g_pyannote_cache_ctx);
+        g_pyannote_cache_ctx = nullptr;
+        g_pyannote_cache_path.clear();
+    }
+}
+
 bool apply_pyannote(const float* mono, int n_samples, int64_t slice_t0_cs, std::vector<CrispasrDiarizeSegment>& segs,
                     const std::string& model_path, int n_threads) {
     if (model_path.empty())
         return false;
 
-    pyannote_seg_context* pctx = pyannote_seg_init(model_path.c_str(), n_threads);
+    std::lock_guard<std::mutex> lock(g_pyannote_cache_mtx);
+    pyannote_seg_context* pctx = pyannote_get_cached_locked(model_path.c_str(), n_threads);
     if (!pctx)
         return false;
 
     int T_seg = 0;
     float* probs = pyannote_seg_run(pctx, mono, n_samples, &T_seg);
-    pyannote_seg_free(pctx);
+    // Do NOT free pctx — it's cached.
     if (!probs || T_seg <= 0) {
         if (probs)
             std::free(probs);

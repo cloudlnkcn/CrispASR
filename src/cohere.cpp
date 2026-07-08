@@ -13,6 +13,7 @@
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -22,6 +23,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -67,6 +69,23 @@ static bool cohere_bench_enabled(void) {
     }
     return enabled;
 }
+
+// ===========================================================================
+// Bench instrumentation — `COHERE_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+struct cohere_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit cohere_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~cohere_bench_stage() {
+        if (!cohere_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  cohere_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 static void cohere_debug(const char* fmt, ...) {
     if (!cohere_debug_enabled())
@@ -1057,6 +1076,7 @@ static ggml_tensor* ct_get_tensor_fmt(cohere_model& model, const char* fmt, int 
 // ---------------------------------------------------------------------------
 
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/audio_chunking.h"
 #include "core/gguf_loader.h"
@@ -1405,6 +1425,7 @@ static void cohere_fft_r2c(const float* in, int N, float* out) {
 // ---------------------------------------------------------------------------
 
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1573,21 +1594,48 @@ static struct ggml_cgraph* cohere_build_graph_decoder(struct cohere_context* ctx
         struct ggml_tensor* Q = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Qcur, head_dim, n_heads, n_tokens), 0, 2, 1,
                                              3); // [hd, n_tok, n_heads]
 
-        // PLAN #73: ggml_flash_attn_ext fuses K-mul-Q + softmax + V-mul
-        // into one op and natively handles quant K/V (no cast tax).
+        // Self-attention: KV cache views for this layer.
         struct ggml_tensor* K =
             ggml_view_3d(ctx0, ctx->kv_k, head_dim, sa_L, n_heads, ctx->kv_k->nb[1], ctx->kv_k->nb[2],
                          il * ctx->kv_k->nb[3]); // [hd, L, n_heads]
         struct ggml_tensor* V =
             ggml_view_3d(ctx0, ctx->kv_v, head_dim, sa_L, n_heads, ctx->kv_v->nb[1], ctx->kv_v->nb[2],
                          il * ctx->kv_v->nb[3]); // [hd, L, n_heads]
-        struct ggml_tensor* sa_out =
-            ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q), K, V, sa_mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
-        // flash_attn_ext output is [hd, n_heads, n_tokens] — same layout
-        // as the legacy ggml_permute(sa_out, 0,2,1,3), so the additional
-        // permute+cont is gone. reshape_2d packs the inner two dims into
-        // d = hd * n_heads.
-        cur = ggml_reshape_2d(ctx0, sa_out, d, n_tokens);
+
+        // CRISPASR_COHERE_LEGACY_SA=1: fall back to the pre-v0.7 manual
+        // mul_mat self-attention path. The flash_attn_ext path (PLAN #73)
+        // fuses Q·K + softmax + V into a single op, but caused a ~10×
+        // CUDA regression on some Windows setups (#161). This env var
+        // lets users bisect whether flash_attn_ext is the culprit.
+        static const bool legacy_sa = (getenv("CRISPASR_COHERE_LEGACY_SA") != nullptr);
+
+        if (legacy_sa) {
+            // Legacy path: explicit mul_mat attention (pre-v0.7).
+            struct ggml_tensor* K_c = ggml_cont(ctx0, K);
+            struct ggml_tensor* KQ = ggml_mul_mat(ctx0, K_c, Q); // [L, n_tok, n_heads]
+            KQ = ggml_scale_inplace(ctx0, KQ, 1.0f / sqrtf((float)head_dim));
+            if (n_tokens > 1) {
+                KQ = ggml_diag_mask_inf_inplace(ctx0, KQ, offset);
+            }
+            KQ = ggml_soft_max_inplace(ctx0, KQ);
+
+            struct ggml_tensor* V_trans = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3)); // [L, hd, n_heads]
+            struct ggml_tensor* sa_out = ggml_mul_mat(ctx0, V_trans, KQ);                     // [hd, n_tok, n_heads]
+
+            sa_out = ggml_permute(ctx0, sa_out, 0, 2, 1, 3); // [hd, n_heads, n_tok]
+            sa_out = ggml_cont(ctx0, sa_out);
+            cur = ggml_reshape_2d(ctx0, sa_out, d, n_tokens);
+        } else {
+            // PLAN #73: ggml_flash_attn_ext fuses K-mul-Q + softmax + V-mul
+            // into one op and natively handles quant K/V (no cast tax).
+            struct ggml_tensor* sa_out =
+                ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q), K, V, sa_mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+            // flash_attn_ext output is [hd, n_heads, n_tokens] — same layout
+            // as the legacy ggml_permute(sa_out, 0,2,1,3), so the additional
+            // permute+cont is gone. reshape_2d packs the inner two dims into
+            // d = hd * n_heads.
+            cur = ggml_reshape_2d(ctx0, sa_out, d, n_tokens);
+        }
 
         // out projection
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_o_w, cur), layer.attn_o_b);
@@ -1852,7 +1900,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
             }
         }
         if (!ctx->ggml_backend) {
-            ctx->ggml_backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+            ctx->ggml_backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
         }
         if (!ctx->ggml_backend) {
             fprintf(stderr, "cohere: failed to initialize any ggml backend\n");
@@ -1922,9 +1970,11 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     if (using_gpu) {
         ggml_backend_t backends[] = {ctx->ggml_backend, ctx->ggml_backend_cpu};
         ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 2, 16384, false, false);
+        crispasr_imatrix_install(ctx->ggml_alloc); // no-op unless CRISPASR_IMATRIX_OUT is set
     } else {
         ggml_backend_t backends[] = {ctx->ggml_backend};
         ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
+        crispasr_imatrix_install(ctx->ggml_alloc); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
 
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + 1024);
@@ -1993,20 +2043,7 @@ int cohere_str_to_token(struct cohere_context* ctx, const char* s) {
 // ---------------------------------------------------------------------------
 
 static std::vector<float> ct_get_f32(const ggml_tensor* t) {
-    const int n = (int)ggml_nelements(t);
-    std::vector<float> res(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, res.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-        for (int i = 0; i < n; i++)
-            res[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        fprintf(stderr, "ct_get_f32: unsupported type %d\n", (int)t->type);
-        abort();
-    }
-    return res;
+    return core_cpu::to_f32(t); // F32/F16/quantized-safe
 }
 
 // ---------------------------------------------------------------------------
@@ -2175,6 +2212,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     }
 
     // --- Feature extraction (single chunk ≤ 30s) ---
+    cohere_bench_stage _b_total("total");
     auto mel_fb = ct_get_f32(ctx->model.fe_mel_fb);
     auto window = ct_get_f32(ctx->model.fe_window);
 
@@ -2204,6 +2242,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     bool do_prof = !do_chunked && (getenv("COHERE_PROF") != nullptr);
 
     {
+        cohere_bench_stage _b_enc("encoder (all chunks)");
         int n_chunks = 0;
         for (int sample_offset = 0; sample_offset < n_samples; sample_offset += CHUNK_SAMPLES) {
             int chunk_n = std::min(CHUNK_SAMPLES, n_samples - sample_offset);
@@ -2338,6 +2377,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
 
     // Assemble cross-KV from per-chunk CPU data and upload to backend buffer.
     {
+        cohere_bench_stage _b_ckv("cross-kv assembly");
         t0 = ggml_time_us();
 
         if (ctx->cross_kv_ctx)
@@ -2433,6 +2473,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     const int T_enc = T_enc_total;
 
     // --- Decoder prompt ---
+    cohere_bench_stage _b_dec("decoder (total)");
     auto tid = [&](const std::string& s) { return voc.token_id(s); };
     const char* lang_tok = lang ? lang : "en";
     char lang_tok_str[32];

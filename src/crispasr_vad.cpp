@@ -29,6 +29,72 @@
 #include <mutex>
 #include <string>
 
+// ---- FireRed VAD context cache (§176e) ----
+// Same pattern as MarbleNet/Silero: avoid init/free per call.
+// firered_vad_context holds only immutable model weights + backend —
+// no per-call mutable state — so the mutex is only needed to prevent
+// concurrent GPU backend access, not for state isolation.
+static std::mutex g_firered_cache_mtx;
+static firered_vad_context* g_firered_cache_ctx = nullptr;
+static std::string g_firered_cache_path;
+
+static firered_vad_context* firered_vad_get_cached_locked(const char* path) {
+    if (g_firered_cache_ctx && g_firered_cache_path == path)
+        return g_firered_cache_ctx;
+    if (g_firered_cache_ctx) {
+        firered_vad_free(g_firered_cache_ctx);
+        g_firered_cache_ctx = nullptr;
+        g_firered_cache_path.clear();
+    }
+    g_firered_cache_ctx = firered_vad_init(path);
+    if (g_firered_cache_ctx)
+        g_firered_cache_path = path;
+    return g_firered_cache_ctx;
+}
+
+// ---- MarbleNet VAD context cache (§176e) ----
+// Same pattern as Silero: avoid init/free per call.
+#ifdef CA_HAVE_MARBLENET_VAD
+static std::mutex g_marblenet_cache_mtx;
+static marblenet_vad_context* g_marblenet_cache_ctx = nullptr;
+static std::string g_marblenet_cache_path;
+
+static marblenet_vad_context* marblenet_vad_get_cached_locked(const char* path) {
+    if (g_marblenet_cache_ctx && g_marblenet_cache_path == path)
+        return g_marblenet_cache_ctx;
+    if (g_marblenet_cache_ctx) {
+        marblenet_vad_free(g_marblenet_cache_ctx);
+        g_marblenet_cache_ctx = nullptr;
+        g_marblenet_cache_path.clear();
+    }
+    g_marblenet_cache_ctx = marblenet_vad_init(path);
+    if (g_marblenet_cache_ctx)
+        g_marblenet_cache_path = path;
+    return g_marblenet_cache_ctx;
+}
+#endif
+
+// ---- WhisperEncDec VAD context cache (§176e) ----
+#ifdef CA_HAVE_WVAD_ENCDEC
+static std::mutex g_encdec_cache_mtx;
+static whisper_vad_encdec_context* g_encdec_cache_ctx = nullptr;
+static std::string g_encdec_cache_path;
+
+static whisper_vad_encdec_context* encdec_vad_get_cached_locked(const char* path) {
+    if (g_encdec_cache_ctx && g_encdec_cache_path == path)
+        return g_encdec_cache_ctx;
+    if (g_encdec_cache_ctx) {
+        whisper_vad_encdec_free(g_encdec_cache_ctx);
+        g_encdec_cache_ctx = nullptr;
+        g_encdec_cache_path.clear();
+    }
+    g_encdec_cache_ctx = whisper_vad_encdec_init(path);
+    if (g_encdec_cache_ctx)
+        g_encdec_cache_path = path;
+    return g_encdec_cache_ctx;
+}
+#endif
+
 // ---- Silero VAD context cache (fixes #132) ----
 // Creating and destroying the ggml scheduler + backend on every request
 // fragments memory; after ~4 cycles the allocator hits a pathological
@@ -68,12 +134,34 @@ static whisper_vad_context* silero_vad_get_cached_locked(const char* vad_model_p
 }
 
 void crispasr_vad_free_cache() {
-    std::lock_guard<std::mutex> lock(g_silero_cache_mtx);
-    if (g_silero_cache_ctx) {
-        whisper_vad_free(g_silero_cache_ctx);
-        g_silero_cache_ctx = nullptr;
-        g_silero_cache_path.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_silero_cache_mtx);
+        if (g_silero_cache_ctx) {
+            whisper_vad_free(g_silero_cache_ctx);
+            g_silero_cache_ctx = nullptr;
+            g_silero_cache_path.clear();
+        }
     }
+#ifdef CA_HAVE_MARBLENET_VAD
+    {
+        std::lock_guard<std::mutex> lock(g_marblenet_cache_mtx);
+        if (g_marblenet_cache_ctx) {
+            marblenet_vad_free(g_marblenet_cache_ctx);
+            g_marblenet_cache_ctx = nullptr;
+            g_marblenet_cache_path.clear();
+        }
+    }
+#endif
+#ifdef CA_HAVE_WVAD_ENCDEC
+    {
+        std::lock_guard<std::mutex> lock(g_encdec_cache_mtx);
+        if (g_encdec_cache_ctx) {
+            whisper_vad_encdec_free(g_encdec_cache_ctx);
+            g_encdec_cache_ctx = nullptr;
+            g_encdec_cache_path.clear();
+        }
+    }
+#endif
 }
 
 // Check if a model path is a FireRedVAD model (by filename pattern)
@@ -91,7 +179,8 @@ static std::vector<crispasr_audio_slice> compute_firered_vad_slices(const float*
                                                                     const crispasr_vad_options& opts) {
     std::vector<crispasr_audio_slice> slices;
 
-    firered_vad_context* vctx = firered_vad_init(vad_model_path);
+    std::unique_lock<std::mutex> lock(g_firered_cache_mtx);
+    firered_vad_context* vctx = firered_vad_get_cached_locked(vad_model_path);
     if (!vctx) {
         fprintf(stderr, "crispasr: warning: failed to load FireRedVAD model '%s'\n", vad_model_path);
         return slices;
@@ -114,8 +203,7 @@ static std::vector<crispasr_audio_slice> compute_firered_vad_slices(const float*
         }
     }
     free(segs);
-    firered_vad_free(vctx);
-    return slices;
+    return slices; // vctx stays cached; lock released here
 }
 
 std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* samples, int n_samples, int sample_rate,
@@ -132,7 +220,8 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
     }
 #ifdef CA_HAVE_MARBLENET_VAD
     else if (vpath.find("marblenet") != std::string::npos && vpath.find(".gguf") != std::string::npos) {
-        marblenet_vad_context* vctx = marblenet_vad_init(vad_model_path);
+        std::lock_guard<std::mutex> vad_lock(g_marblenet_cache_mtx);
+        marblenet_vad_context* vctx = marblenet_vad_get_cached_locked(vad_model_path);
         if (vctx) {
             marblenet_vad_segment* segs = nullptr;
             int n_segs = 0;
@@ -150,7 +239,7 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
             }
             if (segs)
                 free(segs);
-            marblenet_vad_free(vctx);
+            // Do NOT free vctx — it's cached.
         }
     }
 #endif
@@ -158,7 +247,8 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
     else if (std::string(vad_model_path).find("whisper") != std::string::npos &&
              std::string(vad_model_path).find("vad") != std::string::npos &&
              std::string(vad_model_path).find(".gguf") != std::string::npos) {
-        whisper_vad_encdec_context* vctx = whisper_vad_encdec_init(vad_model_path);
+        std::lock_guard<std::mutex> vad_lock(g_encdec_cache_mtx);
+        whisper_vad_encdec_context* vctx = encdec_vad_get_cached_locked(vad_model_path);
         if (vctx) {
             whisper_vad_encdec_segment* segs = nullptr;
             int n_segs = 0;
@@ -191,7 +281,7 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
             }
             if (segs)
                 free(segs);
-            whisper_vad_encdec_free(vctx);
+            // Do NOT free vctx — it's cached.
         }
     }
 #endif
@@ -241,20 +331,25 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
 
     // Post-split: break any VAD segment that exceeds chunk_seconds into
     // sub-segments. Prevents OOM on very long continuous speech (10+ min
-    // lectures). We split into roughly equal parts.
+    // lectures). Cuts land on the lowest-RMS 100 ms inside a ±2 s search
+    // window around each target instead of equal parts, so a cut inside
+    // continuous speech doesn't slice mid-word (issue #89: the words
+    // spanning an arbitrary cut are lost by both adjacent slices).
     if (opts.chunk_seconds > 0) {
         const int max_samples = opts.chunk_seconds * sample_rate;
+        const size_t search_window_samples = (size_t)(2.0 * sample_rate);
+        const size_t energy_win_samples = (size_t)((double)sample_rate * 0.1); // 100 ms
         std::vector<crispasr_audio_slice> split;
         for (auto& sl : slices) {
             const int dur = sl.end - sl.start;
             if (dur <= max_samples) {
                 split.push_back(sl);
             } else {
-                const int n_parts = (dur + max_samples - 1) / max_samples;
-                const int part_samples = dur / n_parts;
-                for (int p = 0; p < n_parts; p++) {
-                    const int s = sl.start + p * part_samples;
-                    const int e = (p == n_parts - 1) ? sl.end : sl.start + (p + 1) * part_samples;
+                auto ranges = audio_chunking::split_at_energy_minima(
+                    samples + sl.start, (size_t)dur, (size_t)max_samples, search_window_samples, energy_win_samples);
+                for (auto& r : ranges) {
+                    const int s = sl.start + (int)r.first;
+                    const int e = sl.start + (int)r.second;
                     split.push_back({
                         s,
                         e,

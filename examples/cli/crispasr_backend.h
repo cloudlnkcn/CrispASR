@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -98,6 +99,7 @@ enum crispasr_capability : uint32_t {
     CAP_INTERNAL_CHUNKING = 1u << 20,   // backend handles its own long-audio chunking internally
                                         // (PLAN #104: parakeet uses chunked-encode + single-decode).
                                         // Skip the crispasr_run.cpp auto-chunk fallback for these.
+    CAP_STREAMING = 1u << 22,           // backend supports true token-level streaming output
 };
 
 // ---------------------------------------------------------------------------
@@ -152,6 +154,21 @@ public:
         return {};
     }
 
+    // Streaming TTS callback: invoked once per generated PCM chunk as the
+    // backend produces audio, with the last chunk flagged is_final=true.
+    // `pcm` is mono float32 at `tts_sample_rate()`.
+    using crispasr_pcm_stream_callback = std::function<void(const float* pcm, int n_samples, bool is_final)>;
+
+    // Synthesize with streaming output. Default implementation falls back to
+    // the whole-clip synthesize() and emits it as a single final chunk.
+    // Backends with CAP_STREAMING override to emit incrementally.
+    virtual void synthesize_streaming(const std::string& text, const whisper_params& p,
+                                      crispasr_pcm_stream_callback cb) {
+        auto v = synthesize(text, p);
+        if (!v.empty())
+            cb(v.data(), (int)v.size(), true);
+    }
+
     // Sample rate of `synthesize()` output PCM. Defaults to 24 kHz since most
     // TTS backends (kokoro, qwen3-tts, vibevoice, chatterbox, orpheus, indextts)
     // produce 24 kHz. Backends that emit a different rate (e.g. voxcpm2-tts at
@@ -186,6 +203,43 @@ public:
     // encoder degenerates on arbitrary-length chunks (e.g. parakeet-ja)
     // override this to get silence-bounded segments that match training.
     virtual bool prefers_vad() const { return false; }
+
+    // Maximum VAD slice duration (seconds) the backend can decode reliably
+    // in one pass; 0 = unbounded. VAD merges continuous speech into slices
+    // as long as the speech runs (40 s+ on podcast audio) — issue #89:
+    // parakeet-ja's encoder collapses past ~12 s, so slices are re-split at
+    // energy minima down to this cap before transcription. Only applied on
+    // the VAD path when the user didn't pass an explicit --chunk-seconds.
+    virtual int vad_slice_cap_seconds() const { return 0; }
+
+    // Streaming transcription callback type.
+    // Called with partial text (empty string counts as keep-alive)
+    // and is_final flag. When is_final is true, partial_text is the
+    // complete final result.
+    using crispasr_stream_callback = std::function<void(const std::string& partial_text, bool is_final)>;
+
+    // Transcribe with streaming output. Default implementation falls back
+    // to non-streaming transcribe().
+    virtual void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_cs,
+                                      const whisper_params& params, crispasr_stream_callback on_text) {
+        (void)samples;
+        (void)n_samples;
+        (void)t_offset_cs;
+        (void)params;
+        (void)on_text;
+        // Fallback: run non-streaming, then push result at once.
+        auto segments = transcribe(samples, n_samples, t_offset_cs, params);
+        std::string full;
+        for (const auto& seg : segments) {
+            if (!seg.text.empty()) {
+                full += seg.text;
+            }
+        }
+        if (!full.empty()) {
+            on_text(full, false); // partial
+        }
+        on_text(full, true); // final
+    }
 
     // Warmup: run a short dummy transcribe to amortize first-call
     // overhead (graph allocation, GPU kernel compilation, gallocr shape

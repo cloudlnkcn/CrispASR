@@ -124,7 +124,27 @@ std::vector<std::string> crispasr_tts_split_sentences(const std::string& text, s
 
 std::vector<std::string> crispasr_tts_plan_chunks_for_backend(const std::string& text, const std::string& backend_name,
                                                               std::size_t max_chars) {
-    if (backend_name == "vibevoice")
+    // VibeVoice, Qwen3-TTS and TADA rely on continuous generated-text context to
+    // preserve speaker identity/prosody across sentences. Match all registered
+    // variants by prefix; the concrete backend names include suffixes such as
+    // "vibevoice-tts" and "qwen3-tts-1.7b-base".
+    //
+    // TADA (#197): the AR Llama-3.2 talker generates multi-sentence utterances in
+    // a single pass, exactly like HumeAI's reference tada.py generate(). Splitting
+    // at punctuation synthesizes each sentence in isolation, where the per-token
+    // duration head over-predicts the trailing pause for a sentence-final period
+    // (e.g. "Hi." alone expands to ~500 frames / ~9 s of silence+hum), and inserts
+    // extra silence between chunks. Both diverge from the reference, so feed the
+    // whole text as one chunk.
+    //
+    // dots.tts (#200): a continuous-latent AR model that generates multi-sentence
+    // utterances in one pass with its own EOS, exactly like the reference
+    // dots.tts generate(text). Splitting re-runs the per-sentence trailing-pause
+    // over-prediction (as TADA) AND — when voice cloning — re-emits the spoken
+    // AI-disclaimer that dots_tts_synthesize prepends on every call (one per
+    // chunk). Feed the whole text as one chunk.
+    if (backend_name.rfind("vibevoice", 0) == 0 || backend_name.rfind("qwen3-tts", 0) == 0 ||
+        backend_name.rfind("tada", 0) == 0 || backend_name.rfind("dots-tts", 0) == 0)
         return {text};
 
     std::vector<std::string> result = crispasr_tts_split_sentences(text, max_chars);

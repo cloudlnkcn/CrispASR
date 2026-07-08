@@ -106,7 +106,11 @@ def main():
     sp = spm.SentencePieceProcessor()
     sp.Load(sp_path)
     sp_vocab = [sp.IdToPiece(i) for i in range(sp.GetPieceSize())]
-    print(f"SP vocab: {len(sp_vocab)} pieces")
+    # Unigram piece scores (log-probs) — required for correct Viterbi tokenization.
+    # XLM-RoBERTa's SP model is a Unigram model; greedy longest-match mis-segments
+    # multi-subword words (e.g. "delayed"), so the engine needs these to run Viterbi.
+    sp_scores = [sp.GetScore(i) for i in range(sp.GetPieceSize())]
+    print(f"SP vocab: {len(sp_vocab)} pieces (+ unigram scores)")
 
     # Create GGUF
     writer = gguf.GGUFWriter(args.output, "pcs")
@@ -124,6 +128,7 @@ def main():
     writer.add_uint32("pcs.cls_id", 0)  # <s>
 
     writer.add_array("tokenizer.ggml.tokens", sp_vocab)
+    writer.add_array("tokenizer.ggml.scores", sp_scores)
     writer.add_array("pcs.post_labels", post_labels)
     writer.add_array("pcs.pre_labels", pre_labels)
 

@@ -16,6 +16,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +29,32 @@
 #endif
 
 namespace chatterbox_s3tok {
+
+// ===========================================================================
+// Bench instrumentation — `CB_S3TOK_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool cb_s3tok_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("CB_S3TOK_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct cb_s3tok_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit cb_s3tok_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~cb_s3tok_bench_stage() {
+        if (!cb_s3tok_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  cb_s3tok_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 namespace {
 
@@ -372,6 +399,7 @@ std::vector<int32_t> encode_tokens(const cb_s3tok_model& m, ggml_backend_sched_t
 
 std::vector<int32_t> tokenize(const cb_s3tok_model& m, ggml_backend_sched_t sched, std::vector<uint8_t>& compute_meta,
                               const float* pcm_16k, int n_samples, int max_tokens) {
+    cb_s3tok_bench_stage _bs_total("tokenize_total");
     int T = 0;
     auto mel = compute_log_mel(pcm_16k, n_samples, T);
     if (mel.empty() || T <= 0)

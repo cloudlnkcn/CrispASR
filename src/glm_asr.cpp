@@ -19,20 +19,49 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `GLM_ASR_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool glm_asr_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("GLM_ASR_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct glm_asr_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit glm_asr_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~glm_asr_bench_stage() {
+        if (!glm_asr_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  glm_asr_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // Model structures
@@ -154,6 +183,12 @@ struct glm_asr_context {
 
     int n_threads = 4;
     std::string ask; // custom instruction (empty = use default)
+
+    // §176s: cached encoder graph — reused when T_mel matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_mel = 0;
 };
 
 // ===========================================================================
@@ -221,7 +256,7 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -416,6 +451,7 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
         backends[n_be++] = ctx->backend_cpu;
     }
     ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
     int n_audio_t = 0, n_llm_t = 0;
@@ -438,6 +474,8 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
 extern "C" void glm_asr_free(struct glm_asr_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
@@ -533,7 +571,11 @@ static char* glm_asr_transcribe_impl(struct glm_asr_context* ctx, const float* s
 
     // 1. Compute mel
     int n_mels = 0, T_mel = 0;
-    float* mel = glm_asr_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
+    float* mel;
+    {
+        glm_asr_bench_stage _b("mel");
+        mel = glm_asr_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
+    }
     if (!mel)
         return nullptr;
 
@@ -558,7 +600,11 @@ static char* glm_asr_transcribe_impl(struct glm_asr_context* ctx, const float* s
 
     // 2. Run encoder + projector
     int N_enc = 0, enc_dim = 0;
-    float* audio_embeds = glm_asr_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &enc_dim);
+    float* audio_embeds;
+    {
+        glm_asr_bench_stage _b("encoder");
+        audio_embeds = glm_asr_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &enc_dim);
+    }
     free(mel);
     if (!audio_embeds)
         return nullptr;
@@ -614,14 +660,21 @@ static char* glm_asr_transcribe_impl(struct glm_asr_context* ctx, const float* s
     free(audio_embeds);
 
     // 6. KV cache + prefill + greedy decode
-    if (!ctx->kv_ctx && !glm_asr_kv_init(ctx, 4096)) {
-        free(text_embeds);
-        return nullptr;
+    {
+        glm_asr_bench_stage _b("kv_init");
+        if (!ctx->kv_ctx && !glm_asr_kv_init(ctx, 4096)) {
+            free(text_embeds);
+            return nullptr;
+        }
+        glm_asr_kv_reset(ctx);
     }
-    glm_asr_kv_reset(ctx);
 
     int n_t = 0, vocab = 0;
-    float* logits = glm_asr_run_llm_kv(ctx, text_embeds, (int)ids.size(), 0, &n_t, &vocab);
+    float* logits;
+    {
+        glm_asr_bench_stage _b("prefill");
+        logits = glm_asr_run_llm_kv(ctx, text_embeds, (int)ids.size(), 0, &n_t, &vocab);
+    }
     free(text_embeds);
     if (!logits)
         return nullptr;
@@ -635,6 +688,7 @@ static char* glm_asr_transcribe_impl(struct glm_asr_context* ctx, const float* s
 
     // Generated token sequence (post-prompt) and per-token softmax probs,
     // produced by either the greedy or beam-search path below.
+    glm_asr_bench_stage _b_dec("ar_decode");
     std::vector<int32_t> gen_ids;
     std::vector<float> gen_probs;
     const int max_tokens = 512;
@@ -915,6 +969,29 @@ extern "C" float* glm_asr_embed_tokens(struct glm_asr_context* ctx, const int32_
     const auto& m = ctx->model;
     const int d = m.hp.llm_hidden;
 
+    // Fast path: single-token lookup avoids graph build + sched overhead.
+    // Gated by CRISPASR_GLM_ASR_EMBED_FAST (default ON).
+    static int use_fast = -1;
+    if (use_fast < 0) {
+        const char* e = std::getenv("CRISPASR_GLM_ASR_EMBED_FAST");
+        use_fast = (!e || *e != '0') ? 1 : 0;
+    }
+    if (n_ids == 1 && use_fast && m.llm.token_embd_w) {
+        const ggml_tensor* w = m.llm.token_embd_w;
+        const size_t row_bytes = ggml_row_size(w->type, d);
+        float* result = (float*)malloc((size_t)d * sizeof(float));
+        if (!result)
+            return nullptr;
+        std::vector<uint8_t> raw(row_bytes);
+        ggml_backend_tensor_get(w, raw.data(), (size_t)ids[0] * row_bytes, row_bytes);
+        if (w->type == GGML_TYPE_F32) {
+            std::memcpy(result, raw.data(), (size_t)d * sizeof(float));
+        } else {
+            ggml_get_type_traits(w->type)->to_float(raw.data(), result, d);
+        }
+        return result;
+    }
+
     // Build tiny graph: token_embd lookup
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -992,7 +1069,7 @@ extern "C" void glm_asr_kv_reset(struct glm_asr_context* ctx) {
     ggml_backend_buffer_clear(ctx->kv_buf, 0);
 }
 
-static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel) {
+static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel, ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hp;
     const int d = hp.enc_hidden;          // 1280
@@ -1003,7 +1080,7 @@ static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel) {
     const float scale = 1.0f / std::sqrt((float)hd);
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // Input mel (n_mels, T_mel)
@@ -1153,7 +1230,8 @@ static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel) {
 
     ggml_set_name(cur, "encoder_out");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -1167,7 +1245,23 @@ extern "C" float* glm_asr_run_encoder(struct glm_asr_context* ctx, const float* 
     const int T_proj = T_enc / 4;
     const int llm_d = hp.llm_hidden; // 2048
 
-    ggml_cgraph* gf = glm_build_encoder(ctx, T_mel);
+    // §176s: reuse cached encoder graph when T_mel matches.
+    ggml_cgraph* gf;
+    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
+        gf = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(aip);
+        gf = glm_build_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_mel = T_mel;
+    }
     if (!gf)
         return nullptr;
 

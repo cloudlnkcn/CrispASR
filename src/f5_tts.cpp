@@ -30,9 +30,15 @@
 #include "ggml-cpu.h"
 
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +51,32 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `F5_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool f5_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("F5_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct f5_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit f5_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~f5_bench_stage() {
+        if (!f5_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  f5_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Hyperparameters ──────────────────────────────────────────────
 
@@ -171,6 +203,57 @@ struct f5_vocab {
     std::map<std::string, int> char_to_idx;
 };
 
+// ── Text and Vocos weight caches ─────────────────────────────────
+// Pre-dequantized F32 copies loaded once at init; avoids per-synthesis
+// read_tensor_f32 (and Q4_K dequantization) in compute_text_embed and
+// vocos_decode.
+
+struct f5_text_block_cache {
+    std::vector<float> dw_w, dw_b;
+    std::vector<float> norm_w, norm_b;
+    std::vector<float> pw_up_w, pw_up_b;
+    std::vector<float> pw_down_w, pw_down_b;
+    std::vector<float> grn_g, grn_b;
+};
+
+struct f5_voc_block_cache {
+    std::vector<float> dw_w, dw_b;
+    std::vector<float> norm_w, norm_b;
+    std::vector<float> pw_up_w, pw_up_b;
+    std::vector<float> pw_down_w, pw_down_b;
+    std::vector<float> layer_scale;
+};
+
+// ── DiT graph cache ───────────────────────────────────────────────
+// All 22 DiT blocks + final AdaLN/proj fused into one ggml graph,
+// built once per T and reused across ODE steps (and cond/uncond passes).
+
+struct f5_dit_graph_cache {
+    int T_cached = -1;
+    ggml_context* gctx = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_tensor* hidden_in = nullptr; // (dim, T) — input hidden state
+    ggml_tensor* t_emb_in = nullptr;  // (dim,)  — timestep embedding
+    ggml_tensor* pos_in = nullptr;    // (T,) i32 — constant [0..T-1]
+    ggml_tensor* output = nullptr;    // (mel_dim, T) — velocity
+
+    void reset() {
+        if (galloc) {
+            ggml_gallocr_free(galloc);
+            galloc = nullptr;
+        }
+        if (gctx) {
+            ggml_free(gctx);
+            gctx = nullptr;
+        }
+        gf = nullptr;
+        hidden_in = t_emb_in = pos_in = output = nullptr;
+        T_cached = -1;
+    }
+    ~f5_dit_graph_cache() { reset(); }
+};
+
 // ── Context ──────────────────────────────────────────────────────
 
 struct f5_tts_context {
@@ -201,6 +284,35 @@ struct f5_tts_context {
 
     // Diff harness: inject reference initial noise for reproducibility
     std::vector<float> ref_init_noise;
+
+    // Cached fused DiT graph (rebuilt only when T changes)
+    f5_dit_graph_cache dit_cache;
+
+    // Pre-dequantized F32 input-embedding weights.
+    // Avoids 64× read_tensor_f32 per synthesis (conv_pos tensors are 7.7 MB each).
+    struct {
+        std::vector<float> input_proj_w; // (dim, cat_dim)
+        std::vector<float> input_proj_b; // (dim,)
+        std::vector<float> conv_pos_0_w; // (dim, dim/groups, K)
+        std::vector<float> conv_pos_0_b; // (dim,)
+        std::vector<float> conv_pos_1_w;
+        std::vector<float> conv_pos_1_b;
+    } emb_cache;
+
+    // Pre-dequantized text ConvNeXtV2 weights (4 blocks, ~21 MB F32).
+    struct {
+        std::vector<float> emb; // (text_num_embeds, text_dim)
+        std::vector<f5_text_block_cache> blocks;
+    } text_cache;
+
+    // Pre-dequantized Vocos vocoder weights (8 blocks, ~54 MB F32).
+    struct {
+        std::vector<float> embed_w, embed_b;
+        std::vector<float> norm_w, norm_b;
+        std::vector<f5_voc_block_cache> blocks;
+        std::vector<float> final_norm_w, final_norm_b;
+        std::vector<float> head_w, head_b;
+    } voc_cache;
 };
 
 // ── Diff dump helpers ────────────────────────────────────────────
@@ -422,11 +534,13 @@ static std::vector<std::string> convert_to_pinyin(const std::string& text) {
     return chars;
 }
 
+// Forward declaration (defined after FFT helpers, used here for text encoder ConvNeXt blocks)
+static void f5_linear(const float* x, const float* W, const float* bias, float* y, int T, int K, int N);
+
 // ── Text Encoder (embedding + sinusoidal pos + ConvNeXtV2 blocks) ─
 
 static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t* tokens, int n_tokens, int seq_len) {
     const auto& hp = ctx->hp;
-    const auto& w = ctx->w;
 
     // tokens are in range [-1, vocab_size-1]. We add 1 to make 0 the filler.
     // Then pad/truncate to seq_len.
@@ -441,9 +555,8 @@ static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t*
         text_mask[i] = (padded[i] == 0) ? 1.0f : 0.0f;
     }
 
-    // Embedding lookup (done manually since ggml embedding is int-indexed)
-    std::vector<float> emb_weight;
-    read_tensor_f32(w.text_emb_weight, emb_weight);
+    // Embedding lookup — use pre-dequantized cache (loaded at init).
+    const std::vector<float>& emb_weight = ctx->text_cache.emb;
 
     std::vector<float> text_emb(seq_len * hp.text_dim, 0.0f);
     for (int t = 0; t < seq_len; t++) {
@@ -480,25 +593,23 @@ static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t*
     // ConvNeXtV2 blocks — implemented on CPU for exact semantics.
     // Each block: dwconv(k=7) → LN → pw_up → GELU → GRN → pw_down → residual
     for (int b = 0; b < hp.conv_layers; b++) {
-        const auto& blk = w.text_blocks[b];
+        const auto& bc = ctx->text_cache.blocks[b];
         int D = hp.text_dim;
         int T = seq_len;
         int K = 7, pad = 3;
         int inter_dim = D * 2; // intermediate_dim = text_dim * conv_mult = 512 * 2
 
-        // Read weights
-        std::vector<float> dw_w, dw_b, norm_w, norm_b, pw_up_w, pw_up_b;
-        std::vector<float> pw_down_w, pw_down_b, grn_g, grn_b_v;
-        read_tensor_f32(blk.dw_weight, dw_w); // (D, 1, K) → flat (D*K)
-        read_tensor_f32(blk.dw_bias, dw_b);
-        read_tensor_f32(blk.norm_weight, norm_w);
-        read_tensor_f32(blk.norm_bias, norm_b);
-        read_tensor_f32(blk.pw_up_weight, pw_up_w); // (inter_dim, D)
-        read_tensor_f32(blk.pw_up_bias, pw_up_b);
-        read_tensor_f32(blk.pw_down_weight, pw_down_w); // (D, inter_dim)
-        read_tensor_f32(blk.pw_down_bias, pw_down_b);
-        read_tensor_f32(blk.grn_gamma, grn_g); // (1,1,inter_dim)
-        read_tensor_f32(blk.grn_beta, grn_b_v);
+        // Use pre-dequantized cached weights.
+        const std::vector<float>& dw_w = bc.dw_w;
+        const std::vector<float>& dw_b = bc.dw_b;
+        const std::vector<float>& norm_w = bc.norm_w;
+        const std::vector<float>& norm_b = bc.norm_b;
+        const std::vector<float>& pw_up_w = bc.pw_up_w;
+        const std::vector<float>& pw_up_b = bc.pw_up_b;
+        const std::vector<float>& pw_down_w = bc.pw_down_w;
+        const std::vector<float>& pw_down_b = bc.pw_down_b;
+        const std::vector<float>& grn_g = bc.grn_g;
+        const std::vector<float>& grn_b_v = bc.grn_b;
 
         // text_emb is (T, D) row-major
         std::vector<float> residual_v = text_emb;
@@ -537,16 +648,8 @@ static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t*
         }
 
         // 3. Pointwise up: (T, D) × (inter_dim, D)^T → (T, inter_dim)
-        std::vector<float> up_out(T * inter_dim, 0.0f);
-        for (int t = 0; t < T; t++) {
-            for (int o = 0; o < inter_dim; o++) {
-                float sum = pw_up_b[o];
-                for (int d = 0; d < D; d++) {
-                    sum += conv_out[t * D + d] * pw_up_w[o * D + d];
-                }
-                up_out[t * inter_dim + o] = sum;
-            }
-        }
+        std::vector<float> up_out(T * inter_dim);
+        f5_linear(conv_out.data(), pw_up_w.data(), pw_up_b.data(), up_out.data(), T, D, inter_dim);
 
         // 4. GELU (exact: x * 0.5 * (1 + erf(x/sqrt(2))))
         for (auto& v : up_out) {
@@ -584,16 +687,8 @@ static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t*
         }
 
         // 6. Pointwise down: (T, inter_dim) × (D, inter_dim)^T → (T, D)
-        std::vector<float> down_out(T * D, 0.0f);
-        for (int t = 0; t < T; t++) {
-            for (int o = 0; o < D; o++) {
-                float sum = pw_down_b[o];
-                for (int d = 0; d < inter_dim; d++) {
-                    sum += up_out[t * inter_dim + d] * pw_down_w[o * inter_dim + d];
-                }
-                down_out[t * D + o] = sum;
-            }
-        }
+        std::vector<float> down_out(T * D);
+        f5_linear(up_out.data(), pw_down_w.data(), pw_down_b.data(), down_out.data(), T, inter_dim, D);
 
         // 7. Residual
         for (int i = 0; i < T * D; i++) {
@@ -769,6 +864,277 @@ static std::vector<float> compute_mel_spectrogram(const float* pcm_24k, int n_sa
 // Runs the full DiT: input_embed → 22 blocks → final adaln + proj.
 // Returns velocity prediction (T, mel_dim).
 //
+// Bypass Accelerate (validate scalar == GEMM, or run on non-Apple): set
+// F5_FORCE_SCALAR=1.
+static bool f5_use_scalar() {
+#if defined(HAVE_ACCELERATE)
+    static const bool force_scalar = std::getenv("F5_FORCE_SCALAR") != nullptr;
+    return force_scalar;
+#else
+    return true;
+#endif
+}
+
+// y[T,N] = x[T,K] @ W[N,K]^T + bias[N]  (PyTorch nn.Linear). PLAN §182:
+// Accelerate cblas_sgemm replaces the scalar triple loops in the F5 DiT
+// (input projection) and Vocos vocoder (pointwise projections) — together the
+// bulk of CPU compute. The scalar fallback is the previous behaviour.
+static void f5_linear(const float* x, const float* W, const float* bias, float* y, int T, int K, int N) {
+#if defined(HAVE_ACCELERATE)
+    if (!f5_use_scalar()) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, N, K, 1.0f, x, K, W, K, 0.0f, y, N);
+        if (bias) {
+            for (int t = 0; t < T; t++) {
+                float* row = y + (size_t)t * N;
+                for (int o = 0; o < N; o++)
+                    row[o] += bias[o];
+            }
+        }
+        return;
+    }
+#endif
+    for (int t = 0; t < T; t++) {
+        const float* xr = x + (size_t)t * K;
+        float* yr = y + (size_t)t * N;
+        for (int o = 0; o < N; o++) {
+            const float* wr = W + (size_t)o * K;
+            float s = bias ? bias[o] : 0.0f;
+            for (int k = 0; k < K; k++)
+                s += xr[k] * wr[k];
+            yr[o] = s;
+        }
+    }
+}
+
+// Grouped causal-"same" Conv1d on (T, C) row-major data (C inner). weight
+// layout [C_out, C_in_per_group, K]; in_ch == out_ch == C; symmetric pad.
+// Output (T, C). PLAN §182: per-group im2col + cblas_sgemm replaces the DiT's
+// ConvPositionEmbedding scalar loop (~4 GFLOP/pass, the DiT's worst hot spot).
+static void f5_grouped_conv1d(const float* in, const float* wt, const float* bias, float* out, int T, int C, int K,
+                              int pad, int groups) {
+    const int cpg = C / groups; // channels per group (in == out)
+#if defined(HAVE_ACCELERATE)
+    if (!f5_use_scalar()) {
+        std::vector<float> col((size_t)cpg * K * T);
+        std::vector<float> Wg((size_t)cpg * cpg * K);
+        std::vector<float> og((size_t)cpg * T);
+        for (int g = 0; g < groups; g++) {
+            const int c0 = g * cpg;
+            // col[(ic*K+k), t] = in[(t+k-pad)*C + c0+ic]  (0 if out of bounds)
+            for (int ic = 0; ic < cpg; ic++)
+                for (int k = 0; k < K; k++) {
+                    float* crow = col.data() + (size_t)(ic * K + k) * T;
+                    for (int t = 0; t < T; t++) {
+                        int ti = t + k - pad;
+                        crow[t] = (ti >= 0 && ti < T) ? in[(size_t)ti * C + c0 + ic] : 0.0f;
+                    }
+                }
+            // Wg[oc, ic*K+k] = wt[(c0+oc)*cpg*K + ic*K + k] (contiguous per oc)
+            for (int oc = 0; oc < cpg; oc++)
+                std::memcpy(Wg.data() + (size_t)oc * cpg * K, wt + (size_t)(c0 + oc) * cpg * K,
+                            (size_t)cpg * K * sizeof(float));
+            // og(cpg, T) = Wg(cpg, cpg*K) @ col(cpg*K, T)
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, cpg, T, cpg * K, 1.0f, Wg.data(), cpg * K,
+                        col.data(), T, 0.0f, og.data(), T);
+            for (int oc = 0; oc < cpg; oc++) {
+                float b = bias ? bias[c0 + oc] : 0.0f;
+                const float* orow = og.data() + (size_t)oc * T;
+                for (int t = 0; t < T; t++)
+                    out[(size_t)t * C + c0 + oc] = orow[t] + b;
+            }
+        }
+        return;
+    }
+#endif
+    for (int g = 0; g < groups; g++) {
+        const int c0 = g * cpg;
+        for (int oc = c0; oc < c0 + cpg; oc++)
+            for (int t = 0; t < T; t++) {
+                float sum = bias ? bias[oc] : 0.0f;
+                for (int ic = 0; ic < cpg; ic++)
+                    for (int k = 0; k < K; k++) {
+                        int ti = t + k - pad;
+                        if (ti >= 0 && ti < T)
+                            sum += in[(size_t)ti * C + c0 + ic] * wt[(size_t)oc * cpg * K + (size_t)ic * K + k];
+                    }
+                out[(size_t)t * C + oc] = sum;
+            }
+    }
+}
+
+// ── Fused DiT graph: build (once per T) ──────────────────────────
+
+static bool f5_dit_cache_build(f5_tts_context* ctx, int T) {
+    auto& cache = ctx->dit_cache;
+    if (cache.T_cached == T && cache.galloc)
+        return true;
+    cache.reset();
+
+    const auto& hp = ctx->hp;
+    const auto& w = ctx->w;
+    int dim = hp.dim;
+    int n_heads = hp.heads;
+    int head_dim = hp.dim_head;
+
+    // 22 blocks × ~42 tensors + final block + inputs: ~950 tensors total.
+    // ~4 MB is well above the ~270 KB actually needed.
+    struct ggml_init_params p = {4 * 1024 * 1024, nullptr, true};
+    cache.gctx = ggml_init(p);
+    if (!cache.gctx)
+        return false;
+
+    // Graph inputs
+    cache.hidden_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, dim, T);
+    ggml_set_name(cache.hidden_in, "hidden_in");
+    ggml_set_input(cache.hidden_in);
+
+    cache.t_emb_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_F32, dim);
+    ggml_set_name(cache.t_emb_in, "t_emb");
+    ggml_set_input(cache.t_emb_in);
+
+    cache.pos_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_I32, T);
+    ggml_set_name(cache.pos_in, "pos");
+    ggml_set_input(cache.pos_in);
+
+    // Chain all 22 DiT blocks
+    ggml_tensor* x = cache.hidden_in;
+    for (int i = 0; i < hp.depth; i++) {
+        const auto& blk = w.dit_blocks[i];
+
+        // AdaLN modulation: silu(t_emb) → linear → 6×dim split
+        ggml_tensor* emb = ggml_silu(cache.gctx, cache.t_emb_in);
+        emb = ggml_mul_mat(cache.gctx, blk.adaln_weight, emb);
+        emb = ggml_add(cache.gctx, emb, blk.adaln_bias);
+
+        ggml_tensor* shift_msa = ggml_view_1d(cache.gctx, emb, dim, 0);
+        ggml_tensor* scale_msa = ggml_view_1d(cache.gctx, emb, dim, 1 * dim * sizeof(float));
+        ggml_tensor* gate_msa = ggml_view_1d(cache.gctx, emb, dim, 2 * dim * sizeof(float));
+        ggml_tensor* shift_mlp = ggml_view_1d(cache.gctx, emb, dim, 3 * dim * sizeof(float));
+        ggml_tensor* scale_mlp = ggml_view_1d(cache.gctx, emb, dim, 4 * dim * sizeof(float));
+        ggml_tensor* gate_mlp = ggml_view_1d(cache.gctx, emb, dim, 5 * dim * sizeof(float));
+
+        // Pre-norm (AdaLN): norm(x) * (1 + scale) + shift
+        ggml_tensor* norm_x = ggml_norm(cache.gctx, x, 1e-6f);
+        ggml_tensor* scaled = ggml_mul(cache.gctx, norm_x, scale_msa);
+        norm_x = ggml_add(cache.gctx, norm_x, scaled);
+        norm_x = ggml_add(cache.gctx, norm_x, shift_msa);
+
+        // QKV projections
+        ggml_tensor* q = ggml_mul_mat(cache.gctx, blk.attn_q_weight, norm_x);
+        q = ggml_add(cache.gctx, q, blk.attn_q_bias);
+        ggml_tensor* k = ggml_mul_mat(cache.gctx, blk.attn_k_weight, norm_x);
+        k = ggml_add(cache.gctx, k, blk.attn_k_bias);
+        ggml_tensor* v = ggml_mul_mat(cache.gctx, blk.attn_v_weight, norm_x);
+        v = ggml_add(cache.gctx, v, blk.attn_v_bias);
+
+        // Reshape for RoPE: (dim, T) → (head_dim, n_heads, T)
+        q = ggml_reshape_3d(cache.gctx, q, head_dim, n_heads, T);
+        k = ggml_reshape_3d(cache.gctx, k, head_dim, n_heads, T);
+        v = ggml_reshape_3d(cache.gctx, v, head_dim, n_heads, T);
+
+        // RoPE (NORMAL mode, freq_base=10000)
+        q = ggml_rope_ext(cache.gctx, q, cache.pos_in, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(cache.gctx, k, cache.pos_in, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        // Permute for flash_attn: (head_dim, n_heads, T) → (head_dim, T, n_heads)
+        q = ggml_permute(cache.gctx, q, 0, 2, 1, 3);
+        k = ggml_permute(cache.gctx, k, 0, 2, 1, 3);
+        v = ggml_permute(cache.gctx, v, 0, 2, 1, 3);
+
+        // Flash attention (bidirectional, no mask)
+        float attn_scale = 1.0f / sqrtf((float)head_dim);
+        ggml_tensor* attn_out = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
+        attn_out = ggml_reshape_2d(cache.gctx, attn_out, dim, T);
+
+        // O-proj + gated residual
+        ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, blk.attn_o_weight, attn_out);
+        attn_proj = ggml_add(cache.gctx, attn_proj, blk.attn_o_bias);
+        ggml_tensor* gated_attn = ggml_mul(cache.gctx, attn_proj, gate_msa);
+        ggml_tensor* x_res = ggml_add(cache.gctx, x, gated_attn);
+
+        // FFN pre-norm
+        ggml_tensor* ff_norm = ggml_norm(cache.gctx, x_res, 1e-6f);
+        ggml_tensor* ff_scaled = ggml_mul(cache.gctx, ff_norm, scale_mlp);
+        ff_norm = ggml_add(cache.gctx, ff_norm, ff_scaled);
+        ff_norm = ggml_add(cache.gctx, ff_norm, shift_mlp);
+
+        // FFN: up → GELU → down
+        ggml_tensor* ff = ggml_mul_mat(cache.gctx, blk.ffn_up_weight, ff_norm);
+        ff = ggml_add(cache.gctx, ff, blk.ffn_up_bias);
+        ff = ggml_gelu(cache.gctx, ff);
+        ff = ggml_mul_mat(cache.gctx, blk.ffn_down_weight, ff);
+        ff = ggml_add(cache.gctx, ff, blk.ffn_down_bias);
+
+        // Gated residual
+        x = ggml_add(cache.gctx, x_res, ggml_mul(cache.gctx, ff, gate_mlp));
+    }
+
+    // Final AdaLN + projection → velocity (mel_dim, T)
+    {
+        ggml_tensor* emb = ggml_silu(cache.gctx, cache.t_emb_in);
+        emb = ggml_mul_mat(cache.gctx, w.final_adaln_weight, emb);
+        emb = ggml_add(cache.gctx, emb, w.final_adaln_bias);
+
+        ggml_tensor* fscale = ggml_view_1d(cache.gctx, emb, dim, 0);
+        ggml_tensor* fshift = ggml_view_1d(cache.gctx, emb, dim, dim * sizeof(float));
+
+        ggml_tensor* norm_x = ggml_norm(cache.gctx, x, 1e-6f);
+        ggml_tensor* fn_sc = ggml_mul(cache.gctx, norm_x, fscale);
+        norm_x = ggml_add(cache.gctx, norm_x, fn_sc);
+        norm_x = ggml_add(cache.gctx, norm_x, fshift);
+
+        ggml_tensor* vel = ggml_mul_mat(cache.gctx, w.final_proj_weight, norm_x);
+        vel = ggml_add(cache.gctx, vel, w.final_proj_bias);
+        ggml_set_name(vel, "velocity");
+        ggml_set_output(vel);
+        cache.output = vel;
+    }
+
+    // Build graph
+    cache.gf = ggml_new_graph_custom(cache.gctx, 8192, false);
+    ggml_build_forward_expand(cache.gf, cache.output);
+
+    // Reserve then allocate memory layout
+    cache.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend_cpu));
+    if (!ggml_gallocr_reserve(cache.galloc, cache.gf) || !ggml_gallocr_alloc_graph(cache.galloc, cache.gf)) {
+        cache.reset();
+        return false;
+    }
+
+    // Set constant position indices — persist across steps
+    std::vector<int32_t> pos_data(T);
+    for (int i = 0; i < T; i++)
+        pos_data[i] = i;
+    ggml_backend_tensor_set(cache.pos_in, pos_data.data(), 0, T * sizeof(int32_t));
+
+    cache.T_cached = T;
+    return true;
+}
+
+// ── Fused DiT graph: run one step ────────────────────────────────
+
+static std::vector<float> f5_dit_run(f5_tts_context* ctx, const float* hidden, int T, const float* t_emb_data) {
+    auto& cache = ctx->dit_cache;
+    if (!f5_dit_cache_build(ctx, T))
+        return {};
+
+    // Re-assign buffer pointers (fast for same T)
+    if (!ggml_gallocr_alloc_graph(cache.galloc, cache.gf))
+        return {};
+
+    const int dim = ctx->hp.dim;
+    ggml_backend_tensor_set(cache.hidden_in, hidden, 0, (size_t)T * dim * sizeof(float));
+    ggml_backend_tensor_set(cache.t_emb_in, t_emb_data, 0, (size_t)dim * sizeof(float));
+
+    if (ggml_backend_graph_compute(ctx->backend_cpu, cache.gf) != GGML_STATUS_SUCCESS)
+        return {};
+
+    const int mel_dim = ctx->hp.mel_dim;
+    std::vector<float> velocity((size_t)T * mel_dim);
+    ggml_backend_tensor_get(cache.output, velocity.data(), 0, velocity.size() * sizeof(float));
+    return velocity;
+}
+
 // x:       (T, mel_dim)   — current ODE state
 // cond:    (T, mel_dim)   — conditioning (masked ref mel)
 // text:    (T, text_dim)  — text embedding
@@ -778,7 +1144,6 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
                                       const float* cond_data, const float* text_data, int text_dim,
                                       const float* time_emb_data, bool drop_audio_cond, bool drop_text, int step_idx) {
     const auto& hp = ctx->hp;
-    const auto& w = ctx->w;
     int dim = hp.dim;
 
     // ── InputEmbedding: cat(x, cond, text) → proj → +conv_pos_embed ──
@@ -799,63 +1164,26 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
 
     if (step_idx == 0 && !drop_audio_cond) {
         dump_stage(ctx, "cat_input", cat_input.data(), cat_input.size());
-        // Dump the weight matrix for verification
-        std::vector<float> proj_w;
-        read_tensor_f32(w.input_proj_weight, proj_w);
-        dump_stage(ctx, "debug_proj_weight", proj_w.data(), proj_w.size());
+        dump_stage(ctx, "debug_proj_weight", ctx->emb_cache.input_proj_w.data(), ctx->emb_cache.input_proj_w.size());
     }
 
-    // Linear projection: (T, 712) → (T, 1024) — on CPU for exact results
-    std::vector<float> proj_w, proj_b;
-    read_tensor_f32(w.input_proj_weight, proj_w); // (1024, 712) row-major
-    read_tensor_f32(w.input_proj_bias, proj_b);
-
+    // Linear projection: (T, 712) → (T, 1024) — use pre-cached F32 weights
     std::vector<float> hidden(T * dim, 0.0f);
-    for (int t = 0; t < T; t++) {
-        for (int o = 0; o < dim; o++) {
-            float sum = proj_b[o];
-            for (int i = 0; i < cat_dim; i++) {
-                sum += cat_input[t * cat_dim + i] * proj_w[o * cat_dim + i];
-            }
-            hidden[t * dim + o] = sum;
-        }
-    }
+    f5_linear(cat_input.data(), ctx->emb_cache.input_proj_w.data(), ctx->emb_cache.input_proj_b.data(), hidden.data(),
+              T, cat_dim, dim);
 
     if (step_idx == 0 && !drop_audio_cond) {
         dump_stage(ctx, "input_proj_out", hidden.data(), hidden.size());
     }
 
     // ConvPositionEmbedding: 2× (Conv1d(dim, dim, k=31, g=16, p=15) + Mish)
-    // Implemented on CPU as grouped conv (groups=16).
+    // Uses pre-cached weights; avoids 7.7 MB read_tensor_f32 per call.
     {
         int K = 31, pad_k = 15, groups = 16;
-        int ch_per_group = dim / groups; // 1024/16 = 64
 
-        auto grouped_conv_mish = [&](const std::vector<float>& input, ggml_tensor* w_tensor, ggml_tensor* b_tensor) {
-            std::vector<float> wt, bias;
-            read_tensor_f32(w_tensor, wt);
-            read_tensor_f32(b_tensor, bias);
-
+        auto grouped_conv_mish = [&](const std::vector<float>& input, const float* wt, const float* bias) {
             std::vector<float> output(T * dim, 0.0f);
-            for (int g = 0; g < groups; g++) {
-                int ch_start = g * ch_per_group;
-                for (int oc = ch_start; oc < ch_start + ch_per_group; oc++) {
-                    for (int t = 0; t < T; t++) {
-                        float sum = bias[oc];
-                        for (int ic_local = 0; ic_local < ch_per_group; ic_local++) {
-                            int ic = ch_start + ic_local;
-                            for (int k = 0; k < K; k++) {
-                                int ti = t + k - pad_k;
-                                if (ti >= 0 && ti < T) {
-                                    float w_val = wt[oc * ch_per_group * K + ic_local * K + k];
-                                    sum += input[ti * dim + ic] * w_val;
-                                }
-                            }
-                        }
-                        output[t * dim + oc] = sum;
-                    }
-                }
-            }
+            f5_grouped_conv1d(input.data(), wt, bias, output.data(), T, dim, K, pad_k, groups);
             for (auto& v : output) {
                 float sp = logf(1.0f + expf(v));
                 v = v * tanhf(sp);
@@ -864,8 +1192,8 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
         };
 
         std::vector<float> proj_out = hidden;
-        hidden = grouped_conv_mish(hidden, w.conv_pos_0_weight, w.conv_pos_0_bias);
-        hidden = grouped_conv_mish(hidden, w.conv_pos_1_weight, w.conv_pos_1_bias);
+        hidden = grouped_conv_mish(hidden, ctx->emb_cache.conv_pos_0_w.data(), ctx->emb_cache.conv_pos_0_b.data());
+        hidden = grouped_conv_mish(hidden, ctx->emb_cache.conv_pos_1_w.data(), ctx->emb_cache.conv_pos_1_b.data());
 
         for (size_t i = 0; i < hidden.size(); i++) {
             hidden[i] += proj_out[i];
@@ -876,198 +1204,13 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
         dump_stage(ctx, "input_embed", hidden.data(), hidden.size());
     }
 
-    // ── RoPE note ──
-    // x_transformers rotate_half pairs adjacent elements (2k, 2k+1):
-    //   x = rearrange(x, '(d r) -> d r', r=2)  →  x1=x[0::2], x2=x[1::2]
-    //   rotated = stack(-x2, x1) → [-x1, x0, -x3, x2, ...]
-    // RotaryEmbedding interleaves freqs: stack((f,f), dim=-1) → [f0,f0,f1,f1,...]
-    // so paired elements share the SAME frequency — a standard 2D rotation,
-    // equivalent to GGML_ROPE_TYPE_NORMAL (mode=0).
-
-    // ── 22 DiT blocks ──
-    for (int blk_idx = 0; blk_idx < hp.depth; blk_idx++) {
-        const auto& blk = w.dit_blocks[blk_idx];
-
-        // Each block:
-        // 1. adaln_modulation = linear(silu(time_emb)) → split into 6 × dim
-        // 2. norm(x) * (1 + scale_msa) + shift_msa → attn input
-        // 3. self_attn with RoPE → attn_output
-        // 4. x = x + gate_msa * attn_output
-        // 5. ff_norm(x) * (1 + scale_mlp) + shift_mlp → ffn input
-        // 6. ffn(input) → ffn_output
-        // 7. x = x + gate_mlp * ffn_output
-
-        int n_heads = hp.heads;
-        int head_dim = hp.dim_head;
-
-        // ── Unified ggml graph: AdaLN + QKV + RoPE + Attention + O-proj + FFN ──
-        {
-            f5_mini_graph mg(ctx->sched, 128 * 1024 * 1024);
-
-            ggml_tensor* x_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, dim, T);
-            ggml_set_name(x_in, "blk_in");
-            ggml_set_input(x_in);
-
-            ggml_tensor* t_emb = ggml_new_tensor_1d(mg.ctx, GGML_TYPE_F32, dim);
-            ggml_set_name(t_emb, "t_emb");
-            ggml_set_input(t_emb);
-
-            // Position indices for RoPE: [0, 1, 2, ..., T-1]
-            ggml_tensor* pos = ggml_new_tensor_1d(mg.ctx, GGML_TYPE_I32, T);
-            ggml_set_name(pos, "pos");
-            ggml_set_input(pos);
-
-            // ── AdaLN modulation ──
-            ggml_tensor* emb = ggml_silu(mg.ctx, t_emb);
-            emb = ggml_mul_mat(mg.ctx, blk.adaln_weight, emb);
-            emb = ggml_add(mg.ctx, emb, blk.adaln_bias);
-
-            ggml_tensor* shift_msa = ggml_view_1d(mg.ctx, emb, dim, 0 * dim * sizeof(float));
-            ggml_tensor* scale_msa = ggml_view_1d(mg.ctx, emb, dim, 1 * dim * sizeof(float));
-            ggml_tensor* gate_msa = ggml_view_1d(mg.ctx, emb, dim, 2 * dim * sizeof(float));
-            ggml_tensor* shift_mlp = ggml_view_1d(mg.ctx, emb, dim, 3 * dim * sizeof(float));
-            ggml_tensor* scale_mlp = ggml_view_1d(mg.ctx, emb, dim, 4 * dim * sizeof(float));
-            ggml_tensor* gate_mlp = ggml_view_1d(mg.ctx, emb, dim, 5 * dim * sizeof(float));
-
-            // ── Pre-norm (AdaLN) ──
-            ggml_tensor* norm_x = ggml_norm(mg.ctx, x_in, 1e-6f);
-            ggml_tensor* scaled = ggml_mul(mg.ctx, norm_x, scale_msa);
-            norm_x = ggml_add(mg.ctx, norm_x, scaled);
-            norm_x = ggml_add(mg.ctx, norm_x, shift_msa);
-
-            // ── QKV projections ──
-            ggml_tensor* q = ggml_mul_mat(mg.ctx, blk.attn_q_weight, norm_x);
-            q = ggml_add(mg.ctx, q, blk.attn_q_bias);
-            ggml_tensor* k = ggml_mul_mat(mg.ctx, blk.attn_k_weight, norm_x);
-            k = ggml_add(mg.ctx, k, blk.attn_k_bias);
-            ggml_tensor* v = ggml_mul_mat(mg.ctx, blk.attn_v_weight, norm_x);
-            v = ggml_add(mg.ctx, v, blk.attn_v_bias);
-
-            // ── Reshape to (head_dim, n_heads, T) for RoPE + attention ──
-            // ggml_rope expects ne[2]=T (sequence dim) to match positions.
-            // ggml_flash_attn_ext expects (head_dim, T, n_heads) so we
-            // permute after RoPE.
-            q = ggml_reshape_3d(mg.ctx, q, head_dim, n_heads, T);
-            k = ggml_reshape_3d(mg.ctx, k, head_dim, n_heads, T);
-            v = ggml_reshape_3d(mg.ctx, v, head_dim, n_heads, T);
-
-            // ── RoPE (GGML_ROPE_TYPE_NORMAL = mode 0, freq_base=10000) ──
-            // Input shape: (head_dim, n_heads, T). RoPE rotates along ne[0],
-            // positions indexed by ne[2].
-            q = ggml_rope_ext(mg.ctx, q, pos, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-            k = ggml_rope_ext(mg.ctx, k, pos, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-
-            // ── Permute for flash_attn: (head_dim, n_heads, T) → (head_dim, T, n_heads) ──
-            q = ggml_permute(mg.ctx, q, 0, 2, 1, 3); // ne: (head_dim, T, n_heads)
-            k = ggml_permute(mg.ctx, k, 0, 2, 1, 3);
-            v = ggml_permute(mg.ctx, v, 0, 2, 1, 3);
-
-            // ── Flash attention (bidirectional, no mask) ──
-            float attn_scale = 1.0f / sqrtf((float)head_dim);
-            ggml_tensor* attn_out = ggml_flash_attn_ext(mg.ctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
-
-            // ── Reshape back to (dim, T) ──
-            attn_out = ggml_reshape_2d(mg.ctx, attn_out, dim, T);
-
-            // ── O-proj + gated residual ──
-            ggml_tensor* attn_proj = ggml_mul_mat(mg.ctx, blk.attn_o_weight, attn_out);
-            attn_proj = ggml_add(mg.ctx, attn_proj, blk.attn_o_bias);
-            ggml_tensor* gated_attn = ggml_mul(mg.ctx, attn_proj, gate_msa);
-            ggml_tensor* x_res = ggml_add(mg.ctx, x_in, gated_attn);
-
-            // ── FFN pre-norm ──
-            ggml_tensor* ff_norm = ggml_norm(mg.ctx, x_res, 1e-6f);
-            ggml_tensor* ff_scaled = ggml_mul(mg.ctx, ff_norm, scale_mlp);
-            ff_norm = ggml_add(mg.ctx, ff_norm, ff_scaled);
-            ff_norm = ggml_add(mg.ctx, ff_norm, shift_mlp);
-
-            // ── FFN ──
-            ggml_tensor* ff = ggml_mul_mat(mg.ctx, blk.ffn_up_weight, ff_norm);
-            ff = ggml_add(mg.ctx, ff, blk.ffn_up_bias);
-            ff = ggml_gelu(mg.ctx, ff);
-            ff = ggml_mul_mat(mg.ctx, blk.ffn_down_weight, ff);
-            ff = ggml_add(mg.ctx, ff, blk.ffn_down_bias);
-
-            // ── Gated residual ──
-            ggml_tensor* gated_ff = ggml_mul(mg.ctx, ff, gate_mlp);
-            ggml_tensor* x_out = ggml_add(mg.ctx, x_res, gated_ff);
-            ggml_set_name(x_out, "blk_out");
-            ggml_set_output(x_out);
-
-            // Build and compute
-            ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 32768, false);
-            ggml_build_forward_expand(gf, x_out);
-            ggml_backend_sched_reset(mg.sched);
-            if (!ggml_backend_sched_alloc_graph(mg.sched, gf))
-                return {};
-
-            // Set inputs
-            mg.set_input(x_in, hidden.data(), hidden.size() * sizeof(float));
-            mg.set_input(t_emb, time_emb_data, dim * sizeof(float));
-            std::vector<int32_t> pos_data(T);
-            for (int i = 0; i < T; i++)
-                pos_data[i] = i;
-            mg.set_input(pos, pos_data.data(), T * sizeof(int32_t));
-
-            ggml_backend_sched_graph_compute(mg.sched, gf);
-
-            hidden.resize(T * dim);
-            ggml_backend_tensor_get(x_out, hidden.data(), 0, hidden.size() * sizeof(float));
-        }
-        if (step_idx == 0 && !drop_audio_cond) {
-            char label[64];
-            snprintf(label, sizeof(label), "dit_layer_%d", blk_idx);
-            dump_stage(ctx, label, hidden.data(), hidden.size());
-        }
-    }
-
-    // ── Final AdaLN + projection ──
+    // ── 22 DiT blocks + final AdaLN/proj (fused single graph) ──
     {
-        f5_mini_graph mg(ctx->sched);
-        ggml_tensor* x_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, dim, T);
-        ggml_set_name(x_in, "final_in");
-        ggml_set_input(x_in);
-
-        ggml_tensor* t_emb = ggml_new_tensor_1d(mg.ctx, GGML_TYPE_F32, dim);
-        ggml_set_name(t_emb, "t_emb_final");
-        ggml_set_input(t_emb);
-
-        // AdaLN_Final: silu(emb) → linear(dim→2*dim) → split scale, shift
-        ggml_tensor* emb = ggml_silu(mg.ctx, t_emb);
-        emb = ggml_mul_mat(mg.ctx, w.final_adaln_weight, emb);
-        emb = ggml_add(mg.ctx, emb, w.final_adaln_bias); // (2*dim,)
-
-        ggml_tensor* scale = ggml_view_1d(mg.ctx, emb, dim, 0);
-        ggml_tensor* shift = ggml_view_1d(mg.ctx, emb, dim, dim * sizeof(float));
-
-        // norm(x) * (1 + scale) + shift = norm + norm*scale + shift
-        ggml_tensor* norm_x = ggml_norm(mg.ctx, x_in, 1e-6f);
-        ggml_tensor* fn_scaled = ggml_mul(mg.ctx, norm_x, scale);
-        norm_x = ggml_add(mg.ctx, norm_x, fn_scaled);
-        norm_x = ggml_add(mg.ctx, norm_x, shift);
-
-        // Project to mel_dim
-        ggml_tensor* output = ggml_mul_mat(mg.ctx, w.final_proj_weight, norm_x);
-        output = ggml_add(mg.ctx, output, w.final_proj_bias);
-
-        ggml_set_name(output, "dit_output");
-        ggml_set_output(output);
-
-        ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 4096, false);
-        ggml_build_forward_expand(gf, output);
-        ggml_backend_sched_reset(mg.sched);
-        if (!ggml_backend_sched_alloc_graph(mg.sched, gf))
+        auto velocity = f5_dit_run(ctx, hidden.data(), T, time_emb_data);
+        if (velocity.empty())
             return {};
-        mg.set_input(x_in, hidden.data(), hidden.size() * sizeof(float));
-        mg.set_input(t_emb, time_emb_data, dim * sizeof(float));
-        ggml_backend_sched_graph_compute(mg.sched, gf);
-
-        std::vector<float> velocity(T * mel_dim);
-        ggml_backend_tensor_get(output, velocity.data(), 0, velocity.size() * sizeof(float));
-
-        if (step_idx == 0 && !drop_audio_cond) {
+        if (step_idx == 0 && !drop_audio_cond)
             dump_stage(ctx, "dit_output", velocity.data(), velocity.size());
-        }
         return velocity;
     }
 }
@@ -1140,7 +1283,6 @@ static void transpose_tc(const float* src, int T, int C, float* dst) {
 
 static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_data, int T_mel, int mel_dim) {
     const auto& hp = ctx->hp;
-    const auto& w = ctx->w;
     int D = hp.voc_dim; // 512
     int T = T_mel;
     int inter_dim = hp.voc_intermediate_dim; // 1536
@@ -1148,18 +1290,18 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "f5_tts: vocos_decode T=%d mel_dim=%d voc_dim=%d\n", T, mel_dim, D);
     }
+    const auto voc_t0 = std::chrono::steady_clock::now();
 
     // mel_data is (T, 100) row-major. Convert to (100, T) for conv operations.
     std::vector<float> x_ct(mel_dim * T);
     transpose_tc(mel_data, T, mel_dim, x_ct.data());
 
+    const auto& vc = ctx->voc_cache;
+
     // ── Embed: Conv1d(100, 512, k=7, pad=3) ──
     {
-        std::vector<float> emb_w, emb_b;
-        read_tensor_f32(w.voc_embed_weight, emb_w); // (512, 100, 7)
-        read_tensor_f32(w.voc_embed_bias, emb_b);
         std::vector<float> out(D * T, 0.0f);
-        cpu_conv1d(x_ct.data(), mel_dim, T, emb_w.data(), emb_b.data(), D, 7, 3, 1, out.data());
+        cpu_conv1d(x_ct.data(), mel_dim, T, vc.embed_w.data(), vc.embed_b.data(), D, 7, 3, 1, out.data());
         x_ct = std::move(out);
     }
 
@@ -1167,53 +1309,30 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
     {
         std::vector<float> x_td(T * D);
         transpose_ct(x_ct.data(), D, T, x_td.data());
-        std::vector<float> norm_w, norm_b;
-        read_tensor_f32(w.voc_norm_weight, norm_w);
-        read_tensor_f32(w.voc_norm_bias, norm_b);
-        cpu_layer_norm(x_td.data(), T, D, norm_w.data(), norm_b.data(), 1e-6f);
+        cpu_layer_norm(x_td.data(), T, D, vc.norm_w.data(), vc.norm_b.data(), 1e-6f);
         transpose_tc(x_td.data(), T, D, x_ct.data());
     }
 
     // ── 8× ConvNeXt blocks ──
     for (int b = 0; b < hp.voc_num_layers; b++) {
-        const auto& blk = w.voc_blocks[b];
+        const auto& bc = vc.blocks[b];
         std::vector<float> residual = x_ct; // (D, T)
 
         // 1. Depthwise Conv1d(512, 512, k=7, pad=3, groups=512)
         {
-            std::vector<float> dw_w, dw_b;
-            read_tensor_f32(blk.dw_weight, dw_w); // (512, 1, 7)
-            read_tensor_f32(blk.dw_bias, dw_b);
             std::vector<float> out(D * T, 0.0f);
-            cpu_conv1d(x_ct.data(), D, T, dw_w.data(), dw_b.data(), D, 7, 3, D, out.data());
+            cpu_conv1d(x_ct.data(), D, T, bc.dw_w.data(), bc.dw_b.data(), D, 7, 3, D, out.data());
             x_ct = std::move(out);
         }
 
         // 2. Transpose to (T, D), LayerNorm
         std::vector<float> x_td(T * D);
         transpose_ct(x_ct.data(), D, T, x_td.data());
-        {
-            std::vector<float> norm_w, norm_b;
-            read_tensor_f32(blk.norm_weight, norm_w);
-            read_tensor_f32(blk.norm_bias, norm_b);
-            cpu_layer_norm(x_td.data(), T, D, norm_w.data(), norm_b.data(), 1e-6f);
-        }
+        cpu_layer_norm(x_td.data(), T, D, bc.norm_w.data(), bc.norm_b.data(), 1e-6f);
 
         // 3. Pointwise up: Linear(512, 1536)
         std::vector<float> up_out(T * inter_dim, 0.0f);
-        {
-            std::vector<float> pw_w, pw_b;
-            read_tensor_f32(blk.pw_up_weight, pw_w); // (1536, 512)
-            read_tensor_f32(blk.pw_up_bias, pw_b);
-            for (int t = 0; t < T; t++) {
-                for (int o = 0; o < inter_dim; o++) {
-                    float sum = pw_b[o];
-                    for (int d = 0; d < D; d++)
-                        sum += x_td[t * D + d] * pw_w[o * D + d];
-                    up_out[t * inter_dim + o] = sum;
-                }
-            }
-        }
+        f5_linear(x_td.data(), bc.pw_up_w.data(), bc.pw_up_b.data(), up_out.data(), T, D, inter_dim);
 
         // 4. GELU (exact: x * 0.5 * (1 + erf(x/sqrt(2))))
         for (auto& v : up_out) {
@@ -1222,28 +1341,12 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
 
         // 5. Pointwise down: Linear(1536, 512)
         std::vector<float> down_out(T * D, 0.0f);
-        {
-            std::vector<float> pw_w, pw_b;
-            read_tensor_f32(blk.pw_down_weight, pw_w); // (512, 1536)
-            read_tensor_f32(blk.pw_down_bias, pw_b);
-            for (int t = 0; t < T; t++) {
-                for (int o = 0; o < D; o++) {
-                    float sum = pw_b[o];
-                    for (int d = 0; d < inter_dim; d++)
-                        sum += up_out[t * inter_dim + d] * pw_w[o * inter_dim + d];
-                    down_out[t * D + o] = sum;
-                }
-            }
-        }
+        f5_linear(up_out.data(), bc.pw_down_w.data(), bc.pw_down_b.data(), down_out.data(), T, inter_dim, D);
 
         // 6. Layer scale (gamma)
-        {
-            std::vector<float> gamma;
-            read_tensor_f32(blk.layer_scale, gamma); // (512,)
-            for (int t = 0; t < T; t++)
-                for (int d = 0; d < D; d++)
-                    down_out[t * D + d] *= gamma[d];
-        }
+        for (int t = 0; t < T; t++)
+            for (int d = 0; d < D; d++)
+                down_out[t * D + d] *= bc.layer_scale[d];
 
         // 7. Transpose back to (D, T) and add residual
         transpose_tc(down_out.data(), T, D, x_ct.data());
@@ -1254,12 +1357,7 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
     // ── Final LayerNorm ──
     std::vector<float> x_td(T * D);
     transpose_ct(x_ct.data(), D, T, x_td.data());
-    {
-        std::vector<float> norm_w, norm_b;
-        read_tensor_f32(w.voc_final_norm_weight, norm_w);
-        read_tensor_f32(w.voc_final_norm_bias, norm_b);
-        cpu_layer_norm(x_td.data(), T, D, norm_w.data(), norm_b.data(), 1e-6f);
-    }
+    cpu_layer_norm(x_td.data(), T, D, vc.final_norm_w.data(), vc.final_norm_b.data(), 1e-6f);
     // x_td is now (T, D) = backbone output
 
     // ── ISTFTHead: Linear(512, 1026) → split mag/phase → iSTFT ──
@@ -1270,19 +1368,7 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
 
     // Linear projection
     std::vector<float> head_out(T * out_dim);
-    {
-        std::vector<float> head_w, head_b;
-        read_tensor_f32(w.voc_head_weight, head_w); // (1026, 512)
-        read_tensor_f32(w.voc_head_bias, head_b);
-        for (int t = 0; t < T; t++) {
-            for (int o = 0; o < out_dim; o++) {
-                float sum = head_b[o];
-                for (int d = 0; d < D; d++)
-                    sum += x_td[t * D + d] * head_w[o * D + d];
-                head_out[t * out_dim + o] = sum;
-            }
-        }
-    }
+    f5_linear(x_td.data(), vc.head_w.data(), vc.head_b.data(), head_out.data(), T, D, out_dim);
 
     // Split into magnitude and phase, each (T, 513)
     // head_out is (T, 1026) row-major. First 513 = magnitude, last 513 = phase.
@@ -1361,7 +1447,8 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
     }
 
     if (ctx->verbosity >= 1) {
-        fprintf(stderr, "f5_tts: vocos_decode produced %d samples\n", trimmed_len);
+        double voc_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - voc_t0).count();
+        fprintf(stderr, "f5_tts: vocos_decode produced %d samples in %.1f ms\n", trimmed_len, voc_ms);
     }
     return result;
 }
@@ -1689,7 +1776,7 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
@@ -1702,6 +1789,68 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
         fprintf(stderr, "f5_tts: failed to load model: %s\n", path_model);
         f5_tts_free(ctx);
         return nullptr;
+    }
+
+    // Pre-dequantize weights once at load time to avoid per-synthesis reads.
+    {
+        const auto& w = ctx->w;
+
+        // §184: input-embedding weights (hot: 64× per synthesis)
+        auto& ec = ctx->emb_cache;
+        read_tensor_f32(w.input_proj_weight, ec.input_proj_w);
+        read_tensor_f32(w.input_proj_bias, ec.input_proj_b);
+        read_tensor_f32(w.conv_pos_0_weight, ec.conv_pos_0_w);
+        read_tensor_f32(w.conv_pos_0_bias, ec.conv_pos_0_b);
+        read_tensor_f32(w.conv_pos_1_weight, ec.conv_pos_1_w);
+        read_tensor_f32(w.conv_pos_1_bias, ec.conv_pos_1_b);
+
+        // §185: text ConvNeXtV2 weights (1× per synthesis, ~21 MB F32)
+        {
+            auto& tc = ctx->text_cache;
+            read_tensor_f32(w.text_emb_weight, tc.emb);
+            tc.blocks.resize(ctx->hp.conv_layers);
+            for (int b = 0; b < ctx->hp.conv_layers; b++) {
+                const auto& blk = w.text_blocks[b];
+                auto& bc = tc.blocks[b];
+                read_tensor_f32(blk.dw_weight, bc.dw_w);
+                read_tensor_f32(blk.dw_bias, bc.dw_b);
+                read_tensor_f32(blk.norm_weight, bc.norm_w);
+                read_tensor_f32(blk.norm_bias, bc.norm_b);
+                read_tensor_f32(blk.pw_up_weight, bc.pw_up_w);
+                read_tensor_f32(blk.pw_up_bias, bc.pw_up_b);
+                read_tensor_f32(blk.pw_down_weight, bc.pw_down_w);
+                read_tensor_f32(blk.pw_down_bias, bc.pw_down_b);
+                read_tensor_f32(blk.grn_gamma, bc.grn_g);
+                read_tensor_f32(blk.grn_beta, bc.grn_b);
+            }
+        }
+
+        // §185: Vocos vocoder weights (1× per synthesis, ~54 MB F32)
+        {
+            auto& vc = ctx->voc_cache;
+            read_tensor_f32(w.voc_embed_weight, vc.embed_w);
+            read_tensor_f32(w.voc_embed_bias, vc.embed_b);
+            read_tensor_f32(w.voc_norm_weight, vc.norm_w);
+            read_tensor_f32(w.voc_norm_bias, vc.norm_b);
+            vc.blocks.resize(ctx->hp.voc_num_layers);
+            for (int b = 0; b < ctx->hp.voc_num_layers; b++) {
+                const auto& blk = w.voc_blocks[b];
+                auto& bc = vc.blocks[b];
+                read_tensor_f32(blk.dw_weight, bc.dw_w);
+                read_tensor_f32(blk.dw_bias, bc.dw_b);
+                read_tensor_f32(blk.norm_weight, bc.norm_w);
+                read_tensor_f32(blk.norm_bias, bc.norm_b);
+                read_tensor_f32(blk.pw_up_weight, bc.pw_up_w);
+                read_tensor_f32(blk.pw_up_bias, bc.pw_up_b);
+                read_tensor_f32(blk.pw_down_weight, bc.pw_down_w);
+                read_tensor_f32(blk.pw_down_bias, bc.pw_down_b);
+                read_tensor_f32(blk.layer_scale, bc.layer_scale);
+            }
+            read_tensor_f32(w.voc_final_norm_weight, vc.final_norm_w);
+            read_tensor_f32(w.voc_final_norm_bias, vc.final_norm_b);
+            read_tensor_f32(w.voc_head_weight, vc.head_w);
+            read_tensor_f32(w.voc_head_bias, vc.head_b);
+        }
     }
 
     // Create backend scheduler
@@ -1818,7 +1967,11 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     }
 
     // ── Text embedding ──
-    auto text_emb = compute_text_embed(ctx, tokens.data(), (int)tokens.size(), duration);
+    std::vector<float> text_emb;
+    {
+        f5_bench_stage _b("text_embed");
+        text_emb = compute_text_embed(ctx, tokens.data(), (int)tokens.size(), duration);
+    }
     if (text_emb.empty())
         return 0;
     dump_stage(ctx, "text_embed", text_emb.data(), text_emb.size());
@@ -1844,7 +1997,11 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     }
 
     // ── ODE solve ──
-    auto generated = euler_solve(ctx, step_cond, text_emb, text_emb_uncond, duration, mel_dim, text_dim);
+    std::vector<float> generated;
+    {
+        f5_bench_stage _b("ode_solve");
+        generated = euler_solve(ctx, step_cond, text_emb, text_emb_uncond, duration, mel_dim, text_dim);
+    }
     if (generated.empty())
         return 0;
 
@@ -1861,6 +2018,7 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     dump_stage(ctx, "vocos_input", gen_mel.data(), gen_mel.size());
 
     // ── Vocos vocoder ──
+    f5_bench_stage _b_voc("vocos_vocoder");
     auto audio = vocos_decode(ctx, gen_mel.data(), gen_T, mel_dim);
     if (audio.empty()) {
         // Fallback: return empty for now, will be filled once vocos is implemented

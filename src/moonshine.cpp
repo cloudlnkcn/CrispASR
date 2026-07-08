@@ -5,6 +5,7 @@
 #include "core/attention.h"
 #include "core/beam_decode.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml.h"
 #include "gguf.h"
@@ -20,6 +21,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `MOONSHINE_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool moonshine_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("MOONSHINE_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct moonshine_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit moonshine_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~moonshine_bench_stage() {
+        if (!moonshine_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  moonshine_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 struct moonshine_context {
     moonshine_model model;
@@ -47,6 +74,11 @@ struct moonshine_context {
     // same audio.
     uint64_t seed_override = 0;
     moonshine_timing timing = {};
+
+    // §176s: cached encoder graph — reused when n_samples matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    int cached_enc_n_samples = 0;
 };
 
 using TensorMap = std::map<std::string, ggml_tensor*>;
@@ -160,7 +192,7 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
     ctx->use_gpu = (ctx->backend != ctx->backend_cpu);
@@ -510,47 +542,57 @@ static bool moonshine_kv_cache_init(moonshine_kv_cache& cache, int n_layers, int
 static int moonshine_run_encoder(struct moonshine_context* ctx, const float* audio, int n_samples) {
     const auto& hp = ctx->model.hparams;
 
-    const size_t n_tensors = hp.enc_n_layers * 25 + 100;
-    const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
-    struct ggml_init_params params = {
-        /*.mem_size   =*/mem_size,
-        /*.mem_buffer =*/nullptr,
-        /*.no_alloc   =*/true,
-    };
-    struct ggml_context* ctx0 = ggml_init(params);
-    if (!ctx0) {
-        fprintf(stderr, "%s: failed to init ggml context\n", __func__);
-        return -1;
+    // §176s: reuse cached encoder graph when n_samples matches.
+    struct ggml_cgraph* graph;
+    struct ggml_context* ctx0 = nullptr;
+    if (ctx->cached_enc_gf && ctx->cached_enc_n_samples == n_samples) {
+        graph = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        const size_t n_tensors = hp.enc_n_layers * 25 + 100;
+        const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
+        struct ggml_init_params params = {mem_size, nullptr, true};
+        ctx0 = ggml_init(params);
+        if (!ctx0) {
+            fprintf(stderr, "%s: failed to init ggml context\n", __func__);
+            return -1;
+        }
+
+        struct ggml_tensor* input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_samples, 1, 1);
+        ggml_set_name(input, "audio_input");
+        ggml_set_input(input);
+        struct ggml_tensor* conv_out = build_conv_stem(ctx0, ctx->model, input);
+        const int seq_len = (int)conv_out->ne[1];
+        struct ggml_tensor* pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, seq_len);
+        ggml_set_name(pos, "enc_pos");
+        ggml_set_input(pos);
+        struct ggml_tensor* output = moonshine_build_encoder(ctx0, ctx->model, conv_out, pos, seq_len);
+        ggml_set_name(output, "encoder_output");
+        ggml_set_output(output);
+        graph = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(graph, output);
+
+        ctx->cached_enc_ctx = ctx0;
+        ctx->cached_enc_gf = graph;
+        ctx->cached_enc_n_samples = n_samples;
+        ctx0 = nullptr; // owned by cache now
     }
-
-    struct ggml_tensor* input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_samples, 1, 1);
-    ggml_set_name(input, "audio_input");
-    ggml_set_input(input);
-
-    struct ggml_tensor* conv_out = build_conv_stem(ctx0, ctx->model, input);
-
-    const int seq_len = (int)conv_out->ne[1];
-
-    struct ggml_tensor* pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, seq_len);
-    ggml_set_name(pos, "enc_pos");
-    ggml_set_input(pos);
-
-    struct ggml_tensor* output = moonshine_build_encoder(ctx0, ctx->model, conv_out, pos, seq_len);
-    ggml_set_name(output, "encoder_output");
-    ggml_set_output(output);
-
-    struct ggml_cgraph* graph = ggml_new_graph(ctx0);
-    ggml_build_forward_expand(graph, output);
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
-        ggml_free(ctx0);
         return -1;
     }
 
+    struct ggml_tensor* input = ggml_graph_get_tensor(graph, "audio_input");
     ggml_backend_tensor_set(input, audio, 0, n_samples * sizeof(float));
 
+    struct ggml_tensor* pos = ggml_graph_get_tensor(graph, "enc_pos");
+    const int seq_len = (int)pos->ne[0];
     std::vector<int32_t> pos_data(seq_len);
     for (int i = 0; i < seq_len; i++) {
         pos_data[i] = i;
@@ -559,19 +601,18 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
 
     if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
-        ggml_free(ctx0);
         return -1;
     }
 
-    const int hidden_dim = (int)output->ne[0];
-    const int out_seq = (int)output->ne[1];
+    struct ggml_tensor* enc_output = ggml_graph_get_tensor(graph, "encoder_output");
+    const int hidden_dim = (int)enc_output->ne[0];
+    const int out_seq = (int)enc_output->ne[1];
     const size_t out_bytes = hidden_dim * out_seq * sizeof(float);
 
     ctx->encoder_out.resize(hidden_dim * out_seq);
     ctx->enc_len = out_seq;
-    ggml_backend_tensor_get(output, ctx->encoder_out.data(), 0, out_bytes);
+    ggml_backend_tensor_get(enc_output, ctx->encoder_out.data(), 0, out_bytes);
 
-    ggml_free(ctx0);
     return 0;
 }
 
@@ -910,7 +951,11 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // 1. Run encoder
-    int ret = moonshine_run_encoder(ctx, audio, n_samples);
+    int ret;
+    {
+        moonshine_bench_stage _b("encoder");
+        ret = moonshine_run_encoder(ctx, audio, n_samples);
+    }
     if (ret != 0) {
         return ret;
     }
@@ -922,17 +967,23 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     }
     int max_len = max_gen + 1; // +1 for BOS
 
-    if (!moonshine_kv_cache_init(ctx->kv_self, hp.dec_n_layers, max_len, hp.n_kv_heads, hp.head_dim)) {
-        return -2;
-    }
+    {
+        moonshine_bench_stage _b("kv_init");
+        if (!moonshine_kv_cache_init(ctx->kv_self, hp.dec_n_layers, max_len, hp.n_kv_heads, hp.head_dim)) {
+            return -2;
+        }
 
-    if (!moonshine_kv_cache_init(ctx->kv_cross, hp.dec_n_layers, ctx->enc_len, hp.n_kv_heads, hp.head_dim)) {
-        ctx->kv_self.reset();
-        return -2;
+        if (!moonshine_kv_cache_init(ctx->kv_cross, hp.dec_n_layers, ctx->enc_len, hp.n_kv_heads, hp.head_dim)) {
+            ctx->kv_self.reset();
+            return -2;
+        }
     }
 
     // 3. Precompute cross-attention KV
-    ret = moonshine_precompute_cross_kv(ctx);
+    {
+        moonshine_bench_stage _b("cross_kv_precompute");
+        ret = moonshine_precompute_cross_kv(ctx);
+    }
     if (ret != 0) {
         ctx->kv_self.reset();
         ctx->kv_cross.reset();
@@ -949,6 +1000,7 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     // softmax(logits/T) + multinomial sample. Beam search (beam_size > 1)
     // takes a separate path below — it ignores temperature and always
     // returns the highest cumulative-log-prob hypothesis.
+    moonshine_bench_stage _b_decode("decode");
     if (ctx->beam_size > 1) {
         // 5a. Prefill BOS to populate slot 0 + capture initial logits.
         std::vector<float> bos_logits;
@@ -1205,6 +1257,9 @@ void moonshine_free(struct moonshine_context* ctx) {
     if (!ctx) {
         return;
     }
+    // §176s: free cached encoder graph.
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     // moonshine_model's destructor frees buf_w + ctx_w. It must run BEFORE

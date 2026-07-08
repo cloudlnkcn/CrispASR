@@ -247,10 +247,17 @@ inline void crispasr_watermark_embed_impl(float* pcm, int n_samples, float alpha
         }
     }
 
-    // Normalize and write back
+    // Normalize and write back only the watermark delta. Near the first and
+    // last Hann-window edges the overlap-add normalization can be tiny; using
+    // a short boundary ramp avoids turning that into an audible impulse.
     for (int i = 0; i < n_samples; i++) {
-        if (norm[i] > 1e-8f)
-            pcm[i] = out[i] / norm[i];
+        if (norm[i] > 1e-4f) {
+            float watermarked = out[i] / norm[i];
+            float delta = watermarked - pcm[i];
+            float ramp_in = std::min(1.0f, (float)i / (float)n_fft);
+            float ramp_out = std::min(1.0f, (float)(n_samples - 1 - i) / (float)n_fft);
+            pcm[i] += delta * std::min(ramp_in, ramp_out);
+        }
     }
 }
 

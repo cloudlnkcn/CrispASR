@@ -24,7 +24,9 @@ public:
 
     const char* name() const override { return "lfm2-audio"; }
 
-    uint32_t capabilities() const override { return CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT | CAP_TTS | CAP_S2S; }
+    uint32_t capabilities() const override {
+        return CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT | CAP_TTS | CAP_S2S | CAP_BEAM_SEARCH;
+    }
 
     int tts_sample_rate() const override { return 24000; }
 
@@ -80,7 +82,11 @@ public:
         if (!ctx_)
             return out;
 
-        char* text = lfm2_audio_transcribe(ctx_, samples, n_samples, nullptr, 0);
+        lfm2_audio_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // Forward the language hint (e.g. `-l en`) so transcribe picks the right
+        // prompt prefix; nullptr keeps the model's default (Japanese).
+        const char* lang = params.language.empty() ? nullptr : params.language.c_str();
+        char* text = lfm2_audio_transcribe(ctx_, samples, n_samples, lang, 0);
         if (!text)
             return out;
 

@@ -26,6 +26,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -33,6 +34,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/crispasr_lcs.h"
 #include "core/fastconformer.h"
@@ -42,6 +44,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <set>
 #include <cstdio>
@@ -57,6 +60,33 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `CANARY_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool canary_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("CANARY_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct canary_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit canary_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~canary_bench_stage() {
+        if (!canary_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  canary_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
 // ===========================================================================
 // Hyper-parameters
 // ===========================================================================
@@ -200,6 +230,12 @@ struct canary_context {
     std::vector<std::vector<float>> step_attn;
 
     int n_threads = 4;
+
+    // §176s: cached encoder graph — reused when T_mel matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_mel = 0;
 
     // Sticky decode-time sampling controls. temperature == 0 keeps the
     // bit-identical greedy path; > 0 switches to numerically-stable
@@ -473,6 +509,7 @@ static void canary_fft_r2c(const float* in, int N, float* out) {
 // Delegates to core_mel::compute() with the NeMo cluster's parameters; only
 // the FFT function pointer differs between parakeet/canary/canary_ctc/cohere.
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -530,7 +567,7 @@ static std::vector<float> canary_compute_mel_impl(canary_context* ctx, const flo
 
 static const float kLayerNormEps = 1e-5f;
 
-static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
+static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel, ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int n_mels = (int)hp.n_mels;
@@ -540,7 +577,7 @@ static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
         /*mem_buffer=*/ctx->compute_meta.data(),
         /*no_alloc=*/true,
     };
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // ----- Inputs -----
@@ -567,7 +604,8 @@ static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
 
     ggml_set_name(cur, "enc_out");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -636,12 +674,29 @@ static std::vector<float> canary_encode_mel(canary_context* ctx, const float* me
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
-    ggml_cgraph* gf = canary_build_graph_encoder(ctx, T_mel);
+    // §176s: reuse cached encoder graph when T_mel matches.
+    ggml_cgraph* gf;
+    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
+        gf = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(aip);
+        gf = canary_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_mel = T_mel;
+    }
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1117,11 +1172,8 @@ static void canary_fold_batchnorm(canary_model& model) {
         for (int c = 0; c < d; c++)
             s[c] = bn_w[c] / sqrtf(bn_var[c] + eps);
 
-        std::vector<ggml_fp16_t> w_f16((size_t)K * d);
-        ggml_backend_tensor_get(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
-        std::vector<float> w_f32((size_t)K * d);
-        for (size_t i = 0; i < w_f16.size(); i++)
-            w_f32[i] = ggml_fp16_to_fp32(w_f16[i]);
+        std::vector<float> w_f32 = core_cpu::to_f32(e.conv_dw_w); // F32/F16/quantized-safe read
+        std::vector<ggml_fp16_t> w_f16(w_f32.size());             // reused for the F16 write-back below
         for (int c = 0; c < d; c++)
             for (int ki = 0; ki < K; ki++)
                 w_f32[ki + c * K] *= s[c];
@@ -1143,11 +1195,11 @@ static void canary_fold_batchnorm(canary_model& model) {
 // ===========================================================================
 
 static ggml_backend_t pick_backend() {
-    // ggml_backend_init_best() tries all compiled backends in priority
+    // crispasr_init_gpu_backend() tries all compiled backends in priority
     // order (CUDA > Metal > Vulkan > CPU) and returns the first one
     // that initialises. This replaces the old Metal/CUDA-specific
     // #ifdef chain and adds Vulkan support for free.
-    ggml_backend_t b = ggml_backend_init_best();
+    ggml_backend_t b = crispasr_init_gpu_backend();
     return b ? b : ggml_backend_cpu_init();
 }
 
@@ -1214,6 +1266,7 @@ extern "C" int canary_run_encoder_staged(struct canary_context* ctx, const float
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 24576, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 24576 + ggml_graph_overhead_custom(24576, false));
@@ -1316,6 +1369,8 @@ extern "C" struct canary_context* canary_init_from_file(const char* path_model, 
 extern "C" void canary_free(struct canary_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->cross_buf)
         ggml_backend_buffer_free(ctx->cross_buf);
     if (ctx->cross_ctx)
@@ -1441,16 +1496,25 @@ extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx
 
     // 1. Mel
     int T_mel = 0;
-    auto mel = canary_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    std::vector<float> mel;
+    {
+        canary_bench_stage _b("mel");
+        mel = canary_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    }
     if (mel.empty())
         return nullptr;
 
     // 2. Encoder
     int T_enc = 0;
-    auto enc = canary_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    std::vector<float> enc;
+    {
+        canary_bench_stage _b("encoder");
+        enc = canary_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    }
     if (enc.empty())
         return nullptr;
 
+    canary_bench_stage _b("decoder");
     return canary_finish_from_encoder(ctx, enc.data(), T_enc, source_lang, target_lang, punctuation, t_offset_cs);
 }
 

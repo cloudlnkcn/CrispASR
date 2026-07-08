@@ -42,8 +42,10 @@
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -61,6 +63,32 @@
 #include <vector>
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `MIMO_ASR_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool mimo_asr_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("MIMO_ASR_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct mimo_asr_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit mimo_asr_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~mimo_asr_bench_stage() {
+        if (!mimo_asr_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  mimo_asr_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 struct mimo_asr_hp {
     // LLM (Qwen2 — model.layers.{0..35}). Defaults match config.json
@@ -207,6 +235,8 @@ struct mimo_asr_context {
     int32_t id_eostm = 151654;    // <|eostm|>
 
     std::string ask; // custom instruction (empty = use default)
+
+    int beam_size = 1; // 1 = greedy (default); >1 = beam search (§167f)
 };
 
 static uint32_t mimo_kv_u32(gguf_context* ctx, const char* key, uint32_t def) {
@@ -349,7 +379,7 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
     // Set CRISPASR_MIMO_FORCE_CPU=1 to override back to CPU-only.
     const bool force_cpu = std::getenv("CRISPASR_MIMO_FORCE_CPU") != nullptr;
     if (params.use_gpu && !force_cpu) {
-        ctx->backend = ggml_backend_init_best();
+        ctx->backend = crispasr_init_gpu_backend();
         if (!ctx->backend) {
             fprintf(stderr, "mimo_asr: GPU backend init failed; falling back to CPU\n");
             ctx->backend = ctx->backend_cpu;
@@ -517,6 +547,7 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -1665,9 +1696,11 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
 // the emitted tokens (one entry per greedy step, including the EOS-trimmed
 // trailing token). Returns a malloc'd char* matching the visible transcript.
 static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float* pcm, int n_samples,
-                                      std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs) {
+                                      std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs,
+                                      mimo_asr_token_cb on_tok = nullptr, void* on_tok_ud = nullptr) {
     if (!ctx || !pcm || n_samples <= 0)
         return nullptr;
+    mimo_asr_bench_stage _b_total("total");
 
     // 1. Lazy-init the audio tokenizer.
     if (!ctx->tokenizer) {
@@ -1688,7 +1721,11 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
 
     // 2. Encode PCM to 8-channel codes.
     int n_frames = 0;
-    int32_t* codes = mimo_tokenizer_encode_pcm16k(ctx->tokenizer, pcm, n_samples, &n_frames);
+    int32_t* codes = nullptr;
+    {
+        mimo_asr_bench_stage _b("audio tokenize");
+        codes = mimo_tokenizer_encode_pcm16k(ctx->tokenizer, pcm, n_samples, &n_frames);
+    }
     if (!codes || n_frames <= 0) {
         fprintf(stderr, "mimo_asr_transcribe: audio tokenization failed (n_frames=%d)\n", n_frames);
         free(codes);
@@ -1746,7 +1783,11 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
         return duration_cast<duration<double, std::milli>>(steady_clock::now().time_since_epoch()).count();
     };
     const double t_prefill0 = bench ? now_ms() : 0.0;
-    float* logits = mimo_asr_run_lm(ctx, input_ids.data(), T_total, /*n_past*/ 0);
+    float* logits = nullptr;
+    {
+        mimo_asr_bench_stage _b("prefill");
+        logits = mimo_asr_run_lm(ctx, input_ids.data(), T_total, /*n_past*/ 0);
+    }
     if (!logits) {
         fprintf(stderr, "mimo_asr_transcribe: prefill failed\n");
         return nullptr;
@@ -1784,17 +1825,20 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
     if (capture_probs)
         generated_probs.reserve((size_t)max_new);
     float prob = 0.0f;
-    int next = pick(logits, capture_probs ? &prob : nullptr);
+    int next = pick(logits, (capture_probs || on_tok) ? &prob : nullptr);
     free(logits);
     generated.push_back(next);
     if (capture_probs)
         generated_probs.push_back(prob);
+    if (on_tok && next != ctx->id_im_end && next != ctx->id_eos)
+        on_tok(next, prob, on_tok_ud);
 
     // 6. Greedy decode loop. Each step uses the lightweight T=1 step
     //    graph (51b/51b'): no audio path, fixed Lk for cached-graph
     //    reuse across steps. The full [9, gs] step would compute zero
     //    in the audio branch (speech_active_mask=0, all audio inputs
     //    zero-mask out) so we skip it entirely.
+    mimo_asr_bench_stage _b_decode("decode loop");
     const double t_decode0 = bench ? now_ms() : 0.0;
     int decode_steps = 0;
     for (int step = 1; step < max_new; step++) {
@@ -1803,12 +1847,14 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
         float* L = mimo_asr_run_lm_step(ctx, next, n_past_groups);
         if (!L)
             return nullptr;
-        next = pick(L, capture_probs ? &prob : nullptr);
+        next = pick(L, (capture_probs || on_tok) ? &prob : nullptr);
         free(L);
         n_past_groups++;
         generated.push_back(next);
         if (capture_probs)
             generated_probs.push_back(prob);
+        if (on_tok && next != ctx->id_im_end && next != ctx->id_eos)
+            on_tok(next, prob, on_tok_ud);
         decode_steps++;
     }
     const double t_decode1 = bench ? now_ms() : 0.0;
@@ -1885,6 +1931,14 @@ extern "C" void mimo_asr_free(struct mimo_asr_context* ctx) {
     delete ctx;
 }
 
+extern "C" void mimo_asr_transcribe_cb(struct mimo_asr_context* ctx, const float* pcm, int n_samples,
+                                       mimo_asr_token_cb cb, void* userdata) {
+    if (!ctx || !pcm || n_samples <= 0 || !cb)
+        return;
+    char* s = mimo_asr_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr, cb, userdata);
+    free(s);
+}
+
 extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* ctx, const float* pcm, int n_samples) {
     return mimo_asr_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr);
 }
@@ -1936,4 +1990,10 @@ extern "C" void mimo_asr_set_n_threads(struct mimo_asr_context* ctx, int n_threa
 extern "C" void mimo_asr_set_ask(struct mimo_asr_context* ctx, const char* prompt) {
     if (ctx)
         ctx->ask = (prompt && prompt[0]) ? prompt : "";
+}
+
+extern "C" void mimo_asr_set_beam_size(struct mimo_asr_context* ctx, int beam_size) {
+    if (!ctx)
+        return;
+    ctx->beam_size = beam_size > 0 ? beam_size : 1;
 }

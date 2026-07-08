@@ -25,6 +25,7 @@ add_executable(${TARGET}
     crispasr_backend_granite_nle.cpp
     crispasr_backend_voxtral.cpp
     crispasr_backend_voxtral4b.cpp
+    crispasr_backend_higgs_stt.cpp
     crispasr_backend_qwen3.cpp
     crispasr_backend_fastconformer_ctc.cpp
     crispasr_backend_wav2vec2.cpp
@@ -36,12 +37,15 @@ add_executable(${TARGET}
     crispasr_backend_tada.cpp
     crispasr_backend_indextts.cpp
     crispasr_backend_f5_tts.cpp
+    crispasr_backend_irodori_tts.cpp
     crispasr_backend_pocket_tts.cpp
     crispasr_backend_csm.cpp
     crispasr_backend_parler.cpp
     crispasr_backend_fastpitch.cpp
+    crispasr_backend_bananamind_tts.cpp
     crispasr_backend_bark.cpp
     crispasr_backend_dia.cpp
+    crispasr_backend_dots_tts.cpp
     crispasr_backend_voxcpm2_tts.cpp
     crispasr_backend_cosyvoice3.cpp
     crispasr_backend_kokoro.cpp
@@ -57,7 +61,9 @@ add_executable(${TARGET}
     crispasr_backend_gemma4_e2b.cpp
     crispasr_backend_omniasr.cpp
     crispasr_backend_mimo_asr.cpp
+    crispasr_backend_ark_asr.cpp
     crispasr_backend_moss_audio.cpp
+    crispasr_backend_moss_transcribe.cpp
     crispasr_backend_funasr.cpp
     crispasr_backend_paraformer.cpp
     crispasr_backend_sensevoice.cpp
@@ -76,6 +82,9 @@ add_executable(${TARGET}
     # Real-time WebSocket ASR streaming, shared with the standalone server
     # (examples/server). Wired into `crispasr --server` via --ws-port.
     ${CMAKE_CURRENT_SOURCE_DIR}/../server/ws_stream.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../server/realtime_server.cpp
+    # Wyoming protocol TCP server (issue #172) — Home Assistant Assist STT+TTS.
+    wyoming.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -179,18 +188,22 @@ target_link_libraries(crispasr-diff PRIVATE
     granite_nle
     voxtral
     voxtral4b
+    higgs_stt
     qwen3_asr
     qwen3_tts
     orpheus
     kokoro
     chatterbox
     tada-tts
+    tada-encoder
     indextts
     m2m100
     gemma4_e2b
     mimo_tokenizer
     mimo_asr
+    ark_asr
     moss_audio
+    moss_transcribe
     voxcpm2_tts
     funasr
     paraformer
@@ -199,6 +212,7 @@ target_link_libraries(crispasr-diff PRIVATE
     csm-tts
     parler-tts
     mini-omni2
+    dots-tts
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -228,9 +242,12 @@ install(TARGETS crispasr-diff RUNTIME BUNDLE DESTINATION bin)
 # MSVC but MinGW silently ignores those pragmas.
 # ---------------------------------------------------------------------------
 add_executable(crispasr-lid crispasr_lid_main.cpp)
+if(TARGET crisp_lid)
+    target_link_libraries(crispasr-lid PRIVATE crisp_lid crispasr-lib)
+else()
+    target_link_libraries(crispasr-lid PRIVATE text-lid-dispatch crispasr-lib)
+endif()
 target_link_libraries(crispasr-lid PRIVATE
-    text-lid-dispatch
-    crispasr-lib
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>
     $<$<BOOL:${WIN32}>:ws2_32>
@@ -269,18 +286,23 @@ target_link_libraries(${TARGET} PRIVATE
     granite_nle
     voxtral
     voxtral4b
+    higgs_stt
     qwen3_asr
     qwen3_tts
     orpheus
     chatterbox
     tada-tts
+    tada-encoder
     indextts
     kokoro
     piper-tts
     speecht5-tts
     fastpitch-tts
+    bananamind-tts
     bark-tts
     dia-tts
+    dots-tts
+    irodori-tts
     pocket-tts
     csm-tts
     voxcpm2_tts
@@ -296,6 +318,7 @@ target_link_libraries(${TARGET} PRIVATE
     paraformer
     sensevoice
     moss_audio
+    moss_transcribe
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>
@@ -328,16 +351,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_parler.cpp")
     target_link_libraries(${TARGET} PRIVATE parler-tts)
 endif()
 
-# Optional MP3 output (libmp3lame)
+# MP3 output — in-tree glint encoder (glint/), always available.
+target_link_libraries(${TARGET} PRIVATE glint)
+
+# Optional libmp3lame fallback (used if glint fails, or forced with
+# CRISPASR_MP3_ENCODER=lame for A/B comparisons)
 find_library(LAME_LIBRARY NAMES mp3lame)
 find_path(LAME_INCLUDE_DIR lame/lame.h)
 if (LAME_LIBRARY AND LAME_INCLUDE_DIR)
     target_link_libraries(${TARGET} PRIVATE ${LAME_LIBRARY})
     target_include_directories(${TARGET} PRIVATE ${LAME_INCLUDE_DIR})
     target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_LAME=1)
-    message(STATUS "MP3 output enabled (libmp3lame)")
+    message(STATUS "MP3 output: glint + libmp3lame fallback")
 else()
-    message(STATUS "MP3 output disabled (libmp3lame-dev not found)")
+    message(STATUS "MP3 output: glint (libmp3lame fallback not found)")
 endif()
 
 # Optional Opus output (libopus + libogg for OGG container)

@@ -15,7 +15,7 @@ BUILD_DIR := build_go
 MODELS_DIR := models
 EXAMPLES_DIR := $(wildcard examples/*)
 INCLUDE_PATH := $(abspath ../../include):$(abspath ../../ggml/include)
-LIBRARY_PATH := $(abspath ../../${BUILD_DIR}/src):$(abspath ../../${BUILD_DIR}/ggml/src):$(abspath ../../${BUILD_DIR}/crisp_audio)
+LIBRARY_PATH := $(abspath ../../${BUILD_DIR}/src):$(abspath ../../${BUILD_DIR}/ggml/src):$(abspath ../../${BUILD_DIR}/crisp_audio):$(abspath ../../${BUILD_DIR}/_deps/crispasr_ogg-build):$(abspath ../../${BUILD_DIR}/_deps/crispasr_opus-build):$(abspath ../../${BUILD_DIR}/_deps/crispasr_opusfile-build)
 
 ifeq ($(GGML_CUDA),1)
 	LIBRARY_PATH := $(LIBRARY_PATH):$(CUDA_PATH)/targets/$(UNAME_M)-linux/lib/
@@ -33,7 +33,9 @@ whisper: mkdir
 	cmake -S ../.. -B ../../${BUILD_DIR} \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DBUILD_SHARED_LIBS=OFF \
-		-DCRISPASR_WITH_ESPEAK_NG=OFF
+		-DCRISPASR_WITH_ESPEAK_NG=OFF \
+		-DCRISPASR_MEL_BLAS=OFF \
+		-DCRISPASR_OPUS_FETCH=ON
 	cmake --build ../../${BUILD_DIR} --target crispasr-lib
 
 test: model-small whisper modtidy

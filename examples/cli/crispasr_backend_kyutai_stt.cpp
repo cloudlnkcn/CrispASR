@@ -44,6 +44,10 @@ public:
         if (!ctx_)
             return out;
 
+        if (!params.language.empty() && params.language != "auto" && params.language != "en")
+            fprintf(stderr, "crispasr[kyutai-stt]: English-only model; language='%s' ignored\n",
+                    params.language.c_str());
+
         // PLAN #125 P6b: kyutai's batch path scales superlinearly with
         // n_samples (~14 s/s on the 50 min file vs 1.36 s/s on JFK, per
         // reports 05 + 11). KV grows O(N) per emitted token, attention
@@ -183,6 +187,43 @@ public:
         if (!seg.text.empty())
             out.push_back(std::move(seg));
         return out;
+    }
+
+    void transcribe_streaming(const float* samples, int n_samples, int64_t /*t_offset_cs*/,
+                              const whisper_params& params, crispasr_stream_callback on_text) override {
+        if (!ctx_) {
+            CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
+            return;
+        }
+        std::string accumulated;
+        bool first_tok = true;
+        // emit_token in kyutai_stt_transcribe_impl already filters padding tokens
+        // and fires on_tok only for valid non-pad text tokens.
+        auto cb = [&](int tok_id, float /*prob*/, void* /*ud*/) {
+            const char* raw = kyutai_stt_token_text(ctx_, tok_id);
+            if (!raw || !*raw)
+                return;
+            std::string piece(raw);
+            size_t pos = 0;
+            while ((pos = piece.find("\xe2\x96\x81", pos)) != std::string::npos) {
+                piece.replace(pos, 3, " ");
+                pos++;
+            }
+            if (first_tok) {
+                size_t sp = 0;
+                while (sp < piece.size() && (piece[sp] == ' ' || piece[sp] == '\n'))
+                    sp++;
+                piece = piece.substr(sp);
+                if (!piece.empty())
+                    first_tok = false;
+            }
+            accumulated += piece;
+            if (!accumulated.empty())
+                on_text(accumulated.c_str(), false);
+        };
+        auto cb_fn = [](int id, float p, void* ud) { (*static_cast<decltype(cb)*>(ud))(id, p, nullptr); };
+        kyutai_stt_transcribe_cb(ctx_, samples, n_samples, cb_fn, &cb);
+        on_text(accumulated.c_str(), true);
     }
 
     void shutdown() override {

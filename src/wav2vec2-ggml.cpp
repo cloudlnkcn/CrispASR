@@ -21,8 +21,10 @@
  */
 
 #include "wav2vec2-ggml.h"
+#include "core/cpu_attention.h" // cpu_dot + cpu_online_softmax_accumulate (shared, #229)
 #include "core/ctc.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include <unordered_map>
 
@@ -31,6 +33,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +41,32 @@
 #include <numeric>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `WAV2VEC2_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool wav2vec2_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("WAV2VEC2_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct wav2vec2_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit wav2vec2_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~wav2vec2_bench_stage() {
+        if (!wav2vec2_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  wav2vec2_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // GGUF loading helpers
@@ -118,7 +147,7 @@ bool wav2vec2_load(const char* fname, wav2vec2_model& model) {
     // Phase 2: load tensors via core_gguf (backend-buffer-backed)
     // GPU (CUDA/Metal/Vulkan) for scheduler-based ggml graphs; CPU fallback
     // for ops that need direct weight pointer access (via read_f32_vec).
-    model.backend = ggml_backend_init_best();
+    model.backend = crispasr_init_gpu_backend();
     if (!model.backend)
         model.backend = ggml_backend_cpu_init();
     if (!model.backend) {
@@ -285,18 +314,6 @@ static void layer_norm(const float* x, float* y, const float* w, const float* b,
 // GELU (exact tanh approximation)
 static inline float gelu(float x) {
     return 0.5f * x * (1.f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-}
-
-// Softmax in-place over n elements
-static void softmax(float* x, int n) {
-    float mx = *std::max_element(x, x + n);
-    float s = 0.f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - mx);
-        s += x[i];
-    }
-    for (int i = 0; i < n; i++)
-        x[i] /= s;
 }
 
 // InstanceNorm (GroupNorm with num_groups=C) on channel-first data [C, L].
@@ -1688,6 +1705,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
 
 std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float* raw_audio, int n_samples,
                                            int n_threads) {
+    wav2vec2_bench_stage _bs_total("compute_logits_total");
     // Try graph path (uses compute_with_ctx for correct F16 weight handling)
     auto result = wav2vec2_compute_logits_graph(m, raw_audio, n_samples, n_threads);
     if (!result.empty())
@@ -1835,7 +1853,6 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
     std::vector<float> attn_out(T * H);
     std::vector<float> ffn_mid(T * I);
     std::vector<float> ffn_out(T * H);
-    std::vector<float> scores(T);
 
     for (uint32_t li = 0; li < hp.num_hidden_layers; li++) {
         const auto& e = m.enc[li];
@@ -1850,27 +1867,21 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         ggml_linear_f32(scratch, e.v_w, tensor_data_f32(e.v_b), normed.data(), V_buf.data(), H, H, T, n_threads,
                         m.backend);
 
+        // Encoder self-attention, hand-rolled CPU path (O(T²) — the alignment
+        // bottleneck on long audio). Vectorized dot + flash-style online softmax,
+        // parallel over (head, query). Shared helpers in core/cpu_attention.h,
+        // same treatment as firered_asr (#229). Q/K/V are [T, H] row-major; for
+        // head h the values live at column offset h*head_dim with row stride H.
         std::fill(attn_out.begin(), attn_out.end(), 0.f);
+#pragma omp parallel for collapse(2) schedule(static)
         for (int h = 0; h < n_heads; h++) {
-            int off = h * head_dim;
             for (int tq = 0; tq < T; tq++) {
-                for (int tk = 0; tk < T; tk++) {
-                    float dot = 0.f;
-                    const float* q = Q_buf.data() + tq * H + off;
-                    const float* k = K_buf.data() + tk * H + off;
-                    for (int d = 0; d < head_dim; d++)
-                        dot += q[d] * k[d];
-                    scores[tk] = dot * scale;
-                }
-                softmax(scores.data(), T);
-
-                float* ao = attn_out.data() + tq * H + off;
-                for (int tv = 0; tv < T; tv++) {
-                    const float* v = V_buf.data() + tv * H + off;
-                    float s = scores[tv];
-                    for (int d = 0; d < head_dim; d++)
-                        ao[d] += s * v[d];
-                }
+                const int off = h * head_dim;
+                const float* q = Q_buf.data() + tq * H + off;
+                crispasr::cpu_attn::cpu_online_softmax_accumulate(
+                    T, head_dim, V_buf.data() + off, H, attn_out.data() + tq * H + off, [&](int tk) {
+                        return crispasr::cpu_attn::cpu_dot(q, K_buf.data() + tk * H + off, head_dim) * scale;
+                    });
             }
         }
 

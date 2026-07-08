@@ -66,6 +66,27 @@ public:
         nemotron_set_temperature(ctx_, params.temperature, params.seed);
         nemotron_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
 
+        // MAES beam search (env: CRISPASR_NEMOTRON_MAES=1).
+        // Requires beam_size > 1. Configurable via env vars.
+        {
+            const char* maes_env = std::getenv("CRISPASR_NEMOTRON_MAES");
+            bool use_maes = (maes_env && atoi(maes_env) > 0);
+            if (use_maes && params.beam_size > 1) {
+                int num_steps = 2;
+                float gamma = 2.3f;
+                int beta = 2;
+                if (const char* v = std::getenv("CRISPASR_MAES_NUM_STEPS"))
+                    num_steps = atoi(v);
+                if (const char* v = std::getenv("CRISPASR_MAES_GAMMA"))
+                    gamma = (float)atof(v);
+                if (const char* v = std::getenv("CRISPASR_MAES_BETA"))
+                    beta = atoi(v);
+                nemotron_set_maes(ctx_, true, num_steps, gamma, beta);
+            } else {
+                nemotron_set_maes(ctx_, false, 0, 0.0f, 0);
+            }
+        }
+
         nemotron_result* r = nemotron_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
         if (!r)
             return out;
@@ -110,6 +131,43 @@ public:
         nemotron_result_free(r);
         out.push_back(std::move(seg));
         return out;
+    }
+
+    void transcribe_streaming(const float* samples, int n_samples, int64_t /*t_offset_cs*/,
+                              const whisper_params& params, crispasr_stream_callback on_text) override {
+        if (!ctx_) {
+            CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
+            return;
+        }
+        std::string accumulated;
+        bool first_tok = true;
+        // nemotron_transcribe_cb fires per-emitted non-blank RNN-T token
+        auto cb = [&](int tok_id, float /*prob*/, void* /*ud*/) {
+            const char* raw = nemotron_token_to_str(ctx_, tok_id);
+            if (!raw || !*raw)
+                return;
+            std::string piece(raw);
+            // SentencePiece ▁ (0xE2 0x96 0x81) → space
+            size_t pos = 0;
+            while ((pos = piece.find("\xe2\x96\x81", pos)) != std::string::npos) {
+                piece.replace(pos, 3, " ");
+                pos++;
+            }
+            if (first_tok) {
+                size_t sp = 0;
+                while (sp < piece.size() && (piece[sp] == ' ' || piece[sp] == '\n'))
+                    sp++;
+                piece = piece.substr(sp);
+                if (!piece.empty())
+                    first_tok = false;
+            }
+            accumulated += piece;
+            if (!accumulated.empty())
+                on_text(accumulated.c_str(), false);
+        };
+        auto cb_fn = [](int id, float p, void* ud) { (*static_cast<decltype(cb)*>(ud))(id, p, nullptr); };
+        nemotron_transcribe_cb(ctx_, samples, n_samples, cb_fn, &cb);
+        on_text(accumulated.c_str(), true);
     }
 
     void shutdown() override {

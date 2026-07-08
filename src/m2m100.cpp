@@ -20,13 +20,43 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include "core/sentencepiece.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `M2M100_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool m2m100_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("M2M100_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct m2m100_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit m2m100_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~m2m100_bench_stage() {
+        if (!m2m100_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  m2m100_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Hyperparameters ──────────────────────────────────────────────
 
@@ -132,6 +162,14 @@ struct m2m100_model {
 struct m2m100_tokenizer {
     std::vector<std::string> id_to_token;
     std::map<std::string, int> token_to_id;
+    // BPE merge scores (= SPM piece scores) + hash map, for core_spm::tokenize_bpe.
+    // token_to_id_u / id_to_token include ~390 SPM "intermediate" pieces (ids
+    // >= embed_vocab_size) that are absent from the embedding vocab but needed as
+    // intermediate BPE merges; a final token with id >= embed_vocab_size maps to
+    // <unk> (matches HF's convert_token_to_id).
+    std::vector<float> scores;
+    std::unordered_map<std::string, int32_t> token_to_id_u;
+    int embed_vocab_size = 0; // ids < this have embedding rows
     // Language code → token ID
     std::vector<std::string> lang_codes;
     std::map<std::string, int> lang_to_token_id;
@@ -217,10 +255,24 @@ static void load_metadata(m2m100_context* c, gguf_context* g) {
         if (tidx >= 0) {
             int n = gguf_get_arr_n(g, tidx);
             c->tokenizer.id_to_token.resize(n);
+            c->tokenizer.token_to_id_u.reserve(n * 2);
             for (int i = 0; i < n; i++) {
                 c->tokenizer.id_to_token[i] = gguf_get_arr_str(g, tidx, i);
                 c->tokenizer.token_to_id[c->tokenizer.id_to_token[i]] = i;
+                c->tokenizer.token_to_id_u[c->tokenizer.id_to_token[i]] = i;
             }
+        }
+        c->tokenizer.embed_vocab_size = hp.vocab_size; // ids >= this are BPE-intermediate only
+        // BPE merge scores (= SPM piece scores). M2M-100's SP model is BPE, not
+        // Unigram, so tokenization follows merge order — greedy longest-match
+        // mis-splits words and degrades translations.
+        int sidx = gguf_find_key(g, "tokenizer.ggml.scores");
+        if (sidx >= 0) {
+            int n = gguf_get_arr_n(g, sidx);
+            c->tokenizer.scores.resize(n);
+            const float* sp = (const float*)gguf_get_arr_data(g, sidx);
+            for (int i = 0; i < n; i++)
+                c->tokenizer.scores[i] = sp[i];
         }
     }
 
@@ -326,9 +378,9 @@ static bool bind_model(m2m100_context* c) {
 }
 
 // ── Tokenizer encode ─────────────────────────────────────────────
-// Simple greedy longest-match tokenization against the vocab.
-// For production use, this should be a proper SentencePiece BPE decoder,
-// but longest-match works for basic testing with the M2M-100 vocab.
+// M2M-100 uses a SentencePiece BPE model: tokenization follows merge order
+// (highest score = lowest rank, merged first), via core_spm::tokenize_bpe over the
+// GGUF's tokenizer.ggml.scores. Falls back to greedy longest-match if scores absent.
 
 static std::vector<int> tokenize(const m2m100_tokenizer& tok, const std::string& text, const std::string& src_lang) {
     std::vector<int> ids;
@@ -339,7 +391,21 @@ static std::vector<int> tokenize(const m2m100_tokenizer& tok, const std::string&
         ids.push_back(it->second);
     }
 
-    // SentencePiece-style greedy longest-match tokenization with ▁ prefix
+    if (!tok.scores.empty() && !tok.token_to_id_u.empty()) {
+        core_spm::Config cfg;
+        cfg.unk_id = 3; // <unk>
+        auto bpe = core_spm::tokenize_bpe(text, tok.token_to_id_u, tok.scores, cfg, /*prepend_space=*/true);
+        for (int id : bpe) {
+            // BPE-intermediate pieces (id >= embed_vocab_size) have no embedding
+            // row and should never be final — if one leaks out, map it to <unk>
+            // (matches HF M2M100Tokenizer.convert_token_to_id).
+            ids.push_back((tok.embed_vocab_size > 0 && id >= tok.embed_vocab_size) ? 3 : id);
+        }
+        ids.push_back(2); // </s>
+        return ids;
+    }
+
+    // Fallback: SentencePiece-style greedy longest-match tokenization with ▁ prefix
     // Split on whitespace, prefix each word with ▁, greedy longest match
     std::vector<std::string> words;
     std::string cur;
@@ -470,8 +536,8 @@ static bool alloc_cross_kv(m2m100_context* c, int T_enc) {
     c->cross_kv_k.resize(nl);
     c->cross_kv_v.resize(nl);
     for (int i = 0; i < nl; i++) {
-        c->cross_kv_k[i] = ggml_new_tensor_3d(c->cross_kv_ctx, GGML_TYPE_F32, hd, T_enc, nh);
-        c->cross_kv_v[i] = ggml_new_tensor_3d(c->cross_kv_ctx, GGML_TYPE_F32, hd, T_enc, nh);
+        c->cross_kv_k[i] = ggml_new_tensor_3d(c->cross_kv_ctx, GGML_TYPE_F16, hd, T_enc, nh);
+        c->cross_kv_v[i] = ggml_new_tensor_3d(c->cross_kv_ctx, GGML_TYPE_F16, hd, T_enc, nh);
         char name[64];
         snprintf(name, sizeof(name), "cross_k_%d", i);
         ggml_set_name(c->cross_kv_k[i], name);
@@ -631,12 +697,15 @@ static bool compute_cross_kv(m2m100_context* c, const float* enc_out, int T_enc)
         // Copy results to cross_kv tensors
         ggml_tensor* K_out = ggml_graph_get_tensor(gf, "cross_k");
         ggml_tensor* V_out = ggml_graph_get_tensor(gf, "cross_v");
-        size_t sz = (size_t)hd * T_enc * nh * sizeof(float);
-        std::vector<float> buf(hd * T_enc * nh);
-        ggml_backend_tensor_get(K_out, buf.data(), 0, sz);
-        ggml_backend_tensor_set(c->cross_kv_k[il], buf.data(), 0, sz);
-        ggml_backend_tensor_get(V_out, buf.data(), 0, sz);
-        ggml_backend_tensor_set(c->cross_kv_v[il], buf.data(), 0, sz);
+        const size_t n_elem = (size_t)hd * T_enc * nh;
+        std::vector<float> buf(n_elem);
+        std::vector<ggml_fp16_t> buf16(n_elem);
+        ggml_backend_tensor_get(K_out, buf.data(), 0, n_elem * sizeof(float));
+        ggml_fp32_to_fp16_row(buf.data(), buf16.data(), (int)n_elem);
+        ggml_backend_tensor_set(c->cross_kv_k[il], buf16.data(), 0, n_elem * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_get(V_out, buf.data(), 0, n_elem * sizeof(float));
+        ggml_fp32_to_fp16_row(buf.data(), buf16.data(), (int)n_elem);
+        ggml_backend_tensor_set(c->cross_kv_v[il], buf16.data(), 0, n_elem * sizeof(ggml_fp16_t));
 
         ggml_free(ctx0);
     }
@@ -955,6 +1024,8 @@ extern "C" char* m2m100_translate(struct m2m100_context* ctx, const char* text, 
         max_new_tokens = 200;
 
     const auto& hp = ctx->model.hp;
+
+    m2m100_bench_stage _bs_total("translate_total");
 
     // 1. Tokenize input
     std::vector<int> enc_ids = tokenize(ctx->tokenizer, text, src_lang);

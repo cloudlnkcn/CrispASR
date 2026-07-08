@@ -608,6 +608,14 @@ struct KvSelfAttnParams {
     bool v_rms_norm = false;
     // Optional per-dimension RoPE frequency factors (e.g. Llama 3 scaling).
     ggml_tensor* rope_freq_factors = nullptr;
+    // Force the cached K/V to be cast to F32 before the GQA repeat/expansion,
+    // exactly like the global CRISPASR_KV_READ_F32 knob but per-call. Needed on
+    // Vulkan, where REPEAT has no f16→f16 pipeline (the GQA head-expansion
+    // `ggml_repeat_4d` on an F16 cache aborts with "Missing op: REPEAT for f16
+    // to f16"; #192). Casting to F32 first lowers it to a supported F32 REPEAT.
+    // Default false → legacy F16 fast path on Metal/CPU. Caller sets it true only
+    // for the Vulkan-native graph.
+    bool force_kv_read_f32 = false;
 };
 
 // KV-cached self-attention. Writes the new K/V into the persistent cache
@@ -768,14 +776,25 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
     // [n_past..n_past+T) by construction for RoPE — exactly the row
     // ids set_rows needs).
     const bool quant_kv = ggml_is_quantized(kv_k->type);
+    // When the write goes through ggml_set_rows we keep the result tensors so
+    // the read view below can be based on them (see the read path) — that gives
+    // the scheduler an explicit write→read dependency edge. Without it the read
+    // views the bare cache and the set_rows nodes become graph dead-ends, so on
+    // Metal the KV read races the in-place set_rows write and reads stale/garbage
+    // (the Lk-bucket single-step decode in orpheus/parler hits this). Mirrors
+    // parler_tts's bucket read path.
+    ggml_tensor* sr_k = nullptr;
+    ggml_tensor* sr_v = nullptr;
     if (kv_indices || quant_kv) {
         ggml_tensor* eff_idx = kv_indices ? kv_indices : positions;
         ggml_tensor* k_layer =
             ggml_view_3d(ctx0, kv_k, hd, kv_k->ne[1], n_kv, kv_k->nb[1], kv_k->nb[2], (size_t)il * kv_k->nb[3]);
         ggml_tensor* v_layer =
             ggml_view_3d(ctx0, kv_v, hd, kv_v->ne[1], n_kv, kv_v->nb[1], kv_v->nb[2], (size_t)il * kv_v->nb[3]);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_layer, K_new_perm, eff_idx));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_layer, V_new_perm, eff_idx));
+        sr_k = ggml_set_rows(ctx0, k_layer, K_new_perm, eff_idx);
+        sr_v = ggml_set_rows(ctx0, v_layer, V_new_perm, eff_idx);
+        ggml_build_forward_expand(gf, sr_k);
+        ggml_build_forward_expand(gf, sr_v);
     } else {
         ggml_tensor* k_view = ggml_view_4d(ctx0, kv_k, hd, T, n_kv, 1, kv_k->nb[1], kv_k->nb[2], kv_k->nb[3],
                                            (size_t)il * kv_k->nb[3] + (size_t)n_past * kv_k->nb[1]);
@@ -800,10 +819,15 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
     // Flash-attn-ext on Metal accepts F32 K/V natively (and F16 / quant
     // too) but mixing types across K and V isn't supported, so both
     // sides cast to the same dtype.
-    ggml_tensor* k_layer_view =
-        ggml_view_3d(ctx0, kv_k, hd, Lk, n_kv, kv_k->nb[1], kv_k->nb[2], (size_t)il * kv_k->nb[3]);
-    ggml_tensor* v_layer_view =
-        ggml_view_3d(ctx0, kv_v, hd, Lk, n_kv, kv_v->nb[1], kv_v->nb[2], (size_t)il * kv_v->nb[3]);
+    // Read from the set_rows RESULT when we wrote via set_rows (sr_k/sr_v are
+    // in-place views of the layer slice, so offset 0 == this layer's data);
+    // otherwise read the bare cache at the per-layer offset (ggml_cpy path).
+    ggml_tensor* k_read_src = sr_k ? sr_k : kv_k;
+    ggml_tensor* v_read_src = sr_v ? sr_v : kv_v;
+    const size_t k_read_off = sr_k ? 0 : (size_t)il * kv_k->nb[3];
+    const size_t v_read_off = sr_v ? 0 : (size_t)il * kv_v->nb[3];
+    ggml_tensor* k_layer_view = ggml_view_3d(ctx0, k_read_src, hd, Lk, n_kv, kv_k->nb[1], kv_k->nb[2], k_read_off);
+    ggml_tensor* v_layer_view = ggml_view_3d(ctx0, v_read_src, hd, Lk, n_kv, kv_v->nb[1], kv_v->nb[2], v_read_off);
     // CRISPASR_KV_READ_F32=1 forces the cache read to dequantise (or
     // upcast F16) to F32 before flash_attn. Useful when F16 attention
     // accumulator drift on Metal sends the sampler off the rails for
@@ -813,8 +837,23 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
         const char* s = std::getenv("CRISPASR_KV_READ_F32");
         return s && *s && std::strcmp(s, "0") != 0;
     }();
-    const bool need_dequant_k = ggml_is_quantized(kv_k->type) || (s_kv_read_f32 && kv_k->type != GGML_TYPE_F32);
-    const bool need_dequant_v = ggml_is_quantized(kv_v->type) || (s_kv_read_f32 && kv_v->type != GGML_TYPE_F32);
+    // Vulkan has no f16→f16 REPEAT pipeline, so the GQA head-expansion
+    // (ggml_repeat_4d below) on an F16 cache aborts with "Missing op: REPEAT
+    // for f16 to f16" (issue #200/#192). When the cache lives on a Vulkan
+    // buffer AND we're about to take the manual-repeat path on an F16 cache,
+    // force the F32 read so the repeat lowers to a supported F32 REPEAT. This
+    // central detection covers every kv_self_attn caller automatically (no
+    // per-backend Vulkan plumbing needed). Scoped to exactly the crash
+    // condition so Metal/CPU and the GQA_NATIVE / MHA / quantized / F32-cache
+    // paths stay bit-identical even on Vulkan.
+    const bool gqa_manual_repeat = (p.gqa_mode != GQA_NATIVE) && (grp > 1);
+    const bool kv_f16_repeat_on_vulkan = gqa_manual_repeat && (kv_k->type == GGML_TYPE_F16) && kv_k->buffer && [&]() {
+        const char* bn = ggml_backend_buft_name(ggml_backend_buffer_get_type(kv_k->buffer));
+        return bn && std::strstr(bn, "Vulkan") != nullptr;
+    }();
+    const bool want_f32_read = s_kv_read_f32 || p.force_kv_read_f32 || kv_f16_repeat_on_vulkan;
+    const bool need_dequant_k = ggml_is_quantized(kv_k->type) || (want_f32_read && kv_k->type != GGML_TYPE_F32);
+    const bool need_dequant_v = ggml_is_quantized(kv_v->type) || (want_f32_read && kv_v->type != GGML_TYPE_F32);
     ggml_tensor* Kfull = need_dequant_k ? ggml_cast(ctx0, k_layer_view, GGML_TYPE_F32) : ggml_cont(ctx0, k_layer_view);
     ggml_tensor* Vfull = need_dequant_v ? ggml_cast(ctx0, v_layer_view, GGML_TYPE_F32) : ggml_cont(ctx0, v_layer_view);
 
