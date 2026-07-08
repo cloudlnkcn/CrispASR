@@ -493,8 +493,14 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
 
     ggml_tensor* cur = input_embeds; // (d_model, T)
 
+    // Position IDs: [0, 1, 2, ..., T-1]
+    ggml_tensor* pos_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(pos_ids, "pos_ids");
+    ggml_set_input(pos_ids);
+
     const float attn_scale = 1.0f / sqrtf((float)hp.head_dim);
 
+    bool dbg = env_bool("OMNIVOICE_DEBUG");
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         auto& b = m.blocks[il];
 
@@ -503,9 +509,28 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
         attn_in = ggml_mul(ctx0, attn_in, b.attn_norm_w);
 
         // Q, K, V projections
+        if (il == 0 && dbg) {
+            fprintf(stderr,
+                    "  L0 attn_in ne=[%ld,%ld] q_w ne=[%ld,%ld] k_w ne=[%ld,%ld] v_w ne=[%ld,%ld] o_w "
+                    "ne=[%ld,%ld]\n",
+                    attn_in->ne[0], attn_in->ne[1], b.attn_q_w->ne[0], b.attn_q_w->ne[1], b.attn_k_w->ne[0],
+                    b.attn_k_w->ne[1], b.attn_v_w->ne[0], b.attn_v_w->ne[1], b.attn_output_w->ne[0],
+                    b.attn_output_w->ne[1]);
+        }
+        if (dbg && il < 2) {
+            fprintf(stderr, "  L%u attn_in ne=[%ld,%ld,%ld,%ld] q_w ne=[%ld,%ld,%ld,%ld]\n", il, attn_in->ne[0],
+                    attn_in->ne[1], attn_in->ne[2], attn_in->ne[3], b.attn_q_w->ne[0], b.attn_q_w->ne[1],
+                    b.attn_q_w->ne[2], b.attn_q_w->ne[3]);
+        }
         ggml_tensor* Q = ggml_mul_mat(ctx0, b.attn_q_w, attn_in);
+        if (il == 0 && dbg)
+            fprintf(stderr, "  Q ok\n");
         ggml_tensor* K = ggml_mul_mat(ctx0, b.attn_k_w, attn_in);
+        if (il == 0 && dbg)
+            fprintf(stderr, "  K ok\n");
         ggml_tensor* V = ggml_mul_mat(ctx0, b.attn_v_w, attn_in);
+        if (il == 0 && dbg)
+            fprintf(stderr, "  V ok\n");
 
         // Reshape to (head_dim, n_heads, T) / (head_dim, n_kv_heads, T)
         Q = ggml_reshape_3d(ctx0, Q, hp.head_dim, hp.n_heads, T);
@@ -523,9 +548,9 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
         }
 
         // RoPE (standard, not mRoPE — OmniVoice uses default rope_type)
-        Q = ggml_rope_ext(ctx0, Q, nullptr, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta, 1.0f, 0.0f,
+        Q = ggml_rope_ext(ctx0, Q, pos_ids, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta, 1.0f, 0.0f,
                           1.0f, 0.0f, 0.0f);
-        K = ggml_rope_ext(ctx0, K, nullptr, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta, 1.0f, 0.0f,
+        K = ggml_rope_ext(ctx0, K, pos_ids, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta, 1.0f, 0.0f,
                           1.0f, 0.0f, 0.0f);
 
         // GQA: expand KV heads
@@ -540,30 +565,15 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
             V = ggml_reshape_3d(ctx0, V, hp.head_dim, hp.n_heads, T);
         }
 
-        // Attention: Q,K,V are (head_dim, n_heads, T)
-        // Permute to (head_dim, T, n_heads) for mul_mat
-        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
-        K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
-
-        ggml_tensor* scores = ggml_mul_mat(ctx0, K, Q); // (T, T, n_heads)
-        scores = ggml_scale(ctx0, scores, attn_scale);
-
-        // No causal mask for OmniVoice — full bidirectional attention
-        // (the model sees all positions including masked tokens)
-        scores = ggml_soft_max(ctx0, scores);
-
-        V = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 2, 0, 3)); // (T, head_dim, n_heads)
-        // Note: V needs to be (T, head_dim, n_heads) for mul_mat with scores (T, T, n_heads)
-        // Actually let's do this correctly:
-        // V = (head_dim, n_heads, T) → permute(1, 0, 2, 3) → (n_heads, head_dim, T)
-        // No, let me follow the standard pattern from the dev doc:
-        // V permute(1, 0, 2, 3) → swap dim0 and dim1
-        V = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, hp.head_dim, hp.n_heads, T), 1, 0, 2, 3));
-        ggml_tensor* attn_out = ggml_mul_mat(ctx0, V, scores); // (head_dim, T, n_heads)
-
-        // Permute back and reshape to (d_model, T)
-        attn_out = ggml_cont(ctx0, ggml_permute(ctx0, attn_out, 0, 2, 1, 3));
-        attn_out = ggml_reshape_2d(ctx0, attn_out, hp.d_model, T);
+        if (il == 0 && dbg) {
+            fprintf(stderr, "  pre-attn Q=[%ld,%ld,%ld] K=[%ld,%ld,%ld] V=[%ld,%ld,%ld]\n", Q->ne[0], Q->ne[1],
+                    Q->ne[2], K->ne[0], K->ne[1], K->ne[2], V->ne[0], V->ne[1], V->ne[2]);
+        }
+        // Attention via ggml_flash_attn_ext — handles Q/K/V layout internally.
+        // Q,K,V are (head_dim, n_heads, T). No mask (full bidirectional).
+        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, attn_scale, 0.0f, 0.0f);
+        // Output: (head_dim, n_heads, T) → reshape to (n_heads*head_dim, T)
+        attn_out = ggml_reshape_2d(ctx0, attn_out, hp.n_heads * hp.head_dim, T);
 
         // Output projection
         attn_out = ggml_mul_mat(ctx0, b.attn_output_w, attn_out);
@@ -581,6 +591,10 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
         ggml_tensor* ffn_out = ggml_mul(ctx0, gate, up);
         ffn_out = ggml_mul_mat(ctx0, b.ffn_down_w, ffn_out);
 
+        if (dbg && il < 2) {
+            fprintf(stderr, "  L%u done ffn (ffn_out ne=[%ld,%ld])\n", il, ffn_out->ne[0], ffn_out->ne[1]);
+        }
+
         cur = ggml_add(ctx0, cur, ffn_out);
     }
 
@@ -588,9 +602,14 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
     cur = ggml_rms_norm(ctx0, cur, hp.rms_norm_eps);
     cur = ggml_mul(ctx0, cur, m.output_norm_w);
 
+    // Audio heads projection: (d_model, T) → (n_codebooks * audio_vocab_size, T)
+    ggml_tensor* logits = ggml_mul_mat(ctx0, m.audio_output_w, cur);
+    ggml_set_name(logits, "audio_logits");
+    ggml_set_output(logits);
+
     ggml_set_name(cur, "llm_out");
     ggml_set_output(cur);
-    ggml_build_forward_expand(gf, cur);
+    ggml_build_forward_expand(gf, logits);
 
     return gf;
 }
@@ -608,6 +627,38 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
 // For the ggml graph we do this entirely in CPU since it's a one-time
 // embedding lookup before the main transformer forward.
 
+// Helper: read an embedding table (potentially F16) to CPU float32.
+// Uses ggml_get_rows via a one-shot graph to dequantize properly.
+static std::vector<float> read_embedding_rows(ggml_backend_t backend, ggml_tensor* embd_w, const int32_t* row_ids,
+                                              int n_rows, int d) {
+    size_t mem_size = (size_t)(n_rows + 4) * ggml_tensor_overhead() + ggml_graph_overhead();
+    std::vector<uint8_t> mem_buf(mem_size);
+    ggml_init_params ip = {mem_size, mem_buf.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+
+    ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+    ggml_set_name(ids, "row_ids");
+    ggml_set_input(ids);
+    ggml_tensor* out = ggml_get_rows(ctx0, embd_w, ids);
+    ggml_set_name(out, "embd_out");
+    ggml_set_output(out);
+
+    ggml_cgraph* gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_alloc_graph(ga, gf);
+    ggml_backend_tensor_set(ids, row_ids, 0, n_rows * sizeof(int32_t));
+    ggml_backend_graph_compute(backend, gf);
+
+    std::vector<float> result(n_rows * d);
+    ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
+
+    ggml_gallocr_free(ga);
+    ggml_free(ctx0);
+    return result;
+}
+
 static std::vector<float> prepare_embeddings(
     omnivoice_context* ctx, const std::vector<int32_t>& text_ids,
     const std::vector<int32_t>& audio_tokens, // (n_codebooks * T_audio) row-major
@@ -617,38 +668,62 @@ static std::vector<float> prepare_embeddings(
     auto& m = ctx->model;
     const int d = (int)hp.d_model;
 
-    // Read weights to CPU
-    std::vector<float> text_embd_data(hp.vocab_size * d);
-    ggml_backend_tensor_get(m.token_embd_w, text_embd_data.data(), 0, text_embd_data.size() * sizeof(float));
+    // Collect unique text token IDs for batch lookup
+    std::vector<int32_t> text_row_ids;
+    std::vector<int> text_positions; // which positions in embeds are text
+    for (int t = 0; t < total_T; t++) {
+        if (!audio_mask[t]) {
+            text_row_ids.push_back(text_ids[t]);
+            text_positions.push_back(t);
+        }
+    }
 
-    std::vector<float> audio_embd_data(hp.n_codebooks * hp.audio_vocab_size * d);
-    ggml_backend_tensor_get(m.audio_embd_w, audio_embd_data.data(), 0, audio_embd_data.size() * sizeof(float));
+    // Collect audio embedding IDs (shifted by codebook offset)
+    int n_audio_pos = 0;
+    for (int t = 0; t < total_T; t++) {
+        if (audio_mask[t])
+            n_audio_pos++;
+    }
+
+    std::vector<int32_t> audio_row_ids;
+    std::vector<int> audio_pos_map; // which output position
+    {
+        int apos = 0;
+        for (int t = 0; t < total_T; t++) {
+            if (!audio_mask[t])
+                continue;
+            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
+                int code = audio_tokens[cb * n_audio_pos + apos];
+                int shifted = code + (int)(cb * hp.audio_vocab_size);
+                audio_row_ids.push_back(shifted);
+                audio_pos_map.push_back(t);
+            }
+            apos++;
+        }
+    }
 
     std::vector<float> embeds(total_T * d, 0.0f);
 
-    int audio_pos = 0; // position within audio_tokens
-    for (int t = 0; t < total_T; t++) {
-        if (!audio_mask[t]) {
-            // Text position: look up from text_ids
-            int tid = text_ids[t];
-            if (tid >= 0 && tid < (int)hp.vocab_size) {
-                const float* src = text_embd_data.data() + (size_t)tid * d;
-                std::memcpy(embeds.data() + (size_t)t * d, src, d * sizeof(float));
-            }
-        } else {
-            // Audio position: sum embeddings across all codebooks with offsets
+    // Look up text embeddings
+    if (!text_row_ids.empty()) {
+        auto text_emb =
+            read_embedding_rows(ctx->backend, m.token_embd_w, text_row_ids.data(), (int)text_row_ids.size(), d);
+        for (size_t i = 0; i < text_positions.size(); i++) {
+            std::memcpy(embeds.data() + (size_t)text_positions[i] * d, text_emb.data() + i * d, d * sizeof(float));
+        }
+    }
+
+    // Look up audio embeddings and sum across codebooks
+    if (!audio_row_ids.empty()) {
+        auto audio_emb =
+            read_embedding_rows(ctx->backend, m.audio_embd_w, audio_row_ids.data(), (int)audio_row_ids.size(), d);
+        for (size_t i = 0; i < audio_row_ids.size(); i++) {
+            int t = audio_pos_map[i];
             float* dst = embeds.data() + (size_t)t * d;
-            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
-                int code = audio_tokens[cb * (total_T - /* adjust for text prefix */ 0) + audio_pos];
-                int shifted = code + (int)(cb * hp.audio_vocab_size);
-                if (shifted >= 0 && shifted < (int)(hp.n_codebooks * hp.audio_vocab_size)) {
-                    const float* src = audio_embd_data.data() + (size_t)shifted * d;
-                    for (int j = 0; j < d; j++) {
-                        dst[j] += src[j];
-                    }
-                }
+            const float* src = audio_emb.data() + i * d;
+            for (int j = 0; j < d; j++) {
+                dst[j] += src[j];
             }
-            audio_pos++;
         }
     }
 
@@ -780,7 +855,10 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         auto embeds = prepare_embeddings(ctx, full_text_ids, audio_tokens, audio_mask, T_total);
 
         // Build and compute LLM graph
-        size_t mem_size = (size_t)T_total * 256 * ggml_tensor_overhead() + ggml_graph_overhead();
+        // 28 layers × ~40 tensors (Q/K/V/O proj + norms + RoPE + GQA + flash_attn
+        // + FFN gate/up/down + silu + residuals) + graph overhead
+        size_t n_tensors = hp.n_layers * 40 + 100;
+        size_t mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(8192, false);
         std::vector<uint8_t> mem_buf(mem_size);
         ggml_init_params ip = {mem_size, mem_buf.data(), true};
         ggml_context* ctx0 = ggml_init(ip);
@@ -795,36 +873,32 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         ggml_gallocr_alloc_graph(gallocr, gf);
 
         ggml_backend_tensor_set(input, embeds.data(), 0, embeds.size() * sizeof(float));
+
+        // Set position IDs [0, 1, 2, ..., T_total-1]
+        {
+            std::vector<int32_t> pos_data(T_total);
+            for (int i = 0; i < T_total; i++)
+                pos_data[i] = i;
+            ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "pos_ids");
+            if (pos_t) {
+                ggml_backend_tensor_set(pos_t, pos_data.data(), 0, pos_data.size() * sizeof(int32_t));
+            }
+        }
+
         ggml_backend_graph_compute(ctx->backend, gf);
 
-        // Get LLM output
-        ggml_tensor* llm_out = ggml_graph_get_tensor(gf, "llm_out");
-        std::vector<float> hidden(T_total * hp.d_model);
-        ggml_backend_tensor_get(llm_out, hidden.data(), 0, hidden.size() * sizeof(float));
-
-        // Compute audio logits via audio_heads
-        // audio_heads: (n_codebooks * audio_vocab_size, d_model)
-        // hidden: (d_model, T_total) → matmul → (n_codebooks * audio_vocab_size, T_total)
+        // Get audio logits from graph (already includes audio_heads matmul)
+        ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "audio_logits");
         int out_dim = (int)(hp.n_codebooks * hp.audio_vocab_size);
-        std::vector<float> audio_heads_data(out_dim * hp.d_model);
-        ggml_backend_tensor_get(ctx->model.audio_output_w, audio_heads_data.data(), 0,
-                                audio_heads_data.size() * sizeof(float));
+        std::vector<float> all_logits(out_dim * T_total);
+        ggml_backend_tensor_get(logits_t, all_logits.data(), 0, all_logits.size() * sizeof(float));
 
         // Extract logits only for target positions
-        // Target positions are the last T_target in the sequence
         int target_start = T_total - T_target;
         std::vector<float> target_logits(out_dim * T_target);
-
         for (int t = 0; t < T_target; t++) {
-            const float* h = hidden.data() + (size_t)(target_start + t) * hp.d_model;
-            for (int o = 0; o < out_dim; o++) {
-                float dot = 0.0f;
-                const float* w = audio_heads_data.data() + (size_t)o * hp.d_model;
-                for (uint32_t j = 0; j < hp.d_model; j++) {
-                    dot += w[j] * h[j];
-                }
-                target_logits[(size_t)t * out_dim + o] = dot;
-            }
+            std::memcpy(target_logits.data() + (size_t)t * out_dim,
+                        all_logits.data() + (size_t)(target_start + t) * out_dim, out_dim * sizeof(float));
         }
 
         // Reshape logits to (T_target, n_codebooks, audio_vocab_size)

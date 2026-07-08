@@ -228,9 +228,16 @@ def main():
             w.add_token_list(toks)
             print(f"  Tokens:        {len(toks)} entries from tokenizer.json")
 
-        # Extract merges
-        merges = tok_data.get("model", {}).get("merges", [])
-        if merges:
+        # Extract merges — tokenizer.json stores merges as [["a","b"], ...]
+        # but the GGUF C reader expects flat strings "a b". Flatten them.
+        raw_merges = tok_data.get("model", {}).get("merges", [])
+        if raw_merges:
+            merges = []
+            for m in raw_merges:
+                if isinstance(m, list):
+                    merges.append(" ".join(m))
+                else:
+                    merges.append(str(m))
             w.add_token_merges(merges)
             print(f"  Merges:        {len(merges)} entries from tokenizer.json")
 
