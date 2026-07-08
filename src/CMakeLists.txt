@@ -628,6 +628,29 @@ if(GGML_CUDA)
 endif()
 
 # ---------------------------------------------------------------------------
+# Canary-Qwen — nvidia/canary-qwen-2.5b (FastConformer + Qwen3-1.7B SALM)
+# ---------------------------------------------------------------------------
+add_library(canary_qwen STATIC
+            canary_qwen.h
+            canary_qwen.cpp
+            )
+target_include_directories(canary_qwen PUBLIC . ../include)
+target_compile_features   (canary_qwen PUBLIC cxx_std_17)
+set_target_properties(canary_qwen PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (canary_qwen PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(canary_qwen PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(canary_qwen PRIVATE GGML_USE_METAL)
+    target_link_libraries(canary_qwen PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(canary_qwen PRIVATE GGML_USE_CUDA)
+    target_link_libraries(canary_qwen PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # Canary CTC aligner — auxiliary CTC model from inside canary-1b-v2.nemo,
 # used for SentencePiece subword forced alignment of any transcript text.
 # ---------------------------------------------------------------------------
@@ -1292,6 +1315,18 @@ target_compile_features   (qwen3_tts PUBLIC cxx_std_17)
 target_link_libraries     (qwen3_tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(qwen3_tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# omnivoice — k2-fsa/OmniVoice (Qwen3 + masked iterative multi-codebook TTS)
+# ---------------------------------------------------------------------------
+add_library(omnivoice STATIC omnivoice.h omnivoice.cpp)
+set_target_properties(omnivoice PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(omnivoice PUBLIC .)
+target_compile_features   (omnivoice PUBLIC cxx_std_17)
+target_link_libraries     (omnivoice PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(omnivoice PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -2109,6 +2144,9 @@ endif()
 if (TARGET canary)
     target_link_libraries(crispasr-lib PUBLIC canary)
 endif()
+if (TARGET canary_qwen)
+    target_link_libraries(crispasr-lib PUBLIC canary_qwen)
+endif()
 if (TARGET lfm2_audio)
     target_link_libraries(crispasr-lib PUBLIC lfm2_audio)
 endif()
@@ -2215,6 +2253,9 @@ if (TARGET moss_transcribe)
 endif()
 if (TARGET qwen3_tts)
     target_link_libraries(crispasr-lib PUBLIC qwen3_tts)
+endif()
+if (TARGET omnivoice)
+    target_link_libraries(crispasr-lib PUBLIC omnivoice)
 endif()
 if (TARGET orpheus)
     target_link_libraries(crispasr-lib PUBLIC orpheus)

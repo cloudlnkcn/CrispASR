@@ -18,6 +18,7 @@ add_executable(${TARGET}
     crispasr_backend_nemotron.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
+    crispasr_backend_canary_qwen.cpp
     crispasr_backend_lfm2_audio.cpp
     crispasr_backend_mini_omni2.cpp
     crispasr_backend_cohere.cpp
@@ -32,6 +33,7 @@ add_executable(${TARGET}
     crispasr_backend_vibevoice.cpp
     crispasr_backend_kugelaudio.cpp
     crispasr_backend_qwen3_tts.cpp
+    crispasr_backend_omnivoice.cpp
     crispasr_backend_orpheus.cpp
     crispasr_backend_chatterbox.cpp
     crispasr_backend_tada.cpp
@@ -191,6 +193,7 @@ target_link_libraries(crispasr-diff PRIVATE
     higgs_stt
     qwen3_asr
     qwen3_tts
+    omnivoice
     orpheus
     kokoro
     chatterbox
@@ -289,6 +292,7 @@ target_link_libraries(${TARGET} PRIVATE
     higgs_stt
     qwen3_asr
     qwen3_tts
+    omnivoice
     orpheus
     chatterbox
     tada-tts

@@ -49,6 +49,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
+    {"canary-qwen", "canary-qwen-2.5b-f16.gguf",
+     "https://huggingface.co/cstr/canary-qwen-2.5b-GGUF/resolve/main/canary-qwen-2.5b-f16.gguf", "~5.1 GB", nullptr, nullptr},
     // AutoArk-AI/ARK-ASR-3B: Whisper-RoPE encoder + Qwen2.5-3B decoder (19-lang).
     // NOTE: GGUF repo to be published (PLAN §ARK) — placeholder URL.
     {"ark-asr", "ark-asr-3b-q4_k.gguf",
@@ -198,6 +200,24 @@ constexpr Entry k_registry[] = {
      "~1.5 GB", nullptr, nullptr},
     {"cohere", "cohere-asr-ja-v0.1-q8_0.gguf",
      "https://huggingface.co/TransWithAI/cohere-transcribe-ja-v0.1-GGUF/resolve/main/cohere-asr-ja-v0.1-q8_0.gguf",
+     "~2.4 GB", nullptr, nullptr},
+    // cohere-transcribe-arabic — Arabic model (CohereLabs/cohere-transcribe-arabic-07-2026,
+    // Apache-2.0; #231). q4_k-imatrix is the recommended Arabic variant (Arabic
+    // CC0 Common Voice calibration; matches F16 transcript where plain q4_k drifts).
+    {"cohere", "cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    // `--backend cohere-ar` (or `-m auto --backend cohere-ar`) short alias →
+    // recommended Arabic imatrix GGUF. Routes to the cohere runtime via the
+    // factory alias in crispasr_backend.cpp. Still pass `-l ar`.
+    {"cohere-ar", "cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    {"cohere", "cohere-transcribe-arabic-q4_k.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    {"cohere", "cohere-transcribe-arabic-q8_0.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q8_0.gguf",
      "~2.4 GB", nullptr, nullptr},
     {"wav2vec2", "wav2vec2-xlsr-en-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
@@ -585,6 +605,16 @@ constexpr Entry k_registry[] = {
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
      "~60 MB"},
+    // OmniVoice: k2-fsa/OmniVoice — Qwen3-0.6B backbone with masked
+    // iterative multi-codebook TTS (8 codebooks × 1025 vocab, 600+
+    // languages). Uses HiggsAudioV2 audio tokenizer for encode/decode.
+    {"omnivoice", "omnivoice-f16.gguf",
+     "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-f16.gguf",
+     "~1.2 GB",
+     "omnivoice-tokenizer-f16.gguf",
+     "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-tokenizer-f16.gguf",
+     "~400 MB"},
+    //
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft is gated; we convert
     // from the non-gated mirror unsloth/orpheus-3b-0.1-ft, llama3.2 —
     // "Built with Llama"). Talker = Llama-3.2-3B-Instruct + 7×4096

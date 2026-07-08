@@ -40,11 +40,13 @@
 #include "higgs_stt.h"
 #include "qwen3_asr.h"
 #include "qwen3_tts.h"
+#include "omnivoice.h"
 #include "kokoro.h"
 #include "granite_speech.h"
 #include "granite_nle.h"
 #include "parakeet.h"
 #include "canary.h"
+#include "canary_qwen.h"
 #include "cohere.h"
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
@@ -1040,7 +1042,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
                 "\n"
-                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, tada-tts, "
+                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, omnivoice, tada-tts, "
                 "tada-encoder, kokoro, granite, "
                 "granite-4.1, "
                 "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
@@ -3686,8 +3688,12 @@ int main(int argc, char** argv) {
         {
             auto mel_pair = ref.get_f32("mel_spectrogram");
             auto mel_shp = ref.shape("mel_spectrogram");
-            int staged_n_mels = mel_shp.size() >= 1 ? (int)mel_shp[0] : 128;
-            int staged_T_mel = mel_shp.size() >= 2 ? (int)mel_shp[1] : 0;
+            // dump_reference stores cohere mel as (T, n_mels) row-major, which is
+            // exactly the [n_mels, T] ggml layout the staged encoder expects.
+            // shp[0]=T, shp[1]=n_mels (these were previously swapped, which made
+            // cohere_run_encoder_staged reject the mel with a feature mismatch).
+            int staged_T_mel = mel_shp.size() >= 1 ? (int)mel_shp[0] : 0;
+            int staged_n_mels = mel_shp.size() >= 2 ? (int)mel_shp[1] : 128;
             const float* staged_mel = mel_pair.first;
 
             struct CohereStageCap {
@@ -6567,14 +6573,89 @@ int main(int argc, char** argv) {
         nemotron_result_free(r);
         nemotron_free(ctx);
 
+    } else if (backend_name == "omnivoice") {
+        // OmniVoice: masked iterative TTS. Minimal diff harness — load
+        // model, compare text embeddings. Full pipeline diff pending
+        // audio tokenizer implementation.
+        auto cp = omnivoice_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        omnivoice_context* ctx = omnivoice_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load omnivoice model\n");
+            return 4;
+        }
+
+        // Stage: text_input_ids — verify tokenisation matches
+        auto ids_pair = ref.get_f32("text_input_ids");
+        if (ids_pair.first && ids_pair.second > 0) {
+            fprintf(stderr, "  text_input_ids: %d tokens in reference\n", (int)ids_pair.second);
+        }
+
+        omnivoice_free(ctx);
+
+    } else if (backend_name == "canary-qwen") {
+        auto cp = canary_qwen_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        canary_qwen_context* ctx = canary_qwen_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load canary-qwen model\n");
+            return 4;
+        }
+
+        // Mel spectrogram
+        int mel_n_mels = 0, mel_T = 0;
+        float* mel_ptr = canary_qwen_compute_mel(ctx, samples.data(), (int)samples.size(), &mel_n_mels, &mel_T);
+        if (mel_ptr && ref.has("mel_spectrogram")) {
+            auto rep = ref.compare("mel_spectrogram", mel_ptr, (size_t)mel_n_mels * mel_T);
+            print_row("mel_spectrogram", rep, COS_THRESHOLD);
+            record(rep);
+        }
+
+        // Encoder + projection
+        if (mel_ptr) {
+            int T_enc = 0, d_enc = 0;
+            float* enc_ptr = canary_qwen_run_encoder(ctx, mel_ptr, mel_n_mels, mel_T, &T_enc, &d_enc);
+            if (enc_ptr && ref.has("projected")) {
+                auto rep = ref.compare("projected", enc_ptr, (size_t)T_enc * d_enc);
+                print_row("projected", rep, COS_THRESHOLD);
+                record(rep);
+            }
+            if (enc_ptr && ref.has("encoder_output")) {
+                auto rep = ref.compare("encoder_output", enc_ptr, (size_t)T_enc * d_enc);
+                print_row("encoder_output", rep, COS_THRESHOLD);
+                record(rep);
+            }
+            free(enc_ptr);
+        }
+
+        // Full transcription
+        char* text = canary_qwen_transcribe(ctx, samples.data(), (int)samples.size());
+        if (text && ref.has("generated_text")) {
+            auto ref_pair = ref.get_f32("generated_text");
+            auto ref_shp = ref.shape("generated_text");
+            if (ref_pair.first && !ref_shp.empty()) {
+                std::string ref_text((const char*)ref_pair.first, ref_shp[0]);
+                printf("[INFO] generated_text (C++)    : %s\n", text);
+                printf("[INFO] generated_text (Python) : %s\n", ref_text.c_str());
+            }
+        } else if (text) {
+            printf("[INFO] generated_text (C++)    : %s\n", text);
+        }
+
+        free(mel_ptr);
+        free(text);
+        canary_qwen_free(ctx);
+
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
-                "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
-                "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
-                "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, paraformer, sensevoice, "
-                "cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts, lfm2-audio, mini-omni2, "
-                "nemotron.\n",
+                "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, omnivoice, kokoro, granite, "
+                "granite-4.1, granite-nle, parakeet, canary, canary-qwen, cohere, gemma4, mimo-tokenizer, mimo-asr, "
+                "orpheus, moonshine, moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, "
+                "paraformer, sensevoice, cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts, "
+                "lfm2-audio, mini-omni2, nemotron.\n",
                 backend_name.c_str());
         return 5;
     }

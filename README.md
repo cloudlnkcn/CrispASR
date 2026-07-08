@@ -88,6 +88,7 @@ to the [TTS table](#text-to-speech-models) for the synthesis side.
 | **fastconformer-ctc** | [`nvidia/parakeet-ctc-1.1b`](https://huggingface.co/cstr/parakeet-ctc-1.1b-GGUF) | 42L FastConformer + CTC, 80 mels | en | CC-BY-4.0 |
 | **fastconformer-ctc** | [`grider-transwithai/parakeet-ctc-1.1b-ja`](https://huggingface.co/cstr/parakeet-ctc-1.1b-ja-GGUF) | 42L FastConformer + CTC, 80 mels, Japanese fine-tune | Japanese | Apache-2.0 |
 | **canary** | [`nvidia/canary-1b-v2`](https://huggingface.co/nvidia/canary-1b-v2) | FastConformer + Transformer decoder | 25 EU (explicit `-sl/-tl`) | CC-BY-4.0 |
+| **canary-qwen** | [`nvidia/canary-qwen-2.5b`](https://huggingface.co/nvidia/canary-qwen-2.5b) | FastConformer + Qwen3-1.7B SALM | en | CC-BY-4.0 |
 | **lfm2-audio** | [`LiquidAI/LFM2.5-Audio-1.5B`](https://huggingface.co/cstr/lfm2-audio-1.5b-GGUF) | FastConformer + LFM2 hybrid conv+attention backbone (ASR+TTS) | en | LFM Open v1.0 |
 | **lfm2-audio** | [`LiquidAI/LFM2.5-Audio-1.5B-JP`](https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF) | FastConformer + LFM2 hybrid conv+attention backbone (ASR+TTS) | ja | LFM Open v1.0 |
 | **mini-omni2** | [`gpt-omni/mini-omni2`](https://huggingface.co/gpt-omni/mini-omni2) | Whisper-small + Qwen2-0.5B (ASR+TTS+S2S) | en | MIT |
@@ -143,6 +144,7 @@ quick-start commands and engine selection guidance.
 | **kugelaudio** | [`kugelaudio-0-open`](https://huggingface.co/cstr/kugelaudio-0-open-GGUF) | Qwen2.5-7B LM + 4L DiT diffusion + acoustic VAE decoder; voice cloning | multilingual | Apache-2.0 |
 | **qwen3-tts** | [`Qwen3-TTS-12Hz-0.6B-Base`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF), [`1.7B-Base`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF), [`1.7B-VoiceDesign`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) | Qwen3 talker LM + 12 Hz RVQ ([more](docs/architecture.md#qwen3-tts)) | multilingual | Apache-2.0 |
 | **qwen3-tts-customvoice** | [`1.7B-CustomVoice`](https://huggingface.co/cstr/qwen3-tts-1.7b-customvoice-GGUF) | Same talker + 9 premium built-in speakers (`--voice <name>`); optional style via `--instruct` (e.g. "spoke very slowly") ([more](docs/architecture.md#qwen3-tts)) | multilingual | Apache-2.0 |
+| **omnivoice** | [`k2-fsa/OmniVoice`](https://huggingface.co/cstr/omnivoice-GGUF) | Qwen3-0.6B + masked iterative 8-codebook TTS (SoundStorm-style); voice cloning; 600+ languages ([more](docs/architecture.md#omnivoice)) | 600+ langs | Apache-2.0 |
 | **melotts** | [`myshell-ai/MeloTTS`](https://github.com/myshell-ai/MeloTTS) EN_V2 | VITS2 (6L transformer + SDP/DP + transformer coupling flow + HiFi-GAN); 44.1 kHz, 102 MB + 52 MB BERT Q4_K companion (154 MB total); neural G2P; 4 EN speakers ([more](docs/architecture.md#melotts)) | en | MIT |
 | **piper** | [`rhasspy/piper`](https://github.com/rhasspy/piper) community voices | VITS (6L transformer + SDP + 4-block coupling flow + HiFi-GAN); 22 kHz mono, 30 MB F16 per voice; built-in G2P for EN/DE/FR/ES (`--g2p-dict`) | 30+ langs (built-in + espeak dlopen) | MIT |
 | **kokoro** | [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M) + German backbones | StyleTTS2 / iSTFTNet (82M); per-voice GGUF ([more](docs/architecture.md#kokoro)) | en, es, fr, hi, it, ja, pt, zh, de | Apache-2.0 |
@@ -171,6 +173,7 @@ quick-start commands and engine selection guidance.
 |---------|:---:|:---:|:---:|:---:|:---:|
 | vibevoice-tts | yes | temp | 24 | yes | yes |
 | qwen3-tts | yes* | temp | 24 | yes | yes |
+| omnivoice | yes | temp | 24 | — | — |
 | kokoro | — | — | 24 | yes | — |
 | orpheus | — | temp | 24 | yes | yes |
 | chatterbox | yes | temp | 24 | yes | yes |
