@@ -336,6 +336,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // code_pred.blk.*) are safe to quantize.
     const bool is_qwen3_tts = (arch.find("qwen3tts") != std::string::npos);
 
+    // OmniVoice: Qwen3 backbone + audio_embeddings + audio_heads.
+    // Keep audio_embd (8200×1024) and audio_output (8200×1024) at original
+    // precision — they map codebook indices to/from hidden space, and
+    // quantization noise in the output head corrupts the masked iterative
+    // decode. LLM backbone weights (llm.blk.*) are safe to quantize.
+    const bool is_omnivoice = (arch.find("omnivoice") != std::string::npos);
+
     // Parler TTS: DAC audio codec weights are precision-sensitive. Audio
     // codecs reconstruct waveforms from codebook embeddings and small
     // conv stacks — quantization noise in the decoder produces audible
@@ -641,6 +648,9 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                                 sname.find("depth.codebook.") == 0 || sname.find("preprocessor.") == 0)) &&
             !(is_mini_omni2 &&
               (sname.find("audio.") == 0 || sname.find("adapter.") == 0 || sname.find("llm.token_embd") == 0)) &&
+            !(is_omnivoice &&
+              (sname.find("audio_embd") == 0 || sname.find("audio_output") == 0 ||
+               sname.find("llm.token_embd") == 0)) &&
             !(is_orpheus && sname.find("talker.token_embd") == 0) &&
             !(is_arkasr && (sname.find("dec.embed.") == 0 || sname.find("enc.") == 0 || sname.find("adapter.") == 0)) &&
             !(is_higgs && (sname == "token_embd.weight" || sname == "output.weight")) &&
