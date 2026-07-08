@@ -273,6 +273,12 @@ so there is nothing TTS-specific per wrapper:
   **or** a `*.wav` clone reference (`ref_text` required for a WAV);
   `set_instruct(...)` for qwen3-tts VoiceDesign.
 
+For cloning backends whose reference encode is expensive (irodori, indextts),
+the encoded conditioning is cached automatically (content-addressed on the
+reference audio) so a repeated reference skips the encode — this happens in the
+runtime, so wrappers get it for free. Control with `CRISPASR_TTS_REF_CACHE=0`
+(disable) / `CRISPASR_TTS_REF_CACHE_DIR` (location).
+
 Open the TTS model GGUF like any other; the backend auto-detects from
 the GGUF architecture. Supported TTS backends: `kokoro`, `qwen3-tts`
 (+ customvoice), `vibevoice-tts` / `vibevoice-1.5b`, `orpheus`,

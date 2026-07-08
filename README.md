@@ -179,7 +179,7 @@ quick-start commands and engine selection guidance.
 | voxcpm2-tts | yes | — | 48 | yes | — |
 | cosyvoice3-tts | yes | temp | 24 | yes | yes |
 | f5-tts | yes | — | 24 | yes | — |
-| irodori-tts | yes (latent) | — | 48 | yes | — |
+| irodori-tts | yes (WAV) | — | 48 | yes | — |
 | csm | — | temp | 24 | yes | — |
 | dia | — | temp | 44 | yes | — |
 | bark | yes (.npz) | temp | 24 | yes | — |

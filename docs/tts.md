@@ -1062,6 +1062,69 @@ N tokens`).
 
 ---
 
+## Irodori-TTS — Japanese voice cloning + emoji emotion control
+
+Irodori-TTS v3 (500M) is an RF-DiT flow-matching model at 48 kHz via the
+Semantic-DACVAE-Japanese-32dim codec. Needs the companion codec GGUF next to the
+model (auto-discovered) or via `--codec-model`.
+
+```bash
+# Plain synthesis:
+crispasr --backend irodori-tts -m irodori-tts-500m-v3-q8_0.gguf \
+    --codec-model dacvae-ja-32dim-f16.gguf --tts "こんにちは、世界。" -o out.wav
+
+# Zero-shot voice cloning from any reference WAV:
+crispasr --backend irodori-tts -m irodori-tts-500m-v3-q8_0.gguf \
+    --codec-model dacvae-ja-32dim-f16.gguf \
+    --voice reference.wav --i-have-rights --tts "テスト。" -o cloned.wav
+```
+
+**Voice cloning** encodes the reference through the DAC-VAE encoder (resample →
+−16 LUFS → latent) and conditions the DiT via speaker CFG. `--i-have-rights` is
+the consent attestation; a spoken AI-disclosure is prepended unless
+`--no-spoken-disclaimer`. A short, clean 5–15 s reference clones as well as a
+long one and is faster.
+
+**Emoji emotion control** — Irodori's emoji drive prosody (👂 whisper, 😮‍💨
+breath, 😭 crying, …); include them in the text. See the model's
+`EMOJI_ANNOTATIONS.md` for the supported set. Emoji outside the trained set are
+harmlessly ignored.
+
+**Output length** is set by the model's duration predictor (kanji unpack to a
+variable number of mora, so a fixed chars/sec heuristic truncates). Nudge it with
+`--duration-scale` (`>1` longer), or pin the exact frame count with
+`CRISPASR_IRODORI_T_LATENT=N`.
+
+**Knobs (env):**
+
+| Variable | Effect |
+| --- | --- |
+| `CRISPASR_IRODORI_CFG_SPEAKER` | Speaker-CFG strength for cloning (default 5.0). |
+| `CRISPASR_IRODORI_T_LATENT` | Force the exact output latent-frame count. |
+| `CRISPASR_IRODORI_DECODE_CHUNK` / `_CTX` | Overlap-save codec-decode window / context (auto for long outputs; `CHUNK=0` disables). Bounds peak decode memory; exact (byte-identical) output. |
+| `CRISPASR_IRODORI_CODEC_GPU=1` | Run the DAC-VAE codec on the GPU under Vulkan (CPU by default there — validated clean on MoltenVK; confirm on your driver). `CRISPASR_IRODORI_CODEC_CPU=1` forces CPU. |
+
+See also the shared [reference-conditioning cache](#reference-conditioning-cache)
+and [streaming TTS output](streaming.md#streaming-synthesized-audio-out).
+
+## Reference-conditioning cache
+
+Voice cloning encodes the reference into a small conditioning blob — a DAC-VAE
+latent (irodori) or Conformer/Perceiver + ECAPA conditioning (indextts) — which
+is slow for long references. CrispASR caches it **content-addressed on the
+reference audio**, in the runtime, so **every entry point** (CLI, server, C ABI,
+language wrappers) skips the encode on a repeat reference automatically — output
+is byte-identical to a fresh encode.
+
+- Cache directory: `CRISPASR_TTS_REF_CACHE_DIR` (default: a `crispasr-tts-refcache`
+  folder under the system temp dir).
+- Disable entirely with `CRISPASR_TTS_REF_CACHE=0`.
+
+No flag is needed to enable it — it's on by default. (f5-tts caches its
+auto-transcribed reference transcript separately, next to the voice file.)
+
+---
+
 ## Local speaker output (`--tts-play`)
 
 Pass `--tts-play` to play TTS output through the local speaker immediately
