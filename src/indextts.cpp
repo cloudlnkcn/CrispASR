@@ -26,6 +26,7 @@
 #include "core/gguf_loader.h"
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/tts_ref_cache.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -2916,6 +2917,33 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
 
     indextts_bench_stage _bs_synth("synthesize");
 
+    // Content-addressed reference cache (runtime, so every consumer — CLI, C
+    // ABI, server, wrappers — benefits). Key = hash of the reference PCM; a hit
+    // restores the Conformer/Perceiver conditioning + ECAPA embedding, skipping
+    // the expensive per-run encode. Blob = [cond_dim floats][512 ECAPA floats?].
+    uint64_t ref_key = 0;
+    bool ref_cache_miss = false;
+    if (ref_pcm && ref_n_samples > 0 && !ctx->ref_cached && !crispasr_ref_cache::disabled()) {
+        ref_key = crispasr_ref_cache::fnv1a(ref_pcm, (size_t)ref_n_samples * sizeof(float));
+        const int cond_dim = (int)(ctx->hp.perceiver_n_latents * ctx->hp.d_model);
+        std::vector<uint32_t> shape;
+        std::vector<float> blob;
+        if (crispasr_ref_cache::get_floats("indextts-cond", &ref_key, sizeof(ref_key), shape, blob) &&
+            shape.size() == 2 && (int)shape[0] == cond_dim && (shape[1] == 0 || shape[1] == 512) &&
+            blob.size() == (size_t)shape[0] + shape[1]) {
+            ctx->cond_latents.assign(blob.begin(), blob.begin() + cond_dim);
+            if (shape[1] == 512)
+                ctx->spk_emb.assign(blob.begin() + cond_dim, blob.end());
+            else
+                ctx->spk_emb.clear();
+            ctx->ref_cached = true; // generate_mel_codes + the ECAPA step now reuse these
+            if (ctx->params.verbosity >= 1)
+                fprintf(stderr, "indextts: reference conditioning from cache\n");
+        } else {
+            ref_cache_miss = true;
+        }
+    }
+
     // Step 1: Generate mel codes via AR decode
     int n_codes = 0;
     int32_t* codes;
@@ -3024,6 +3052,19 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
                         target_norm > 0.0f ? "clamped" : "raw");
             }
         }
+    }
+
+    // On a cache miss, persist the freshly-computed conditioning + ECAPA
+    // embedding, and freeze them so later chunks in this run reuse them too.
+    if (ref_cache_miss && !ctx->cond_latents.empty()) {
+        ctx->ref_cached = true;
+        std::vector<float> blob(ctx->cond_latents);
+        const bool has_spk = ctx->spk_emb.size() == 512;
+        if (has_spk)
+            blob.insert(blob.end(), ctx->spk_emb.begin(), ctx->spk_emb.end());
+        crispasr_ref_cache::put_floats("indextts-cond", &ref_key, sizeof(ref_key),
+                                       {(uint32_t)ctx->cond_latents.size(), (uint32_t)(has_spk ? 512 : 0)}, blob.data(),
+                                       blob.size());
     }
 
     // Debug: override latent from file if INDEXTTS_LATENT_FILE is set
