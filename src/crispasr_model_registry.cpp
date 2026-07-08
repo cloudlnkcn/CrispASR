@@ -205,6 +205,12 @@ constexpr Entry k_registry[] = {
     {"cohere", "cohere-transcribe-arabic-q4_k-imatrix.gguf",
      "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k-imatrix.gguf",
      "~1.5 GB", nullptr, nullptr},
+    // `--backend cohere-ar` (or `-m auto --backend cohere-ar`) short alias →
+    // recommended Arabic imatrix GGUF. Routes to the cohere runtime via the
+    // factory alias in crispasr_backend.cpp. Still pass `-l ar`.
+    {"cohere-ar", "cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "~1.5 GB", nullptr, nullptr},
     {"cohere", "cohere-transcribe-arabic-q4_k.gguf",
      "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k.gguf",
      "~1.5 GB", nullptr, nullptr},

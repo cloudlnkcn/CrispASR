@@ -670,6 +670,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "cohere";
             else if (a == "cohere-transcribe")
                 result = "cohere";
+            else if (a == "cohere-ar")
+                // Arabic alias: routes to the cohere runtime; `-m auto` resolves
+                // the recommended Arabic imatrix GGUF via the registry (#231).
+                result = "cohere";
             else if (a == "qwen3-asr" || a == "qwen3_asr" || a == "qwen3asr")
                 result = "qwen3";
             else if (a == "qwen3-tts" || a == "qwen3_tts" || a == "qwen3tts")
