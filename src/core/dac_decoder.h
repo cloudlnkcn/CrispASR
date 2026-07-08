@@ -61,10 +61,43 @@
 #include "core/conv.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace core_dac {
+
+// Overlap-save codec decode — bounds peak decode memory for long outputs.
+// Decodes overlapping windows of `chunk` frames with `ctx_frames` of context on
+// each side and keeps only the center. Exact when the codec upsamples each
+// frame to exactly `hop` samples with SAME-padded convs (the whole DAC family)
+// and `ctx_frames` covers its receptive field (a handful of frames; 32 is
+// generous). `decode_window(start, n)` must decode frames [start, start+n) into
+// n*hop PCM samples; return empty to signal failure. Falls back to a single
+// decode when chunking is disabled (chunk<=0) or the output is short
+// (T <= chunk + 2*ctx_frames), so short outputs are unchanged.
+static inline std::vector<float> decode_overlap_save(
+    int T, int hop, int chunk, int ctx_frames,
+    const std::function<std::vector<float>(int start, int n)>& decode_window) {
+    if (chunk <= 0 || T <= chunk + 2 * ctx_frames)
+        return decode_window(0, T);
+    std::vector<float> pcm;
+    pcm.reserve((size_t)T * hop);
+    for (int start = 0; start < T; start += chunk) {
+        const int end = std::min(start + chunk, T);
+        const int w0 = std::max(0, start - ctx_frames);
+        const int w1 = std::min(T, end + ctx_frames);
+        std::vector<float> win = decode_window(w0, w1 - w0);
+        if (win.empty())
+            return {};
+        const size_t lo = (size_t)(start - w0) * hop;
+        const size_t hi = std::min(win.size(), (size_t)(end - w0) * hop);
+        if (lo < hi)
+            pcm.insert(pcm.end(), win.begin() + lo, win.begin() + hi);
+    }
+    return pcm;
+}
 
 // Configuration constants for descript/dac_44khz
 struct DacConfig {

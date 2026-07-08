@@ -2522,27 +2522,9 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         ctx_frames = std::max(0, std::atoi(e));
     const bool chunked = chunk > 0 && T > chunk + 2 * ctx_frames;
 
-    std::vector<float> pcm;
-    if (!chunked) {
-        pcm = decode_dac_window(ctx, x_t.data(), T);
-    } else {
-        pcm.reserve((size_t)T * hop);
-        for (int start = 0; start < T; start += chunk) {
-            const int end = std::min(start + chunk, T);
-            const int w0 = std::max(0, start - ctx_frames);
-            const int w1 = std::min(T, end + ctx_frames);
-            std::vector<float> win = decode_dac_window(ctx, x_t.data() + (size_t)w0 * latent_d, w1 - w0);
-            if (win.empty()) {
-                pcm.clear();
-                break;
-            }
-            // Keep only the center [start,end): PCM [(start-w0)·hop, (end-w0)·hop).
-            const size_t lo = (size_t)(start - w0) * hop;
-            const size_t hi = std::min(win.size(), (size_t)(end - w0) * hop);
-            if (lo < hi)
-                pcm.insert(pcm.end(), win.begin() + lo, win.begin() + hi);
-        }
-    }
+    std::vector<float> pcm = core_dac::decode_overlap_save(T, hop, chunk, ctx_frames, [&](int start, int n) {
+        return decode_dac_window(ctx, x_t.data() + (size_t)start * latent_d, n);
+    });
 
     if (pcm.empty()) {
         // Fallback: silence

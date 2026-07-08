@@ -2598,12 +2598,47 @@ float* zonos_tts_synthesize(struct zonos_tts_context* ctx, const char* text, int
         return nullptr;
     }
 
-    // DAC decode: codes -> 44.1 kHz PCM
+    // DAC decode: codes -> 44.1 kHz PCM. Overlap-save chunking bounds peak
+    // decode memory on long outputs; the descript-DAC decoder is the same
+    // SAME-padded conv family proven exact for irodori (cos=1.0), so the center
+    // crop is exact when ctx_frames covers the receptive field. Auto for long
+    // outputs; CRISPASR_ZONOS_DECODE_CHUNK=0 disables, _CHUNK/_CTX tune.
     int n_samples = 0;
-    float* pcm;
+    float* pcm = nullptr;
     {
         zonos_tts_bench_stage _bs("dac_decode");
-        pcm = dac_decode(ctx, codes, n_codes, n_codebooks, &n_samples);
+        const auto& dcfg = ctx->dac_w.config;
+        int hop = 1;
+        for (int b = 0; b < dcfg.n_decoder_blocks; b++)
+            hop *= dcfg.upsampling_ratios[b];
+        int chunk = 800, ctx_frames = 32;
+        if (const char* e = getenv("CRISPASR_ZONOS_DECODE_CHUNK"))
+            chunk = atoi(e);
+        if (const char* e = getenv("CRISPASR_ZONOS_DECODE_CTX"))
+            ctx_frames = std::max(0, atoi(e));
+        // Window [start,start+n): repack codes (codebook-major codes[k*n_codes+t])
+        // into a contiguous n-frame buffer, then decode it.
+        std::vector<int32_t> win_codes;
+        auto decode_window = [&](int start, int n) -> std::vector<float> {
+            win_codes.resize((size_t)n_codebooks * n);
+            for (int k = 0; k < n_codebooks; k++)
+                std::memcpy(&win_codes[(size_t)k * n], &codes[(size_t)k * n_codes + start],
+                            (size_t)n * sizeof(int32_t));
+            int ns = 0;
+            float* p = dac_decode(ctx, win_codes.data(), n, n_codebooks, &ns);
+            if (!p || ns <= 0)
+                return {};
+            std::vector<float> out(p, p + ns);
+            free(p);
+            return out;
+        };
+        std::vector<float> full = core_dac::decode_overlap_save(n_codes, hop, chunk, ctx_frames, decode_window);
+        if (!full.empty()) {
+            n_samples = (int)full.size();
+            pcm = (float*)malloc(full.size() * sizeof(float));
+            if (pcm)
+                std::memcpy(pcm, full.data(), full.size() * sizeof(float));
+        }
     }
     free(codes);
     if (!pcm) {
