@@ -1673,8 +1673,8 @@ int irodori_tts_set_reference(struct irodori_tts_context* ctx, const float* ref_
         return -1;
     }
 
-    const int SR = ctx->hparams.sample_rate;       // 48000
-    const int hop = ctx->hparams.codec_hop_length; // 1920
+    const int SR = ctx->hparams.sample_rate;                                        // 48000
+    const int hop = ctx->hparams.codec_hop_length;                                  // 1920
     const int latent_pd = ctx->hparams.latent_dim * ctx->hparams.latent_patch_size; // 32
 
     // Debug: feed an already-normalized waveform straight through (isolates
