@@ -138,6 +138,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Qwen3-TTS-Tokenizer-12Hz codec ENCODER (audio → codes).
     # model_dir = the Tokenizer-12Hz HF snapshot. audio is unused.
     "qwen3-tts-cenc":  "reference_backends.qwen3_tts_cenc",
+    # OmniVoice: k2-fsa/OmniVoice — Qwen3 + masked iterative TTS.
+    # model_dir = k2-fsa/OmniVoice (HF id) or local snapshot.
+    # audio arg is unused (TTS). Text from OMNIVOICE_SYN_TEXT env.
+    "omnivoice":  "reference_backends.omnivoice",
     # VibeVoice-ASR 7B: two σ-VAE encoders + connectors + Qwen2 decoder.
     # NOTE: audio must be 16 kHz on entry (shared loader); the backend
     # resamples to 24 kHz internally.

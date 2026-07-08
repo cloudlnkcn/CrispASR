@@ -585,6 +585,12 @@ constexpr Entry k_registry[] = {
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
      "~60 MB"},
+    // OmniVoice: k2-fsa/OmniVoice — Qwen3-0.6B backbone with masked
+    // iterative multi-codebook TTS (8 codebooks × 1025 vocab, 600+
+    // languages). Uses HiggsAudioV2 audio tokenizer for encode/decode.
+    // Converter: models/convert-omnivoice-to-gguf.py — user-supplied
+    // model; no pre-converted GGUF published yet.
+    //
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft is gated; we convert
     // from the non-gated mirror unsloth/orpheus-3b-0.1-ft, llama3.2 —
     // "Built with Llama"). Talker = Llama-3.2-3B-Instruct + 7×4096

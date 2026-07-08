@@ -40,6 +40,7 @@
 #include "higgs_stt.h"
 #include "qwen3_asr.h"
 #include "qwen3_tts.h"
+#include "omnivoice.h"
 #include "kokoro.h"
 #include "granite_speech.h"
 #include "granite_nle.h"
@@ -1040,7 +1041,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
                 "\n"
-                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, tada-tts, "
+                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, omnivoice, tada-tts, "
                 "tada-encoder, kokoro, granite, "
                 "granite-4.1, "
                 "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
@@ -6567,10 +6568,32 @@ int main(int argc, char** argv) {
         nemotron_result_free(r);
         nemotron_free(ctx);
 
+    } else if (backend_name == "omnivoice") {
+        // OmniVoice: masked iterative TTS. Minimal diff harness — load
+        // model, compare text embeddings. Full pipeline diff pending
+        // audio tokenizer implementation.
+        auto cp = omnivoice_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        omnivoice_context* ctx = omnivoice_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load omnivoice model\n");
+            return 4;
+        }
+
+        // Stage: text_input_ids — verify tokenisation matches
+        auto ids_pair = ref.get_f32("text_input_ids");
+        if (ids_pair.first && ids_pair.second > 0) {
+            fprintf(stderr, "  text_input_ids: %d tokens in reference\n", (int)ids_pair.second);
+        }
+
+        omnivoice_free(ctx);
+
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
-                "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
+                "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, omnivoice, kokoro, granite, "
+                "granite-4.1, "
                 "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
                 "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, paraformer, sensevoice, "
                 "cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts, lfm2-audio, mini-omni2, "

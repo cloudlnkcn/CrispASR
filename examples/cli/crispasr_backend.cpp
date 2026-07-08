@@ -69,6 +69,8 @@ std::unique_ptr<CrispasrBackend> crispasr_make_fastpitch_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_csm_tts_backend();
 // bananamind-tts: BananaMind-TTS-V2.1 Tacotron-lite + HiFi-GAN (en-us/de-de).
 std::unique_ptr<CrispasrBackend> crispasr_make_bananamind_tts_backend();
+// omnivoice: k2-fsa/OmniVoice — Qwen3-based masked iterative TTS (600+ languages).
+std::unique_ptr<CrispasrBackend> crispasr_make_omnivoice_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -219,6 +221,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_csm_tts_backend();
     if (name == "bananamind" || name == "bananamind-tts" || name == "bananamind_tts" || name == "banana-tts")
         return crispasr_make_bananamind_tts_backend();
+    if (name == "omnivoice" || name == "omnivoice-tts" || name == "omnivoice_tts" || name == "omnivoice-singing")
+        return crispasr_make_omnivoice_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -312,6 +316,8 @@ std::vector<std::string> crispasr_list_backends() {
         "csm-tts",
         "sesame",
         "bananamind-tts",
+        "omnivoice",
+        "omnivoice-singing",
     };
 }
 
@@ -680,6 +686,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "fastpitch";
             else if (a == "bananamind_tts" || a == "bananamind-tts")
                 result = "bananamind-tts";
+            else if (a == "omnivoice" || a == "omnivoice-tts" || a == "omnivoice_tts")
+                result = "omnivoice";
             else if (a == "piper" || a == "piper-tts" || a == "piper_tts" || a == "vits")
                 result = "piper";
             else if (a == "melotts" || a == "melo-tts" || a == "melo_tts" || a == "vits2")

@@ -1295,6 +1295,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# omnivoice — k2-fsa/OmniVoice (Qwen3 + masked iterative multi-codebook TTS)
+# ---------------------------------------------------------------------------
+add_library(omnivoice STATIC omnivoice.h omnivoice.cpp)
+set_target_properties(omnivoice PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(omnivoice PUBLIC .)
+target_compile_features   (omnivoice PUBLIC cxx_std_17)
+target_link_libraries     (omnivoice PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(omnivoice PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # orpheus — canopylabs/orpheus-3b-0.1-ft (Llama-3.2-3B + SNAC 24 kHz codec)
 # ---------------------------------------------------------------------------
 add_library(orpheus STATIC orpheus.h orpheus.cpp)
@@ -2215,6 +2227,9 @@ if (TARGET moss_transcribe)
 endif()
 if (TARGET qwen3_tts)
     target_link_libraries(crispasr-lib PUBLIC qwen3_tts)
+endif()
+if (TARGET omnivoice)
+    target_link_libraries(crispasr-lib PUBLIC omnivoice)
 endif()
 if (TARGET orpheus)
     target_link_libraries(crispasr-lib PUBLIC orpheus)

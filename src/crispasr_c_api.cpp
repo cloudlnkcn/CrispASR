@@ -134,6 +134,10 @@
 #include "qwen3_tts.h"
 #define CA_HAVE_QWEN3_TTS 1
 #endif
+#if __has_include("omnivoice.h")
+#include "omnivoice.h"
+#define CA_HAVE_OMNIVOICE 1
+#endif
 #if __has_include("kokoro.h")
 #include "kokoro.h"
 #define CA_HAVE_KOKORO 1
@@ -1280,6 +1284,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "vibevoice";
     else if (strcmp(arch, "qwen3-tts") == 0 || strcmp(arch, "qwen3_tts") == 0)
         backend = "qwen3-tts";
+    else if (strcmp(arch, "omnivoice") == 0 || strcmp(arch, "omnivoice-tts") == 0)
+        backend = "omnivoice";
     else if (strcmp(arch, "orpheus") == 0)
         backend = "orpheus";
     else if (strcmp(arch, "chatterbox") == 0 || strcmp(arch, "chatterbox_turbo") == 0 ||
@@ -1591,6 +1597,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_QWEN3_TTS
     qwen3_tts_context* qwen3_tts_ctx = nullptr;
     bool qwen3_tts_voice_loaded = false;
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    omnivoice_context* omnivoice_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_GLMASR
     void* glmasr_ctx = nullptr;
@@ -2241,6 +2250,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         }
         // Codec must be loaded before synthesise. Caller does so via
         // `crispasr_session_set_codec_path` after open.
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->backend == "omnivoice" || s->backend == "omnivoice-tts" || s->backend == "omnivoice-singing") {
+        omnivoice_context_params p = omnivoice_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->omnivoice_ctx = omnivoice_init_from_file(model_path, p);
+        if (!s->omnivoice_ctx) {
+            delete s;
+            return nullptr;
+        }
         return s;
     }
 #endif
@@ -6713,6 +6737,16 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         return pcm;
     }
 #endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx) {
+        float* pcm = omnivoice_synthesize(s->omnivoice_ctx, text, out_n_samples);
+        if (!pcm && s->last_synth_error.empty()) {
+            s->last_synth_error = "omnivoice synthesis failed — "
+                                  "audio tokenizer may not be loaded";
+        }
+        return pcm;
+    }
+#endif
 #ifdef CA_HAVE_ORPHEUS
     if (s->orpheus_ctx) {
         if (!s->orpheus_codec_loaded) {
@@ -7406,6 +7440,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx)
         qwen3_tts_free(s->qwen3_tts_ctx);
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx)
+        omnivoice_free(s->omnivoice_ctx);
 #endif
 #ifdef CA_HAVE_GLMASR
     if (s->glmasr_ctx)
