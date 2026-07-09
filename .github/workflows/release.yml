@@ -90,7 +90,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ patchelf libopenblas-dev
 
       - name: Build
         run: |
@@ -101,9 +101,18 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p release/crispasr-linux-x86_64
-          cp build/bin/crispasr release/crispasr-linux-x86_64/
-          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64/
+          set -euo pipefail
+          OUT=release/crispasr-linux-x86_64
+          mkdir -p "$OUT/lib"
+          cp build/bin/crispasr "$OUT/"
+          cp build/bin/crispasr-quantize "$OUT/"
+          # Bundle libopenblas (not present on a base Ubuntu install) and
+          # set RPATH=$ORIGIN/lib so the binary finds it without
+          # LD_LIBRARY_PATH. cp -L dereferences the SONAME symlink.
+          cp -L /usr/lib/x86_64-linux-gnu/libopenblas.so.0 "$OUT/lib/" 2>/dev/null || echo "warn: libopenblas.so.0 not found"
+          for f in "$OUT"/crispasr "$OUT"/crispasr-quantize; do
+            patchelf --set-rpath '$ORIGIN/lib' "$f"
+          done
           cd release && tar czf crispasr-linux-x86_64.tar.gz crispasr-linux-x86_64/
 
       - uses: actions/upload-artifact@v4
@@ -174,7 +183,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ patchelf libopenblas-dev
 
       - name: Build
         run: |
@@ -186,9 +195,18 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p release/crispasr-linux-x86_64-avx512
-          cp build/bin/crispasr release/crispasr-linux-x86_64-avx512/
-          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-avx512/
+          set -euo pipefail
+          OUT=release/crispasr-linux-x86_64-avx512
+          mkdir -p "$OUT/lib"
+          cp build/bin/crispasr "$OUT/"
+          cp build/bin/crispasr-quantize "$OUT/"
+          # Bundle libopenblas (not present on a base Ubuntu install) and
+          # set RPATH=$ORIGIN/lib so the binary finds it without
+          # LD_LIBRARY_PATH. cp -L dereferences the SONAME symlink.
+          cp -L /usr/lib/x86_64-linux-gnu/libopenblas.so.0 "$OUT/lib/" 2>/dev/null || echo "warn: libopenblas.so.0 not found"
+          for f in "$OUT"/crispasr "$OUT"/crispasr-quantize; do
+            patchelf --set-rpath '$ORIGIN/lib' "$f"
+          done
           cd release && tar czf crispasr-linux-x86_64-avx512.tar.gz \
               crispasr-linux-x86_64-avx512/
 
@@ -515,8 +533,10 @@ jobs:
   # ── Linux x86_64 CLI — Vulkan variant ──────────────────────────────────────
   # GPU-accelerated CLI for systems without NVIDIA CUDA (AMD, Intel Arc,
   # or NVIDIA via the Vulkan ICD). Useful as a fallback in environments
-  # where the CUDA release binary is incompatible. Ships libvulkan
-  # dynamically linked — the host must have a Vulkan-capable driver.
+  # where the CUDA release binary is incompatible. Bundles libvulkan.so.1
+  # + libopenblas.so.0 and sets RPATH=$ORIGIN so the tarball is
+  # self-contained — without this the binary exits 127 on hosts that
+  # don't have libvulkan1 / libopenblas0 installed.
   build-linux-x86_64-vulkan:
     runs-on: ubuntu-22.04
     steps:
@@ -529,7 +549,7 @@ jobs:
       - name: Install deps + Vulkan SDK
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libopenblas-dev
+          sudo apt-get install -y cmake g++ patchelf libopenblas-dev
           # Install LunarG Vulkan SDK (provides libvulkan-dev + glslc).
           # Ubuntu 22.04 doesn't ship a glslc package; the SDK is the
           # reliable way to get both headers and the shader compiler.
@@ -554,9 +574,21 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p release/crispasr-linux-x86_64-vulkan
-          cp build/bin/crispasr release/crispasr-linux-x86_64-vulkan/
-          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-vulkan/
+          set -euo pipefail
+          OUT=release/crispasr-linux-x86_64-vulkan
+          mkdir -p "$OUT/lib"
+          cp build/bin/crispasr "$OUT/"
+          cp build/bin/crispasr-quantize "$OUT/"
+          # Bundle the runtime .so deps that aren't part of a base Ubuntu
+          # install. cp -L dereferences symlinks so the real SONAME file
+          # lands in lib/.
+          cp -L /usr/lib/x86_64-linux-gnu/libvulkan.so.1   "$OUT/lib/" 2>/dev/null || echo "warn: libvulkan.so.1 not found"
+          cp -L /usr/lib/x86_64-linux-gnu/libopenblas.so.0 "$OUT/lib/" 2>/dev/null || echo "warn: libopenblas.so.0 not found"
+          # RPATH=$ORIGIN/lib so the binary finds the bundled libs without
+          # LD_LIBRARY_PATH and without polluting system lib dirs.
+          for f in "$OUT"/crispasr "$OUT"/crispasr-quantize; do
+            patchelf --set-rpath '$ORIGIN/lib' "$f"
+          done
           cd release && tar czf crispasr-linux-x86_64-vulkan.tar.gz crispasr-linux-x86_64-vulkan/
           ls -lh crispasr-linux-x86_64-vulkan.tar.gz
 
