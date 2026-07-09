@@ -16,17 +16,35 @@ permissions:
   contents: write
 
 jobs:
+  # Guard: workflow_dispatch's inputs.tag defaults to "" if invoked without
+  # the required field (API / old links / `gh workflow run` without -f tag=).
+  # Every build job uses `inputs.tag` directly (tag_name / checkout ref / notes),
+  # so an empty value would resolve to "" — softprops/action-gh-release then
+  # fetches a release for a non-existent tag and dies with 500 "Server Error".
+  # Fail fast here with an actionable message instead.
+  require-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert inputs.tag was provided
+        run: |
+          if [ -z "${{ inputs.tag }}" ]; then
+            echo "::error::This workflow needs a 'tag' input (e.g. v0.8.9). Re-run with 'Run workflow' and fill the Tag field, or: gh workflow run release.yml -f tag=v0.8.9"
+            exit 1
+          fi
+          echo "Releasing tag: ${{ inputs.tag }}"
+
   validate-version:
+    needs: require-tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
       - name: Verify VERSION matches tag
         run: |
-          tag_version="${{ inputs.tag || github.ref_name }}"
+          tag_version="${{ inputs.tag }}"
           tag_version="${tag_version#v}"
           file_version="$(tr -d '[:space:]' < VERSION)"
           echo "Tag: $tag_version  VERSION file: $file_version"
@@ -45,7 +63,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
       - name: Verify in-tree glint matches upstream main
         run: |
@@ -68,7 +86,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -96,7 +114,7 @@ jobs:
       - name: Attach crispasr-linux-x86_64.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-linux-x86_64.tar.gz
           fail_on_unmatched_files: false
 
@@ -107,7 +125,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Setup emsdk
@@ -132,7 +150,7 @@ jobs:
       - name: Attach crispasr-wasm.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-wasm.tar.gz
           fail_on_unmatched_files: false
 
@@ -152,7 +170,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -182,7 +200,7 @@ jobs:
       - name: Attach crispasr-linux-x86_64-avx512.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-linux-x86_64-avx512.tar.gz
           fail_on_unmatched_files: false
 
@@ -200,7 +218,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -244,7 +262,7 @@ jobs:
       - name: Attach crispasr-linux-x86_64-cuda.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-linux-x86_64-cuda.tar.gz
           fail_on_unmatched_files: false
 
@@ -262,7 +280,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -306,7 +324,7 @@ jobs:
       - name: Attach crispasr-linux-x86_64-cuda13.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-linux-x86_64-cuda13.tar.gz
           fail_on_unmatched_files: false
 
@@ -335,7 +353,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install ROCm 6.3 + build deps
@@ -393,7 +411,7 @@ jobs:
       - name: Attach crispasr-linux-x86_64-hip.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-linux-x86_64-hip.tar.gz
           fail_on_unmatched_files: false
 
@@ -417,7 +435,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install ROCm 6.3 + build deps
@@ -490,7 +508,7 @@ jobs:
       - name: Attach libcrispasr-linux-x86_64-hip.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-linux-x86_64-hip.tar.gz
           fail_on_unmatched_files: false
 
@@ -505,7 +523,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps + Vulkan SDK
@@ -550,7 +568,7 @@ jobs:
       - name: Attach crispasr-linux-x86_64-vulkan.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-linux-x86_64-vulkan.tar.gz
           fail_on_unmatched_files: false
 
@@ -565,7 +583,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -591,7 +609,7 @@ jobs:
       - name: Attach crispasr-linux-arm64.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-linux-arm64.tar.gz
           fail_on_unmatched_files: false
 
@@ -601,7 +619,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -665,7 +683,7 @@ jobs:
       - name: Attach crispasr-python-linux-x86_64.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-python-linux-x86_64.tar.gz
           fail_on_unmatched_files: false
 
@@ -679,7 +697,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -736,7 +754,7 @@ jobs:
       - name: Attach crispasr-python-linux-arm64.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-python-linux-arm64.tar.gz
           fail_on_unmatched_files: false
 
@@ -746,7 +764,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Build
@@ -769,7 +787,7 @@ jobs:
       - name: Attach crispasr-macos.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-macos.tar.gz
           fail_on_unmatched_files: false
 
@@ -790,7 +808,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Build (shared libs, Metal + Accelerate)
@@ -844,7 +862,7 @@ jobs:
       - name: Attach libcrispasr-macos-arm64.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-macos-arm64.tar.gz
           fail_on_unmatched_files: false
 
@@ -860,7 +878,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -915,7 +933,7 @@ jobs:
       - name: Attach libcrispasr-linux-x86_64.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-linux-x86_64.tar.gz
           fail_on_unmatched_files: false
 
@@ -929,7 +947,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -979,7 +997,7 @@ jobs:
       - name: Attach libcrispasr-linux-x86_64-avx512.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-linux-x86_64-avx512.tar.gz
           fail_on_unmatched_files: false
 
@@ -993,7 +1011,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -1047,7 +1065,7 @@ jobs:
       - name: Attach libcrispasr-linux-arm64.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-linux-arm64.tar.gz
           fail_on_unmatched_files: false
 
@@ -1063,7 +1081,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Build (shared libs, CPU)
@@ -1113,7 +1131,7 @@ jobs:
       - name: Attach libcrispasr-windows-x86_64.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-windows-x86_64.tar.gz
           fail_on_unmatched_files: false
 
@@ -1128,7 +1146,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install Vulkan SDK
@@ -1207,7 +1225,7 @@ jobs:
       - name: Attach libcrispasr-windows-x86_64-vulkan.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-windows-x86_64-vulkan.tar.gz
           fail_on_unmatched_files: false
 
@@ -1226,7 +1244,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install deps
@@ -1291,7 +1309,7 @@ jobs:
       - name: Attach libcrispasr-linux-x86_64-cuda.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-linux-x86_64-cuda.tar.gz
           fail_on_unmatched_files: false
 
@@ -1309,7 +1327,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install CUDA Toolkit 12.8.0
@@ -1386,7 +1404,7 @@ jobs:
       - name: Attach libcrispasr-windows-x86_64-cuda.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-windows-x86_64-cuda.tar.gz
           fail_on_unmatched_files: false
 
@@ -1402,7 +1420,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Build (shared libs, CPU legacy SSE4.2)
@@ -1447,7 +1465,7 @@ jobs:
       - name: Attach libcrispasr-windows-x86_64-cpu-legacy.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/libcrispasr-windows-x86_64-cpu-legacy.tar.gz
           fail_on_unmatched_files: false
 
@@ -1458,7 +1476,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Build
@@ -1485,7 +1503,7 @@ jobs:
       - name: Attach crispasr-windows-x86_64-cpu.zip to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-windows-x86_64-cpu.zip
           fail_on_unmatched_files: false
 
@@ -1499,7 +1517,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Build
@@ -1527,7 +1545,7 @@ jobs:
       - name: Attach crispasr-windows-x86_64-cpu-legacy.zip to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-windows-x86_64-cpu-legacy.zip
           fail_on_unmatched_files: false
 
@@ -1541,7 +1559,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       # CUDA 12.8 is the minimum that ships sm_120 SASS for Blackwell
@@ -1591,7 +1609,7 @@ jobs:
       - name: Attach crispasr-windows-x86_64-cuda.zip to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-windows-x86_64-cuda.zip
           fail_on_unmatched_files: false
 
@@ -1602,7 +1620,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install Vulkan SDK
@@ -1647,7 +1665,7 @@ jobs:
       - name: Attach crispasr-windows-x86_64-vulkan.zip to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-windows-x86_64-vulkan.zip
           fail_on_unmatched_files: false
 
@@ -1680,7 +1698,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Set up NDK
@@ -1732,7 +1750,7 @@ jobs:
       - name: Attach crispasr-android-arm64-v8a.tar.gz to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/crispasr-android-arm64-v8a.tar.gz
           fail_on_unmatched_files: false
 
@@ -1766,7 +1784,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           # Glob ** picks up whatever build jobs actually produced. If a
           # job failed and didn't upload its artifact, that file is just
           # absent from the upload set — fail_on_unmatched_files: false
@@ -1780,7 +1798,7 @@ jobs:
       - name: Set release notes body
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag }}
         run: |
           NOTES="RELEASE_NOTES_${TAG}.md"
           if [ -f "$NOTES" ]; then
