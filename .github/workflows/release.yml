@@ -342,6 +342,10 @@ jobs:
         # Add AMD's ROCm apt repo, then install the HIP toolchain + math
         # libraries. GGML_HIP needs hipBLAS/rocBLAS (and their cmake config
         # files) or `find_package(hipblas)` fails at configure time (#196).
+        # Apt pinning is required: Ubuntu 22.04 ships its own rocm-cmake
+        # / rocm-device-libs which conflict with the ROCm 6.3 versions;
+        # pinning the ROCm repo at priority 600 (above Ubuntu's 500) makes
+        # apt prefer the ROCm versions.
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake g++ patchelf wget gnupg2
@@ -351,6 +355,8 @@ jobs:
             | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.3 jammy main" \
             | sudo tee /etc/apt/sources.list.d/rocm.list
+          echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
           sudo apt-get install -y rocm-dev hipblas-dev rocblas-dev
           echo "/opt/rocm/bin" >> "$GITHUB_PATH"
