@@ -317,12 +317,20 @@ jobs:
   # (gfx1201 support was added in ROCm 6.3). Prefer this over Vulkan on Linux
   # AMD: HIP has full flash-attention, tinyBLAS INT8 VNNI, and MFMA paths.
   build-linux-x86_64-hip:
+    # Runs on bare ubuntu-22.04 (not the rocm/dev container) to avoid
+    # "No space left on device" — the rocm/dev-ubuntu-22.04:6.3 image is
+    # ~10 GB and hipblas-dev/rocblas-dev pull in rocSOLVER/rocSPARSE etc.,
+    # overflowing the ~14 GB runner disk.  By running on the host we can
+    # reclaim ~7 GB of pre-installed software first, then install only the
+    # ROCm packages we need from AMD's apt repo.
     runs-on: ubuntu-22.04
-    container:
-      image: rocm/dev-ubuntu-22.04:6.3
     steps:
-      - name: Install git
-        run: apt-get update -y && apt-get install -y git
+      - name: Free up disk space
+        run: |
+          sudo apt-get remove -y '^dotnet-.*' '^llvm-.*' '^mysql-.*' '^postgresql-.*'
+          sudo apt-get autoremove -y
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - uses: actions/checkout@v7
         with:
@@ -330,11 +338,22 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
-      - name: Install deps
-        # The slim rocm/dev image ships the HIP compiler + runtime but NOT the
-        # math libraries; GGML_HIP needs hipBLAS/rocBLAS (and their cmake config
+      - name: Install ROCm 6.3 + build deps
+        # Add AMD's ROCm apt repo, then install the HIP toolchain + math
+        # libraries. GGML_HIP needs hipBLAS/rocBLAS (and their cmake config
         # files) or `find_package(hipblas)` fails at configure time (#196).
-        run: apt-get install -y cmake g++ hipblas-dev rocblas-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ patchelf wget gnupg2
+          # Add ROCm 6.3 apt repo (Ubuntu 22.04 / jammy)
+          sudo mkdir -p --mode=0755 /etc/apt/keyrings
+          wget -q -O - https://repo.radeon.com/rocm/rocm.gpg.key \
+            | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.3 jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get update
+          sudo apt-get install -y rocm-dev hipblas-dev rocblas-dev
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
       - name: Build
         run: |
@@ -377,12 +396,17 @@ jobs:
   # FFI consumers (Rust crispasr-sys, Dart, Python ctypes) that need AMD GPU
   # acceleration without rebuilding from source.
   build-libs-linux-x86_64-hip:
+    # Same disk-space strategy as build-linux-x86_64-hip: bare runner +
+    # reclaim space + install ROCm from apt (see that job's comment for
+    # rationale).
     runs-on: ubuntu-22.04
-    container:
-      image: rocm/dev-ubuntu-22.04:6.3
     steps:
-      - name: Install git
-        run: apt-get update -y && apt-get install -y git
+      - name: Free up disk space
+        run: |
+          sudo apt-get remove -y '^dotnet-.*' '^llvm-.*' '^mysql-.*' '^postgresql-.*'
+          sudo apt-get autoremove -y
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - uses: actions/checkout@v7
         with:
@@ -390,10 +414,17 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
-      - name: Install deps
+      - name: Install ROCm 6.3 + build deps
         # See build-linux-x86_64-hip: the slim rocm/dev image lacks hipBLAS/
         # rocBLAS, which GGML_HIP requires at configure time (#196).
-        run: apt-get install -y cmake g++ patchelf hipblas-dev rocblas-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ patchelf wget gnupg2
+          wget -q -O - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
+          echo 'deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.3/ ubuntu main' | sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get update
+          sudo apt-get install -y rocm-hip-runtime-dev hipblas-dev rocblas-dev
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
       - name: Build (shared libs, HIP)
         run: |
@@ -412,11 +443,9 @@ jobs:
           cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
-        # This job runs inside the rocm/dev-ubuntu-22.04 container, where GitHub
-        # Actions defaults `run:` to `sh` (dash). `set -o pipefail` is a bashism
-        # that dash rejects on line 1 ("Illegal option -o pipefail" → exit 2),
-        # which is what kept this HIP libs asset persistently failing to package
-        # even though the build succeeds. Pin bash (present in the image).
+        # Pin bash for `set -o pipefail` (was needed when this job ran inside
+        # the rocm/dev container which defaults to dash; still safe on the
+        # bare runner which also defaults to bash).
         shell: bash
         run: |
           set -euo pipefail
