@@ -421,13 +421,21 @@ jobs:
           fetch-depth: 0
 
       - name: Install ROCm 6.3 + build deps
-        # See build-linux-x86_64-hip: the slim rocm/dev image lacks hipBLAS/
-        # rocBLAS, which GGML_HIP requires at configure time (#196).
+        # Mirror build-linux-x86_64-hip's repo setup. Apt pinning is required:
+        # Ubuntu 22.04's universe repo ships rocm-device-libs 5.0.0 / rocm-cmake
+        # 5.0.0, whose versions sort ABOVE ROCm's 1.0.0.60300 / 0.14.0.60300, so
+        # without a priority pin apt selects the stale Ubuntu copies and
+        # rocm-hip-runtime-dev ends up with broken held packages (#196).
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake g++ patchelf wget gnupg2
-          wget -q -O - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
-          echo 'deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.3/ ubuntu main' | sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo mkdir -p --mode=0755 /etc/apt/keyrings
+          wget -q -O - https://repo.radeon.com/rocm/rocm.gpg.key \
+            | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.3 jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
           sudo apt-get install -y rocm-hip-runtime-dev hipblas-dev rocblas-dev
           echo "/opt/rocm/bin" >> "$GITHUB_PATH"
