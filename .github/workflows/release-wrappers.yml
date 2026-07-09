@@ -63,10 +63,11 @@ jobs:
     permissions:
       id-token: write  # for PyPI trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       # Probe whether the trusted publisher is configured AND the package
       # exists. Brand-new packages need either a "pending publisher"
@@ -107,10 +108,11 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       # Fail fast (and clearly) if the token isn't set, instead of letting
       # cargo emit the obscure "please provide a non-empty token" message.
@@ -156,10 +158,11 @@ jobs:
     permissions:
       id-token: write  # for pub.dev OIDC publishing
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       # pub.dev's automated publishing requires the package to already
       # exist (the very first `dart pub publish` for a brand-new package

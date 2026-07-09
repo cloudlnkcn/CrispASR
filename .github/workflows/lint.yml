@@ -50,7 +50,7 @@ jobs:
     name: clang-format (style)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -101,7 +101,7 @@ jobs:
     name: clang-tidy (lint / types / security)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -138,7 +138,7 @@ jobs:
     name: cppcheck (static analysis)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -193,7 +193,7 @@ jobs:
     # block PRs. The job is best-effort: missing upstream metadata or
     # network errors degrade to "skip" without failing the lint.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 

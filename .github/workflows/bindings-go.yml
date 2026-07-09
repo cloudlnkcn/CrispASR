@@ -23,7 +23,7 @@ jobs:
   cgo-ldflags-drift:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - run: |
@@ -43,7 +43,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: '^1.23'
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - run: |

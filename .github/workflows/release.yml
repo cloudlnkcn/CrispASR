@@ -19,10 +19,11 @@ jobs:
   validate-version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
       - name: Verify VERSION matches tag
         run: |
           tag_version="${{ inputs.tag || github.ref_name }}"
@@ -41,10 +42,11 @@ jobs:
   validate-glint-fresh:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
       - name: Verify in-tree glint matches upstream main
         run: |
           synced="$(sed -n 's/.*Synced at upstream commit: `\([0-9a-f]*\)`.*/\1/p' glint/README.md)"
@@ -63,10 +65,11 @@ jobs:
   build-linux:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
@@ -101,10 +104,11 @@ jobs:
   build-wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Setup emsdk
         uses: mymindstorm/setup-emsdk@v14
@@ -145,10 +149,11 @@ jobs:
   build-linux-x86_64-avx512:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
@@ -192,10 +197,11 @@ jobs:
     env:
       CUDA_VERSION: "12.8.0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
@@ -253,10 +259,11 @@ jobs:
     env:
       CUDA_VERSION: "13.0.0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
@@ -317,10 +324,11 @@ jobs:
       - name: Install git
         run: apt-get update -y && apt-get install -y git
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         # The slim rocm/dev image ships the HIP compiler + runtime but NOT the
@@ -376,10 +384,11 @@ jobs:
       - name: Install git
         run: apt-get update -y && apt-get install -y git
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         # See build-linux-x86_64-hip: the slim rocm/dev image lacks hipBLAS/
@@ -450,10 +459,11 @@ jobs:
   build-linux-x86_64-vulkan:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps + Vulkan SDK
         run: |
@@ -509,10 +519,11 @@ jobs:
   build-linux-arm64:
     runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
@@ -544,10 +555,11 @@ jobs:
   build-python-linux:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ patchelf
@@ -621,10 +633,11 @@ jobs:
   build-python-linux-arm64:
     runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ patchelf
@@ -687,10 +700,11 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Build
         run: |
@@ -730,10 +744,11 @@ jobs:
   build-libs-macos-arm64:
     runs-on: macos-latest # arm64 since macos-13 was retired
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Build (shared libs, Metal + Accelerate)
         # Add Apple Accelerate BLAS so the GPU-not-eligible matmuls fall
@@ -799,10 +814,11 @@ jobs:
   build-libs-linux-x86_64:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev patchelf
@@ -867,10 +883,11 @@ jobs:
   build-libs-linux-x86_64-avx512:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev patchelf
@@ -930,10 +947,11 @@ jobs:
   build-libs-linux-arm64:
     runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev patchelf
@@ -999,10 +1017,11 @@ jobs:
   build-libs-windows-x86_64:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Build (shared libs, CPU)
         run: |
@@ -1063,10 +1082,11 @@ jobs:
   build-libs-windows-x86_64-vulkan:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install Vulkan SDK
         shell: pwsh
@@ -1160,10 +1180,11 @@ jobs:
     env:
       CUDA_VERSION: "12.8.0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ patchelf
@@ -1242,10 +1263,11 @@ jobs:
     env:
       CUDA_VERSION: "12.8.0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install CUDA Toolkit 12.8.0
         uses: Jimver/cuda-toolkit@v0.2.35
@@ -1334,10 +1356,11 @@ jobs:
   build-libs-windows-x86_64-cpu-legacy:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Build (shared libs, CPU legacy SSE4.2)
         run: |
@@ -1389,10 +1412,11 @@ jobs:
   build-windows-cpu:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Build
         run: |
@@ -1429,10 +1453,11 @@ jobs:
   build-windows-cpu-legacy:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Build
         run: |
@@ -1470,10 +1495,11 @@ jobs:
     env:
       CUDA_VERSION: "12.8.0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       # CUDA 12.8 is the minimum that ships sm_120 SASS for Blackwell
       # consumer GPUs (RTX 50xx). Earlier toolkits (12.4 etc.) only know
@@ -1530,10 +1556,11 @@ jobs:
   build-windows-vulkan:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install Vulkan SDK
         shell: pwsh
@@ -1607,10 +1634,11 @@ jobs:
   build-android-arm64:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Set up NDK
         uses: nttld/setup-ndk@v1
@@ -1679,10 +1707,10 @@ jobs:
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
