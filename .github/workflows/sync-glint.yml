@@ -1,13 +1,10 @@
 name: Sync glint
 
 # Keeps the in-tree glint/ encoder copy current with
-# github.com/CrispStrobe/glint so releases always ship the latest
-# committed glint. Triggered by:
-#   - repository_dispatch "glint-push" (sent by glint's notify-crispasr
-#     workflow on every push to its main — needs a CRISPASR_SYNC_PAT
-#     secret over there)
-#   - a daily schedule (fallback when the dispatch secret is absent)
-#   - manual workflow_dispatch
+# github.com/CrispStrobe/glint. Manual only — run via workflow_dispatch
+# when you want to pull the latest committed glint. (The daily schedule
+# and repository_dispatch auto-sync were removed: this fork syncs glint
+# by hand so releases follow the fork's own rhythm, not upstream's.)
 #
 # A sync commit is only pushed after the MP3/AAC provenance unit tests
 # pass against the new sources. Note: pushes made with the default
@@ -15,10 +12,6 @@ name: Sync glint
 # secret in this repo if you want sync commits to run CI too.
 
 on:
-  repository_dispatch:
-    types: [glint-push]
-  schedule:
-    - cron: '17 4 * * *'
   workflow_dispatch:
 
 concurrency:
