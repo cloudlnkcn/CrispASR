@@ -18,6 +18,16 @@
 //   GET  /v1/voices                   — list voices in --voice-dir (CAP_TTS only)
 //   POST /v1/voices                   — upload voice file (multipart, CAP_TTS only)
 //   DELETE /v1/voices/:name           — delete voice file (CAP_TTS only)
+//   GET  /v1/speakers                 — list enrolled speaker voiceprints
+//   POST /v1/speakers                 — enroll a speaker voiceprint (multipart audio)
+//   DELETE /v1/speakers/:name         — delete a speaker voiceprint
+//   POST /v1/speakers/match           — 1:N identify a speaker from audio
+//   GET  /v1/speakers/libraries       — list voiceprint sub-libraries
+//   POST /v1/speakers/libraries/:name — create an empty sub-library
+//   DELETE /v1/speakers/libraries/:name — remove a sub-library + its profiles
+//   POST /v1/speakers/enroll-from-segment — enroll from a recording + time range
+//   GET  /v1/speakers/export          — export a library (base64 JSON)
+//   POST /v1/speakers/import          — import voiceprints (base64 JSON)
 //
 // Adapted from examples/server/server.cpp for multi-backend support.
 
@@ -25,6 +35,7 @@
 #include "crispasr_diarize_cli.h"
 #include "crispasr_gap_fill.h"
 #include "crispasr_speaker_embedder.h"
+#include "speaker_db.h"             // speaker_db_{load,match,enroll,count} — voiceprint DB
 #include "crispasr_lid.h"
 #include "crispasr_lid_cli.h"
 #include "crispasr_output.h"
@@ -72,6 +83,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -573,6 +585,64 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                     crispasr_remap_speakers_via_embeddings(result.segs, pcmf32.data(), n_samples, embedder.get(), rp);
                 }
             }
+
+            // Named-speaker identification (speaker_db 1:N match). When a
+            // voiceprint DB is configured (--speaker-db + --speaker-db-consent),
+            // each diarized cluster is matched against enrolled profiles and,
+            // on a hit, the anonymous "(speaker N) " label is replaced with the
+            // enrolled name "(<name>) ". Unmatched clusters keep their anonymous
+            // label. This runs *after* clustering so each cluster is identified
+            // once (per-segment matching is noisier and slower). Mirrors the
+            // CLI path in crispasr_run.cpp:887-913 but operates per-cluster.
+            if (!rp.speaker_db.empty() && rp.speaker_db_consent && !pcmf32.empty()) {
+                speaker_db* spk_db = speaker_db_load(rp.speaker_db.c_str());
+                if (spk_db && speaker_db_count(spk_db) > 0) {
+                    // Resolve the embedder used for clustering (same model so
+                    // embeddings are comparable to the enrolled ones).
+                    std::string emb_spec = rp.diarize_embedder.empty() ? "auto" : rp.diarize_embedder;
+                    auto match_embedder = crispasr_make_speaker_embedder(emb_spec, rp.n_threads, rp.cache_dir);
+                    if (match_embedder) {
+                        const int dim = match_embedder->dim();
+                        // Collect unique cluster labels and their segment ranges.
+                        // Labels are the raw "(speaker N) " strings assigned above.
+                        std::map<std::string, std::vector<std::pair<int64_t, int64_t>>> cluster_ranges;
+                        for (const auto& seg : result.segs) {
+                            if (!seg.speaker.empty())
+                                cluster_ranges[seg.speaker].push_back({seg.t0, seg.t1});
+                        }
+                        for (const auto& [label, ranges] : cluster_ranges) {
+                            // Gather + concatenate this cluster's PCM (centiseconds → 16 kHz samples).
+                            std::vector<float> cluster_pcm;
+                            for (const auto& [t0_cs, t1_cs] : ranges) {
+                                int64_t s = t0_cs * 160; // 1 cs = 10 ms = 160 samples @16kHz
+                                int64_t e = t1_cs * 160;
+                                if (s < 0) s = 0;
+                                if (e > n_samples) e = n_samples;
+                                if (e > s)
+                                    cluster_pcm.insert(cluster_pcm.end(), pcmf32.begin() + s, pcmf32.begin() + e);
+                            }
+                            if (cluster_pcm.size() < (size_t)(0.3f * 16000.0f))
+                                continue; // too little audio for a stable embedding
+                            std::vector<float> emb(dim);
+                            if (!match_embedder->embed(cluster_pcm.data(), (int)cluster_pcm.size(), emb.data()))
+                                continue;
+                            float score = 0.0f;
+                            const char* name =
+                                speaker_db_match(spk_db, emb.data(), dim, rp.speaker_threshold, &score);
+                            if (name) {
+                                const std::string new_label = std::string("(") + name + ") ";
+                                fprintf(stderr, "crispasr-server: identified %s → %s (score %.3f)\n",
+                                        label.c_str(), name, score);
+                                for (auto& seg : result.segs)
+                                    if (seg.speaker == label)
+                                        seg.speaker = new_label;
+                            }
+                        }
+                    }
+                }
+                if (spk_db)
+                    speaker_db_free(spk_db);
+            }
         }
 
         // Punctuation stripping: when `--no-punctuation` / `punctuation=false`
@@ -898,6 +968,22 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.diarize_embedder = form_string(req, "diarize_embedder", rp.diarize_embedder);
         rp.diarize_cluster_threshold = form_float(req, "diarize_cluster_threshold", rp.diarize_cluster_threshold);
         rp.diarize_max_speakers = form_int(req, "diarize_max_speakers", rp.diarize_max_speakers);
+        // Speaker voiceprint identification (named-speaker match after diarize).
+        // Spec resolution (matches resolve_speaker_db used by /v1/speakers/*):
+        //   "" / "default" → launch --speaker-db dir
+        //   bare name      → <speaker_db>/<name> sub-library
+        //   path           → literal
+        {
+            std::string sdb = form_string(req, "speaker_db", "");
+            if (sdb.empty() || sdb == "default") {
+                rp.speaker_db = params.speaker_db;
+            } else if (sdb.find('/') != std::string::npos || sdb.find('\\') != std::string::npos) {
+                rp.speaker_db = sdb;
+            } else {
+                rp.speaker_db = params.speaker_db + "/" + sdb;
+            }
+        }
+        rp.speaker_threshold = form_float(req, "speaker_threshold", params.speaker_threshold);
         rp.vad = form_bool(req, "vad", rp.vad);
         rp.vad_threshold = form_float(req, "vad_threshold", rp.vad_threshold);
         rp.vad_min_speech_duration_ms = form_int(req, "vad_min_speech_duration_ms", rp.vad_min_speech_duration_ms);
@@ -983,6 +1069,12 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //   punctuation      (optional) — true|false, enable punctuation restoration
     //   diarize          (optional) — true|false, enable speaker diarization
     //   diarize_method   (optional) — energy|xcorr|vad-turns|pyannote|sherpa
+    //   diarize_embedder (optional) — speaker embedding model ("auto"/"titanet"/"ecapa"/<path.gguf>)
+    //   diarize_cluster_threshold (optional) — cosine merge threshold for clustering
+    //   diarize_max_speakers (optional) — cap on diarized speakers (default 8)
+    //   speaker_db       (optional) — path to .spkr voiceprint dir; replaces anonymous
+    //                                  "(speaker N)" labels with enrolled names when matched
+    //   speaker_threshold(optional) — cosine similarity threshold for voiceprint match (default 0.7)
     //   vad              (optional) — true|false, enable VAD pre-processing
     //   vad_threshold    (optional) — VAD speech probability threshold
     //   hotwords         (optional) — comma-separated hotword list
@@ -1057,6 +1149,22 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.diarize_embedder = form_string(req, "diarize_embedder", rp.diarize_embedder);
         rp.diarize_cluster_threshold = form_float(req, "diarize_cluster_threshold", rp.diarize_cluster_threshold);
         rp.diarize_max_speakers = form_int(req, "diarize_max_speakers", rp.diarize_max_speakers);
+        // Speaker voiceprint identification (named-speaker match after diarize).
+        // Spec resolution (matches resolve_speaker_db used by /v1/speakers/*):
+        //   "" / "default" → launch --speaker-db dir
+        //   bare name      → <speaker_db>/<name> sub-library
+        //   path           → literal
+        {
+            std::string sdb = form_string(req, "speaker_db", "");
+            if (sdb.empty() || sdb == "default") {
+                rp.speaker_db = params.speaker_db;
+            } else if (sdb.find('/') != std::string::npos || sdb.find('\\') != std::string::npos) {
+                rp.speaker_db = sdb;
+            } else {
+                rp.speaker_db = params.speaker_db + "/" + sdb;
+            }
+        }
+        rp.speaker_threshold = form_float(req, "speaker_threshold", params.speaker_threshold);
         rp.vad = form_bool(req, "vad", rp.vad);
         rp.vad_threshold = form_float(req, "vad_threshold", rp.vad_threshold);
         rp.vad_min_speech_duration_ms = form_int(req, "vad_min_speech_duration_ms", rp.vad_min_speech_duration_ms);
@@ -2175,6 +2283,732 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         resp["deleted"] = voice_name;
         res.set_content(resp.dump(), "application/json");
         fprintf(stderr, "crispasr-server: deleted voice '%s'\n", voice_name.c_str());
+    });
+
+    // -----------------------------------------------------------------------
+    // Speaker voiceprint management endpoints (speaker identification).
+    //
+    // These complement the anonymous diarization labels produced by
+    // diarize=true (which only yields "(speaker N)"/"A"/"B"…). A persistent
+    // .spkr voiceprint DB lets enrolled speakers be identified *by name* in
+    // subsequent transcriptions (when speaker_db is passed to the
+    // transcription request).
+    //
+    // Storage: <speaker_db>/<name>.spkr (see src/speaker_db.h for the binary
+    // format — magic "SPKR" + dim + L2-normalized TitaNet/ECAPA embedding).
+    //
+    // Consent gate: biometric identification (GDPR Art. 9) requires the
+    // deployer to affirm --speaker-db-consent at server launch. Without it,
+    // enroll returns 403 and transcription silently keeps anonymous labels.
+    // -----------------------------------------------------------------------
+
+    // Process-wide cached embedder + db handle (built lazily on first use).
+    // The TitaNet model load (~46 MB) is slow (~1s) but amortised across all
+    // enroll/match calls. The mutex serialises concurrent first-touch.
+    static std::mutex speaker_embedder_mutex;
+    static std::unique_ptr<CrispasrSpeakerEmbedder> speaker_embedder;
+    static speaker_db* speaker_db_cache = nullptr;
+    static std::string speaker_db_cache_dir;
+
+    auto ensure_speaker_embedder = [&]() -> CrispasrSpeakerEmbedder* {
+        std::lock_guard<std::mutex> lk(speaker_embedder_mutex);
+        if (speaker_embedder)
+            return speaker_embedder.get();
+        // Resolve embedder spec: prefer --diarize-embedder (a concrete .gguf
+        // path kyserai provisions), fall back to --titanet-model, else "auto".
+        // Using a concrete path avoids the HF auto-download so enroll/match
+        // work fully offline once the model is cached.
+        std::string spec;
+        if (!params.diarize_embedder.empty())
+            spec = params.diarize_embedder;
+        else if (!params.titanet_model.empty())
+            spec = params.titanet_model;
+        else
+            spec = "auto";
+        speaker_embedder = crispasr_make_speaker_embedder(spec, params.n_threads, params.cache_dir);
+        if (speaker_embedder) {
+            fprintf(stderr, "crispasr-server: speaker embedder loaded (%s, %d-d)\n",
+                    speaker_embedder->name(), speaker_embedder->dim());
+        }
+        return speaker_embedder.get();
+    };
+
+    // Reload the speaker_db cache when the on-disk directory changes (new
+    // enroll/delete). Compared by directory path; a stale cache is freed and
+    // reloaded so new/removed profiles take effect.
+    auto ensure_speaker_db = [&](const std::string& dir) -> speaker_db* {
+        std::lock_guard<std::mutex> lk(speaker_embedder_mutex);
+        if (speaker_db_cache && speaker_db_cache_dir == dir && !dir.empty())
+            return speaker_db_cache;
+        if (speaker_db_cache) {
+            speaker_db_free(speaker_db_cache);
+            speaker_db_cache = nullptr;
+        }
+        speaker_db_cache_dir = dir;
+        if (dir.empty())
+            return nullptr;
+        speaker_db_cache = speaker_db_load(dir.c_str());
+        return speaker_db_cache;
+    };
+
+    // Resolve a speaker_db specifier to a concrete directory path:
+    //   "" or "default" → the server's launch --speaker-db directory
+    //   "meeting-q3"    → <speaker_db>/<name> (a named sub-library)
+    //   "/abs/path"     → the literal path (advanced/external)
+    // Returns "" when no speaker_db is configured at all.
+    auto resolve_speaker_db = [&](const std::string& spec) -> std::string {
+        if (params.speaker_db.empty())
+            return "";
+        if (spec.empty() || spec == "default")
+            return params.speaker_db;
+        // Absolute/relative path → use as-is.
+        if (spec.find('/') != std::string::npos || spec.find('\\') != std::string::npos)
+            return spec;
+        // Bare name → sub-library under the root speaker_db dir.
+        return params.speaker_db + "/" + spec;
+    };
+
+    // Invalidate the db cache (called after enroll/delete so the next match
+    // reloads from disk). Scoped to the current resolved directory.
+    auto invalidate_speaker_db_cache = [&]() {
+        std::lock_guard<std::mutex> lk(speaker_embedder_mutex);
+        if (speaker_db_cache) {
+            speaker_db_free(speaker_db_cache);
+            speaker_db_cache = nullptr;
+        }
+    };
+
+    // -----------------------------------------------------------------------
+    // GET /v1/speakers — list enrolled speaker voiceprints
+    // Returns: {"speakers": [{"name","dim","size_bytes"}], "count": N}
+    // -----------------------------------------------------------------------
+    svr.Get("/v1/speakers", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        std::string db_dir = resolve_speaker_db(req.has_param("library") ? req.get_param_value("library") : "");
+        if (db_dir.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured; cannot list voiceprints");
+            return;
+        }
+
+        nlohmann::json speakers = nlohmann::json::array();
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(db_dir, ec)) {
+            if (ec)
+                break;
+            if (!entry.is_regular_file())
+                continue;
+            if (entry.path().extension() != ".spkr")
+                continue;
+            // Read dim from the .spkr header (magic[4] + version[4] + dim[4]).
+            uint32_t dim = 0;
+            std::ifstream f(entry.path(), std::ios::binary);
+            if (f) {
+                char magic[4];
+                uint32_t ver = 0;
+                f.read(magic, 4);
+                f.read(reinterpret_cast<char*>(&ver), 4);
+                f.read(reinterpret_cast<char*>(&dim), 4);
+            }
+            speakers.push_back({
+                {"name", entry.path().stem().string()},
+                {"dim", (int)dim},
+                {"size_bytes", (uintmax_t)entry.file_size(ec)}
+            });
+        }
+
+        nlohmann::json resp;
+        resp["speakers"] = std::move(speakers);
+        resp["count"] = resp["speakers"].size();
+        resp["library"] = req.has_param("library") ? req.get_param_value("library") : "default";
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    // -----------------------------------------------------------------------
+    // POST /v1/speakers — enroll a speaker voiceprint
+    //   multipart: "name" (required), "file" (audio, required),
+    //              "embedder" (optional, defaults to params.titanet_model/"auto")
+    //   ?force=true to overwrite an existing profile.
+    // Returns 201: {"name","dim","duration_sec","stored":true}
+    // -----------------------------------------------------------------------
+    svr.Post("/v1/speakers", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        std::string db_dir = resolve_speaker_db(req.has_file("library") ? req.get_file_value("library").content
+                                                                          : (req.has_param("library") ? req.get_param_value("library") : ""));
+        if (db_dir.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured; cannot enroll voiceprints");
+            return;
+        }
+        if (!params.speaker_db_consent) {
+            json_error(res, 403,
+                       "speaker enrollment is biometric identification (GDPR Art. 9); "
+                       "restart the server with --speaker-db-consent to affirm a lawful basis",
+                       "consent_required");
+            return;
+        }
+        if (!req.has_file("file")) {
+            json_error(res, 400, "missing multipart 'file' audio field");
+            return;
+        }
+
+        const auto& audio_file = req.get_file_value("file");
+        std::string spk_name;
+        if (req.has_file("name")) {
+            spk_name = req.get_file_value("name").content;
+        } else if (!audio_file.filename.empty()) {
+            spk_name = std::filesystem::path(audio_file.filename).stem().string();
+        }
+        if (spk_name.empty()) {
+            json_error(res, 400, "cannot derive speaker name; provide a 'name' form field");
+            return;
+        }
+        // Validate: alphanumeric, dash, underscore only (prevents path traversal).
+        for (char c : spk_name) {
+            if (!std::isalnum((unsigned char)c) && c != '-' && c != '_') {
+                json_error(res, 400, "speaker name must match [a-zA-Z0-9_-]+");
+                return;
+            }
+        }
+
+        // Ensure the (sub-)library directory exists (creates on first enroll).
+        std::error_code mk_ec;
+        std::filesystem::create_directories(db_dir, mk_ec);
+
+        std::string dest = db_dir + "/" + spk_name + ".spkr";
+        if (std::filesystem::exists(dest) && !req.has_param("force")) {
+            json_error(res, 409, "speaker '" + spk_name + "' already exists; add ?force=true to overwrite");
+            return;
+        }
+
+        // Decode audio → mono 16 kHz float PCM (same path as transcription).
+        std::string tmp_path =
+            write_temp_audio(audio_file.content.data(), audio_file.content.size(), audio_file.filename);
+        if (tmp_path.empty()) {
+            json_error(res, 500, "failed to create temporary file for audio");
+            return;
+        }
+        std::vector<float> pcmf32;
+        std::vector<std::vector<float>> pcmf32s;
+        bool ok = read_audio_data(tmp_path, pcmf32, pcmf32s, false);
+        std::remove(tmp_path.c_str());
+        if (!ok || pcmf32.empty()) {
+            json_error(res, 400, "failed to decode audio or audio is silent");
+            return;
+        }
+        // Require at least ~1.5 s of audio for a usable embedding.
+        const int min_samples = (int)(1.5f * 16000.0f);
+        if ((int)pcmf32.size() < min_samples) {
+            json_error(res, 400, "audio too short for a reliable voiceprint; provide at least ~1.5 s");
+            return;
+        }
+
+        // Extract embedding via the cached embedder (loads TitaNet on first call).
+        CrispasrSpeakerEmbedder* emb = ensure_speaker_embedder();
+        if (!emb) {
+            json_error(res, 500, "failed to load speaker embedding model (TitaNet/ECAPA)");
+            return;
+        }
+        std::vector<float> embedding(emb->dim());
+        if (!emb->embed(pcmf32.data(), (int)pcmf32.size(), embedding.data())) {
+            json_error(res, 500, "failed to extract speaker embedding from audio");
+            return;
+        }
+
+        // Persist the voiceprint to the resolved (sub-)library directory.
+        if (!speaker_db_enroll(db_dir.c_str(), spk_name.c_str(), embedding.data(), emb->dim())) {
+            json_error(res, 500, "failed to write voiceprint file");
+            return;
+        }
+        // Invalidate the db cache so the next transcription/match sees the new profile.
+        invalidate_speaker_db_cache();
+
+        nlohmann::json resp;
+        resp["name"] = spk_name;
+        resp["dim"] = emb->dim();
+        resp["duration_sec"] = (double)pcmf32.size() / 16000.0;
+        resp["stored"] = true;
+        resp["library"] = req.has_file("library") ? req.get_file_value("library").content
+                  : (req.has_param("library") ? req.get_param_value("library") : "default");
+        res.status = 201;
+        res.set_content(resp.dump(), "application/json");
+        fprintf(stderr, "crispasr-server: enrolled speaker '%s' (%d-d, %.2fs)\n", spk_name.c_str(),
+                emb->dim(), (double)pcmf32.size() / 16000.0);
+    });
+
+    // -----------------------------------------------------------------------
+    // DELETE /v1/speakers/:name — remove a speaker voiceprint
+    // Returns 200: {"deleted": "<name>"}
+    // -----------------------------------------------------------------------
+    svr.Delete(R"(/v1/speakers/([a-zA-Z0-9_-]+))", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        std::string db_dir = resolve_speaker_db(req.has_param("library") ? req.get_param_value("library") : "");
+        if (db_dir.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured");
+            return;
+        }
+
+        const std::string spk_name = req.matches[1].str();
+        std::string path = db_dir + "/" + spk_name + ".spkr";
+        if (!std::filesystem::exists(path)) {
+            json_error(res, 404, "speaker '" + spk_name + "' not found in library");
+            return;
+        }
+        std::remove(path.c_str());
+        invalidate_speaker_db_cache();
+
+        nlohmann::json resp;
+        resp["deleted"] = spk_name;
+        res.set_content(resp.dump(), "application/json");
+        fprintf(stderr, "crispasr-server: deleted speaker '%s'\n", spk_name.c_str());
+    });
+
+    // -----------------------------------------------------------------------
+    // POST /v1/speakers/match — 1:N identify a speaker from an audio sample
+    //   multipart: "file" (audio), optional "threshold" (default 0.7),
+    //              optional "top_k" (default 1)
+    // Returns: {"matches":[{"name","score"}], "best":{...}|null, "matched":bool}
+    // -----------------------------------------------------------------------
+    svr.Post("/v1/speakers/match", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        std::string db_dir = resolve_speaker_db(req.has_file("library") ? req.get_file_value("library").content
+                                                                          : (req.has_param("library") ? req.get_param_value("library") : ""));
+        if (db_dir.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured");
+            return;
+        }
+        if (!params.speaker_db_consent) {
+            json_error(res, 403,
+                       "speaker matching is biometric identification (GDPR Art. 9); "
+                       "restart the server with --speaker-db-consent",
+                       "consent_required");
+            return;
+        }
+        if (!req.has_file("file")) {
+            json_error(res, 400, "missing multipart 'file' audio field");
+            return;
+        }
+
+        const auto& audio_file = req.get_file_value("file");
+        std::string tmp_path =
+            write_temp_audio(audio_file.content.data(), audio_file.content.size(), audio_file.filename);
+        if (tmp_path.empty()) {
+            json_error(res, 500, "failed to create temporary file for audio");
+            return;
+        }
+        std::vector<float> pcmf32;
+        std::vector<std::vector<float>> pcmf32s;
+        bool ok = read_audio_data(tmp_path, pcmf32, pcmf32s, false);
+        std::remove(tmp_path.c_str());
+        if (!ok || pcmf32.empty()) {
+            json_error(res, 400, "failed to decode audio or audio is silent");
+            return;
+        }
+
+        const float threshold = form_float(req, "threshold", params.speaker_threshold);
+        CrispasrSpeakerEmbedder* emb = ensure_speaker_embedder();
+        if (!emb) {
+            json_error(res, 500, "failed to load speaker embedding model");
+            return;
+        }
+        std::vector<float> embedding(emb->dim());
+        if (!emb->embed(pcmf32.data(), (int)pcmf32.size(), embedding.data())) {
+            json_error(res, 500, "failed to extract speaker embedding");
+            return;
+        }
+
+        speaker_db* db = ensure_speaker_db(db_dir);
+        if (!db || speaker_db_count(db) == 0) {
+            nlohmann::json resp;
+            resp["matches"] = nlohmann::json::array();
+            resp["best"] = nullptr;
+            resp["matched"] = false;
+            res.set_content(resp.dump(), "application/json");
+            return;
+        }
+
+        float score = 0.0f;
+        const char* name = speaker_db_match(db, embedding.data(), emb->dim(), threshold, &score);
+        nlohmann::json matches = nlohmann::json::array();
+        nlohmann::json best = nullptr;
+        bool matched = false;
+        if (name) {
+            matches.push_back({{"name", std::string(name)}, {"score", (double)score}});
+            best = {{"name", std::string(name)}, {"score", (double)score}};
+            matched = true;
+        }
+        nlohmann::json resp;
+        resp["matches"] = std::move(matches);
+        resp["best"] = std::move(best);
+        resp["matched"] = matched;
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    // =======================================================================
+    // Sub-library management (named voiceprint libraries).
+    //
+    // A sub-library is a subdirectory of the root --speaker-db dir, e.g.
+    // <speaker_db>/meeting-q3/*.spkr. This lets users keep separate voiceprint
+    // sets for different contexts (meetings, podcasts, …) and reference them
+    // by name via ?library=<name> on the speaker endpoints above.
+    // =======================================================================
+
+    // GET /v1/speakers/libraries — list sub-libraries (subdirectories).
+    // The root dir itself is reported as "default".
+    svr.Get("/v1/speakers/libraries", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        if (params.speaker_db.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured");
+            return;
+        }
+        nlohmann::json libs = nlohmann::json::array();
+        // Always include the root ("default") library.
+        {
+            int root_count = 0;
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(params.speaker_db, ec))
+                if (e.is_regular_file() && e.path().extension() == ".spkr")
+                    root_count++;
+            libs.push_back({{"name", "default"}, {"count", root_count}});
+        }
+        // List subdirectories as named libraries.
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(params.speaker_db, ec)) {
+            if (ec) break;
+            if (!entry.is_directory())
+                continue;
+            int cnt = 0;
+            for (const auto& e : std::filesystem::directory_iterator(entry.path(), ec))
+                if (e.is_regular_file() && e.path().extension() == ".spkr")
+                    cnt++;
+            libs.push_back({{"name", entry.path().filename().string()}, {"count", cnt}});
+        }
+        nlohmann::json resp;
+        resp["libraries"] = std::move(libs);
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    // POST /v1/speakers/libraries/:name — create an empty named sub-library.
+    svr.Post(R"(/v1/speakers/libraries/([a-zA-Z0-9_-]+))", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        if (params.speaker_db.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured");
+            return;
+        }
+        const std::string lib_name = req.matches[1].str();
+        std::string dir = params.speaker_db + "/" + lib_name;
+        if (std::filesystem::exists(dir)) {
+            json_error(res, 409, "library '" + lib_name + "' already exists");
+            return;
+        }
+        std::error_code mk_ec;
+        std::filesystem::create_directories(dir, mk_ec);
+        if (mk_ec) {
+            json_error(res, 500, "failed to create library directory: " + mk_ec.message());
+            return;
+        }
+        nlohmann::json resp;
+        resp["name"] = lib_name;
+        resp["created"] = true;
+        res.status = 201;
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    // DELETE /v1/speakers/libraries/:name — remove a named sub-library and its profiles.
+    svr.Delete(R"(/v1/speakers/libraries/([a-zA-Z0-9_-]+))", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        if (params.speaker_db.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured");
+            return;
+        }
+        const std::string lib_name = req.matches[1].str();
+        std::string dir = params.speaker_db + "/" + lib_name;
+        if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
+            json_error(res, 404, "library '" + lib_name + "' not found");
+            return;
+        }
+        std::error_code rm_ec;
+        std::filesystem::remove_all(dir, rm_ec);
+        if (rm_ec) {
+            json_error(res, 500, "failed to remove library: " + rm_ec.message());
+            return;
+        }
+        invalidate_speaker_db_cache();
+        nlohmann::json resp;
+        resp["deleted"] = lib_name;
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    // =======================================================================
+    // POST /v1/speakers/enroll-from-segment — enroll from a recording + segment range.
+    //
+    // Convenience for "register this unknown speaker from a finalized transcript":
+    // the client sends the full recording audio + a start/end time range (seconds)
+    // identifying the unknown speaker's speech, and the server extracts the
+    // embedding from that clip and enrolls it. Avoids the client needing to
+    // pre-clip audio.
+    //
+    // multipart: "name" (required), "file" (full recording audio),
+    //            "start" / "end" (seconds, required), optional "library",
+    //            ?force=true to overwrite.
+    // =======================================================================
+    svr.Post("/v1/speakers/enroll-from-segment", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        std::string db_dir = resolve_speaker_db(req.has_file("library") ? req.get_file_value("library").content
+                                                                          : (req.has_param("library") ? req.get_param_value("library") : ""));
+        if (db_dir.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured");
+            return;
+        }
+        if (!params.speaker_db_consent) {
+            json_error(res, 403, "enrollment requires --speaker-db-consent", "consent_required");
+            return;
+        }
+        if (!req.has_file("file") || !req.has_file("name") || !req.has_file("start") || !req.has_file("end")) {
+            json_error(res, 400, "required fields: name, file, start (seconds), end (seconds)");
+            return;
+        }
+        std::string spk_name = req.get_file_value("name").content;
+        for (char c : spk_name) {
+            if (!std::isalnum((unsigned char)c) && c != '-' && c != '_') {
+                json_error(res, 400, "speaker name must match [a-zA-Z0-9_-]+");
+                return;
+            }
+        }
+        double start_sec = 0, end_sec = 0;
+        try {
+            start_sec = std::stod(req.get_file_value("start").content);
+            end_sec = std::stod(req.get_file_value("end").content);
+        } catch (...) {
+            json_error(res, 400, "start/end must be numeric seconds");
+            return;
+        }
+        if (end_sec <= start_sec || start_sec < 0) {
+            json_error(res, 400, "end must be greater than start (both >= 0)");
+            return;
+        }
+
+        const auto& audio_file = req.get_file_value("file");
+        std::string tmp_path =
+            write_temp_audio(audio_file.content.data(), audio_file.content.size(), audio_file.filename);
+        if (tmp_path.empty()) {
+            json_error(res, 500, "failed to create temporary file for audio");
+            return;
+        }
+        std::vector<float> pcmf32;
+        std::vector<std::vector<float>> pcmf32s;
+        bool ok = read_audio_data(tmp_path, pcmf32, pcmf32s, false);
+        std::remove(tmp_path.c_str());
+        if (!ok || pcmf32.empty()) {
+            json_error(res, 400, "failed to decode audio or audio is silent");
+            return;
+        }
+
+        // Clip to the requested [start, end] range (16 kHz samples).
+        int64_t s = (int64_t)(start_sec * 16000.0);
+        int64_t e = (int64_t)(end_sec * 16000.0);
+        if (e > (int64_t)pcmf32.size()) e = (int64_t)pcmf32.size();
+        if (s >= e) {
+            json_error(res, 400, "segment range is outside the recording or empty");
+            return;
+        }
+        // Require at least ~1.5 s of clipped audio for a usable embedding.
+        if (e - s < (int64_t)(1.5f * 16000.0f)) {
+            json_error(res, 400, "segment is too short; provide a range with at least ~1.5 s of speech");
+            return;
+        }
+
+        std::error_code mk_ec;
+        std::filesystem::create_directories(db_dir, mk_ec);
+        std::string dest = db_dir + "/" + spk_name + ".spkr";
+        if (std::filesystem::exists(dest) && !req.has_param("force")) {
+            json_error(res, 409, "speaker '" + spk_name + "' already exists; add ?force=true to overwrite");
+            return;
+        }
+
+        CrispasrSpeakerEmbedder* emb = ensure_speaker_embedder();
+        if (!emb) {
+            json_error(res, 500, "failed to load speaker embedding model");
+            return;
+        }
+        std::vector<float> embedding(emb->dim());
+        if (!emb->embed(pcmf32.data() + s, (int)(e - s), embedding.data())) {
+            json_error(res, 500, "failed to extract speaker embedding from segment");
+            return;
+        }
+        if (!speaker_db_enroll(db_dir.c_str(), spk_name.c_str(), embedding.data(), emb->dim())) {
+            json_error(res, 500, "failed to write voiceprint file");
+            return;
+        }
+        invalidate_speaker_db_cache();
+
+        nlohmann::json resp;
+        resp["name"] = spk_name;
+        resp["dim"] = emb->dim();
+        resp["segment_start"] = start_sec;
+        resp["segment_end"] = end_sec;
+        resp["stored"] = true;
+        res.status = 201;
+        res.set_content(resp.dump(), "application/json");
+        fprintf(stderr, "crispasr-server: enrolled speaker '%s' from segment [%.2f-%.2f] s (%d-d)\n",
+                spk_name.c_str(), start_sec, end_sec, emb->dim());
+    });
+
+    // =======================================================================
+    // Export / import voiceprints (base64-encoded JSON — no zip dependency).
+    //
+    // .spkr files are tiny (~800 B each for 192-d), so a JSON manifest with
+    // base64-encoded file contents is compact and portable. Importantly this
+    // format is self-contained: names + embeddings, no machine-specific paths.
+    // =======================================================================
+
+    // GET /v1/speakers/export?library=<name> — export a library as JSON.
+    // Returns: {"library","speakers":[{"name","dim","data(base64)"}]}
+    svr.Get("/v1/speakers/export", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        std::string db_dir = resolve_speaker_db(req.has_param("library") ? req.get_param_value("library") : "");
+        if (db_dir.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured");
+            return;
+        }
+        auto b64encode = [](const std::string& in) -> std::string {
+            static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string out;
+            out.reserve(((in.size() + 2) / 3) * 4);
+            size_t i = 0;
+            for (; i + 2 < in.size(); i += 3) {
+                unsigned v = (unsigned char)in[i] << 16 | (unsigned char)in[i + 1] << 8 | (unsigned char)in[i + 2];
+                out.push_back(T[(v >> 18) & 63]);
+                out.push_back(T[(v >> 12) & 63]);
+                out.push_back(T[(v >> 6) & 63]);
+                out.push_back(T[v & 63]);
+            }
+            if (i < in.size()) {
+                unsigned v = (unsigned char)in[i] << 16;
+                if (i + 1 < in.size())
+                    v |= (unsigned char)in[i + 1] << 8;
+                out.push_back(T[(v >> 18) & 63]);
+                out.push_back(T[(v >> 12) & 63]);
+                out.push_back(i + 1 < in.size() ? T[(v >> 6) & 63] : '=');
+                out.push_back('=');
+            }
+            return out;
+        };
+
+        nlohmann::json speakers = nlohmann::json::array();
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(db_dir, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file() || entry.path().extension() != ".spkr")
+                continue;
+            std::ifstream f(entry.path(), std::ios::binary);
+            std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            uint32_t dim = 0;
+            if (content.size() >= 12)
+                memcpy(&dim, content.data() + 8, 4);
+            speakers.push_back({
+                {"name", entry.path().stem().string()},
+                {"dim", (int)dim},
+                {"data", b64encode(content)}
+            });
+        }
+        nlohmann::json resp;
+        resp["library"] = req.has_param("library") ? req.get_param_value("library") : "default";
+        resp["speakers"] = std::move(speakers);
+        resp["count"] = resp["speakers"].size();
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    // POST /v1/speakers/import — import voiceprints from an export JSON.
+    // Body: the JSON produced by /export ({"speakers":[{"name","data(base64)}]}),
+    //       optional "library" field/query to target a sub-library.
+    //       ?force=true to overwrite existing.
+    // Returns: {"imported": N, "skipped": N}
+    svr.Post("/v1/speakers/import", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        std::string db_dir = resolve_speaker_db(req.has_param("library") ? req.get_param_value("library") : "");
+        if (db_dir.empty()) {
+            json_error(res, 400, "server has no --speaker-db configured");
+            return;
+        }
+        if (!params.speaker_db_consent) {
+            json_error(res, 403, "import requires --speaker-db-consent", "consent_required");
+            return;
+        }
+        nlohmann::json body;
+        try {
+            body = nlohmann::json::parse(req.body);
+        } catch (...) {
+            json_error(res, 400, "invalid JSON body; expected the output of GET /export");
+            return;
+        }
+        if (!body.contains("speakers") || !body["speakers"].is_array()) {
+            json_error(res, 400, "JSON body must contain a 'speakers' array");
+            return;
+        }
+
+        // base64 decode (tolerant of padding).
+        auto b64decode = [](const std::string& in) -> std::string {
+            static const char kEnc[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            int8_t T[256];
+            memset(T, -1, sizeof(T));
+            for (int i = 0; i < 64; i++)
+                T[(unsigned char)kEnc[i]] = (int8_t)i;
+            std::string out;
+            out.reserve(in.size() * 3 / 4);
+            int val = 0, bits = 0;
+            for (char c : in) {
+                if (c == '=') break;
+                int8_t t = T[(unsigned char)c];
+                if (t < 0) continue; // skip non-b64 (whitespace/newlines)
+                val = (val << 6) | t;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    out.push_back((char)((val >> bits) & 0xFF));
+                }
+            }
+            return out;
+        };
+
+        std::error_code mk_ec;
+        std::filesystem::create_directories(db_dir, mk_ec);
+        bool force = req.has_param("force");
+        int imported = 0, skipped = 0;
+        for (const auto& spk : body["speakers"]) {
+            if (!spk.contains("name") || !spk.contains("data"))
+                continue;
+            std::string name = spk["name"].get<std::string>();
+            // Validate name.
+            bool valid = !name.empty();
+            for (char c : name)
+                if (!std::isalnum((unsigned char)c) && c != '-' && c != '_') { valid = false; break; }
+            if (!valid) { skipped++; continue; }
+            std::string path = db_dir + "/" + name + ".spkr";
+            if (std::filesystem::exists(path) && !force) { skipped++; continue; }
+            std::string content = b64decode(spk["data"].get<std::string>());
+            // Basic format sanity: magic "SPKR" + at least 12-byte header.
+            if (content.size() < 12 || content.compare(0, 4, "SPKR") != 0) { skipped++; continue; }
+            std::ofstream f(path, std::ios::binary);
+            if (!f) { skipped++; continue; }
+            f.write(content.data(), (std::streamsize)content.size());
+            imported++;
+        }
+        invalidate_speaker_db_cache();
+        nlohmann::json resp;
+        resp["imported"] = imported;
+        resp["skipped"] = skipped;
+        res.set_content(resp.dump(), "application/json");
+        fprintf(stderr, "crispasr-server: imported %d voiceprints (%d skipped)\n", imported, skipped);
     });
 
     // -----------------------------------------------------------------------
