@@ -221,6 +221,25 @@ static std::string trim_copy(std::string v) {
     return v;
 }
 
+// Validate a speaker/library name for filesystem safety while allowing
+// Unicode letters (e.g. Chinese, Japanese). The name is used as a filename
+// (`<name>.spkr`), so we block path separators, control characters, the
+// path-traversal sequence "..", and leading dots (hidden files). ASCII
+// letters/digits and '-'/'_' always pass; any byte >= 0x80 is treated as
+// part of a multibyte UTF-8 character and allowed (it cannot form a path
+// separator or traversal on its own).
+static bool is_safe_name(const std::string& name) {
+    if (name.empty()) return false;
+    if (name.find("..") != std::string::npos) return false;        // path traversal
+    for (unsigned char c : name) {
+        if (c == '/' || c == '\\') return false;                   // path separators
+        if (c < 0x20 || c == 0x7F) return false;                   // control characters
+        if (c == ' ') return false;                                // no spaces in filenames
+    }
+    if (name.front() == '.') return false;                         // no hidden-file names
+    return true;
+}
+
 static std::vector<std::string> split_api_keys(const std::string& csv) {
     std::vector<std::string> keys;
     std::stringstream ss(csv);
@@ -2463,12 +2482,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             json_error(res, 400, "cannot derive speaker name; provide a 'name' form field");
             return;
         }
-        // Validate: alphanumeric, dash, underscore only (prevents path traversal).
-        for (char c : spk_name) {
-            if (!std::isalnum((unsigned char)c) && c != '-' && c != '_') {
-                json_error(res, 400, "speaker name must match [a-zA-Z0-9_-]+");
-                return;
-            }
+        // Validate name for filesystem safety (allows Unicode letters such as
+        // Chinese names; blocks path separators, control chars, "..", spaces).
+        if (!is_safe_name(spk_name)) {
+            json_error(res, 400, "speaker name contains invalid characters (no spaces, slashes, or '..')");
+            return;
         }
 
         // Ensure the (sub-)library directory exists (creates on first enroll).
@@ -2540,7 +2558,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // DELETE /v1/speakers/:name — remove a speaker voiceprint
     // Returns 200: {"deleted": "<name>"}
     // -----------------------------------------------------------------------
-    svr.Delete(R"(/v1/speakers/([a-zA-Z0-9_-]+))", [&](const Request& req, Response& res) {
+    svr.Delete(R"(/v1/speakers/([^/]+))", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
         std::string db_dir = resolve_speaker_db(req.has_param("library") ? req.get_param_value("library") : "");
@@ -2550,6 +2568,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
 
         const std::string spk_name = req.matches[1].str();
+        if (!is_safe_name(spk_name)) {
+            json_error(res, 400, "speaker name contains invalid characters (no spaces, slashes, or '..')");
+            return;
+        }
         std::string path = db_dir + "/" + spk_name + ".spkr";
         if (!std::filesystem::exists(path)) {
             json_error(res, 404, "speaker '" + spk_name + "' not found in library");
@@ -2775,11 +2797,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             return;
         }
         std::string spk_name = req.get_file_value("name").content;
-        for (char c : spk_name) {
-            if (!std::isalnum((unsigned char)c) && c != '-' && c != '_') {
-                json_error(res, 400, "speaker name must match [a-zA-Z0-9_-]+");
-                return;
-            }
+        if (!is_safe_name(spk_name)) {
+            json_error(res, 400, "speaker name contains invalid characters (no spaces, slashes, or '..')");
+            return;
         }
         double start_sec = 0, end_sec = 0;
         try {
