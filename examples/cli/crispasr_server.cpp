@@ -240,6 +240,75 @@ static bool is_safe_name(const std::string& name) {
     return true;
 }
 
+// Validate a human-readable display name (e.g. Chinese "张三"). Unlike
+// is_safe_name, this is NOT used as a filename, so spaces and most Unicode
+// are allowed. We only block control characters, NUL bytes, and impose a
+// sane length cap. Newlines/tabs are also rejected.
+static bool is_safe_display_name(const std::string& name) {
+    if (name.empty()) return false;
+    if (name.size() > 128) return false;                           // length cap
+    for (unsigned char c : name) {
+        if (c == 0 || c < 0x20 || c == 0x7F) return false;         // control chars
+    }
+    return true;
+}
+
+// ── Speaker display_name sidecar metadata ──
+// Stored as <db_dir>/<name>.meta.json alongside each <name>.spkr file.
+// The .spkr binary format is intentionally untouched (C ABI + tests depend on
+// it); display_name lives in this sidecar so it can be shared across clients.
+// Format: { "display_name": "张三" }
+
+static std::string speaker_meta_path(const std::string& db_dir, const std::string& name) {
+    return db_dir + "/" + name + ".meta.json";
+}
+
+// Read a speaker's display_name from its sidecar. Returns "" if missing or
+// unreadable (caller treats empty as "no display_name").
+static std::string read_display_name(const std::string& db_dir, const std::string& name) {
+    std::string path = speaker_meta_path(db_dir, name);
+    std::ifstream f(path);
+    if (!f)
+        return "";
+    try {
+        nlohmann::json j;
+        f >> j;
+        if (j.is_object() && j.contains("display_name") && j["display_name"].is_string())
+            return j["display_name"].get<std::string>();
+    } catch (...) {
+        // Corrupt sidecar — ignore, fall back to no display_name.
+    }
+    return "";
+}
+
+// Persist a speaker's display_name to its sidecar. Empty display_name removes
+// the sidecar (keeps the directory clean when name == display_name or unset).
+static void write_display_name(const std::string& db_dir, const std::string& name,
+                               const std::string& display_name) {
+    std::string path = speaker_meta_path(db_dir, name);
+    if (display_name.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return;
+    }
+    try {
+        nlohmann::json j;
+        j["display_name"] = display_name;
+        std::ofstream f(path);
+        if (f)
+            f << j.dump();
+    } catch (...) {
+        // Non-fatal: enrollment of the embedding already succeeded.
+        fprintf(stderr, "speaker_db: cannot write display_name sidecar %s\n", path.c_str());
+    }
+}
+
+// Remove a speaker's display_name sidecar (called on speaker deletion).
+static void remove_display_name(const std::string& db_dir, const std::string& name) {
+    std::error_code ec;
+    std::filesystem::remove(speaker_meta_path(db_dir, name), ec);
+}
+
 static std::vector<std::string> split_api_keys(const std::string& csv) {
     std::vector<std::string> keys;
     std::stringstream ss(csv);
@@ -2434,6 +2503,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 {"dim", (int)dim},
                 {"size_bytes", (uintmax_t)entry.file_size(ec)}
             });
+            // Attach display_name from sidecar if present (cross-device shared name).
+            std::string dn = read_display_name(db_dir, entry.path().stem().string());
+            if (!dn.empty())
+                speakers.back()["display_name"] = dn;
         }
 
         nlohmann::json resp;
@@ -2489,6 +2562,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             return;
         }
 
+        // Optional human-readable display name (e.g. Chinese "张三"). Stored in
+        // a sidecar so it can be shared across clients; the .spkr filename
+        // keeps using the ASCII spk_key. Invalid values are ignored (empty).
+        std::string display_name = form_string(req, "display_name", "");
+        if (!display_name.empty() && !is_safe_display_name(display_name))
+            display_name.clear();
+
         // Ensure the (sub-)library directory exists (creates on first enroll).
         std::error_code mk_ec;
         std::filesystem::create_directories(db_dir, mk_ec);
@@ -2538,11 +2618,15 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             json_error(res, 500, "failed to write voiceprint file");
             return;
         }
+        // Persist display_name sidecar (cross-device shared name).
+        write_display_name(db_dir, spk_name, display_name);
         // Invalidate the db cache so the next transcription/match sees the new profile.
         invalidate_speaker_db_cache();
 
         nlohmann::json resp;
         resp["name"] = spk_name;
+        if (!display_name.empty())
+            resp["display_name"] = display_name;
         resp["dim"] = emb->dim();
         resp["duration_sec"] = (double)pcmf32.size() / 16000.0;
         resp["stored"] = true;
@@ -2578,6 +2662,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             return;
         }
         std::remove(path.c_str());
+        remove_display_name(db_dir, spk_name);   // also drop the display_name sidecar
         invalidate_speaker_db_cache();
 
         nlohmann::json resp;
@@ -2657,8 +2742,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         nlohmann::json best = nullptr;
         bool matched = false;
         if (name) {
-            matches.push_back({{"name", std::string(name)}, {"score", (double)score}});
-            best = {{"name", std::string(name)}, {"score", (double)score}};
+            std::string matched_name(name);
+            std::string dn = read_display_name(db_dir, matched_name);
+            nlohmann::json m = {{"name", matched_name}, {"score", (double)score}};
+            if (!dn.empty())
+                m["display_name"] = dn;
+            matches.push_back(m);
+            best = m;
             matched = true;
         }
         nlohmann::json resp;
@@ -2801,6 +2891,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             json_error(res, 400, "speaker name contains invalid characters (no spaces, slashes, or '..')");
             return;
         }
+        // Optional human-readable display name (see enroll handler).
+        std::string display_name = form_string(req, "display_name", "");
+        if (!display_name.empty() && !is_safe_display_name(display_name))
+            display_name.clear();
         double start_sec = 0, end_sec = 0;
         try {
             start_sec = std::stod(req.get_file_value("start").content);
@@ -2866,10 +2960,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             json_error(res, 500, "failed to write voiceprint file");
             return;
         }
+        write_display_name(db_dir, spk_name, display_name);
         invalidate_speaker_db_cache();
 
         nlohmann::json resp;
         resp["name"] = spk_name;
+        if (!display_name.empty())
+            resp["display_name"] = display_name;
         resp["dim"] = emb->dim();
         resp["segment_start"] = start_sec;
         resp["segment_end"] = end_sec;
