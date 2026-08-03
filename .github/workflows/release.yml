@@ -662,8 +662,11 @@ jobs:
         # Level-Zero loader）进 lib/，patchelf 设 RPATH=$ORIGIN/lib，
         # tarball 解压即用、目标机无需安装 oneAPI。与 Vulkan job 同款做法。
         run: |
-          set -euo pipefail
+          # 必须先 source setvars.sh 再开 `set -u`：Intel 的 vars.sh 内部会
+          # 引用未设默认值的 OCL_ICD_FILENAMES 等变量，在 nounset 下会
+          # "unbound variable" 退出（line 258 报错就是这个）。
           source /opt/intel/oneapi/setvars.sh
+          set -euo pipefail
           OUT=release/crispasr-linux-x86_64-sycl
           mkdir -p "$OUT/lib"
           cp build/bin/crispasr "$OUT/"
