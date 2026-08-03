@@ -591,6 +591,108 @@ jobs:
           files: release/crispasr-linux-x86_64-vulkan.tar.gz
           fail_on_unmatched_files: false
 
+  # ── Linux x86_64 CLI — Intel SYCL variant ───────────────────────────────────
+  # Intel GPU 专用路径（Arc / Data Center Max / Flex / Meteor Lake iGPU）。
+  # 用 oneAPI Base Toolkit 的 icx/icpx 编译，GGML_SYCL=ON。
+  # 强制 MKL：ggml/src/ggml-sycl/CMakeLists.txt 在 INTEL target 下
+  # find_package(MKL REQUIRED)。默认 FP32（GGML_SYCL_F16=OFF，与 build.sh 和
+  # main-intel.Dockerfile 默认一致）。
+  build-linux-x86_64-sycl:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Free up disk space
+        # oneAPI apt 安装约 3-5GB，先腾空间。脚本与 build-linux-x86_64-hip
+        # 完全一致：清掉 dotnet/llvm/mysql/postgresql 与几个大头缓存目录。
+        run: |
+          sudo apt-get remove -y '^dotnet-.*' '^llvm-.*' '^mysql-.*' '^postgresql-.*'
+          sudo apt-get autoremove -y
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install oneAPI Base Toolkit (DPC++ + MKL)
+        # 仅装编译 + MKL 必需组件，避免整包 basekit（~10GB）撑爆磁盘。
+        # ggml-sycl/CMakeLists.txt 要求 ENV{ONEAPI_ROOT} 与 find_package(MKL)，
+        # 所以这里必须 source setvars.sh 再把 ONEAPI_ROOT 暴露给后续 step。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ patchelf wget gnupg2
+          # Intel oneAPI apt 仓库
+          wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-9.PUB \
+            | sudo gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+          sudo apt-get install -y \
+            intel-oneapi-compiler-dpcpp-cpp \
+            intel-oneapi-mkl-devel \
+            intel-oneapi-tbb-devel
+          source /opt/intel/oneapi/setvars.sh --force
+          echo "ONEAPI_ROOT=$ONEAPI_ROOT" >> "$GITHUB_ENV"
+
+      - name: Build
+        # setvars.sh 在每个独立 step 顶部 source 一次：GitHub Actions 的
+        # 每个 step 是新 shell，$GITHUB_ENV 里的 ONEAPI_ROOT 只赋值不执行
+        # setvars 的其它导出（PATH、LD_LIBRARY_PATH 等），故仍需显式 source。
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_SYCL=ON \
+            -DGGML_BLAS=OFF \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+            -DCMAKE_C_COMPILER=icx \
+            -DCMAKE_CXX_COMPILER=icpx \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON \
+            -DCRISPASR_BUILD_SERVER=OFF
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
+
+      - name: Package
+        # 打包所有 NEEDED 的 Intel runtime（libsycl / MKL / TBB / svml /
+        # Level-Zero loader）进 lib/，patchelf 设 RPATH=$ORIGIN/lib，
+        # tarball 解压即用、目标机无需安装 oneAPI。与 Vulkan job 同款做法。
+        run: |
+          set -euo pipefail
+          source /opt/intel/oneapi/setvars.sh
+          OUT=release/crispasr-linux-x86_64-sycl
+          mkdir -p "$OUT/lib"
+          cp build/bin/crispasr "$OUT/"
+          cp build/bin/crispasr-quantize "$OUT/"
+          # 抓取 ldd 报告的所有 /opt/intel/* 依赖（含传递依赖）
+          ldd "$OUT/crispasr" "$OUT/crispasr-quantize" \
+            | awk '/=> \/opt\/intel/ {print $3}' | sort -u \
+            | xargs -r -I{} cp -L {} "$OUT/lib/"
+          # 兜底常见 SONAME：防止 ldd 解析路径变化或某些库仅以 soname 形式出现
+          for lib in libsycl.so.7 libm_sycl.so.7 libze_loader.so.1 \
+                     libtbb.so.12 libsvml.so libirng.so libintlc.so.5; do
+            found=$(find /opt/intel/oneapi -name "$lib" -type f 2>/dev/null | head -1)
+            [ -n "$found" ] && cp -L "$found" "$OUT/lib/"
+          done
+          for f in "$OUT"/crispasr "$OUT"/crispasr-quantize; do
+            patchelf --set-rpath '$ORIGIN/lib' "$f"
+          done
+          cd release && tar czf crispasr-linux-x86_64-sycl.tar.gz crispasr-linux-x86_64-sycl/
+          ls -lh crispasr-linux-x86_64-sycl.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-sycl
+          path: release/crispasr-linux-x86_64-sycl.tar.gz
+
+      - name: Attach crispasr-linux-x86_64-sycl.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: release/crispasr-linux-x86_64-sycl.tar.gz
+          fail_on_unmatched_files: false
+
   # ── Linux ARM64 CLI binaries ─────────────────────────────────────────────────
   # Mirror of build-linux on GitHub's ubuntu-22.04-arm runner. NEON is the
   # native SIMD path on aarch64, so OpenBLAS adds little — keep it on (same
@@ -1804,7 +1906,7 @@ jobs:
   # to transient permission issues). softprops won't clobber files that
   # already exist on the release.
   publish:
-    needs: [validate-version, build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-x86_64-hip, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-x86_64-hip, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
+    needs: [validate-version, build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-x86_64-hip, build-linux-x86_64-sycl, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-x86_64-hip, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
