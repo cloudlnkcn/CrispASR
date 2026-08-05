@@ -615,13 +615,28 @@ jobs:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
 
-      - name: Install oneAPI Base Toolkit (DPC++ + MKL)
-        # 仅装编译 + MKL 必需组件，避免整包 basekit（~10GB）撑爆磁盘。
-        # ggml-sycl/CMakeLists.txt 要求 ENV{ONEAPI_ROOT} 与 find_package(MKL)，
-        # 所以这里必须 source setvars.sh 再把 ONEAPI_ROOT 暴露给后续 step。
+      - name: Install build deps + Level Zero SDK
+        # Level Zero 的 headers/loader 既不在 Ubuntu 22.04 archive 也不在 oneAPI
+        # apt 仓库里，需要从 oneapi-src 的 GitHub release 装 .deb 对。它是 ggml
+        # SYCL 的可选依赖（用于直接 device-memory 分配），缺失只会发一条 CMake
+        # WARNING，不影响编译；但装上可以让 backend 用上更高效的内存路径。
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ patchelf wget gnupg2
+          sudo apt-get install -y cmake g++ patchelf wget gnupg2 \
+            ocl-icd-opencl-dev ca-certificates
+          lz_ver="1.17.2"; lz_u="u22.04"
+          base="https://github.com/oneapi-src/level-zero/releases/download/v${lz_ver}"
+          wget -q "${base}/level-zero_${lz_ver}%2B${lz_u}_amd64.deb" -O /tmp/level-zero.deb
+          wget -q "${base}/level-zero-devel_${lz_ver}%2B${lz_u}_amd64.deb" -O /tmp/level-zero-devel.deb
+          sudo apt-get install -y /tmp/level-zero.deb /tmp/level-zero-devel.deb
+
+      - name: Install oneAPI Base Toolkit (DPC++ + MKL + oneDNN)
+        # 仅装编译 + MKL/oneDNN 必需组件，避免整包 basekit（~10GB）撑爆磁盘。
+        # ggml-sycl/CMakeLists.txt 要求 ENV{ONEAPI_ROOT} 与 find_package(MKL)，
+        # 所以这里必须 source setvars.sh 再把 ONEAPI_ROOT 暴露给后续 step。
+        # oneDNN devel 用来消掉 find_package(DNNL) 的 CMake 警告（可选，但
+        # 与 llama.cpp ubuntu-24-sycl job 保持一致）。
+        run: |
           # Intel oneAPI apt 仓库。key 文件名是 GPG-PUB-KEY-INTEL-SW-PRODUCTS-2023.PUB
           # （-PRODUCTS-2023 段不能省：旧的 -SW-9.PUB 已 404，会导致 gpg 收到
           # S3 NoSuchKey XML 报文 → "no valid OpenPGP data found" 退出码 2）。
@@ -634,6 +649,7 @@ jobs:
           sudo apt-get install -y \
             intel-oneapi-compiler-dpcpp-cpp \
             intel-oneapi-mkl-devel \
+            intel-oneapi-dnnl-devel \
             intel-oneapi-tbb-devel
           source /opt/intel/oneapi/setvars.sh --force
           echo "ONEAPI_ROOT=$ONEAPI_ROOT" >> "$GITHUB_ENV"
@@ -661,31 +677,100 @@ jobs:
         # 打包所有 NEEDED 的 Intel runtime（libsycl / MKL / TBB / svml /
         # Level-Zero loader）进 lib/，patchelf 设 RPATH=$ORIGIN/lib，
         # tarball 解压即用、目标机无需安装 oneAPI。与 Vulkan job 同款做法。
+        #
+        # 与 llama.cpp ubuntu-24-sycl 的打包纪律对齐：除了 ldd 能直接看到的
+        # 依赖，还要补三类 ldd 看不到的间接依赖（详见下方注释），否则在真实
+        # Intel GPU 上 SYCL backend 会被静默跳过、模型只跑 CPU。
         run: |
           # 必须先 source setvars.sh 再开 `set -u`：Intel 的 vars.sh 内部会
           # 引用未设默认值的 OCL_ICD_FILENAMES 等变量，在 nounset 下会
           # "unbound variable" 退出（line 258 报错就是这个）。
-          source /opt/intel/oneapi/setvars.sh
+          source /opt/intel/oneapi/setvars.sh --force
           set -euo pipefail
           OUT=release/crispasr-linux-x86_64-sycl
           mkdir -p "$OUT/lib"
           cp build/bin/crispasr "$OUT/"
           cp build/bin/crispasr-quantize "$OUT/"
-          # 抓取 ldd 报告的所有 /opt/intel/* 依赖（含传递依赖）
-          ldd "$OUT/crispasr" "$OUT/crispasr-quantize" \
-            | awk '/=> \/opt\/intel/ {print $3}' | sort -u \
-            | xargs -r -I{} cp -L {} "$OUT/lib/"
-          # 兜底常见 SONAME：防止 ldd 解析路径变化或某些库仅以 soname 形式出现
-          for lib in libsycl.so.7 libm_sycl.so.7 libze_loader.so.1 \
-                     libtbb.so.12 libsvml.so libirng.so libintlc.so.5; do
-            found=$(find /opt/intel/oneapi -name "$lib" -type f 2>/dev/null | head -1)
-            [ -n "$found" ] && cp -L "$found" "$OUT/lib/"
+
+          # 1) 用 ldd 自动发现所有解析到 /opt/intel/oneapi 的运行时依赖，
+          #    比手工维护 SONAME 列表更稳：覆盖 libsycl/libm_sycl/libsvml/
+          #    libirng/libintlc/libze_loader 等，并自动跟进传递依赖。
+          #    同时拷贝每个依赖所在目录下的同名 soname 家族（symlink + 版本
+          #    变体），保证 loader 能按 NEEDED 找到 libsvml.so.5 之类。
+          mapfile -t intel_libs < <(
+            ldd "$OUT/crispasr" "$OUT/crispasr-quantize" 2>/dev/null \
+              | awk '/=> \//{print $3}' | sort -u \
+              | grep '^/opt/intel/oneapi' || true
+          )
+          if [ ${#intel_libs[@]} -eq 0 ]; then
+            echo "::error::No Intel oneAPI runtime dependencies discovered via ldd."
+            exit 1
+          fi
+          for lib in "${intel_libs[@]}"; do
+            d=$(dirname "$lib")
+            # 提取基名前缀（去掉 .so 之后的版本号），拷贝整族文件
+            stem=$(basename "$lib" | sed -E 's/\.so.*$/.so/')
+            cp -aL "$d"/"$stem"* "$OUT/lib/" 2>/dev/null || true
           done
+
+          # 2) ldd 看不到的三类间接依赖，必须显式拷贝（参考 llama.cpp
+          #    ubuntu-24-sycl 的 Bundle SYCL runtime libraries 步骤）：
+          #      - libur_adapter_*.so : Unified Runtime adapters，被
+          #        libur_loader.so 在运行时 dlopen 来枚举 Intel GPU。没有
+          #        ELF NEEDED 引用它们，ldd 不会列出，缺失会导致 SYCL 抛
+          #        "No device of requested type available"，backend 被跳过。
+          #      - libumf.so*         : Unified Memory Framework，level-zero
+          #        adapter 的直接 NEEDED；adapter 自身只是被 dlopen，其依赖
+          #        在扫描 build/bin 时不会走到，缺失会导致 adapter 加载了但
+          #        设备枚举返回 0。
+          #      - libtbb.so* / libtbbbind*.so* : oneTBB。系统 libtbb12 可能
+          #        满足 ldd，但 MKL 的 TBB threading 是基于这套 oneTBB ABI
+          #        编的；加载系统副本会触发 `undefined symbol:
+          #        ...tbb::detail::r1::get_thread_reference_vertex...`。
+          find /opt/intel/oneapi -name 'libur_adapter_*.so*' -exec cp -aL {} "$OUT/lib/" \;
+          find /opt/intel/oneapi -name 'libumf.so*'          -exec cp -aL {} "$OUT/lib/" \;
+          find /opt/intel/oneapi -name 'libtbb.so*'          -exec cp -aL {} "$OUT/lib/" \;
+          find /opt/intel/oneapi -name 'libtbbbind*.so*'     -exec cp -aL {} "$OUT/lib/" \;
+          # 某些 oneAPI 安装带 debug 变体（libtbbbind_*_debug.so*），体积大
+          # 且运行时不需要，删掉保持包精简。
+          rm -f "$OUT/lib"/libtbbbind*_debug.so* "$OUT/lib"/libtbbbind_*_debug.so*
+
+          # RPATH=$ORIGIN/lib，让扁平包自包含。
           for f in "$OUT"/crispasr "$OUT"/crispasr-quantize; do
             patchelf --set-rpath '$ORIGIN/lib' "$f"
           done
           cd release && tar czf crispasr-linux-x86_64-sycl.tar.gz crispasr-linux-x86_64-sycl/
           ls -lh crispasr-linux-x86_64-sycl.tar.gz
+
+      - name: Validate SYCL package contents
+        # 回归保护：校验上面那些 ldd 看不到的间接依赖确实进了包，并对整包
+        # 做 ldd 链接检查。Intel GPU 驱动栈（Level Zero loader / OpenCL ICD）
+        # 由目标机驱动提供，视为已解析，与 llama.cpp OpenVINO/SYCL job 同款。
+        run: |
+          source /opt/intel/oneapi/setvars.sh --force >/dev/null
+          set -e
+          shopt -s nullglob
+          OUT=release/crispasr-linux-x86_64-sycl
+
+          # 间接依赖回归守卫：缺任一个都会让 SYCL backend 在终端机器上看不到 GPU。
+          for lib in 'libur_adapter_level_zero.so*' 'libumf.so*' 'libtbb.so*'; do
+            matches=("$OUT/lib"/$lib)
+            if [ ${#matches[@]} -eq 0 ]; then
+              echo "::error::Missing ${lib} — SYCL backend won't see the GPU at runtime"
+              exit 1
+            fi
+          done
+
+          # 整包链接检查（含两个可执行文件本身）。Intel GPU 驱动栈视为已解析。
+          for f in "$OUT"/crispasr "$OUT"/crispasr-quantize; do
+            missing=$(ldd "$f" \
+              | awk '/=> not found/ && $1 !~ /^(libze_loader|libOpenCL)\./ { print }')
+            if [ -n "$missing" ]; then
+              echo "::error::Unresolved runtime dependencies for $f"
+              echo "$missing"
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:
