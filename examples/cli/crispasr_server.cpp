@@ -1723,6 +1723,34 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             rp.tts_voice = voice_name;
         if (!instructions.empty())
             rp.tts_instruct = instructions;
+
+        // WAV-clone voices require a reference transcription (the adapter
+        // refuses to synthesize from a .wav without tts_ref_text). Auto-read
+        // the companion .txt written by POST /v1/voices so clients that
+        // uploaded a reference through the standard flow don't need to resend
+        // the transcript on every request.
+        if (is_voice_clone && rp.tts_ref_text.empty() && !params.tts_voice_dir.empty()) {
+            std::string clone_base = voice_name;
+            const std::string wav_ext = ".wav";
+            if (clone_base.size() >= wav_ext.size())
+                clone_base.resize(clone_base.size() - wav_ext.size());
+            std::ifstream txt_file(params.tts_voice_dir + "/" + clone_base + ".txt");
+            if (txt_file) {
+                std::ostringstream txt_buf;
+                txt_buf << txt_file.rdbuf();
+                rp.tts_ref_text = txt_buf.str();
+            }
+            if (rp.tts_ref_text.empty()) {
+                json_error(res, 400,
+                           "voice '" + voice_name + "' is missing its reference transcription: upload '"
+                               + clone_base + ".txt' (the transcript of the reference audio) via "
+                               "POST /v1/voices, or pass 'ref_text' in the request body",
+                           "missing_reference_text", "ref_text");
+                return;
+            }
+        }
+        if (body.contains("ref_text") && body["ref_text"].is_string())
+            rp.tts_ref_text = body["ref_text"].get<std::string>();
         if (body.contains("seed") && body["seed"].is_number_integer())
             rp.seed = body["seed"].get<uint64_t>();
         if (body.contains("temperature") && body["temperature"].is_number())
