@@ -4,6 +4,59 @@ This file tracks fixes and features that this fork would benefit from
 upstream (crispasr / ggml / NeMo / etc.). Each entry has the issue,
 the impact on this fork, and the workaround we currently apply.
 
+## Sync state — 2026-10-10 (upstream v0.8.42)
+
+This fork was fully synced to upstream `CrispStrobe/CrispASR@main`
+(v0.8.42, commit `1e42e5432`). Upstream rewrote git history after
+2026-05-12, so a plain `git merge` produces thousands of phantom
+conflicts; instead the fork's own features were re-ported on top of the
+fresh upstream tree (branch `sync/upstream-2026-10`, merged back with
+`-s ours` to preserve both lineages). Future syncs can be normal
+`git merge upstream/main` again — the merge-base is now real upstream
+history.
+
+Fork features carried across (ported, adapted to the new APIs):
+
+- **Server voiceprint endpoints** (`/v1/speakers*`, incl. sub-libraries,
+  segment enrollment, export/import) + per-cluster named-speaker
+  identification in transcriptions + `display_name` sidecar metadata +
+  Unicode-safe name validation. `speaker_db_enroll()` gained a consent
+  parameter upstream (v2 format, issue #266) — the server passes its
+  launch-time `--speaker-db-consent` gate through. Docs:
+  `docs/server.md` § "Speaker voiceprints", design notes in
+  `docs/voiceprint-speaker-recognition-design.md`.
+- **cosyvoice3 bare-name `.wav` voices resolve against `--voice-dir`**
+  (`resolve_wav_voice`); upstream added equivalent resolution to its
+  newer TTS backends but not cosyvoice3. Upstream's own auto-transcribe
+  ref-text path (`resolve_ref_text`) supersedes the fork's companion-
+  `.txt` server logic, so that part was dropped.
+- **Intel SYCL release job** (`build-linux-x86_64-sycl` in
+  `.github/workflows/release.yml`), adapted to upstream's checkout pin +
+  `inputs.only` + tag-guard conventions; LICENSE now ships in the
+  tarball like upstream's other jobs.
+- **HF workflow guards** — `deploy-hf-space` / `sync-hf-space` only run
+  in the upstream repo.
+- Superseded upstream-side (dropped): libopenblas/libgfortran bundling
+  fixes (upstream #296 does this), release-workflow checkout/OOM fixes
+  (upstream PR #527 pins checkouts), ROCm apt-priority fixes (upstream's
+  release.yml has no ROCm job), fork's `/v1/voices` + ref-text server
+  work (upstream shipped its own), fork VERSION bumps 0.8.10–0.8.13
+  (VERSION now tracks upstream: 0.8.42).
+
+Upstream highlights absorbed in this sync (v0.8.14 → v0.8.42, ~3700
+commits): NVIDIA Nemotron-3-Diarization (Sortformer v3) with streaming
+presets, transformers-exact beam-search semantics as the default, CTC
+character timestamps across alignment surfaces, new ASR backends
+(xasr, hojo-asr, dolphin, raon-speech, orukeet, parakeet-ultra/redux,
+canary Flash GGUFs, phonon-2), new TTS (voxcpm2, confucius4, miotts,
+omnivoice duration control, hikari, qwen3-tts native-Vulkan talker),
+live transcribe+translate (`--live-translate`) + Opus-MT/Marian
+translation backend, Index-Echo 9B S2TT, music separation
+(htdemucs / mel-band-roformer / beat-this) and piano transcription
+(Onsets & Frames / hFT-Transformer / MT3), ggml CPU repack routing,
+shared-library plugin discovery, and hundreds of backend fixes.
+
+
 ## crispasr — `examples/ffmpeg-transcode.cpp` mp4-container handling
 
 **Status:** ⏳ pending upstream
