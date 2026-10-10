@@ -252,11 +252,32 @@ def mirror(args):
     return 0
 
 
+def print_create_commands(args):
+    """Emit one `ms create` line per missing repo — run the output on any
+    machine/network where ModelScope's WAF allows repo creation, then re-run
+    `mirror` here to fill the files."""
+    models, datasets = extract_inventory(args.root)
+    ns = args.namespace
+    lines = []
+    for repo in sorted(models):
+        repo_id = f"{ns}/{repo.split('/', 1)[1]}"
+        if ms_repo_files(repo_id) is None:
+            lines.append(f"ms create {repo_id} --repo-type model --exist-ok")
+    for repo in sorted(datasets):
+        repo_id = f"{ns}/{repo.split('/', 1)[1]}"
+        if not any(ms_dataset_has(repo_id, f) for f in list(datasets[repo])[:1]) \
+                and not ms_dataset_repo_exists(repo_id):
+            lines.append(f"ms create {repo_id} --repo-type dataset --exist-ok")
+    print("\n".join(lines))
+    print(f"# {len(lines)} repo(s) to create", file=sys.stderr)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("check", "mirror"):
+    for name in ("check", "mirror", "commands"):
         s = sub.add_parser(name)
         s.add_argument("--root", default=os.path.join(os.path.dirname(__file__), ".."))
         s.add_argument("--namespace", default=DEFAULT_NS)
@@ -282,6 +303,8 @@ def main():
             miss = sorted(f for f in files if not ms_dataset_has(repo_id, f))
             if miss:
                 print(f"dataset {repo}: missing {miss}")
+    elif args.cmd == "commands":
+        sys.exit(print_create_commands(args))
     else:
         sys.exit(mirror(args))
 
