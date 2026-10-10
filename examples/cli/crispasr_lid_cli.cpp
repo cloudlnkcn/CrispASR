@@ -58,7 +58,7 @@ constexpr const char* kFireredLidDefaultUrl =
     "https://huggingface.co/cstr/firered-lid-GGUF/resolve/main/firered-lid-f16.gguf";
 constexpr const char* kFireredLidDefaultFile = "firered-lid-f16.gguf";
 constexpr const char* kEcapaLidDefaultUrl =
-    "https://huggingface.co/cstr/ecapa-lid-107-GGUF/resolve/main/ecapa-lid-107.gguf";
+    "https://huggingface.co/cstr/ecapa-lid-107-GGUF/resolve/main/ecapa-lid-107-f16.gguf";
 
 std::string scratch_dir() {
     const char* env = std::getenv("CRISPASR_SCRATCH_DIR");
@@ -66,7 +66,7 @@ std::string scratch_dir() {
     mkdir(d.c_str(), 0755);
     return d;
 }
-constexpr const char* kEcapaLidDefaultFile = "ecapa-lid-107.gguf";
+constexpr const char* kEcapaLidDefaultFile = "ecapa-lid-107-f16.gguf";
 
 std::string resolve_whisper_lid_model(const whisper_params& p) {
     if (!p.lid_model.empty())

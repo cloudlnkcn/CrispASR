@@ -1,3 +1,35 @@
+## ModelScope mirror of built-in model downloads (2026-10-10)
+
+Every auto-download URL built into the code is a `huggingface.co` resolve
+URL (~250 repos / ~340 files; registry, VAD/LID/punc loaders, TTS
+companions, G2P dicts). Since huggingface.co is unreachable from
+mainland-China networks, the download layer (`src/crispasr_cache.cpp`)
+now rewrites candidates per `CRISPASR_MIRROR`:
+
+| CRISPASR_MIRROR | order |
+|---|---|
+| `auto` (default) | huggingface.co → `modelscope.cn/models/cloudlnk/<repo>` → hf-mirror.com |
+| `modelscope` / `ms` | ModelScope → hf-mirror.com → huggingface.co |
+| `hf-mirror` | hf-mirror.com → ModelScope → huggingface.co |
+| `off` | huggingface.co only |
+
+The ModelScope mirror keeps the same repo name and file path as HF
+(`huggingface.co/cstr/titanet-large-GGUF` →
+`modelscope.cn/models/cloudlnk/titanet-large-GGUF`), so the rewrite is
+pure string surgery. Namespace override: `CRISPASR_MODELSCOPE_NS`.
+The `.src` sidecar treats all candidates as one source, so a cache filled
+from the mirror validates against the HF url and vice versa.
+
+Mirror coverage is maintained by `scripts/mirror-modelscope.py`
+(`check` reports gaps, `mirror` fills them from hf-mirror.com). Status
+2026-10-10: ~48 repos mirrored (incl. whisper.cpp full set, qwen3-asr/tts,
+cosyvoice3, titanet, kokoro, funasr, pyannote, …); the remaining ~190
+repos are pending because modelscope.cn's WAF blocks repo *creation* from
+this network (`YUNWAF_CLIENT_UNCLASSIFIED` on `POST /api/v1/models`) while
+uploads to existing repos work — create the repos once via the web UI
+(or from another network), then re-run the script; until then the
+hf-mirror fallback keeps every model downloadable.
+
 # Upstream issues / patches we depend on
 
 This file tracks fixes and features that this fork would benefit from

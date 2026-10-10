@@ -37,6 +37,9 @@ bool file_present(const std::string& path);
 //   Windows: tries WinHTTP first (built-in, handles HTTPS + redirects natively,
 //            no shell-quoting issues), then falls back to curl, then wget.
 //   POSIX  : tries curl, then wget.
+// Source order follows CRISPASR_MIRROR (see crispasr_cache.cpp): by default
+// huggingface.co first, then the ModelScope mirror (modelscope.cn, namespace
+// "cloudlnk" — same repo name and file path), then the hf-mirror.com proxy.
 // Returns true iff the file is present and non-empty after the download.
 // `quiet=true` suppresses progress bars; failure messages always go to stderr.
 bool fetch(const std::string& url, const std::string& dest, bool quiet);

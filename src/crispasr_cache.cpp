@@ -360,6 +360,127 @@ static bool fetch_libcurl(const std::string& url, const std::string& dest, bool 
 
 } // anonymous namespace
 
+// ─── mirror candidates (ModelScope / hf-mirror fallback) ─────────────────────
+//
+// The registry's canonical URLs point at huggingface.co, which is
+// unreachable from mainland-China networks without a proxy. This fork keeps
+// per-file mirrors under the `cloudlnk` namespace on ModelScope
+// (modelscope.cn) — same repo name, same file path — and can also rewrite
+// the host to the hf-mirror.com proxy for anything not yet mirrored.
+//
+//   CRISPASR_MIRROR=auto        (default) huggingface.co first, then the
+//                               ModelScope mirror, then the hf-mirror.com
+//                               proxy — so a model that is not mirrored yet
+//                               still downloads from mainland-China networks
+//   CRISPASR_MIRROR=modelscope  ModelScope mirror first, then hf-mirror.com,
+//                               then huggingface.co (aliases: ms, cn)
+//   CRISPASR_MIRROR=hf-mirror   hf-mirror.com proxy first, then ModelScope,
+//                               then huggingface.co
+//   CRISPASR_MIRROR=off         huggingface.co only
+//   CRISPASR_MODELSCOPE_NS      namespace holding the mirrors (default
+//                               "cloudlnk")
+//
+// Only `https://huggingface.co/<org>/<repo>/resolve/<ref>/<path>` URLs are
+// rewritten (pinned-SHA refs map to the mirrored repo's master branch);
+// every other URL passes through untouched. ensure_cached_file() treats all
+// candidates of one request as the same source for the .src sidecar, so a
+// cache filled from the mirror validates against the HF url and vice versa.
+
+static bool env_is(const char* name, std::initializer_list<const char*> values) {
+    const char* v = getenv(name);
+    if (!v)
+        return false;
+    for (const char* want : values) {
+        if (strlen(v) != strlen(want))
+            continue;
+        bool same = true;
+        for (size_t i = 0; same && i < strlen(v); i++)
+            same = tolower((unsigned char)v[i]) == tolower((unsigned char)want[i]);
+        if (same)
+            return true;
+    }
+    return false;
+}
+
+// Rewrite one huggingface.co resolve URL to its ModelScope mirror, or return
+// "" when it is not one (other hosts, dataset URLs, bare repo pages).
+static std::string modelscope_mirror_url(const std::string& url) {
+    static const char kHF[] = "https://huggingface.co/";
+    if (url.compare(0, sizeof(kHF) - 1, kHF) != 0)
+        return "";
+    const std::string rest = url.substr(sizeof(kHF) - 1);
+    // <org>/<repo>/resolve/<ref>/<file-path>
+    const std::size_t r = rest.find("/resolve/");
+    if (r == std::string::npos)
+        return "";
+    const std::string org_repo = rest.substr(0, r);
+    const std::size_t slash = org_repo.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 >= org_repo.size())
+        return "";
+    if (org_repo.compare(0, slash, "datasets") == 0)
+        return ""; // dataset URLs have no ModelScope mirror layout — passthrough
+    const std::string repo = org_repo.substr(slash + 1);
+    const std::size_t fsep = rest.find('/', r + 9); // end of "<ref>/"
+    if (fsep == std::string::npos)
+        return "";
+    const std::string file_path = rest.substr(fsep + 1);
+    if (file_path.empty())
+        return "";
+    const char* ns = getenv("CRISPASR_MODELSCOPE_NS");
+    std::string namespace_ = (ns && *ns) ? ns : "cloudlnk";
+    while (!namespace_.empty() && namespace_.back() == '/')
+        namespace_.pop_back();
+    if (namespace_.empty())
+        return "";
+    return "https://modelscope.cn/models/" + namespace_ + "/" + repo + "/resolve/master/" + file_path;
+}
+
+// Host-swap to the hf-mirror.com proxy (keeps repos, refs incl. pinned SHAs,
+// datasets and query strings intact).
+static std::string hf_mirror_url(const std::string& url) {
+    static const char kHF[] = "https://huggingface.co/";
+    if (url.compare(0, sizeof(kHF) - 1, kHF) != 0)
+        return "";
+    return "https://hf-mirror.com/" + url.substr(sizeof(kHF) - 1);
+}
+
+// Ordered source candidates for `url` per CRISPASR_MIRROR. When `preferred`
+// is non-null it receives the first candidate (the source a fresh download
+// will be attempted from).
+static std::vector<std::string> mirror_candidates(const std::string& url, std::string* preferred = nullptr) {
+    std::vector<std::string> out;
+    auto push = [&](const std::string& candidate) {
+        if (!candidate.empty() && std::find(out.begin(), out.end(), candidate) == out.end())
+            out.push_back(candidate);
+    };
+    const std::string ms = modelscope_mirror_url(url);
+    const std::string hfm = hf_mirror_url(url);
+
+    if (env_is("CRISPASR_MIRROR", {"off", "none", "hf-only"})) {
+        push(url);
+    } else if (env_is("CRISPASR_MIRROR", {"modelscope", "ms", "cn"})) {
+        // China-first ordering; hf-mirror keeps unmirrored models reachable
+        // without eating the huggingface.co connect timeout.
+        push(ms);
+        push(hfm);
+        push(url);
+    } else if (env_is("CRISPASR_MIRROR", {"hf-mirror", "hfmirror"})) {
+        push(hfm);
+        push(ms);
+        push(url);
+    } else { // "auto" (default) or unset: canonical source, then ModelScope
+             // mirror, then the hf-mirror.com proxy as the last resort
+        push(url);
+        push(ms);
+        push(hfm);
+    }
+    if (out.empty())
+        push(url);
+    if (preferred)
+        *preferred = out.front();
+    return out;
+}
+
 // ─── public API ──────────────────────────────────────────────────────────────
 
 namespace {
@@ -586,7 +707,11 @@ static bool fetch_download(const std::string& url, const std::string& dest, bool
 // place. An interrupted transfer therefore never leaves a partial non-zero file
 // at `dest` (which file_present() would later mistake for a valid cache hit),
 // and concurrent downloads to the same `dest` use distinct temps.
-bool fetch(const std::string& url, const std::string& dest, bool quiet) {
+//
+// Tries the CRISPASR_MIRROR source list in order (huggingface.co, then the
+// ModelScope mirror by default) and records the URL that actually served the
+// bytes in `used_url` so the .src sidecar reflects reality.
+static bool fetch_first(const std::string& url, const std::string& dest, bool quiet, std::string* used_url) {
     std::error_code ec;
     const auto parent = std::filesystem::path(dest).parent_path();
     if (!parent.empty())
@@ -594,10 +719,22 @@ bool fetch(const std::string& url, const std::string& dest, bool quiet) {
     if (ec)
         return false;
     const std::string tmp = unique_temp_path(dest);
-    if (fetch_download(url, tmp, quiet) && file_present(tmp) && atomic_rename(tmp, dest) && file_present(dest))
-        return true;
-    ::remove(tmp.c_str()); // clean up any partial/temp bytes
+    for (const std::string& candidate : mirror_candidates(url, used_url)) {
+        if (candidate != url && !quiet)
+            fprintf(stderr, "crispasr: primary source failed, trying mirror %s\n", candidate.c_str());
+        if (fetch_download(candidate, tmp, quiet) && file_present(tmp) && atomic_rename(tmp, dest) &&
+            file_present(dest)) {
+            if (used_url)
+                *used_url = candidate;
+            return true;
+        }
+        ::remove(tmp.c_str()); // clean up any partial/temp bytes
+    }
     return false;
+}
+
+bool fetch(const std::string& url, const std::string& dest, bool quiet) {
+    return fetch_first(url, dest, quiet, nullptr);
 }
 
 // Build the well-known search list for already-on-disk model files.
@@ -651,6 +788,10 @@ std::string probe_cached_file(const std::string& filename, const std::string& ca
 
 std::string ensure_cached_file(const std::string& filename, const std::string& url, bool quiet,
                                const char* pretty_label, const std::string& cache_dir_override) {
+    // All mirror candidates of `url` name the same artifact: a cache filled
+    // from the ModelScope mirror must validate for the huggingface.co request
+    // and vice versa, so the sidecar check accepts any of them (issue #250).
+    const std::vector<std::string> candidates = mirror_candidates(url);
     // Probe all well-known locations. A hit is reused unless its `.src` sidecar
     // records a DIFFERENT origin url — that is a same-basename file from another
     // repository (issue #250) and must not be handed to the loader. No sidecar =
@@ -662,7 +803,8 @@ std::string ensure_cached_file(const std::string& filename, const std::string& u
         if (!file_present(p))
             continue;
         const std::string sc = sidecar_path(p);
-        if (file_present(sc) && read_text_file(sc) != url) {
+        if (file_present(sc) && std::find(candidates.begin(), candidates.end(), read_text_file(sc)) ==
+                                        candidates.end()) {
             if (!quiet)
                 fprintf(stderr, "%s: cached %s is from a different source; not reusing\n", pretty_label, p.c_str());
             continue; // wrong source — keep probing, then re-download below
@@ -674,12 +816,15 @@ std::string ensure_cached_file(const std::string& filename, const std::string& u
 
     // No source-consistent hit. Download into the canonical cache dir (atomically,
     // overwriting any wrong-source file that lives there) and record the origin.
+    // fetch_first() walks the CRISPASR_MIRROR source list (huggingface.co, then
+    // the ModelScope mirror by default) and reports which URL actually served.
     const std::string dst = canonical + "/" + filename;
     if (!quiet)
         fprintf(stderr, "%s: downloading %s\n", pretty_label, url.c_str());
-    if (!fetch(url, dst, quiet))
+    std::string used;
+    if (!fetch_first(url, dst, quiet, &used))
         return "";
-    write_text_file(sidecar_path(dst), url); // record source so a later same-basename request validates
+    write_text_file(sidecar_path(dst), used.empty() ? url : used); // record source so a later same-basename request validates
     return dst;
 }
 
