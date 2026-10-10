@@ -47,6 +47,24 @@ bool file_exists(const std::string& path) {
     return stat(path.c_str(), &st) == 0;
 }
 
+// Resolve a `voice` value to a usable .wav path. A bare filename (no path
+// separator) that isn't present in the process cwd is looked up in
+// tts_voice_dir, where POST /v1/voices stores uploaded clone references.
+std::string resolve_wav_voice(const whisper_params& params) {
+    const std::string& voice = params.tts_voice;
+    if (voice.empty() || voice.find('/') != std::string::npos || file_exists(voice))
+        return voice;
+    if (!params.tts_voice_dir.empty()) {
+        std::string candidate = params.tts_voice_dir;
+        if (!candidate.empty() && candidate.back() != '/')
+            candidate += '/';
+        candidate += voice;
+        if (file_exists(candidate))
+            return candidate;
+    }
+    return voice;
+}
+
 std::string dir_of(const std::string& path) {
     auto sep = path.find_last_of("/\\");
     return (sep == std::string::npos) ? std::string(".") : path.substr(0, sep);
@@ -231,7 +249,13 @@ public:
 
         int n = 0;
         float* pcm = nullptr;
-        if (ends_with_ci(params.tts_voice, ".wav")) {
+        // Bare-name .wav voices resolve against --voice-dir (uploaded clone
+        // references); without this the engine would open the name relative
+        // to the process cwd and silently return empty audio. The resolved
+        // path also keys the reference-transcript cache, so the companion
+        // .txt / cached transcription is found per file, not per spelling.
+        const std::string wav_voice = resolve_wav_voice(params);
+        if (ends_with_ci(wav_voice, ".wav")) {
             // #334: the talker is conditioned on the (reference transcript,
             // reference speech) pair and reads the speaker's rate off it, so a
             // transcript that does not match the clip is the single most
@@ -240,7 +264,7 @@ public:
             // onto the caller, who typically approximates. Transcribe it
             // ourselves instead (cached beside the clip), exactly as f5-tts
             // already does; an explicit --ref-text still wins.
-            const std::string ref_text = resolve_ref_text(params);
+            const std::string ref_text = resolve_ref_text(params, wav_voice);
             if (ref_text.empty()) {
                 fprintf(stderr,
                         "crispasr[cosyvoice3-tts]: --voice is a WAV and --ref-text was not set, and the reference "
@@ -249,7 +273,7 @@ public:
             }
             if (!ensure_cloning_models())
                 return {};
-            pcm = cosyvoice3_tts_synth_from_wav(ctx_, text.c_str(), params.tts_voice.c_str(), ref_text.c_str(), &n);
+            pcm = cosyvoice3_tts_synth_from_wav(ctx_, text.c_str(), wav_voice.c_str(), ref_text.c_str(), &n);
         } else {
             const char* voice = params.tts_voice.empty() ? nullptr : params.tts_voice.c_str();
             pcm = cosyvoice3_tts_synth(ctx_, text.c_str(), voice, &n);
@@ -274,20 +298,21 @@ public:
 private:
     // An explicit --ref-text wins; otherwise read the clip, resample to 16 kHz
     // and hand it to the ASR backend behind the shared ref-text cache. Returns
-    // "" only when both are unavailable.
-    std::string resolve_ref_text(const whisper_params& p) {
+    // "" only when both are unavailable. `wav_path` is the resolved voice file
+    // (see resolve_wav_voice) and doubles as the cache key.
+    std::string resolve_ref_text(const whisper_params& p, const std::string& wav_path) {
         if (!p.tts_ref_text.empty())
             return p.tts_ref_text;
         std::vector<float> pcm;
         int sr = 0;
-        if (!crispasr::core::read_wav_mono_pcm16(p.tts_voice, pcm, sr) || pcm.empty() || sr <= 0) {
+        if (!crispasr::core::read_wav_mono_pcm16(wav_path, pcm, sr) || pcm.empty() || sr <= 0) {
             fprintf(stderr, "crispasr[cosyvoice3-tts]: could not read '%s' as PCM16 WAV for auto-transcription\n",
-                    p.tts_voice.c_str());
+                    wav_path.c_str());
             return "";
         }
         if (sr != 16000)
             pcm = core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, 16000);
-        return crispasr_ref_text::resolve_cached(p.tts_voice, pcm, p, "crispasr[cosyvoice3-tts]",
+        return crispasr_ref_text::resolve_cached(wav_path, pcm, p, "crispasr[cosyvoice3-tts]",
                                                  crispasr_ref_cache::kCv3RefTextSuffix);
     }
 
