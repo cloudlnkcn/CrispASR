@@ -88,6 +88,19 @@ def ms_repo_files(repo_id, repo_type="model"):
         return None
 
 
+def ms_dataset_has(repo_id, path):
+    """HEAD the resolve URL — the same path the C++ fallback downloads from.
+    The dataset listing API (oss/tree) lags or 404s unpredictably, so
+    existence is judged by whether the file actually resolves."""
+    url = f"https://modelscope.cn/datasets/{repo_id}/resolve/master/{path}"
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
 def hf_tree(repo):
     """file sizes from the hf-mirror tree API (empty on failure)"""
     url = f"{HF_MIRROR}/api/models/{repo}/tree/main?recursive=true"
@@ -106,6 +119,15 @@ def content_length(url):
             return int(r.headers.get("Content-Length") or 0)
     except Exception:
         return 0
+
+
+def ms_dataset_repo_exists(repo_id):
+    url = f"https://modelscope.cn/api/v1/datasets/{repo_id}"
+    try:
+        with urllib.request.urlopen(url, timeout=20) as r:
+            return json.loads(r.read()).get("Code") == 200
+    except Exception:
+        return False
 
 
 def diff_against_modelscope(models, ns):
@@ -135,8 +157,8 @@ def mirror(args):
     # dataset repos (g2p-dicts) mirror to ModelScope datasets
     work = []
     for repo, files in sorted(datasets.items()):
-        existing = ms_repo_files(f"{ns}/{repo.split('/', 1)[1]}", repo_type="dataset")
-        miss = sorted(set(files) - (existing or set()))
+        repo_id = f"{ns}/{repo.split('/', 1)[1]}"
+        miss = sorted(f for f in files if not ms_dataset_has(repo_id, f))
         if miss:
             work.append({"repo": repo, "files": miss, "repo_type": "dataset"})
     for repo, files in sorted(models.items()):
@@ -168,7 +190,9 @@ def mirror(args):
         # bandwidth (uploads to existing repos are unaffected by the WAF).
         create = subprocess.run(["ms", "create", repo_id, "--repo-type", w["repo_type"],
                                  "--exist-ok"], capture_output=True, text=True)
-        if create.returncode != 0 and ms_repo_files(repo_id, w["repo_type"]) is None:
+        exists = ms_repo_files(repo_id) is not None if w["repo_type"] == "model" \
+            else ms_dataset_repo_exists(repo_id)
+        if create.returncode != 0 and not exists:
             print(f"   ms create blocked/failed — repo needs creating once manually", flush=True)
             state["failed"][key] = "needs-create"
             json.dump(state, open(state_path, "w"), indent=1)
@@ -205,8 +229,11 @@ def mirror(args):
             print(f"   upload FAILED: {up.stderr[-200:]}", flush=True)
             state["failed"][key] = "upload"
         else:
-            remote = ms_repo_files(repo_id, w["repo_type"]) or set()
-            still = [f for f in files if f not in remote]
+            if w["repo_type"] == "model":
+                remote = ms_repo_files(repo_id) or set()
+                still = [f for f in files if f not in remote]
+            else:
+                still = [f for f in files if not ms_dataset_has(repo_id, f)]
             if still:
                 print(f"   verify FAILED, missing: {still}", flush=True)
                 state["failed"][key] = f"verify: {still}"
@@ -239,27 +266,24 @@ def main():
         s.add_argument("--budget", type=float, default=0,
                        help="stop after this many seconds (0 = no limit)")
     args = ap.parse_args()
+    args.check = args.cmd == "check"
     if args.cmd == "check":
         models, datasets = extract_inventory(args.root)
         partial, absent = diff_against_modelscope(models, args.namespace)
         print(f"inventory: {len(models)} model repos, {len(datasets)} dataset repos")
-        print(f"completely missing on ModelScope ({ns_default(args.namespace)}): {len(absent)}")
+        print(f"completely missing on ModelScope ({args.namespace}): {len(absent)}")
         for r in absent:
             print(f"  {r}: {sorted(models[r])}")
         print(f"partially missing: {len(partial)}")
         for r, m in partial.items():
             print(f"  {r}: {m}")
         for repo, files in datasets.items():
-            have = ms_repo_files(f"{args.namespace}/{repo.split('/', 1)[1]}", repo_type="dataset")
-            miss = sorted(set(files) - (have or set()))
+            repo_id = f"{args.namespace}/{repo.split('/', 1)[1]}"
+            miss = sorted(f for f in files if not ms_dataset_has(repo_id, f))
             if miss:
                 print(f"dataset {repo}: missing {miss}")
     else:
         sys.exit(mirror(args))
-
-
-def ns_default(ns):
-    return ns
 
 
 if __name__ == "__main__":

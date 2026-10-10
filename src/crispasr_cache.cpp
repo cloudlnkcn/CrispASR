@@ -402,13 +402,18 @@ static bool env_is(const char* name, std::initializer_list<const char*> values) 
     return false;
 }
 
-// Rewrite one huggingface.co resolve URL to its ModelScope mirror, or return
-// "" when it is not one (other hosts, dataset URLs, bare repo pages).
+// Rewrite one huggingface.co URL (model or dataset resolve) to its ModelScope
+// mirror, or return "" when it is not one (other hosts, bare repo pages).
 static std::string modelscope_mirror_url(const std::string& url) {
     static const char kHF[] = "https://huggingface.co/";
     if (url.compare(0, sizeof(kHF) - 1, kHF) != 0)
         return "";
-    const std::string rest = url.substr(sizeof(kHF) - 1);
+    bool is_dataset = false;
+    std::string rest = url.substr(sizeof(kHF) - 1);
+    if (rest.compare(0, 9, "datasets/") == 0) {
+        is_dataset = true;
+        rest = rest.substr(9);
+    }
     // <org>/<repo>/resolve/<ref>/<file-path>
     const std::size_t r = rest.find("/resolve/");
     if (r == std::string::npos)
@@ -417,8 +422,6 @@ static std::string modelscope_mirror_url(const std::string& url) {
     const std::size_t slash = org_repo.find('/');
     if (slash == std::string::npos || slash == 0 || slash + 1 >= org_repo.size())
         return "";
-    if (org_repo.compare(0, slash, "datasets") == 0)
-        return ""; // dataset URLs have no ModelScope mirror layout — passthrough
     const std::string repo = org_repo.substr(slash + 1);
     const std::size_t fsep = rest.find('/', r + 9); // end of "<ref>/"
     if (fsep == std::string::npos)
@@ -432,7 +435,10 @@ static std::string modelscope_mirror_url(const std::string& url) {
         namespace_.pop_back();
     if (namespace_.empty())
         return "";
-    return "https://modelscope.cn/models/" + namespace_ + "/" + repo + "/resolve/master/" + file_path;
+    // Datasets live under modelscope.cn/datasets/<ns>/<repo>; models under
+    // modelscope.cn/models/<ns>/<repo>.
+    return std::string("https://modelscope.cn/") + (is_dataset ? "datasets/" : "models/") + namespace_ + "/" +
+           repo + "/resolve/master/" + file_path;
 }
 
 // Host-swap to the hf-mirror.com proxy (keeps repos, refs incl. pinned SHAs,
