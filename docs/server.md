@@ -558,6 +558,61 @@ resp = client.audio.speech.create(
 resp.stream_to_file("out.wav")
 ```
 
+## Speaker voiceprints (named-speaker identification)
+
+Anonymous diarization only yields "(speaker N)"/"A"/"B" labels. The
+`/v1/speakers/*` endpoints add a persistent voiceprint database so enrolled
+speakers are identified **by name** in later transcriptions. Requires the
+server to start with `--speaker-db <dir>`; every biometric operation
+(enroll / match / import) additionally requires `--speaker-db-consent` and
+returns `403 consent_required` without it (GDPR Art. 9 — see
+[`eu-ai-act.md`](eu-ai-act.md)). Storage is one L2-normalized TitaNet/ECAPA
+embedding per speaker (`<dir>/<name>.spkr`, `src/speaker_db.h`), plus an
+optional `<dir>/<name>.meta.json` sidecar carrying a human-readable
+`display_name` so clients can share names across devices.
+
+```bash
+# Enroll (multipart audio, ≥ ~1.5 s). Names may be Unicode (张三); no
+# spaces / slashes / "..". ?force=true overwrites an existing profile.
+curl -X POST http://localhost:8080/v1/speakers \
+  -F name=zhangsan -F "display_name=张三" -F file=@zhangsan.wav
+# 201 {"name":"zhangsan","display_name":"张三","dim":192,"stored":true}
+
+curl http://localhost:8080/v1/speakers            # list (name, dim, display_name)
+curl -X DELETE http://localhost:8080/v1/speakers/zhangsan
+
+# 1:N identify a clip against the library
+curl -X POST http://localhost:8080/v1/speakers/match -F file=@clip.wav
+# {"matches":[{"name":"zhangsan","score":0.94}],"best":{...},"matched":true}
+
+# Sub-libraries (separate voiceprint sets under <speaker-db>/<name>)
+curl http://localhost:8080/v1/speakers/libraries
+curl -X POST http://localhost:8080/v1/speakers/libraries/meeting-q3
+curl -X DELETE http://localhost:8080/v1/speakers/libraries/meeting-q3
+
+# Enroll straight from a finalized recording + time range (seconds)
+curl -X POST http://localhost:8080/v1/speakers/enroll-from-segment \
+  -F name=guest -F file=@panel.wav -F start=612.5 -F end=631.0
+
+# Portable backup / restore (base64 JSON, no zip dependency)
+curl "http://localhost:8080/v1/speakers/export?library=meeting-q3" > q3.json
+curl -X POST http://localhost:8080/v1/speakers/import -d @q3.json
+```
+
+To label transcriptions, pass `speaker_db` (a library name, `"default"`, or a
+path) and optionally `speaker_threshold` (cosine threshold, default 0.7) on
+`/inference` or `/v1/audio/transcriptions` with `diarize=true` +
+`diarize_embedder=auto`: each diarized cluster is embedded once and, on a
+match, its anonymous `(speaker N)` label is replaced with the enrolled name.
+Unmatched clusters keep their anonymous labels.
+
+> **Posture note.** Upstream's CLI keeps speaker matching to a *closed
+> roster* (`--expect-speakers`, issue #266). The server exposes opt-in
+> open 1:N identification instead — gated behind the launch-time
+> `--speaker-db-consent` flag — so a single long-lived server can serve a
+> growing enrolled roster. Design notes:
+> [`voiceprint-speaker-recognition-design.md`](voiceprint-speaker-recognition-design.md).
+
 ## Speech-to-speech endpoint
 
 `POST /v1/audio/speech-to-speech` runs end-to-end audio-in → audio-out
