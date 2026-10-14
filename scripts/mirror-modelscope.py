@@ -207,7 +207,7 @@ def mirror(args):
             src = f"{HF_MIRROR}/{repo}/resolve/main/{f}" if w["repo_type"] == "model" \
                 else f"{HF_MIRROR}/datasets/{repo}/resolve/main/{f}"
             want = content_length(src)
-            if want > args.max_bytes:
+            if args.max_bytes and want > args.max_bytes:
                 print(f"   skip {f}: {want/1e6:.0f} MB > --max-bytes", flush=True)
                 continue
             rc = subprocess.run(["curl", "-fSL", "--retry", "3", "--connect-timeout", "20",
