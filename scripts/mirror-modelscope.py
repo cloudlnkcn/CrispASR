@@ -181,8 +181,8 @@ def mirror(args):
             break
         repo, files = w["repo"], w["files"]
         key = f"{w['repo_type']}:{repo}"
-        if key in state["done"] or key in state["failed"]:
-            continue
+        if key in state["done"]:
+            continue  # already mirrored; failed entries ARE retried on re-run
         repo_id = f"{ns}/{repo.split('/', 1)[1]}"
         print(f"== {repo} -> {repo_id} ({len(files)} file(s))", flush=True)
 
@@ -223,10 +223,28 @@ def mirror(args):
             subprocess.run(["rm", "-rf", stage])
             continue
 
-        up = subprocess.run(["ms", "upload", repo_id, stage, "/", "--repo-type", w["repo_type"],
-                             "--max-workers", "4"], capture_output=True, text=True, timeout=14400)
-        if up.returncode != 0:
-            print(f"   upload FAILED: {up.stderr[-200:]}", flush=True)
+        # Per-file uploads, NOT folder upload: ms upload's folder flow
+        # pre-validates against ModelScope's global content-addressed store —
+        # when the blob already exists platform-wide (it does: the original
+        # cstr repos are on modelscope.cn), it concludes "All files already
+        # committed" and skips the commit, leaving the target repo empty.
+        # Single-file mode always issues the commit.
+        staged = []
+        for root_, _, names_ in os.walk(stage):
+            for n in names_:
+                local = os.path.join(root_, n)
+                rel = os.path.relpath(local, stage).replace(os.sep, "/")
+                staged.append((local, rel))
+        upload_failed = None
+        for local, rel in staged:
+            up = subprocess.run(["ms", "upload", repo_id, local, rel, "--repo-type", w["repo_type"]],
+                                capture_output=True, text=True, timeout=14400)
+            out = up.stdout + up.stderr
+            if up.returncode != 0 or "Upload complete" not in out:
+                upload_failed = f"{rel}: rc={up.returncode} {out[-160:]}"
+                print(f"   upload FAILED {rel}", flush=True)
+                break
+        if upload_failed:
             state["failed"][key] = "upload"
         else:
             if w["repo_type"] == "model":
