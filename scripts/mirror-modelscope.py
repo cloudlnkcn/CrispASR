@@ -62,10 +62,10 @@ def extract_inventory(root):
         for line in out.splitlines():
             for repo, ref_and_path in DATASET_RE.findall(line):
                 path = ref_and_path.split("/", 1)[1] if "/" in ref_and_path else ref_and_path
-                datasets.setdefault(repo, set()).add(path.rstrip("\\,;"))
+                datasets.setdefault(repo, set()).add(path.rstrip("\\,;`"))
             for repo, ref_and_path in HF_RE.findall(line):
                 path = ref_and_path.split("/", 1)[1] if "/" in ref_and_path else ref_and_path
-                models.setdefault(repo, set()).add(path.rstrip("\\,;"))
+                models.setdefault(repo, set()).add(path.rstrip("\\,;`"))
     # drop empty paths and runtime-templated filenames ("ggml-#{name}.bin",
     # "…{HF_REPO}…") — those are substituted per-request and cannot be
     # mirrored statically.
